@@ -1,0 +1,203 @@
+🧭 0. System Overview
+
+Goal:
+
+Detect IR LEDs → match to known 3D layout → estimate pose → optionally triangulate
+
+Pipeline:
+
+Image → Blob Detection → Blob Filtering → Matching → Pose Estimation (PnP)
+      → Temporal Tracking (IMU fusion) → (Optional) Triangulation
+
+🔍 1. LED Detection (Blob Detection)
+
+Minimal:
+1. Convert image → grayscale (or IR channel)
+2. Apply threshold
+3. Find connected components
+4. Extract:
+      * centroid (x, y)
+      * area
+
+👉 This already works in controlled environments
+
+Optimal:
+1. Adaptive threshold (per frame or region)
+2. Handle:
+    * merged blobs (split using shape heuristics)
+    * faint blobs (lower threshold + filtering)
+3. Use multi-scale detection:
+    image pyramid → detect blobs at different scales
+4. Subpixel centroid estimation
+
+👉 Inspired by:
+
+* blob segmentation improvements
+* pyramid-based detection
+
+🧹 2. Blob Filtering (Outlier Rejection)
+Minimal
+Filter by:
+min/max area
+brightness threshold
+
+👉 Removes obvious noise
+
+Optimal
+
+Two-stage filtering:
+
+A. Geometric / temporal filtering
+Track blobs across frames
+Identify stationary blobs
+Build 3D map (triangulate over time)
+Remove them in future frames
+
+👉 Removes:
+
+lights, reflections, background clutter
+B. Learned / physical filtering
+Validate blob size using:
+distance estimate
+viewing angle
+Option:
+small classifier (e.g., lightweight CNN)
+
+👉 Removes:
+
+physically inconsistent blobs
+
+
+🔗 3. Matching (2D blobs ↔ 3D LEDs)
+Minimal
+Assume:
+small number of blobs
+known LED layout
+
+Approach:
+
+brute-force assign correspondences
+try all combinations (small N)
+run PnP → pick lowest reprojection error
+
+👉 Works if:
+
+few blobs
+low ambiguity
+Optimal
+A. Two matching modes
+1. Brute matching
+used when:
+no prior pose
+enumerate hypotheses
+2. Proximity matching
+use previous pose
+project 3D LEDs → image
+search only nearby blobs
+
+👉 Much faster and more stable
+
+B. Multi-camera matching
+combine observations across cameras
+enforce geometric consistency
+
+👉 Important when:
+
+each camera sees few LEDs
+C. Hypothesis + validation (RANSAC-style)
+pick minimal matches → generate pose
+validate with remaining blobs
+choose best hypothesis
+📐 4. Pose Estimation (PnP)
+Minimal
+
+Use standard Perspective-n-Point (PnP) problem:
+
+OpenCV solvePnP
+Require ≥4 matches
+Optimal
+A. Multiple solvers
+Full PnP (≥4 points)
+P3P (minimal)
+Reduced solvers:
+P2P (use prior orientation)
+P1P (strong prior)
+
+👉 Enables tracking with:
+
+1–3 LEDs visible
+B. Use priors
+initialize with previous pose
+constrain optimization
+C. Robust optimization
+minimize reprojection error
+reject outliers (RANSAC / M-estimators)
+🔁 5. Temporal Tracking (Filtering + IMU Fusion)
+Minimal
+Use previous pose as initialization
+simple smoothing (moving average)
+Optimal
+A. IMU fusion
+combine:
+camera pose
+IMU (gyro + accel)
+e.g.:
+Extended Kalman Filter (EKF)
+B. Prediction
+predict pose when LEDs missing
+reduces need for brute matching
+C. State machine
+
+Switch modes:
+
+good tracking → fast methods
+lost tracking → brute recovery
+📍 6. Triangulation (if multi-view / multi-frame)
+Minimal
+If 2+ cameras:
+match same LED across views
+triangulate via ray intersection
+Optimal
+A. Multi-view triangulation
+use all cameras jointly
+least squares solution
+B. Temporal triangulation
+accumulate observations over time
+refine LED positions or landmarks
+C. Use for:
+mapping environment (SLAM-style)
+filtering static lights
+⚡ 7. Performance Optimization
+Minimal
+process every frame equally
+Optimal
+adaptive compute:
+skip heavy steps when confident
+enable pyramids only when needed
+ROI-based processing
+parallelize per camera
+🧠 Recommended thesis progression
+Stage 1 (baseline)
+threshold + blob detection
+brute-force matching
+basic PnP
+
+👉 proves pipeline works
+
+Stage 2 (robust detection)
+better blob filtering
+handle merged blobs
+subpixel accuracy
+Stage 3 (tracking)
+temporal prior
+proximity matching
+Stage 4 (robust matching)
+RANSAC-style hypothesis/validation
+multi-camera consistency
+Stage 5 (advanced)
+IMU fusion
+reduced-point solvers (P2P, P1P)
+pyramid-based detection
+Stage 6 (real-world robustness)
+static light mapping
+learned blob filtering
