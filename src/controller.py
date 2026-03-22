@@ -1,46 +1,174 @@
-import json
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from typing import List, Tuple, Optional, Dict
+from src.camera import CameraCalibration
 
 
-def visualize_leds(leds_data):
-    """Visualize LED positions and normals"""
-    positions = np.array([led['Position'] for led in leds_data])
-    normals = np.array([led['Normal'] for led in leds_data])
-
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot LED positions
-    ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
-               c='red', s=50, label='LED Positions')
-
-    # Plot normal vectors (scaled for visibility)
-    scale = 0.03  # Scale factor to make normals visible
-    for pos, norm in zip(positions, normals):
-        ax.quiver(pos[0], pos[1], pos[2],
-                  norm[0] * scale, norm[1] * scale, norm[2] * scale,
-                  color='blue', alpha=0.5)
-
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    ax.set_title('Controller LED Constellation')
-    ax.legend()
-    plt.show()
+def create_leds_from_config(cfg):
+    """Create list of ControllerLED instances from config data"""
+    calibration_information = cfg["CalibrationInformation"]["ControllerLeds"]
+    leds = []
+    for led in calibration_information:
+        position = np.array(led["Position"])
+        normal = np.array(led["Normal"])
+        leds.append(ControllerLED(position, normal))
+    return leds
 
 
-def get_controller_positions(cfg):
+class ControllerLED:
+    def __init__(self, position: np.ndarray, normal: np.ndarray):
+        """LED on the controller with position and normal"""
 
-    with open(cfg["right_controller"]["config_path"]) as f:
-        controller_config = json.load(f)
-    calibration_information = controller_config["CalibrationInformation"]["ControllerLeds"]
-    # visualize_leds(calibration_information)
-    positions_3d = np.array([led['Position'] for led in calibration_information])
-    return positions_3d
+        self.position = position # 3D position relative to controller center
+        self.normal = normal # LED orientation vector
 
 
+    def __le__(self, other):
+        """Less than or equal comparison"""
+        if not isinstance(other, ControllerLED):
+            return NotImplemented
+        return tuple(self.position) <= tuple(other.position)
 
 
+class ControllerTracker:
+    def __init__(self, camera_calib: CameraCalibration,
+                 leds_3d: List[ControllerLED]):
+        """
+        Initialize tracker
 
+        Args:
+            camera_calib: Camera calibration parameters
+            leds_3d: List of LED positions and normals in controller space
+            camera_pose: (rotation, translation) of camera in world space
+        """
+
+        self.cam = camera_calib
+        self.leds_3d = leds_3d
+        self.cam_R = camera_calib.camera_pose[0]  # Camera rotation (world to camera)
+        self.cam_t = camera_calib.camera_pose[1]  # Camera translation
+
+        # For temporal tracking
+        self.prev_pose = None  # Previous controller pose (rvec, tvec)
+        self.prev_assignment = None  # Previous LED-to-blob mapping
+        self.kd_tree_cache = None  # For proximity matching
+
+        from src._matching import proximity_match, brute_match
+        from src._pnp_solver import p2p_solver, p1p_solver
+        self.proximity_match = proximity_match.__get__(self)
+        self.brute_match = brute_match.__get__(self)
+        self.p2p_solver = p2p_solver.__get__(self)
+        self.p1p_solver = p1p_solver.__get__(self)
+
+
+    def project_leds_to_image(self, controller_R: np.ndarray,
+                              controller_t: np.ndarray) -> List[Tuple[int, np.ndarray, bool]]:
+        """
+        Project LEDs from controller space to camera image
+
+        Args:
+            controller_R: Controller rotation (world space)
+            controller_t: Controller translation (world space)
+
+        Returns:
+            List of (led_index, projected_point, is_visible)
+        """
+        projected = []
+
+        for idx, led in enumerate(self.leds_3d):
+            # Transform LED from controller to world
+            led_world = controller_R @ led.position + controller_t
+
+            # Transform from world to camera
+            led_cam = self.cam_R @ led_world + self.cam_t
+
+            # Check if LED is behind camera
+            if led_cam[2] <= 0:
+                projected.append((idx, None, False))
+                continue
+
+            # Project to image plane (pinhole model)
+            x = led_cam[0] / led_cam[2]
+            y = led_cam[1] / led_cam[2]
+
+            # Apply distortion (radtan8 model)
+            r2 = x * x + y * y
+            r4 = r2 * r2
+            r6 = r2 * r4
+
+            # Radial distortion
+            radial = (1 + self.cam.k1 * r2 + self.cam.k2 * r4 + self.cam.k3 * r6) / \
+                     (1 + self.cam.k4 * r2 + self.cam.k5 * r4 + self.cam.k6 * r6)
+
+            # Tangential distortion
+            dx = 2 * self.cam.p1 * x * y + self.cam.p2 * (r2 + 2 * x * x)
+            dy = self.cam.p1 * (r2 + 2 * y * y) + 2 * self.cam.p2 * x * y
+
+            x_dist = x * radial + dx
+            y_dist = y * radial + dy
+
+            # Convert to pixel coordinates
+            u = self.cam.fx * x_dist + self.cam.cx
+            v = self.cam.fy * y_dist + self.cam.cy
+
+            # Check visibility based on LED normal
+            # Transform LED normal to camera space
+            normal_world = controller_R @ led.normal
+            normal_cam = self.cam_R @ normal_world
+            view_dir = -led_cam / np.linalg.norm(led_cam)
+            is_visible = np.dot(normal_cam, view_dir) > 0.3  # Cosine threshold
+
+            projected.append((idx, np.array([u, v]), is_visible))
+
+        return projected
+
+
+    def track(self, blobs: np.ndarray) -> Optional[Dict]:
+        """
+        Main tracking function with state machine for selecting appropriate solver
+
+        Args:
+            blobs: Detected blob centers (N x 2)
+
+        Returns:
+            Pose solution or None if tracking lost
+        """
+        n_blobs = len(blobs)
+
+        # State machine based on number of blobs and prior information
+        if self.prev_pose is None:
+            # No prior pose - use brute force matching
+            if n_blobs >= 4:
+                solution = self.brute_match(blobs, min_matches=4)
+            else:
+                return None
+        else:
+            # Have prior pose - try progressive solvers
+            solution = None
+
+            if n_blobs >= 3:
+                # Try proximity matching first
+                solution = self.proximity_match(blobs, self.prev_pose)
+
+                # If that fails, try P2P
+                if not solution or solution["error"] > 8.0:
+                    p2p_solution = self.p2p_solver(blobs, self.prev_pose)
+                    if p2p_solution and p2p_solution["error"] < 10.0:
+                        solution = p2p_solution
+
+            elif n_blobs >= 2:
+                # Try P2P
+                solution = self.p2p_solver(blobs, self.prev_pose)
+
+            elif n_blobs >= 1:
+                # Try P1P as last resort
+                solution = self.p1p_solver(blobs, self.prev_pose)
+
+        # Update tracking state
+        if solution and solution["error"] < 15.0:
+            self.prev_pose = (solution["rvec"], solution["tvec"])
+            self.prev_assignment = solution["assignment"]
+            return solution
+        else:
+            # Tracking lost - reset
+            self.prev_pose = None
+            self.prev_assignment = None
+            return None

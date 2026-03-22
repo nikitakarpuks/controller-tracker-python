@@ -5,6 +5,8 @@ data:
   total_cameras_number: 4
   selected_cameras: [0] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
+cameras:
+  intrinsics_path: "./data/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
 
 controllers:
   right_controller:

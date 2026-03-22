@@ -39,4 +39,4 @@ def get_centroids(image, cfg):
 
         centroids.append((cx, cy))
 
-    return centroids
+    return np.array(centroids)
