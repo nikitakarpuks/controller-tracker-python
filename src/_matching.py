@@ -23,8 +23,19 @@ def proximity_match(self, blobs: np.ndarray,
     rvec_pred, tvec_pred = predicted_pose
     R_pred = cv2.Rodrigues(rvec_pred)[0]
 
+    R_cam_ctrl = R_pred
+    t_cam_ctrl = tvec_pred
+
+    # Invert camera extrinsics
+    R_imu_cam = self.cam_R.T
+    t_imu_cam = -R_imu_cam @ self.cam_t
+
+    # Compose
+    R_imu_ctrl = R_imu_cam @ R_cam_ctrl
+    t_imu_ctrl = R_imu_cam @ t_cam_ctrl + t_imu_cam
+
     # Project LEDs using predicted pose
-    projected = self.project_leds_to_image(R_pred, tvec_pred)
+    projected = self.project_leds_to_image(R_imu_ctrl, t_imu_ctrl)
 
     # Filter visible LEDs
     visible = [(idx, proj) for idx, proj, visible in projected if visible and proj is not None]
@@ -33,7 +44,7 @@ def proximity_match(self, blobs: np.ndarray,
         return None
 
     # Build KD-tree for fast nearest neighbor matching
-    led_positions = np.array([proj for _, proj in visible])
+    led_positions = np.array([proj[:, 0] for _, proj in visible])
     led_indices = [idx for idx, _ in visible]
     tree = KDTree(led_positions)
 
@@ -95,63 +106,147 @@ def proximity_match(self, blobs: np.ndarray,
         "method": "proximity"
     }
 
-def brute_match(self, blobs: np.ndarray,
-                min_matches: int = 4,
-                reprojection_threshold: float = 5.0) -> Optional[Dict]:
+def brute_match(self,
+                blobs: np.ndarray,
+                max_iterations: int = 2000,
+                reprojection_threshold: float = 5.0,
+                min_inliers: int = 5) -> Optional[Dict]:
     """
-    Exhaustive matching when no prior pose exists
+    RANSAC-style brute matching (no prior pose)
 
-    Args:
-        blobs: Detected blob centers (N x 2)
-        min_matches: Minimum number of matches required
-        reprojection_threshold: Maximum allowed reprojection error
-
-    Returns:
-        Best matching solution
+    - Uses small hypothesis (4 points)
+    - Validates using all blobs
+    - Selects best based on inliers + reprojection error
     """
+
     n_blobs = len(blobs)
     n_leds = len(self.leds_3d)
 
-    if n_blobs < min_matches:
+    if n_blobs < 4:
         return None
 
+    led_positions = np.array([led.position for led in self.leds_3d])
+
     best_solution = None
+    best_inliers = 0
     best_error = np.inf
 
-    # Try all combinations of LEDs
-    for led_indices in itertools.combinations(range(n_leds), n_blobs):
-        selected_leds = [self.leds_3d[idx].position for idx in led_indices]
+    for iteration in range(max_iterations):
 
-        # Try all permutations of assignments
-        for perm in itertools.permutations(range(n_blobs)):
-            object_points = np.array([selected_leds[idx] for idx in perm])
-            image_points = blobs
+        # --- 1. Sample hypothesis (4-point) ---
+        blob_indices = np.random.choice(n_blobs, 4, replace=False)
+        led_indices = np.random.choice(n_leds, 4, replace=False)
 
-            success, rvec, tvec = cv2.solvePnP(
-                object_points,
-                image_points,
-                self.cam.camera_matrix,
-                self.cam.dist_coeffs,
-                flags=cv2.SOLVEPNP_ITERATIVE
-            )
+        object_points = led_positions[led_indices]
+        image_points = blobs[blob_indices]
 
-            if not success:
-                continue
+        # --- 2. Solve PnP (stable method) ---
+        success, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            self.cam.camera_matrix,
+            self.cam.dist_coeffs,
+            flags=cv2.SOLVEPNP_EPNP
+        )
 
-            # Reprojection error
-            projected, _ = cv2.projectPoints(object_points, rvec, tvec,
-                                             self.cam.camera_matrix, self.cam.dist_coeffs)
-            projected = projected.reshape(-1, 2)
-            error = np.mean(np.linalg.norm(projected - image_points, axis=1))
+        if not success:
+            continue
 
-            if error < best_error and error < reprojection_threshold:
-                best_error = error
-                best_solution = {
-                    "rvec": rvec,
-                    "tvec": tvec,
-                    "error": error,
-                    "assignment": list(zip(range(n_blobs), np.array(led_indices)[list(perm)])),
-                    "method": "brute"
-                }
+        # --- 3. Project all LEDs ---
+        projected, _ = cv2.projectPoints(
+            led_positions, rvec, tvec,
+            self.cam.camera_matrix,
+            self.cam.dist_coeffs
+        )
+        projected = projected.reshape(-1, 2)
+
+        # --- NaN / Inf safety ---
+        if not np.all(np.isfinite(projected)):
+            continue
+
+        # --- 4. Match blobs to nearest projected LEDs ---
+        tree = KDTree(projected)
+        distances, indices = tree.query(blobs)
+
+        # --- 5. Inlier selection with uniqueness ---
+        used_leds = set()
+        inlier_blob_idx = []
+        inlier_led_idx = []
+
+        for blob_idx, (dist, led_idx) in enumerate(zip(distances, indices)):
+            if dist < reprojection_threshold and led_idx not in used_leds:
+                used_leds.add(led_idx)
+                inlier_blob_idx.append(blob_idx)
+                inlier_led_idx.append(led_idx)
+
+        num_inliers = len(inlier_blob_idx)
+
+        if num_inliers < min_inliers:
+            continue
+
+        inlier_blob_idx = np.array(inlier_blob_idx)
+        inlier_led_idx = np.array(inlier_led_idx)
+
+        # --- 6. Compute reprojection error on inliers ---
+        proj_inliers, _ = cv2.projectPoints(
+            led_positions[inlier_led_idx],
+            rvec, tvec,
+            self.cam.camera_matrix,
+            self.cam.dist_coeffs
+        )
+        proj_inliers = proj_inliers.reshape(-1, 2)
+
+        errors = np.linalg.norm(proj_inliers - blobs[inlier_blob_idx], axis=1)
+        mean_error = np.mean(errors)
+
+        # --- 7. Check if this is best solution ---
+        is_better = (
+            (num_inliers > best_inliers) or
+            (num_inliers == best_inliers and mean_error < best_error)
+        )
+
+        if not is_better:
+            continue
+
+        # --- 8. Refine pose using all inliers ---
+        success, rvec_refined, tvec_refined = cv2.solvePnP(
+            led_positions[inlier_led_idx],
+            blobs[inlier_blob_idx],
+            self.cam.camera_matrix,
+            self.cam.dist_coeffs,
+            rvec, tvec,
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+
+        if not success:
+            continue
+
+        # --- 9. Final error after refinement ---
+        proj_refined, _ = cv2.projectPoints(
+            led_positions[inlier_led_idx],
+            rvec_refined, tvec_refined,
+            self.cam.camera_matrix,
+            self.cam.dist_coeffs
+        )
+        proj_refined = proj_refined.reshape(-1, 2)
+
+        final_errors = np.linalg.norm(
+            proj_refined - blobs[inlier_blob_idx], axis=1
+        )
+        final_mean_error = np.mean(final_errors)
+
+        # --- 10. Update best solution ---
+        best_inliers = num_inliers
+        best_error = final_mean_error
+
+        best_solution = {
+            "rvec": rvec_refined,
+            "tvec": tvec_refined,
+            "inliers": num_inliers,
+            "error": final_mean_error,
+            "assignment": list(zip(inlier_blob_idx, inlier_led_idx)),
+            "method": "ransac_brute"
+        }
 
     return best_solution

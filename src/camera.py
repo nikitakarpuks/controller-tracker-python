@@ -1,5 +1,5 @@
 import numpy as np
-import cv2
+from scipy.spatial.transform import Rotation as R
 
 class CameraCalibration:
     def __init__(self, cfg, camera_idx: int = 0):
@@ -26,7 +26,7 @@ class CameraCalibration:
         self.qx = extrinsics["qx"]
         self.qy = extrinsics["qy"]
         self.qz = extrinsics["qz"]
-        # self.qw = extrinsics["qw"]
+        self.qw = extrinsics["qw"]
 
         self.camera_matrix = self.camera_matrix()
         self.dist_coeffs = self.dist_coeffs()
@@ -43,7 +43,14 @@ class CameraCalibration:
                          self.k3, self.k4, self.k5, self.k6], dtype=np.float32)
 
     def camera_pose(self):
-        # camera relative to IMU
-        cam_R = cv2.Rodrigues(np.array([self.qx, self.qy, self.qz]))[0] # performs a change of basis from world to camera coordinate system
-        cam_t = np.array([self.px, self.py, self.pz])
-        return cam_R, cam_t
+
+        # convention: T_target_source, so T_imu_cam = transform from camera frame -> IMU frame
+
+        R_imu_cam = R.from_quat([self.qx, self.qy, self.qz, self.qw]).as_matrix()
+        t_imu_cam = np.array([[self.px, self.py, self.pz]]).T
+
+        # invert to get (headset) imu -> camera
+        R_cam_imu = R_imu_cam.T
+        t_cam_imu = -R_cam_imu @ t_imu_cam
+
+        return R_cam_imu, t_cam_imu

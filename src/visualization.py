@@ -151,7 +151,7 @@ class ControllerVisualizer:
         plt.show()
 
 
-def visualize_leds_with_controller(leds: list, stl_path: str, position: tuple, orientation: tuple):
+def visualize_leds_with_controller(leds: list, cfg: dict):
     """Visualize LED positions and normals with controller model"""
 
     positions = []
@@ -162,17 +162,19 @@ def visualize_leds_with_controller(leds: list, stl_path: str, position: tuple, o
 
     # Create visualizer
     viz = ControllerVisualizer()
-    viz.load_controller_model(stl_path)
-    viz.add_controller_model(position, orientation)
+    viz.load_controller_model(cfg["3d_model_path"])
+
+    translation_cfg = cfg["initial_position_change"]["translation"]
+    translation = (translation_cfg["x"], translation_cfg["y"], translation_cfg["z"])
+
+    rotation_cfg = cfg["initial_position_change"]["rotation"]
+    rotation = (rotation_cfg["rx"], rotation_cfg["ry"], rotation_cfg["rz"])
+
+    viz.add_controller_model(translation,
+                             rotation)
     viz.add_leds(positions)# normals)
     # viz.set_equal_axes(leds)
     viz.show()
-
-
-
-
-
-
 
 
 def visualize_leds(leds: list):

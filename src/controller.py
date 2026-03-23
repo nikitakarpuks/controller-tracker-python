@@ -8,8 +8,8 @@ def create_leds_from_config(cfg):
     calibration_information = cfg["CalibrationInformation"]["ControllerLeds"]
     leds = []
     for led in calibration_information:
-        position = np.array(led["Position"])
-        normal = np.array(led["Normal"])
+        position = np.array([led["Position"]]).T
+        normal = np.array([led["Normal"]]).T
         leds.append(ControllerLED(position, normal))
     return leds
 
@@ -22,11 +22,11 @@ class ControllerLED:
         self.normal = normal # LED orientation vector
 
 
-    def __le__(self, other):
-        """Less than or equal comparison"""
-        if not isinstance(other, ControllerLED):
-            return NotImplemented
-        return tuple(self.position) <= tuple(other.position)
+    # def __le__(self, other):
+    #     """Less than or equal comparison"""
+    #     if not isinstance(other, ControllerLED):
+    #         return NotImplemented
+    #     return tuple(self.position) <= tuple(other.position)
 
 
 class ControllerTracker:
@@ -43,8 +43,8 @@ class ControllerTracker:
 
         self.cam = camera_calib
         self.leds_3d = leds_3d
-        self.cam_R = camera_calib.camera_pose[0]  # Camera rotation (world to camera)
-        self.cam_t = camera_calib.camera_pose[1]  # Camera translation
+
+        self.cam_R, self.cam_t = camera_calib.camera_pose  # headset imu to camera
 
         # For temporal tracking
         self.prev_pose = None  # Previous controller pose (rvec, tvec)
@@ -62,26 +62,28 @@ class ControllerTracker:
     def project_leds_to_image(self, controller_R: np.ndarray,
                               controller_t: np.ndarray) -> List[Tuple[int, np.ndarray, bool]]:
         """
-        Project LEDs from controller space to camera image
+        Project LEDs from controller frame into camera image.
 
         Args:
-            controller_R: Controller rotation (world space)
-            controller_t: Controller translation (world space)
+            controller_R: Rotation from controller -> IMU(world)
+            controller_t: Translation from controller -> IMU(world)
 
         Returns:
-            List of (led_index, projected_point, is_visible)
+            List of (led_index, projected_point (2D), is_visible)
         """
         projected = []
 
         for idx, led in enumerate(self.leds_3d):
-            # Transform LED from controller to world
-            led_world = controller_R @ led.position + controller_t
+            # --- Controller -> IMU (world) ---
+            led_imu = controller_R @ led.position + controller_t
 
-            # Transform from world to camera
-            led_cam = self.cam_R @ led_world + self.cam_t
+            # --- IMU -> Camera ---
+            led_cam = self.cam_R @ led_imu + self.cam_t
 
-            # Check if LED is behind camera
-            if led_cam[2] <= 0:
+            z = led_cam[2]
+
+            # Reject points behind or too close to camera
+            if z <= 1e-6:
                 projected.append((idx, None, False))
                 continue
 
@@ -109,12 +111,15 @@ class ControllerTracker:
             u = self.cam.fx * x_dist + self.cam.cx
             v = self.cam.fy * y_dist + self.cam.cy
 
-            # Check visibility based on LED normal
-            # Transform LED normal to camera space
-            normal_world = controller_R @ led.normal
-            normal_cam = self.cam_R @ normal_world
+            # --- Visibility check (LED normal) ---
+            # Controller -> IMU -> Camera
+            normal_imu = controller_R @ led.normal
+            normal_cam = self.cam_R @ normal_imu
+
             view_dir = -led_cam / np.linalg.norm(led_cam)
-            is_visible = np.dot(normal_cam, view_dir) > 0.3  # Cosine threshold
+
+            # Slightly relaxed threshold is safer in practice
+            is_visible = normal_cam.T @ view_dir > 0.2
 
             projected.append((idx, np.array([u, v]), is_visible))
 
@@ -137,7 +142,7 @@ class ControllerTracker:
         if self.prev_pose is None:
             # No prior pose - use brute force matching
             if n_blobs >= 4:
-                solution = self.brute_match(blobs, min_matches=4)
+                solution = self.brute_match(blobs)
             else:
                 return None
         else:
