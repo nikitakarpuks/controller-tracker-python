@@ -1,0 +1,96 @@
+Q: Why does accelerometer measure acceleration, not velocity?
+
+A: Because force on the proof mass satisfies 
+𝐹 = 𝑚𝑎 = 𝑘𝑥
+, so displacement (measured via capacitance) is proportional to acceleration.
+
+Q: What connects capacitance and displacement?
+
+A: 𝐶 = 𝜀𝐴/𝑑
+, and small displacement changes gap → differential capacitance ∝ displacement.
+
+Q: Why do IMUs have bias if physics is correct?
+
+A: Manufacturing imperfections, temperature changes, electronics offsets, and aging introduce constant errors.
+
+Q: Why does IMU drift explode over time?
+
+A: Bias integrates:
+* velocity error grows linearly
+* position error grows quadratically
+
+Q: Why not use IMU alone?
+
+A: It has no absolute reference → drift becomes huge over time.
+
+Q: Why not use vision alone?
+
+A: Too slow, fails under blur, occlusion, low texture.
+
+Q: Why combine IMU + vision?
+
+A:
+
+IMU → fast, smooth motion
+
+vision → corrects drift
+Together → robust tracking
+
+Q: What does IMU do in fusion?
+
+A: Predicts motion continuously (high frequency).
+
+Q: What does vision (or IR tracking) do?
+
+A: Provides absolute pose measurements (low frequency).
+
+Q: What is corrected during fusion?
+
+A:
+* position
+* orientation
+* IMU biases
+
+Q: Do we modify IMU measurements directly?
+
+A: No. We update the state estimate, not raw IMU data.
+
+Q: What is PnP in controller tracking?
+
+A: Estimating controller pose from known 3D LED positions and their 2D image projections.
+
+Q: Is controller tracking SLAM?
+
+A: No. It’s model-based pose estimation (PnP).
+
+Q: Why use infrared LEDs?
+
+A: Easy detection, robust to lighting, no need for natural features.
+
+Q: Do IR LEDs work continuously?
+
+A: Yes, typically continuously but modulated (pulsed) for robustness.
+
+Q: Why does tracking fail outdoors?
+
+A: Sunlight emits strong infrared → destroys signal-to-noise ratio.
+
+Q: Will cameras always see controllers?
+
+A: No — limited field of view, occlusions, fast motion.
+
+Q: What happens when controller is not visible?
+
+A: System falls back to IMU → drift starts accumulating.
+
+Q: Why is IMU critical for VR?
+
+A: Provides low-latency motion → prevents lag and motion sickness.
+
+Q: What is SLAM doing in VR headset?
+
+A: Tracking headset pose in the environment and maintaining a consistent map.
+
+Q: Do we need IR points for SLAM?
+
+A: No. SLAM uses natural image features.
