@@ -21,15 +21,25 @@ visualization:
   3d_model_path: "./data/reverb_g2_controller.stp"
   initial_position_change:
     translation: # in meters
-      x: 0.2040 # red
-      y: 0.04 # green
-      z: -0.088 # blue
+#      x: 0.1960 # red
+#      y: 0.015 # green
+#      z: -0.0935 # blue
+#
+      x: 0.1962 # red opposite
+      y: 0.0148 # green correct
+      z: -0.0935 # blue
 
-#      three points: (0.2565, 0.03, -0.095), (0.1640, -0.02, -0.1054), (0.2040, 0.079, -0.0903)
+#      three points (old): (0.2565, 0.03, -0.095), (0.1640, -0.02, -0.1054), (0.2040, 0.079, -0.0903)
+#      three points (new with zero euler angles):
+  # (0.2697, 0.0234, -0.0486), (0.1810, -0.0299, -0.0690), (0.2078, 0.072, -0.0628)
 
 
     rotation: # in radians
-      rx: -0.1362
-      ry: 0.0380
-      rz: 0.0
+      rx: -0.0005
+      ry: 0.226
+      rz: 0.0 #3.1416
+
+#      rx: 0.14
+#      ry: 0.19
+#      rz: 0.0
 
