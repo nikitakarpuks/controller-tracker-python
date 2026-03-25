@@ -5,6 +5,9 @@ import numpy as np
 from scipy.spatial import KDTree
 from typing import Tuple, Dict, Optional
 import itertools
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
+
 
 def proximity_match(self, blobs: np.ndarray,
                     predicted_pose: Tuple[np.ndarray, np.ndarray],
@@ -21,6 +24,10 @@ def proximity_match(self, blobs: np.ndarray,
         Matching solution or None if insufficient matches
     """
     rvec_pred, tvec_pred = predicted_pose
+
+    rvec_pred = np.asarray(rvec_pred, dtype=np.float32).reshape(3, 1)
+    tvec_pred = np.asarray(tvec_pred, dtype=np.float32).reshape(3, )
+
     R_pred = cv2.Rodrigues(rvec_pred)[0]
 
     R_cam_ctrl = R_pred
@@ -28,11 +35,11 @@ def proximity_match(self, blobs: np.ndarray,
 
     # Invert camera extrinsics
     R_imu_cam = self.cam_R.T
-    t_imu_cam = -R_imu_cam @ self.cam_t
+    t_imu_cam = (-R_imu_cam @ self.cam_t.reshape(3, )).reshape(3, )
 
     # Compose
     R_imu_ctrl = R_imu_cam @ R_cam_ctrl
-    t_imu_ctrl = R_imu_cam @ t_cam_ctrl + t_imu_cam
+    t_imu_ctrl = (R_imu_cam @ t_cam_ctrl.reshape(3, ) + t_imu_cam).reshape(3, )
 
     # Project LEDs using predicted pose
     projected = self.project_leds_to_image(R_imu_ctrl, t_imu_ctrl)
@@ -44,7 +51,7 @@ def proximity_match(self, blobs: np.ndarray,
         return None
 
     # Build KD-tree for fast nearest neighbor matching
-    led_positions = np.array([proj[:, 0] for _, proj in visible])
+    led_positions = np.array([proj for _, proj in visible], dtype=np.float32)
     led_indices = [idx for idx, _ in visible]
     tree = KDTree(led_positions)
 
@@ -59,13 +66,18 @@ def proximity_match(self, blobs: np.ndarray,
     if len(valid_matches) < 3:
         return None
 
-    # Check for uniqueness (one LED per blob)
-    used_leds = set()
+    # Build cost matrix (blob ↔ projected LED distances)
+    cost_matrix = cdist(blobs, led_positions)  # shape: (num_blobs, num_leds)
+
+    # Solve assignment problem
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    # Filter by distance threshold
     unique_matches = []
-    for blob_idx, led_idx in valid_matches:
-        if led_idx not in used_leds:
-            used_leds.add(led_idx)
-            unique_matches.append((blob_idx, led_idx))
+    for blob_idx, led_idx in zip(row_ind, col_ind):
+        dist = cost_matrix[blob_idx, led_idx]
+        if dist < max_distance_px:
+            unique_matches.append((blob_idx, led_indices[led_idx]))
 
     if len(unique_matches) < 3:
         return None

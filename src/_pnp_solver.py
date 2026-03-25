@@ -5,7 +5,7 @@ from typing import Tuple, Dict, Optional
 
 def p2p_solver(self, blobs: np.ndarray,
                prior_pose: Tuple[np.ndarray, np.ndarray],
-               prior_error: float = None) -> Optional[Dict]:
+               prior_error: float = None, proximity_result=None) -> Optional[Dict]:
     """
     P2P solver - uses 2 matches with prior orientation information
     Suitable when only 2-3 LEDs are visible
@@ -18,7 +18,8 @@ def p2p_solver(self, blobs: np.ndarray,
     Returns:
         Pose solution with at least 3 matches total
     """
-    if len(blobs) < 2:
+
+    if len(blobs) < 3:
         return None
 
     rvec_prior, tvec_prior = prior_pose
@@ -26,7 +27,8 @@ def p2p_solver(self, blobs: np.ndarray,
     best_error = np.inf
 
     # Use proximity matching to find good matches
-    proximity_result = self.proximity_match(blobs, prior_pose)
+    if proximity_result is None:
+        proximity_result = self.proximity_match(blobs, prior_pose)
     if not proximity_result or len(proximity_result["assignment"]) < 2:
         return None
 
@@ -39,9 +41,19 @@ def p2p_solver(self, blobs: np.ndarray,
         for j in range(i + 1, len(matches_sorted)):
             pair = [matches_sorted[i], matches_sorted[j]]
 
-            # Use these 2 matches as hard constraints
-            object_points = np.array([self.leds_3d[led_idx].position for _, led_idx in pair])
-            image_points = np.array([blobs[blob_idx] for blob_idx, _ in pair])
+            # # Use these 2 matches as hard constraints
+            # object_points = np.array([self.leds_3d[led_idx].position for _, led_idx in pair])
+            # image_points = np.array([blobs[blob_idx] for blob_idx, _ in pair])
+
+            object_points = np.array(
+                [self.leds_3d[led_idx].position for _, led_idx in matches],
+                dtype=np.float32
+            ).reshape(-1, 3)
+
+            image_points = np.array(
+                [blobs[blob_idx] for blob_idx, _ in matches],
+                dtype=np.float32
+            ).reshape(-1, 2)
 
             # Solve with prior orientation
             success, rvec, tvec = cv2.solvePnP(
