@@ -2,6 +2,40 @@ import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
 import open3d as o3d
+from scipy.optimize import least_squares
+
+
+def refine_translation(mesh, positions, rx, ry, rz, t_init):
+    """
+    Optimize translation t so that transformed LEDs lie on mesh surface
+    """
+
+    # --- rotations ---
+    R_rz = trimesh.transformations.euler_matrix(0, 0, rz)[:3, :3]
+    R_base = trimesh.transformations.euler_matrix(rx, ry, 0)[:3, :3]
+    R_base_inv = R_base.T
+
+    # --- precompute constant part ---
+    A = (R_base_inv @ (R_rz @ positions.T)).T  # Nx3
+
+    def residual(t):
+        t = np.asarray(t)
+
+        # transform points (same model as your pipeline)
+        pts = A - (R_base_inv @ t)
+
+        # project to mesh
+        closest, _, _ = mesh.nearest.on_surface(pts)
+
+        return (pts - closest).ravel()
+
+    result = least_squares(
+        residual,
+        t_init,
+        verbose=2
+    )
+
+    return result.x
 
 
 class ControllerVisualizer3D:
@@ -114,33 +148,91 @@ class ControllerVisualizer3D:
 # USAGE FUNCTION
 # =========================
 def visualize_leds_with_controller(leds, cfg):
-    positions = [led.position.squeeze(-1) for led in leds]
-    normals = [led.normal.squeeze(-1) for led in leds]
+    positions = np.array(
+        [led.position.reshape(3) for led in leds],
+        dtype=np.float64
+    )
+
+    normals = np.array(
+        [led.normal.reshape(3) for led in leds],
+        dtype=np.float64
+    )
 
     viz = ControllerVisualizer3D()
     viz.load_controller_model(cfg["3d_model_path"])
 
-    # Optional initial transform (if you already have it)
-    translation_cfg = cfg["initial_position_change"]["translation"]
-    translation = (
-        translation_cfg["x"],
-        translation_cfg["y"],
-        translation_cfg["z"]
-    )
+    # parameters
+    t = np.array([
+        cfg["initial_position_change"]["translation"]["x"],
+        cfg["initial_position_change"]["translation"]["y"],
+        cfg["initial_position_change"]["translation"]["z"]
+    ])
 
-    rotation_cfg = cfg["initial_position_change"]["rotation"]
-    rotation = (
-        rotation_cfg["rx"],
-        rotation_cfg["ry"],
-        rotation_cfg["rz"]
-    )
+    rx = cfg["initial_position_change"]["rotation"]["rx"]
+    ry = cfg["initial_position_change"]["rotation"]["ry"]
+    rz = cfg["initial_position_change"]["rotation"]["rz"]
 
-    viz.transform_model(translation, rotation)
+    # Step 1: First, apply rz rotation to the original point cloud (centered near origin)
+    R_rz = trimesh.transformations.euler_matrix(0, 0, rz)[:3, :3]
+    positions_rotated = (R_rz @ positions.T).T
+    normals_rotated = (R_rz @ normals.T).T
 
-    viz.add_leds(positions, normals, scale=1.0)
+    # Step 2: Transform points to controller's local coordinate system
+    # This is the inverse of what viz.transform_model would do
+    # Original transformation would be: p_world = R_base @ p_local + t
+    # So p_local = R_base.T @ (p_world - t)
+
+    R_base = trimesh.transformations.euler_matrix(rx, ry, 0)[:3, :3]
+
+    # First center at controller position, then apply inverse rotation
+    positions_final = (R_base.T @ (positions_rotated - t).T).T
+    normals_final = (R_base.T @ normals_rotated.T).T
+
+    # Add LEDs (now in controller's local coordinate system, origin at controller center)
+    viz.add_leds(positions_final, normals_final)
+
+    # Add coordinate frame at origin (controller center)
     viz.add_frame()
 
+    # Controller model stays at origin (no transformation)
     viz.show()
+
+def run_full_pipeline(leds, cfg):
+    # --- prepare data ---
+    positions = np.array(
+        [led.position.reshape(3) for led in leds],
+        dtype=np.float64
+    )
+
+    # --- load mesh ---
+    scene = trimesh.load(cfg["3d_model_path"], force='scene')
+    mesh = scene.geometry["REVERB_G2_CONTROLLER_RIGHT_HAND"].copy()
+
+    # OPTIONAL: scale fix (uncomment if needed)
+    # mesh.apply_scale(0.001)
+
+    # --- parameters ---
+    rx = cfg["initial_position_change"]["rotation"]["rx"]
+    ry = cfg["initial_position_change"]["rotation"]["ry"]
+    rz = cfg["initial_position_change"]["rotation"]["rz"]
+
+    t_init = np.array([
+        cfg["initial_position_change"]["translation"]["x"],
+        cfg["initial_position_change"]["translation"]["y"],
+        cfg["initial_position_change"]["translation"]["z"]
+    ])
+
+    # --- refine translation ---
+    print("Refining translation...")
+    t_refined = refine_translation(mesh, positions, rx, ry, rz, t_init)
+
+    print("\n=== RESULT ===")
+    print("Refined translation:", t_refined)
+
+    # --- visualize ---
+    visualize_leds_with_controller(leds, cfg, refined_t=t_refined)
+
+    return t_refined
 
 
 def visualize_leds(leds: list):
