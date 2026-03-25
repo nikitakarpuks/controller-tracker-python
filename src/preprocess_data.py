@@ -23,7 +23,6 @@ class ImageDataset(Dataset):
 
         for ext in extensions:
             self.image_paths.extend(self.root_dir.glob(ext))
-            self.image_paths.extend(self.root_dir.glob(ext.upper()))
 
         # Sort for consistent ordering
         self.image_paths = sorted(self.image_paths)
@@ -40,7 +39,7 @@ class ImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        return image  # Return only image, no label
+        return img_path, image
 
 class StaticCrop:
     """Static crop to specific coordinates"""

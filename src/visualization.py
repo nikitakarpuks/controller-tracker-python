@@ -1,179 +1,145 @@
 import matplotlib.pyplot as plt
 import numpy as np
-
-from mpl_toolkits.mplot3d import Axes3D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import trimesh
+import open3d as o3d
 
 
-class ControllerVisualizer:
+class ControllerVisualizer3D:
     def __init__(self):
-        self.fig = plt.figure(figsize=(12, 10))
-        self.ax = self.fig.add_subplot(111, projection='3d')
-        self.controller_mesh = None
+        self.mesh = None
+        self.geometries = []
 
-    def load_controller_model(self, stl_path):
-        self.controller_mesh = trimesh.load(stl_path)
+    # =========================
+    # 1) LOAD RIGHT CONTROLLER
+    # =========================
+    def load_controller_model(self, path):
+        scene = trimesh.load(path, force='scene')
 
-        print(f"Original: {len(self.controller_mesh.faces)} faces")
+        if "REVERB_G2_CONTROLLER_RIGHT_HAND" not in scene.geometry:
+            raise ValueError(
+                f"Right controller not found. Available keys: {list(scene.geometry.keys())}"
+            )
 
-        # 🔥 Simplify mesh (CRITICAL)
-        target_faces = 3000
-        if len(self.controller_mesh.faces) > target_faces:
-            self.controller_mesh = self.controller_mesh.simplify_quadric_decimation(face_count=target_faces)
+        mesh = scene.geometry["REVERB_G2_CONTROLLER_RIGHT_HAND"].copy()
 
-        print(f"Simplified: {len(self.controller_mesh.faces)} faces")
+        print(f"Loaded right controller: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
 
-    def add_controller_model(self, position=(0, 0, 0), orientation=(0, 0, 0)):
-        mesh = self.controller_mesh.copy()
+        # # 🔥 Simplify (critical for performance)
+        # if len(mesh.faces) > 5000:
+        #     mesh = mesh.simplify_quadric_decimation(5000)
+        #     print(f"Simplified to {len(mesh.faces)} faces")
 
-        # Apply transform
-        mesh.apply_translation(position)
-
-        if any(orientation):
-            rx, ry, rz = orientation
-            R = trimesh.transformations.euler_matrix(rx, ry, rz)
-            mesh.apply_transform(R)
-
-        vertices = mesh.vertices
-        faces = mesh.faces
-
-        collection = Poly3DCollection(
-            vertices[faces],
-            facecolor='lightgray',
-            edgecolor='none',
-            alpha=0.6
+        # Convert to Open3D
+        o3d_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(mesh.vertices),
+            o3d.utility.Vector3iVector(mesh.faces)
         )
 
-        self.ax.add_collection3d(collection)
+        o3d_mesh.compute_vertex_normals()
+        o3d_mesh.paint_uniform_color([0.7, 0.7, 0.7])
 
-    def add_leds(self, led_coords, normals=None, colors=None):
-        if colors is None:
-            colors = ['red'] * len(led_coords)
+        self.mesh = o3d_mesh
+        self.geometries.append(o3d_mesh)
 
-        led_coords = np.array(led_coords)
-        led_coords *= 80  # Scale up for better visibility
+    # =========================
+    # APPLY TRANSFORM (optional)
+    # =========================
+    def transform_model(self, position=(0, 0, 0), orientation=(0, 0, 0)):
+        if self.mesh is None:
+            return
 
-        # 🔥 BIGGER + always visible
-        self.ax.scatter(
-            led_coords[:, 0],
-            led_coords[:, 1],
-            led_coords[:, 2],
-            c=colors,
-            s=50,  # bigger
-            depthshade=False,  # 🔥 important
-            edgecolors='black'
+        rx, ry, rz = orientation
+        R = trimesh.transformations.euler_matrix(rx, ry, rz)[:3, :3]
+
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = np.array(position)
+
+        self.mesh.transform(T)
+
+    # =========================
+    # 2) ADD LEDS
+    # =========================
+    def add_leds(self, led_coords, normals=None, scale=1.0):
+        pts = np.array(led_coords) * scale
+
+        # --- LED points ---
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd.colors = o3d.utility.Vector3dVector(
+            np.tile([1, 0, 0], (len(pts), 1))
         )
 
-        # Draw origin point (0,0,0)
-        self.ax.scatter(
-            0, 0, 0,
-            c='black',
-            s=100,
-            depthshade=False,
-            edgecolors='white',
-            linewidth=1.5,
-            label='Origin'
-        )
+        self.geometries.append(pcd)
 
-        # Draw X, Y, Z unit vectors from origin
-        # X-axis (red)
-        self.ax.quiver(
-            0, 0, 0, 1, 0, 0,
-            color='red',
-            length=1.0,
-            linewidth=3,
-            arrow_length_ratio=0.2
-        )
-        self.ax.text(1.1, 0, 0, 'X', color='red', fontsize=12, fontweight='bold')
-
-        # Y-axis (green)
-        self.ax.quiver(
-            0, 0, 0, 0, 1, 0,
-            color='green',
-            length=1.0,
-            linewidth=3,
-            arrow_length_ratio=0.2
-        )
-        self.ax.text(0, 1.1, 0, 'Y', color='green', fontsize=12, fontweight='bold')
-
-        # Z-axis (blue)
-        self.ax.quiver(
-            0, 0, 0, 0, 0, 1,
-            color='blue',
-            length=1.0,
-            linewidth=3,
-            arrow_length_ratio=0.2
-        )
-        self.ax.text(0, 0, 1.1, 'Z', color='blue', fontsize=12, fontweight='bold')
-
-        # Normals
+        # --- Normals ---
         if normals is not None:
             normals = np.array(normals)
 
-            self.ax.quiver(
-                led_coords[:, 0],
-                led_coords[:, 1],
-                led_coords[:, 2],
-                normals[:, 0],
-                normals[:, 1],
-                normals[:, 2],
-                length=0.03,
-                color='blue',
-                linewidth=2
+            line_points = []
+            lines = []
+
+            for i, (p, n) in enumerate(zip(pts, normals)):
+                line_points.append(p)
+                line_points.append(p + n * 0.03)
+
+                lines.append([2*i, 2*i + 1])
+
+            line_set = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(line_points),
+                lines=o3d.utility.Vector2iVector(lines)
             )
 
-    # def set_equal_axes(self, points=None):
-    #     if self.controller_mesh is not None:
-    #         bounds = self.controller_mesh.bounds
-    #     else:
-    #         bounds = np.array([[0, 0, 0], [1, 1, 1]])
-    #
-    #     if points is not None:
-    #         pts = np.array(points)
-    #         bounds = np.vstack([bounds, [pts.min(axis=0), pts.max(axis=0)]])
-    #
-    #     min_b = bounds.min(axis=0)
-    #     max_b = bounds.max(axis=0)
-    #
-    #     center = (min_b + max_b) / 2
-    #     size = (max_b - min_b).max() / 2
-    #
-    #     self.ax.set_xlim(center[0] - size, center[0] + size)
-    #     self.ax.set_ylim(center[1] - size, center[1] + size)
-    #     self.ax.set_zlim(center[2] - size, center[2] + size)
-    #
-    #     self.ax.set_box_aspect([1, 1, 1])
+            line_set.colors = o3d.utility.Vector3dVector(
+                [[0, 0, 1]] * len(lines)
+            )
 
+            self.geometries.append(line_set)
+
+    # =========================
+    # COORDINATE FRAME
+    # =========================
+    def add_frame(self, size=0.05):
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+        self.geometries.append(frame)
+
+    # =========================
+    # SHOW
+    # =========================
     def show(self):
-        """Display the visualization"""
-        plt.tight_layout()
-        plt.show()
+        o3d.visualization.draw_geometries(self.geometries)
 
 
-def visualize_leds_with_controller(leds: list, cfg: dict):
-    """Visualize LED positions and normals with controller model"""
+# =========================
+# USAGE FUNCTION
+# =========================
+def visualize_leds_with_controller(leds, cfg):
+    positions = [led.position.squeeze(-1) for led in leds]
+    normals = [led.normal.squeeze(-1) for led in leds]
 
-    positions = []
-    normals = []
-    for led in leds:
-        positions.append(led.position)
-        normals.append(led.normal)
-
-    # Create visualizer
-    viz = ControllerVisualizer()
+    viz = ControllerVisualizer3D()
     viz.load_controller_model(cfg["3d_model_path"])
 
+    # Optional initial transform (if you already have it)
     translation_cfg = cfg["initial_position_change"]["translation"]
-    translation = (translation_cfg["x"], translation_cfg["y"], translation_cfg["z"])
+    translation = (
+        translation_cfg["x"],
+        translation_cfg["y"],
+        translation_cfg["z"]
+    )
 
     rotation_cfg = cfg["initial_position_change"]["rotation"]
-    rotation = (rotation_cfg["rx"], rotation_cfg["ry"], rotation_cfg["rz"])
+    rotation = (
+        rotation_cfg["rx"],
+        rotation_cfg["ry"],
+        rotation_cfg["rz"]
+    )
 
-    viz.add_controller_model(translation,
-                             rotation)
-    viz.add_leds(positions)# normals)
-    # viz.set_equal_axes(leds)
+    viz.transform_model(translation, rotation)
+
+    viz.add_leds(positions, normals, scale=1.0)
+    viz.add_frame()
+
     viz.show()
 
 

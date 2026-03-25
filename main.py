@@ -18,16 +18,16 @@ def main():
     right_controller_leds = create_leds_from_config(calibration_config)
 
     # visualize_leds(right_controller_leds)
-    # visualize_leds_with_controller(right_controller_leds, config["visualization"])
+    visualize_leds_with_controller(right_controller_leds, config["visualization"])
 
     controller_tracker = ControllerTracker(camera_calibration, right_controller_leds)
 
     dataloader = get_data(config["data"])
 
     # Iterate
-    for image_batch in dataloader:
-        image = image_batch[0]
-        blob_centroids = get_centroids(image, config["blob_detection"])
+    for batch in dataloader:
+        img_path, image = batch[0][0], batch[0][1]
+        blob_centroids = get_centroids(image, config["blob_detection"], visualize=False, img_path=img_path)
 
         # Track controller
         solution = controller_tracker.track(blob_centroids)
