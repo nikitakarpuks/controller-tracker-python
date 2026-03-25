@@ -8,8 +8,12 @@ def create_leds_from_config(cfg):
     calibration_information = cfg["CalibrationInformation"]["ControllerLeds"]
     leds = []
     for led in calibration_information:
-        position = np.array([led["Position"]]).T
-        normal = np.array([led["Normal"]]).T
+        # position = np.array([led["Position"]]).T
+        # normal = np.array([led["Normal"]]).T
+
+        position = np.array(led["Position"], dtype=np.float32).reshape(3, )
+        normal = np.array(led["Normal"], dtype=np.float32).reshape(3, )
+
         leds.append(ControllerLED(position, normal))
     return leds
 
@@ -45,6 +49,8 @@ class ControllerTracker:
         self.leds_3d = leds_3d
 
         self.cam_R, self.cam_t = camera_calib.camera_pose  # headset imu to camera
+        self.cam_R = np.asarray(self.cam_R, dtype=np.float32).reshape(3, 3)
+        self.cam_t = np.asarray(self.cam_t, dtype=np.float32).reshape(3, )
 
         # For temporal tracking
         self.prev_pose = None  # Previous controller pose (rvec, tvec)
@@ -73,6 +79,12 @@ class ControllerTracker:
         """
         projected = []
 
+        controller_t = np.asarray(controller_t, dtype=np.float32).reshape(3, )
+        controller_R = np.asarray(controller_R, dtype=np.float32).reshape(3, 3)
+
+        assert controller_t.shape == (3,)
+        assert self.cam_t.shape == (3,)
+
         for idx, led in enumerate(self.leds_3d):
             # --- Controller -> IMU (world) ---
             led_imu = controller_R @ led.position + controller_t
@@ -80,7 +92,7 @@ class ControllerTracker:
             # --- IMU -> Camera ---
             led_cam = self.cam_R @ led_imu + self.cam_t
 
-            z = led_cam[2]
+            z = float(led_cam[2])
 
             # Reject points behind or too close to camera
             if z <= 1e-6:
@@ -136,7 +148,17 @@ class ControllerTracker:
         Returns:
             Pose solution or None if tracking lost
         """
+
+        blobs = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
+
         n_blobs = len(blobs)
+
+        if self.prev_pose is not None:
+            rvec, tvec = self.prev_pose
+            self.prev_pose = (
+                np.asarray(rvec, dtype=np.float32).reshape(3, 1),  # OpenCV expects (3,1)
+                np.asarray(tvec, dtype=np.float32).reshape(3, )
+            )
 
         # State machine based on number of blobs and prior information
         if self.prev_pose is None:
@@ -154,14 +176,14 @@ class ControllerTracker:
                 solution = self.proximity_match(blobs, self.prev_pose)
 
                 # If that fails, try P2P
-                if not solution or solution["error"] > 8.0:
-                    p2p_solution = self.p2p_solver(blobs, self.prev_pose)
+                if not solution or solution["error"] > 12.0:
+                    p2p_solution = self.p2p_solver(blobs, self.prev_pose, proximity_result=solution)
                     if p2p_solution and p2p_solution["error"] < 10.0:
                         solution = p2p_solution
 
-            elif n_blobs >= 2:
-                # Try P2P
-                solution = self.p2p_solver(blobs, self.prev_pose)
+            # elif n_blobs >= 2:
+            #     # Try P2P
+            #     solution = self.p2p_solver(blobs, self.prev_pose)
 
             elif n_blobs >= 1:
                 # Try P1P as last resort
