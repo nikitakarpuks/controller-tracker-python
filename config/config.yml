@@ -18,13 +18,18 @@ blob_detection:
   max_area: 50
 
 visualization:
-  3d_model_path: "./data/quest2_contollers_div0_right.stl"
+  3d_model_path: "./data/reverb_g2_controller.stp"
   initial_position_change:
     translation: # in meters
-      x: -0.87
-      y: -2.30
-      z: 0.5
+      x: 0.2040 # red
+      y: 0.04 # green
+      z: -0.088 # blue
+
+#      three points: (0.2565, 0.03, -0.095), (0.1640, -0.02, -0.1054), (0.2040, 0.079, -0.0903)
+
+
     rotation: # in radians
-      rx: 0.75
-      ry: -0.2
-      rz: 1.6
+      rx: -0.1362
+      ry: 0.0380
+      rz: 0.0
+
