@@ -3,7 +3,7 @@ from src.preprocess_data import get_data
 from src.blobs_detection import get_centroids
 from src.camera import CameraCalibration
 from src.controller import ControllerTracker, create_leds_from_config
-from src.visualization import visualize_leds, visualize_leds_with_controller
+from src.visualization import visualize_leds, visualize_leds_with_controller, run_full_pipeline
 
 
 def main():
@@ -19,6 +19,7 @@ def main():
 
     # visualize_leds(right_controller_leds)
     visualize_leds_with_controller(right_controller_leds, config["visualization"])
+    # run_full_pipeline(right_controller_leds, config["visualization"])
 
     controller_tracker = ControllerTracker(camera_calibration, right_controller_leds)
 
