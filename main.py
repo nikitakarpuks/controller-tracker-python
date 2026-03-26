@@ -3,7 +3,7 @@ from src.preprocess_data import get_data
 from src.blobs_detection import get_centroids
 from src.camera import CameraCalibration
 from src.controller import ControllerTracker, create_leds_from_config
-from src.visualization import visualize_leds, visualize_leds_with_controller, run_full_pipeline
+from src.visualization import visualize_leds, get_aligned_geometry, ControllerAnimator # run_full_pipeline
 
 
 def main():
@@ -18,12 +18,24 @@ def main():
     right_controller_leds = create_leds_from_config(calibration_config)
 
     # visualize_leds(right_controller_leds)
-    # visualize_leds_with_controller(right_controller_leds, config["visualization"])
     # run_full_pipeline(right_controller_leds, config["visualization"])
+
+    # Step 1: get aligned geometry
+    positions_aligned, normals_aligned = get_aligned_geometry(right_controller_leds, config["visualization"],
+                                                              visualize=False)
+
+    # Step 2: create animator
+    anim = ControllerAnimator(
+        config["visualization"]["3d_model_path"],
+        positions_aligned,
+        normals_aligned
+    )
 
     controller_tracker = ControllerTracker(camera_calibration, right_controller_leds)
 
     dataloader = get_data(config["data"])
+
+    poses = []
 
     # Iterate
     for batch in dataloader:
@@ -34,6 +46,9 @@ def main():
         solution = controller_tracker.track(blob_centroids)
 
         if solution:
+
+            poses.append((solution['rvec'], solution['tvec']))
+
             print(f"Tracking method: {solution['method']}")
             print(f"Reprojection error: {solution['error']:.2f} pixels")
             print(f"Rotation vector: {solution['rvec'].flatten()}")
@@ -41,6 +56,10 @@ def main():
             print(f"Assignment: {solution['assignment']}")
         else:
             print("Tracking lost")
+
+    # Step 3: run
+    anim.run(poses, fps=30, output="controller.mp4")
+
 
 
 if __name__ == '__main__':

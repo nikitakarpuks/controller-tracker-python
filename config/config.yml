@@ -1,5 +1,5 @@
 data:
-  root: "./data/cam0_controller_20260316/mav0/cam0/data"
+  root: "./data/cam0_controller_20260316/mav0/cam0/data/test_subset"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -15,7 +15,7 @@ controllers:
 blob_detection:
   min_threshold: 10
   min_area: 2
-  max_area: 50
+  max_area: 150
 
 visualization:
   3d_model_path: "./data/reverb_g2_controller.stp"
