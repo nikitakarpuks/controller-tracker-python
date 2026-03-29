@@ -1,15 +1,15 @@
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data
 from src.blobs_detection import get_centroids
-from src.camera import CameraCalibration
-from src.controller import ControllerTracker, create_leds_from_config
-from src.visualization import visualize_leds, get_aligned_geometry, ControllerAnimator # run_full_pipeline
+from src.camera import Camera
+from src.controller import ControllerModel, TrackingSystem, create_leds_from_config
+# from src.visualization import visualize_leds, get_aligned_geometry, ControllerAnimator # run_full_pipeline
 
 
 def main():
     config = load_yaml_config('./config/config.yml')
 
-    camera_calibration = CameraCalibration(
+    camera_0 = Camera(
         load_json_config(config["cameras"]["intrinsics_path"]),
         camera_idx = 0
     )
@@ -20,18 +20,20 @@ def main():
     # visualize_leds(right_controller_leds)
     # run_full_pipeline(right_controller_leds, config["visualization"])
 
-    # Step 1: get aligned geometry
-    positions_aligned, normals_aligned = get_aligned_geometry(right_controller_leds, config["visualization"],
-                                                              visualize=False)
+    # # Step 1: get aligned geometry
+    # positions_aligned, normals_aligned = get_aligned_geometry(right_controller_leds, config["visualization"],
+    #                                                           visualize=True)
+    #
+    # # Step 2: create animator
+    # anim = ControllerAnimator(
+    #     config["visualization"]["3d_model_path"],
+    #     positions_aligned,
+    #     normals_aligned
+    # )
 
-    # Step 2: create animator
-    anim = ControllerAnimator(
-        config["visualization"]["3d_model_path"],
-        positions_aligned,
-        normals_aligned
-    )
+    right_controller = ControllerModel(right_controller_leds, "right_controller")
 
-    controller_tracker = ControllerTracker(camera_calibration, right_controller_leds)
+    tracking_system = TrackingSystem([right_controller], [camera_0])
 
     dataloader = get_data(config["data"])
 
@@ -43,7 +45,8 @@ def main():
         blob_centroids = get_centroids(image, config["blob_detection"], visualize=True, img_path=img_path)
 
         # Track controller
-        solution = controller_tracker.track(blob_centroids)
+        solution_ = tracking_system.update({0: blob_centroids})
+        solution = solution_.get(("right_controller", camera_0.camera_idx))
 
         if solution:
 
@@ -57,8 +60,8 @@ def main():
         else:
             print("Tracking lost")
 
-    # Step 3: run
-    anim.run(poses, fps=30, output="controller.mp4")
+    # # Step 3: run
+    # anim.run(poses, fps=30, output="controller.mp4")
 
 
 

@@ -1,9 +1,12 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-class CameraCalibration:
+class Camera:
     def __init__(self, cfg, camera_idx: int = 0):
         """Camera calibration parameters"""
+
+        self.camera_idx = camera_idx
+
         intrinsics = cfg["value0"]["intrinsics"][camera_idx]["intrinsics"]
         self.fx = intrinsics["fx"]
         self.fy = intrinsics["fy"]
@@ -30,7 +33,9 @@ class CameraCalibration:
 
         self.camera_matrix = self.camera_matrix()
         self.dist_coeffs = self.dist_coeffs()
-        self.camera_pose = self.camera_pose()
+        self.T_imu_cam = self.T_imu_cam()
+        self.T_cam_imu = self.T_cam_imu()
+
 
     def camera_matrix(self):
         return np.array([[self.fx, 0, self.cx],
@@ -42,14 +47,18 @@ class CameraCalibration:
         return np.array([self.k1, self.k2, self.p1, self.p2,
                          self.k3, self.k4, self.k5, self.k6], dtype=np.float32)
 
-    def camera_pose(self):
-
-        # convention: T_target_source, so T_imu_cam = transform from camera frame -> IMU frame
+    # convention: T_target_source, so T_imu_cam = transform from camera frame -> VRH IMU frame
+    def T_imu_cam(self):
 
         R_imu_cam = R.from_quat([self.qx, self.qy, self.qz, self.qw]).as_matrix()
         t_imu_cam = np.array([[self.px, self.py, self.pz]]).T
 
-        # invert to get (headset) imu -> camera
+        return R_imu_cam, t_imu_cam
+
+    def T_cam_imu(self):
+
+        R_imu_cam, t_imu_cam = self.T_imu_cam
+
         R_cam_imu = R_imu_cam.T
         t_cam_imu = -R_cam_imu @ t_imu_cam
 
