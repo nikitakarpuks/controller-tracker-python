@@ -9,6 +9,39 @@ import copy
 import cv2
 
 
+class SceneVisualizer:
+    def draw_controller(self, model: ControllerModel, pose: Transform):
+        # Add LEDs (now in controller's local coordinate system, origin at controller center)
+        viz.add_leds(positions_final, normals_final)
+
+        # Add coordinate frame at origin (controller center)
+        viz.add_frame()
+
+        # Controller model stays at origin (no transformation)
+        viz.show()
+
+    def add_frame(self, size=0.05):
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
+        self.geometries.append(frame)
+
+    # =========================
+    # SHOW
+    # =========================
+    def show(self):
+        o3d.visualization.draw_geometries(self.geometries)
+
+
+
+
+
+
+
+
+
+
+
+
+
 def rt_to_matrix(rvec, tvec):
     R, _ = cv2.Rodrigues(rvec)
     T = np.eye(4)
@@ -313,21 +346,17 @@ def get_aligned_geometry(leds, cfg, visualize=True):
     ry = cfg["initial_position_change"]["rotation"]["ry"]
     rz = cfg["initial_position_change"]["rotation"]["rz"]
 
-    # Step 1: First, apply rz rotation to the original point cloud (centered near origin)
+    # Build rotations
     R_rz = trimesh.transformations.euler_matrix(0, 0, rz)[:3, :3]
-    positions_rotated = (R_rz @ positions.T).T
-    normals_rotated = (R_rz @ normals.T).T
-
-    # Step 2: Transform points to controller's local coordinate system
-    # This is the inverse of what viz.transform_model would do
-    # Original transformation would be: p_world = R_base @ p_local + t
-    # So p_local = R_base.T @ (p_world - t)
-
     R_base = trimesh.transformations.euler_matrix(rx, ry, 0)[:3, :3]
 
-    # First center at controller position, then apply inverse rotation
-    positions_final = (R_base.T @ (positions_rotated - t).T).T
-    normals_final = (R_base.T @ normals_rotated.T).T
+    # Combine
+    R_combined = R_base.T @ R_rz
+    t_combined = -R_base.T @ t
+
+    # Apply once
+    positions_final = (R_combined @ positions.T).T + t_combined
+    normals_final = (R_combined @ normals.T).T
 
     if visualize:
         # Add LEDs (now in controller's local coordinate system, origin at controller center)
@@ -377,31 +406,3 @@ def get_aligned_geometry(leds, cfg, visualize=True):
 #     visualize_leds_with_controller(leds, cfg, refined_t=t_refined)
 #
 #     return t_refined
-
-
-def visualize_leds(leds: list):
-    """Visualize LED positions and normals"""
-
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-
-    positions = np.array([led.position for led in leds])
-    normals = np.array([led.normal for led in leds])
-
-    # Plot LED positions
-    ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
-               c='red', s=50, label='LED Positions')
-
-    # Plot normal vectors (scaled for visibility)
-    scale = 0.03  # Scale factor to make normals visible
-    for pos, norm in zip(positions, normals):
-        ax.quiver(pos[0], pos[1], pos[2],
-                  norm[0] * scale, norm[1] * scale, norm[2] * scale,
-                  color='blue', alpha=0.5)
-
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    ax.set_title('Controller LED Constellation')
-    ax.legend()
-    plt.show()
