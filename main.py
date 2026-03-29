@@ -3,7 +3,7 @@ from src.preprocess_data import get_data
 from src.blobs_detection import get_centroids
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config
-# from src.visualization import visualize_leds, get_aligned_geometry, ControllerAnimator # run_full_pipeline
+from src.visualization import prepare_model_geometry, show_initial_alignment, ControllerAnimatorInteractive
 
 
 def main():
@@ -17,20 +17,6 @@ def main():
     calibration_config = load_json_config(config["controllers"]["right_controller"]["config_path"])
     right_controller_leds = create_leds_from_config(calibration_config)
 
-    # visualize_leds(right_controller_leds)
-    # run_full_pipeline(right_controller_leds, config["visualization"])
-
-    # # Step 1: get aligned geometry
-    # positions_aligned, normals_aligned = get_aligned_geometry(right_controller_leds, config["visualization"],
-    #                                                           visualize=True)
-    #
-    # # Step 2: create animator
-    # anim = ControllerAnimator(
-    #     config["visualization"]["3d_model_path"],
-    #     positions_aligned,
-    #     normals_aligned
-    # )
-
     right_controller = ControllerModel(right_controller_leds, "right_controller")
 
     tracking_system = TrackingSystem([right_controller], [camera_0])
@@ -38,6 +24,20 @@ def main():
     dataloader = get_data(config["data"])
 
     poses = []
+
+
+
+
+    positions_model, normals_model, T_model_ctrl = prepare_model_geometry(right_controller_leds, config["visualization"])
+
+    show_initial_alignment(positions_model, normals_model, config["visualization"]["3d_model_path"])
+
+    controler_animator = ControllerAnimatorInteractive(
+        config["visualization"]["3d_model_path"],
+        positions_model
+    )
+
+
 
     # Iterate
     for batch in dataloader:
@@ -58,10 +58,15 @@ def main():
             print(f"Translation vector: {solution['tvec'].flatten()}")
             print(f"Assignment: {solution['assignment']}")
         else:
+            poses.append(None)
             print("Tracking lost")
 
-    # # Step 3: run
-    # anim.run(poses, fps=30, output="controller.mp4")
+    # --- sanity check ---
+    if all(p is None for p in poses):
+        raise RuntimeError("No valid poses found")
+
+    # --- start interactive viewer ---
+    controler_animator.start(poses, T_model_ctrl)
 
 
 

@@ -12,3 +12,5 @@ fast-simplification==0.1.13
 cascadio==0.0.17
 open3d==0.19.0
 rtree==1.4.1
+# imageio==2.37.3
+# imageio-ffmpeg==0.6.0
