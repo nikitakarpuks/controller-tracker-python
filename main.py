@@ -24,17 +24,19 @@ def main():
     dataloader = get_data(config["data"])
 
     poses = []
+    assignments = []
 
 
 
 
     positions_model, normals_model, T_model_ctrl = prepare_model_geometry(right_controller_leds, config["visualization"])
 
-    show_initial_alignment(positions_model, normals_model, config["visualization"]["3d_model_path"])
+    # show_initial_alignment(positions_model, normals_model, config["visualization"]["3d_model_path"])
 
     controler_animator = ControllerAnimatorInteractive(
         config["visualization"]["3d_model_path"],
-        positions_model
+        positions_model,
+        normals_model
     )
 
 
@@ -50,7 +52,8 @@ def main():
 
         if solution:
 
-            poses.append((solution['rvec'], solution['tvec']))
+            poses.append((solution['rvec'].copy(), solution['tvec'].copy()))
+            assignments.append(solution["assignment"].copy())
 
             print(f"Tracking method: {solution['method']}")
             print(f"Reprojection error: {solution['error']:.2f} pixels")
@@ -66,7 +69,7 @@ def main():
         raise RuntimeError("No valid poses found")
 
     # --- start interactive viewer ---
-    controler_animator.start(poses, T_model_ctrl)
+    controler_animator.start(poses, assignments, T_model_ctrl)
 
 
 
