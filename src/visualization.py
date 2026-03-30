@@ -165,6 +165,47 @@ def create_normals(points: np.ndarray, normals: np.ndarray, scale=0.03):
 
     return line_set
 
+def create_image_plane(width=640, height=480, fx=500, fy=500, scale=1.0):
+    """
+    Create a plane at z=1 in camera coords
+    """
+    z = 1.0 * scale
+
+    corners = np.array([
+        [0, 0, z],
+        [width, 0, z],
+        [width, height, z],
+        [0, height, z]
+    ], dtype=np.float32)
+
+    # normalize using intrinsics
+    corners[:, 0] = (corners[:, 0] - width / 2) / fx * z
+    corners[:, 1] = (corners[:, 1] - height / 2) / fy * z
+
+    lines = [[0,1],[1,2],[2,3],[3,0]]
+
+    plane = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(corners),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+
+    plane.colors = o3d.utility.Vector3dVector([[1,1,1]] * 4)
+
+    return plane
+
+def backproject_to_plane(blobs, fx, fy, cx, cy, z=1.0):
+    """
+    Convert 2D image points → 3D points on plane z
+    """
+    pts = []
+
+    for u, v in blobs:
+        x = (u - cx) / fx * z
+        y = (v - cy) / fy * z
+        pts.append([x, y, z])
+
+    return np.array(pts, dtype=np.float32)
+
 class ControllerAnimatorInteractive:
 
     def __init__(self, mesh_path, model_positions, model_normals):
@@ -218,8 +259,12 @@ class ControllerAnimatorInteractive:
             # Return a simple cube as fallback
             return o3d.geometry.TriangleMesh.create_box(0.1, 0.1, 0.1)
 
-    def start(self, poses, assignments, T_model_ctrl):
+    def start(self, poses, assignments, blobs_all, camera, T_model_ctrl):
         """Start the visualization"""
+
+        self.blobs_all = blobs_all
+        self.camera = camera
+
         # Initialize GUI
         gui.Application.instance.initialize()
 
@@ -299,6 +344,17 @@ class ControllerAnimatorInteractive:
         # Setup camera
         bounds = self.mesh.get_axis_aligned_bounding_box()
         self.scene.setup_camera(60, bounds, bounds.get_center())
+
+        self.image_plane = create_image_plane(
+            width=self.camera.width,
+            height=self.camera.height,
+            fx=self.camera.fx,
+            fy=self.camera.fy,
+        )
+
+        self.scene.scene.add_geometry("image_plane", self.image_plane, self.mat_lines)
+
+        self.scene.scene.add_geometry("image_plane", self.image_plane, self.mat_lines)
 
         # Add scene to main window
         self.window.add_child(self.scene)
@@ -407,6 +463,93 @@ class ControllerAnimatorInteractive:
             T_ctrl_model = self.T_model_ctrl.inverse()
             T_cam_model = T_cam_ctrl.compose(T_ctrl_model)
 
+            # =========================
+            # BLOBS + PROJECTIONS
+            # =========================
+
+            if self.blobs_all is not None and self.idx < len(self.blobs_all):
+
+                blobs = self.blobs_all[self.idx]
+
+                # --- blobs → plane ---
+                pts_plane = backproject_to_plane(
+                    blobs,
+                    self.camera.fx,
+                    self.camera.fy,
+                    self.camera.cx,
+                    self.camera.cy,
+                    z=1.0
+                )
+
+                blob_pcd = o3d.geometry.PointCloud()
+                blob_pcd.points = o3d.utility.Vector3dVector(pts_plane)
+                blob_pcd.colors = o3d.utility.Vector3dVector(
+                    np.tile([1, 1, 0], (len(pts_plane), 1))  # yellow blobs
+                )
+
+                if hasattr(self, "blob_vis") and self.blob_vis is not None:
+                    self.scene.scene.remove_geometry("blobs")
+
+                self.scene.scene.add_geometry("blobs", blob_pcd, self.mat_leds)
+                self.blob_vis = blob_pcd
+
+                # --- project LEDs (PnP result) ---
+                object_points = np.asarray(self.base_leds.points)
+
+                proj_2d, _ = cv2.projectPoints(
+                    object_points,
+                    rvec,
+                    tvec,
+                    self.camera.camera_matrix,
+                    self.camera.dist_coeffs
+                )
+
+                proj_2d = proj_2d.reshape(-1, 2)
+
+                proj_plane = backproject_to_plane(
+                    proj_2d,
+                    self.camera.fx,
+                    self.camera.fy,
+                    self.camera.cx,
+                    self.camera.cy,
+                    z=1.0
+                )
+
+                proj_pcd = o3d.geometry.PointCloud()
+                proj_pcd.points = o3d.utility.Vector3dVector(proj_plane)
+                proj_pcd.colors = o3d.utility.Vector3dVector(
+                    np.tile([0, 1, 0], (len(proj_plane), 1))  # green projected LEDs
+                )
+
+                if hasattr(self, "proj_vis") and self.proj_vis is not None:
+                    self.scene.scene.remove_geometry("proj")
+
+                self.scene.scene.add_geometry("proj", proj_pcd, self.mat_leds)
+                self.proj_vis = proj_pcd
+
+            error_lines = []
+            error_edges = []
+
+            for i, (p, b) in enumerate(zip(proj_plane, pts_plane)):
+                error_lines.append(p)
+                error_lines.append(b)
+                error_edges.append([2 * i, 2 * i + 1])
+
+            err_ls = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(error_lines),
+                lines=o3d.utility.Vector2iVector(error_edges)
+            )
+
+            err_ls.colors = o3d.utility.Vector3dVector(
+                [[1, 0, 0]] * len(error_edges)  # red error lines
+            )
+
+            if hasattr(self, "err_vis") and self.err_vis is not None:
+                self.scene.scene.remove_geometry("err")
+
+            self.scene.scene.add_geometry("err", err_ls, self.mat_lines)
+            self.err_vis = err_ls
+
             # --- normals ---
             pts_model = np.asarray(self.base_leds.points)
             normals_model = self.base_normals
@@ -454,12 +597,11 @@ class ControllerAnimatorInteractive:
                 if hasattr(self, "rays") and self.rays is not None:
                     self.scene.scene.remove_geometry("rays")
 
-                self.scene.scene.add_geometry("rays", rays, self.mat_leds)
+                self.scene.scene.add_geometry("rays", rays, self.mat_lines)
                 self.rays = rays
 
             # Update mesh and point cloud transformations
             # Create transformed copies
-            self.mesh = copy.deepcopy(self.base_mesh)
             self.mesh = copy.deepcopy(self.base_mesh)
             self.mesh.transform(T4)
 
