@@ -7,6 +7,10 @@ class Camera:
 
         self.camera_idx = camera_idx
 
+        resolution = cfg["value0"]["resolution"][camera_idx]
+        self.width = resolution[0]
+        self.height = resolution[1]
+
         intrinsics = cfg["value0"]["intrinsics"][camera_idx]["intrinsics"]
         self.fx = intrinsics["fx"]
         self.fy = intrinsics["fy"]

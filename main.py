@@ -25,9 +25,7 @@ def main():
 
     poses = []
     assignments = []
-
-
-
+    blobs = []
 
     positions_model, normals_model, T_model_ctrl = prepare_model_geometry(right_controller_leds, config["visualization"])
 
@@ -39,12 +37,11 @@ def main():
         normals_model
     )
 
-
-
     # Iterate
     for batch in dataloader:
         img_path, image = batch[0][0], batch[0][1]
         blob_centroids = get_centroids(image, config["blob_detection"], visualize=True, img_path=img_path)
+        blobs.append(blob_centroids.copy())
 
         # Track controller
         solution_ = tracking_system.update({0: blob_centroids})
@@ -69,7 +66,7 @@ def main():
         raise RuntimeError("No valid poses found")
 
     # --- start interactive viewer ---
-    controler_animator.start(poses, assignments, T_model_ctrl)
+    controler_animator.start(poses, assignments, blobs, camera_0, T_model_ctrl)
 
 
 
