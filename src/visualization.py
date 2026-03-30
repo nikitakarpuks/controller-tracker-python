@@ -14,9 +14,55 @@ from src.transformations import Transform
 # Utility
 # =========================================================
 
+def create_rays(points_cam: np.ndarray):
+    """
+    Create rays from camera origin to 3D points (in camera frame)
+    """
+    origin = np.zeros((len(points_cam), 3))
+
+    line_points = []
+    lines = []
+
+    for i, (o, p) in enumerate(zip(origin, points_cam)):
+        line_points.append(o)
+        line_points.append(p)
+        lines.append([2*i, 2*i + 1])
+
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(line_points),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+
+    # color: blue rays
+    line_set.colors = o3d.utility.Vector3dVector(
+        [[0, 0, 1]] * len(lines)
+    )
+
+    return line_set
+
 def rt_to_transform(rvec: np.ndarray, tvec: np.ndarray) -> Transform:
     R, _ = cv2.Rodrigues(rvec)
     return Transform(R, tvec.reshape(3))
+
+
+def create_camera_frustum(scale=0.1):
+    points = np.array([
+        [0, 0, 0],      # camera center
+        [-1, -1, 1],
+        [1, -1, 1],
+        [1, 1, 1],
+        [-1, 1, 1],
+    ]) * scale
+
+    lines = [
+        [0,1],[0,2],[0,3],[0,4],
+        [1,2],[2,3],[3,4],[4,1]
+    ]
+
+    return o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(points),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
 
 
 def transform_to_matrix(T: Transform) -> np.ndarray:
@@ -98,13 +144,35 @@ def show_initial_alignment(model_positions: np.ndarray,
 # Animator
 # =========================================================
 
+def create_normals(points: np.ndarray, normals: np.ndarray, scale=0.03):
+    line_points = []
+    lines = []
+
+    for i, (p, n) in enumerate(zip(points, normals)):
+        line_points.append(p)
+        line_points.append(p + n * scale)
+        lines.append([2*i, 2*i + 1])
+
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(line_points),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+
+    # blue normals
+    line_set.colors = o3d.utility.Vector3dVector(
+        [[0, 0, 1]] * len(lines)
+    )
+
+    return line_set
 
 class ControllerAnimatorInteractive:
 
-    def __init__(self, mesh_path, model_positions):
+    def __init__(self, mesh_path, model_positions, model_normals):
         self.base_mesh = self._load_mesh(mesh_path)
         self.base_leds = o3d.geometry.PointCloud()
+        self.base_normals = model_normals
         self.base_leds.points = o3d.utility.Vector3dVector(model_positions)
+
         self.base_leds.colors = o3d.utility.Vector3dVector(
             np.tile([1, 0, 0], (len(model_positions), 1))
         )
@@ -150,7 +218,7 @@ class ControllerAnimatorInteractive:
             # Return a simple cube as fallback
             return o3d.geometry.TriangleMesh.create_box(0.1, 0.1, 0.1)
 
-    def start(self, poses, T_model_ctrl):
+    def start(self, poses, assignments, T_model_ctrl):
         """Start the visualization"""
         # Initialize GUI
         gui.Application.instance.initialize()
@@ -162,7 +230,7 @@ class ControllerAnimatorInteractive:
 
         # Create control panel window (separate window)
         self.control_window = gui.Application.instance.create_window(
-            "Controls", 300, 200, x=1024, y=0
+            "Controls", 300, 200, x=1024, y=1024
         )
 
         # Create control panel layout
@@ -197,17 +265,36 @@ class ControllerAnimatorInteractive:
         self.leds = copy.deepcopy(self.base_leds)
 
         # Create material records
-        mesh_material = rendering.MaterialRecord()
-        mesh_material.shader = "defaultLit"
-        mesh_material.point_size = 5.0
+        self.mat_mesh = rendering.MaterialRecord()
+        self.mat_mesh.shader = "defaultLit"
 
-        leds_material = rendering.MaterialRecord()
-        leds_material.shader = "defaultUnlit"
-        leds_material.point_size = 5.0
+        self.mat_leds = rendering.MaterialRecord()
+        self.mat_leds.shader = "defaultUnlit"
+        self.mat_leds.point_size = 5.0
 
-        self.scene.scene.add_geometry("mesh", self.mesh, mesh_material)
-        self.scene.scene.add_geometry("leds", self.leds, leds_material)
-        self.scene.scene.add_geometry("frame", self.frame, mesh_material)
+        self.mat_lines = rendering.MaterialRecord()
+        self.mat_lines.shader = "unlitLine"
+        self.mat_lines.line_width = 2.0  # optional, makes lines thicker
+
+        self.normals_vis = None
+
+        self.scene.scene.add_geometry("mesh", self.mesh, self.mat_mesh)
+        self.scene.scene.add_geometry("leds", self.leds, self.mat_leds)
+        self.rays = None
+        # self.scene.scene.add_geometry("frame", self.frame, mesh_material)
+
+        # --- CAMERA (static) ---
+        self.camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+        self.camera_frustum = create_camera_frustum(scale=0.15)
+        self.camera_frustum.colors = o3d.utility.Vector3dVector(
+            [[0, 1, 0]] * len(self.camera_frustum.lines)  # green
+        )
+
+        cam_mat = rendering.MaterialRecord()
+        cam_mat.shader = "defaultUnlit"
+
+        self.scene.scene.add_geometry("camera_frame", self.camera_frame, cam_mat)
+        self.scene.scene.add_geometry("camera_frustum", self.camera_frustum, cam_mat)
 
         # Setup camera
         bounds = self.mesh.get_axis_aligned_bounding_box()
@@ -227,6 +314,7 @@ class ControllerAnimatorInteractive:
 
         # Store data
         self.poses = poses
+        self.assignments = assignments
         self.T_model_ctrl = T_model_ctrl
 
         # Keyboard controls
@@ -319,31 +407,81 @@ class ControllerAnimatorInteractive:
             T_ctrl_model = self.T_model_ctrl.inverse()
             T_cam_model = T_cam_ctrl.compose(T_ctrl_model)
 
+            # --- normals ---
+            pts_model = np.asarray(self.base_leds.points)
+            normals_model = self.base_normals
+
+            # transform normals (rotation only!)
+            normals_cam = (T_cam_model.R @ normals_model.T).T
+
+            # transform points
+            pts_cam = (T_cam_model.R @ pts_model.T).T + T_cam_model.t
+
+            normals_vis = create_normals(pts_cam, normals_cam, scale=0.03)
+
+            # update scene
+            if hasattr(self, "normals_vis") and self.normals_vis is not None:
+                self.scene.scene.remove_geometry("normals")
+
+            self.scene.scene.add_geometry("normals", normals_vis, self.mat_lines)
+            self.normals_vis = normals_vis
+
             # Create 4x4 transformation matrix
             T4 = np.eye(4)
             T4[:3, :3] = T_cam_model.R
             T4[:3, 3] = T_cam_model.t
 
+            # --- rays ---
+            assignment = None
+            if self.assignments is not None and self.idx < len(self.assignments):
+                assignment = self.assignments[self.idx]
+
+            if assignment is not None and len(assignment) > 0:
+
+                # get LED positions in MODEL frame
+                led_ids = [lid for _, lid in assignment]
+
+                pts_model = self.base_leds.points
+
+                pts_model = np.asarray(pts_model)[led_ids]
+
+                # transform to camera frame
+                pts_cam = (T_cam_model.R @ pts_model.T).T + T_cam_model.t
+
+                rays = create_rays(pts_cam)
+
+                # update scene
+                if hasattr(self, "rays") and self.rays is not None:
+                    self.scene.scene.remove_geometry("rays")
+
+                self.scene.scene.add_geometry("rays", rays, self.mat_leds)
+                self.rays = rays
+
             # Update mesh and point cloud transformations
             # Create transformed copies
+            self.mesh = copy.deepcopy(self.base_mesh)
             self.mesh = copy.deepcopy(self.base_mesh)
             self.mesh.transform(T4)
 
             self.leds = copy.deepcopy(self.base_leds)
             self.leds.transform(T4)
 
-            # Update geometries in scene
-            mesh_material = rendering.MaterialRecord()
-            mesh_material.shader = "defaultLit"
+            # --- color LEDs ---
+            colors = np.tile([1, 0, 0], (len(self.base_leds.points), 1))  # red
 
-            leds_material = rendering.MaterialRecord()
-            leds_material.shader = "defaultUnlit"
-            leds_material.point_size = 5.0
+            if assignment:
+                for _, lid in assignment:
+                    colors[lid] = [0, 1, 0]  # green matched
+
+            self.leds.colors = o3d.utility.Vector3dVector(colors)
+
+            # # Update geometries in scene
 
             self.scene.scene.remove_geometry("mesh")
             self.scene.scene.remove_geometry("leds")
-            self.scene.scene.add_geometry("mesh", self.mesh, mesh_material)
-            self.scene.scene.add_geometry("leds", self.leds, leds_material)
+
+            self.scene.scene.add_geometry("mesh", self.mesh, self.mat_mesh)
+            self.scene.scene.add_geometry("leds", self.leds, self.mat_leds)
 
         except Exception as e:
             print(f"Error updating frame {self.idx}: {e}")
