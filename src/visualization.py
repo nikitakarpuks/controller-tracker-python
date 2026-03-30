@@ -253,6 +253,8 @@ class ControllerAnimatorInteractive:
         self.pending_step = None
         self.pending_reset = False
 
+        self.visual_offset = np.array([0.0, 0.0, 0.3])  # push forward
+
     def _load_mesh(self, path):
         """Load mesh from file"""
         import trimesh
@@ -475,6 +477,9 @@ class ControllerAnimatorInteractive:
             T_ctrl_model = self.T_model_ctrl.inverse()
             T_cam_model = T_cam_ctrl.compose(T_ctrl_model)
 
+            # >>> ADDED: visual offset <<<
+            visual_offset = np.array([0.0, 0.0, 0.3])
+
             # =========================
             # BLOBS + PROJECTIONS
             # =========================
@@ -501,9 +506,8 @@ class ControllerAnimatorInteractive:
                 # --- project LEDs (PnP result) ---
                 object_points = np.asarray(self.base_leds.points)
 
-                # --- project LEDs directly onto plane (CORRECT WAY) ---
-
-                pts_cam = (T_cam_model.R @ object_points.T).T + T_cam_model.t  # Nx3
+                # >>> ADDED offset here <<<
+                pts_cam = (T_cam_model.R @ object_points.T).T + T_cam_model.t + visual_offset
 
                 Z_plane = self.frustum_z
 
@@ -557,15 +561,13 @@ class ControllerAnimatorInteractive:
             pts_model = np.asarray(self.base_leds.points)
             normals_model = self.base_normals
 
-            # transform normals (rotation only!)
             normals_cam = (T_cam_model.R @ normals_model.T).T
 
-            # transform points
-            pts_cam = (T_cam_model.R @ pts_model.T).T + T_cam_model.t
+            # >>> ADDED offset here <<<
+            pts_cam = (T_cam_model.R @ pts_model.T).T + T_cam_model.t + visual_offset
 
             normals_vis = create_normals(pts_cam, normals_cam, scale=0.03)
 
-            # update scene
             if hasattr(self, "normals_vis") and self.normals_vis is not None:
                 self.scene.scene.remove_geometry("normals")
 
@@ -575,7 +577,8 @@ class ControllerAnimatorInteractive:
             # Create 4x4 transformation matrix
             T4 = np.eye(4)
             T4[:3, :3] = T_cam_model.R
-            T4[:3, 3] = T_cam_model.t
+            # >>> ADDED offset here <<<
+            T4[:3, 3] = T_cam_model.t + visual_offset
 
             # --- rays ---
             assignment = None
@@ -584,19 +587,16 @@ class ControllerAnimatorInteractive:
 
             if assignment is not None and len(assignment) > 0:
 
-                # get LED positions in MODEL frame
                 led_ids = [lid for _, lid in assignment]
 
                 pts_model = self.base_leds.points
-
                 pts_model = np.asarray(pts_model)[led_ids]
 
-                # transform to camera frame
-                pts_cam = (T_cam_model.R @ pts_model.T).T + T_cam_model.t
+                # >>> ADDED offset here <<<
+                pts_cam = (T_cam_model.R @ pts_model.T).T + T_cam_model.t + visual_offset
 
                 rays = create_rays(pts_cam)
 
-                # update scene
                 if hasattr(self, "rays") and self.rays is not None:
                     self.scene.scene.remove_geometry("rays")
 
@@ -604,7 +604,6 @@ class ControllerAnimatorInteractive:
                 self.rays = rays
 
             # Update mesh and point cloud transformations
-            # Create transformed copies
             self.mesh = copy.deepcopy(self.base_mesh)
             self.mesh.transform(T4)
 
@@ -612,15 +611,13 @@ class ControllerAnimatorInteractive:
             self.leds.transform(T4)
 
             # --- color LEDs ---
-            colors = np.tile([1, 0, 0], (len(self.base_leds.points), 1))  # red
+            colors = np.tile([1, 0, 0], (len(self.base_leds.points), 1))
 
             if assignment:
                 for _, lid in assignment:
-                    colors[lid] = [0, 1, 0]  # green matched
+                    colors[lid] = [0, 1, 0]
 
             self.leds.colors = o3d.utility.Vector3dVector(colors)
-
-            # # Update geometries in scene
 
             self.scene.scene.remove_geometry("mesh")
             self.scene.scene.remove_geometry("leds")
