@@ -45,26 +45,6 @@ def rt_to_transform(rvec: np.ndarray, tvec: np.ndarray) -> Transform:
     return Transform(R, tvec.reshape(3))
 
 
-def create_camera_frustum(scale=0.1):
-    points = np.array([
-        [0, 0, 0],      # camera center
-        [-1, -1, 1],
-        [1, -1, 1],
-        [1, 1, 1],
-        [-1, 1, 1],
-    ]) * scale
-
-    lines = [
-        [0,1],[0,2],[0,3],[0,4],
-        [1,2],[2,3],[3,4],[4,1]
-    ]
-
-    return o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(points),
-        lines=o3d.utility.Vector2iVector(lines)
-    )
-
-
 def transform_to_matrix(T: Transform) -> np.ndarray:
     T4 = np.eye(4)
     T4[:3, :3] = T.R
@@ -165,46 +145,86 @@ def create_normals(points: np.ndarray, normals: np.ndarray, scale=0.03):
 
     return line_set
 
-def create_image_plane(width=640, height=480, fx=500, fy=500, scale=1.0):
+def create_image_plane(cam, z=0.2):
     """
-    Create a plane at z=1 in camera coords
+    Image plane aligned with frustum
     """
-    z = 1.0 * scale
 
-    corners = np.array([
-        [0, 0, z],
-        [width, 0, z],
-        [width, height, z],
-        [0, height, z]
+    corners_px = np.array([
+        [0, 0],
+        [cam.width, 0],
+        [cam.width, cam.height],
+        [0, cam.height]
     ], dtype=np.float32)
 
-    # normalize using intrinsics
-    corners[:, 0] = (corners[:, 0] - width / 2) / fx * z
-    corners[:, 1] = (corners[:, 1] - height / 2) / fy * z
+    pts = []
+
+    for u, v in corners_px:
+        x = (u - cam.cx) / cam.fx * z
+        y = (v - cam.cy) / cam.fy * z
+        pts.append([x, y, z])
+
+    pts = np.array(pts)
 
     lines = [[0,1],[1,2],[2,3],[3,0]]
 
     plane = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(corners),
+        points=o3d.utility.Vector3dVector(pts),
         lines=o3d.utility.Vector2iVector(lines)
     )
 
-    plane.colors = o3d.utility.Vector3dVector([[1,1,1]] * 4)
+    plane.colors = o3d.utility.Vector3dVector(
+        [[1, 1, 1]] * len(lines)  # white
+    )
 
     return plane
 
-def backproject_to_plane(blobs, fx, fy, cx, cy, z=1.0):
-    """
-    Convert 2D image points → 3D points on plane z
-    """
+def backproject_to_plane(blobs, cam, z=0.2):
     pts = []
 
     for u, v in blobs:
-        x = (u - cx) / fx * z
-        y = (v - cy) / fy * z
+        x = (u - cam.cx) / cam.fx * z
+        y = (v - cam.cy) / cam.fy * z
         pts.append([x, y, z])
 
     return np.array(pts, dtype=np.float32)
+
+def create_camera_frustum_intrinsics(cam, z=0.2):
+    """
+    Build frustum directly from camera intrinsics
+    """
+
+    corners_px = np.array([
+        [0, 0],
+        [cam.width, 0],
+        [cam.width, cam.height],
+        [0, cam.height]
+    ], dtype=np.float32)
+
+    pts = [[0, 0, 0]]  # camera center
+
+    for u, v in corners_px:
+        x = (u - cam.cx) / cam.fx * z
+        y = (v - cam.cy) / cam.fy * z
+        pts.append([x, y, z])
+
+    pts = np.array(pts)
+
+    lines = [
+        [0,1],[0,2],[0,3],[0,4],
+        [1,2],[2,3],[3,4],[4,1]
+    ]
+
+    frustum = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(pts),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+
+    frustum.colors = o3d.utility.Vector3dVector(
+        [[0, 1, 0]] * len(lines)  # green
+    )
+
+    return frustum
 
 class ControllerAnimatorInteractive:
 
@@ -330,30 +350,14 @@ class ControllerAnimatorInteractive:
 
         # --- CAMERA (static) ---
         self.camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-        self.camera_frustum = create_camera_frustum(scale=0.15)
-        self.camera_frustum.colors = o3d.utility.Vector3dVector(
-            [[0, 1, 0]] * len(self.camera_frustum.lines)  # green
-        )
 
-        cam_mat = rendering.MaterialRecord()
-        cam_mat.shader = "defaultUnlit"
+        self.frustum_z = 0.2  # <-- single source of truth
 
-        self.scene.scene.add_geometry("camera_frame", self.camera_frame, cam_mat)
-        self.scene.scene.add_geometry("camera_frustum", self.camera_frustum, cam_mat)
+        self.camera_frustum = create_camera_frustum_intrinsics(self.camera, z=self.frustum_z)
+        self.image_plane = create_image_plane(self.camera, z=self.frustum_z)
 
-        # Setup camera
-        bounds = self.mesh.get_axis_aligned_bounding_box()
-        self.scene.setup_camera(60, bounds, bounds.get_center())
-
-        self.image_plane = create_image_plane(
-            width=self.camera.width,
-            height=self.camera.height,
-            fx=self.camera.fx,
-            fy=self.camera.fy,
-        )
-
-        self.scene.scene.add_geometry("image_plane", self.image_plane, self.mat_lines)
-
+        self.scene.scene.add_geometry("camera_frame", self.camera_frame, self.mat_mesh)
+        self.scene.scene.add_geometry("camera_frustum", self.camera_frustum, self.mat_lines)
         self.scene.scene.add_geometry("image_plane", self.image_plane, self.mat_lines)
 
         # Add scene to main window
@@ -472,14 +476,7 @@ class ControllerAnimatorInteractive:
                 blobs = self.blobs_all[self.idx]
 
                 # --- blobs → plane ---
-                pts_plane = backproject_to_plane(
-                    blobs,
-                    self.camera.fx,
-                    self.camera.fy,
-                    self.camera.cx,
-                    self.camera.cy,
-                    z=1.0
-                )
+                pts_plane = backproject_to_plane(blobs, self.camera, z=self.frustum_z)
 
                 blob_pcd = o3d.geometry.PointCloud()
                 blob_pcd.points = o3d.utility.Vector3dVector(pts_plane)
@@ -496,24 +493,22 @@ class ControllerAnimatorInteractive:
                 # --- project LEDs (PnP result) ---
                 object_points = np.asarray(self.base_leds.points)
 
-                proj_2d, _ = cv2.projectPoints(
-                    object_points,
-                    rvec,
-                    tvec,
-                    self.camera.camera_matrix,
-                    self.camera.dist_coeffs
-                )
+                # --- project LEDs directly onto plane (CORRECT WAY) ---
 
-                proj_2d = proj_2d.reshape(-1, 2)
+                pts_cam = (T_cam_model.R @ object_points.T).T + T_cam_model.t  # Nx3
 
-                proj_plane = backproject_to_plane(
-                    proj_2d,
-                    self.camera.fx,
-                    self.camera.fy,
-                    self.camera.cx,
-                    self.camera.cy,
-                    z=1.0
-                )
+                Z_plane = self.frustum_z
+
+                proj_plane = []
+
+                for X, Y, Z in pts_cam:
+                    if Z <= 1e-6:
+                        continue
+
+                    scale = Z_plane / Z
+                    proj_plane.append([X * scale, Y * scale, Z_plane])
+
+                proj_plane = np.array(proj_plane, dtype=np.float32)
 
                 proj_pcd = o3d.geometry.PointCloud()
                 proj_pcd.points = o3d.utility.Vector3dVector(proj_plane)
