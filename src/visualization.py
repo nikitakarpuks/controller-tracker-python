@@ -250,6 +250,9 @@ class ControllerAnimatorInteractive:
         self.control_window = None
         self._tick_callback = None
 
+        self.pending_step = None
+        self.pending_reset = False
+
     def _load_mesh(self, path):
         """Load mesh from file"""
         import trimesh
@@ -295,7 +298,7 @@ class ControllerAnimatorInteractive:
 
         # Create control panel window (separate window)
         self.control_window = gui.Application.instance.create_window(
-            "Controls", 300, 200, x=1024, y=1024
+            "Controls", 300, 200, x=512, y=512
         )
 
         # Create control panel layout
@@ -394,19 +397,10 @@ class ControllerAnimatorInteractive:
         self.paused = not self.paused
 
     def _step(self, direction):
-        """Step forward or backward by one frame"""
-        new_idx = self.idx + direction
-        if 0 <= new_idx < len(self.poses):
-            self.idx = new_idx
-            self._update_frame()
-            self._update_status()
+        self.pending_step = direction
 
     def _reset(self):
-        """Reset to first frame"""
-        self.idx = 0
-        self.paused = True
-        self._update_frame()
-        self._update_status()
+        self.pending_reset = True
 
     def _on_key(self, event):
         """Handle keyboard events"""
@@ -433,17 +427,31 @@ class ControllerAnimatorInteractive:
             self.status_label.text = f"Frame: {current} / {total}"
 
     def _tick(self):
-        """Animation tick function"""
-        if not self.paused and self.poses is not None and len(self.poses) > 0:
-            self.idx = (self.idx + 1) % len(self.poses)
-            self._update_frame()
-            self._update_status()
+        if self.window is None:
+            return
 
-        # Schedule next tick if window still exists
-        if self.window:
-            self._tick_callback = gui.Application.instance.post_to_main_thread(
-                self.window, self._tick
-            )
+        # --- handle control inputs ---
+        if hasattr(self, "pending_reset") and self.pending_reset:
+            self.idx = 0
+            self.paused = True
+            self.pending_reset = False
+
+        if hasattr(self, "pending_step") and self.pending_step is not None:
+            new_idx = self.idx + self.pending_step
+            if 0 <= new_idx < len(self.poses):
+                self.idx = new_idx
+            self.pending_step = None
+
+        # --- animation ---
+        if not self.paused and self.poses:
+            self.idx = (self.idx + 1) % len(self.poses)
+
+        # --- SINGLE place where update happens ---
+        self._update_frame()
+        self._update_status()
+
+        # schedule next tick
+        gui.Application.instance.post_to_main_thread(self.window, self._tick)
 
     def _update_frame(self):
         """Update the current frame based on pose"""
