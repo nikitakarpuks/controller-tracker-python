@@ -31,12 +31,6 @@ def main():
 
     # show_initial_alignment(positions_model, normals_model, config["visualization"]["3d_model_path"])
 
-    controler_animator = ControllerAnimatorInteractive(
-        config["visualization"]["3d_model_path"],
-        positions_model,
-        normals_model
-    )
-
     # Iterate
     for batch in dataloader:
         img_path, image = batch[0][0], batch[0][1]
@@ -66,6 +60,13 @@ def main():
         raise RuntimeError("No valid poses found")
 
     # --- start interactive viewer ---
+
+    controler_animator = ControllerAnimatorInteractive(
+        config["visualization"]["3d_model_path"],
+        positions_model,
+        normals_model
+    )
+
     controler_animator.start(poses, assignments, blobs, camera_0, T_model_ctrl)
 
 
