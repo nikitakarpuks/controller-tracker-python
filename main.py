@@ -3,7 +3,7 @@ from src.preprocess_data import get_data
 from src.blobs_detection import get_centroids
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config
-from src.visualization import prepare_model_geometry, show_initial_alignment, ControllerAnimatorInteractive
+from src.visualization import ControllerAnimatorRerun, prepare_model_geometry, show_initial_alignment
 
 
 def main():
@@ -61,7 +61,7 @@ def main():
 
     # --- start interactive viewer ---
 
-    controler_animator = ControllerAnimatorInteractive(
+    controler_animator = ControllerAnimatorRerun(
         config["visualization"]["3d_model_path"],
         positions_model,
         normals_model
