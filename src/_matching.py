@@ -141,30 +141,18 @@ def proximity_match(
 def brute_match(
     self,
     blobs: np.ndarray,
-    max_iterations: int = 2000,
+    max_iterations: int = 1500,
     reprojection_threshold: float = 5.0,
-    min_inliers: int = 5
+    min_inliers: int = 5,
+    blob_radius: float = 80.0  # NEW: enforce locality
 ) -> Optional[Dict]:
-    """
-    Brute-force RANSAC PnP matching without prior pose.
-    This method randomly samples 4 blobs and 4 LEDs to estimate an initial pose,
-    then counts inliers based on reprojection error, and finally refines the pose using all inliers.
-    Args:
-    - blobs: Detected blob positions in the image (shape: Nx2).
-    - max_iterations: Number of RANSAC iterations.
-    - reprojection_threshold: Maximum pixel distance for a blob to be considered an inlier.
-    - min_inliers: Minimum number of inliers required to accept a solution.
-    Returns:
-    - A dictionary containing the best pose estimate (in camera coordinates), inlier count, error, and assignment
-    """
 
     n_blobs = len(blobs)
-    n_leds = len(self.model.positions)
-
     if n_blobs < 4:
         return None
 
     led_positions = self.model.positions
+    led_normals = self.model.normals
 
     best_solution = None
     best_inliers = 0
@@ -172,12 +160,25 @@ def brute_match(
 
     for _ in range(max_iterations):
 
-        # choosing blobs and leds randomly for initial PnP estimation
-        blob_idx = np.random.choice(n_blobs, 4, replace=False)
-        led_idx = np.random.choice(n_leds, 4, replace=False)
+        # =====================================================
+        # 1. Sample LOCAL blob cluster (instead of random)
+        # =====================================================
+        seed = np.random.randint(n_blobs)
+        dists = np.linalg.norm(blobs - blobs[seed], axis=1)
 
-        obj = led_positions[led_idx]
+        neighbors = np.where(dists < blob_radius)[0]
+
+        if len(neighbors) < 4:
+            continue
+
+        blob_idx = np.random.choice(neighbors, 4, replace=False)
         img = blobs[blob_idx]
+
+        # =====================================================
+        # 2. Try ALL LED quadruples? No → sample smart subset
+        # =====================================================
+        led_idx = np.random.choice(len(led_positions), 4, replace=False)
+        obj = led_positions[led_idx]
 
         success, rvec, tvec = cv2.solvePnP(
             obj,
@@ -190,9 +191,30 @@ def brute_match(
         if not success:
             continue
 
-        # project to camera
+        # =====================================================
+        # 3. Visibility filtering USING NORMALS (NEW)
+        # =====================================================
+        R, _ = cv2.Rodrigues(rvec)
+
+        led_cam = (R @ led_positions.T).T + tvec.reshape(1, 3)
+        normals_cam = (R @ led_normals.T).T
+
+        view_dir = -led_cam / np.linalg.norm(led_cam, axis=1, keepdims=True)
+
+        visible = (normals_cam * view_dir).sum(axis=1) > 0.2
+
+        if np.sum(visible) < 4:
+            continue
+
+        visible_leds = led_positions[visible]
+
+        # =====================================================
+        # 4. Project only visible LEDs
+        # =====================================================
         proj, _ = cv2.projectPoints(
-            led_positions, rvec, tvec,
+            visible_leds,
+            rvec,
+            tvec,
             self.camera.camera_matrix,
             self.camera.dist_coeffs
         )
@@ -202,7 +224,9 @@ def brute_match(
         if not np.all(np.isfinite(proj)):
             continue
 
-        # nearest neighbours
+        # =====================================================
+        # 5. Nearest-neighbor assignment
+        # =====================================================
         tree = KDTree(proj)
         distances, indices = tree.query(blobs)
 
@@ -210,12 +234,13 @@ def brute_match(
         inlier_b = []
         inlier_l = []
 
-        # extract inliers
+        visible_ids = np.where(visible)[0]
+
         for b_idx, (d, l_idx) in enumerate(zip(distances, indices)):
             if d < reprojection_threshold and l_idx not in used:
                 used.add(l_idx)
                 inlier_b.append(b_idx)
-                inlier_l.append(l_idx)
+                inlier_l.append(visible_ids[l_idx])
 
         if len(inlier_b) < min_inliers:
             continue
@@ -223,26 +248,16 @@ def brute_match(
         inlier_b = np.array(inlier_b)
         inlier_l = np.array(inlier_l)
 
-        proj_in = proj[inlier_l]
-
-        # calculate error between projected inliers and blobs
-        err = np.linalg.norm(proj_in - blobs[inlier_b], axis=1).mean()
-
-        is_better = (
-            len(inlier_b) > best_inliers or
-            (len(inlier_b) == best_inliers and err < best_error)
-        )
-
-        if not is_better:
-            continue
-
-        # --- refine ---
+        # =====================================================
+        # 6. Refinement
+        # =====================================================
         success, rvec_ref, tvec_ref = cv2.solvePnP(
             led_positions[inlier_l],
             blobs[inlier_b],
             self.camera.camera_matrix,
             self.camera.dist_coeffs,
-            rvec, tvec,
+            rvec,
+            tvec,
             useExtrinsicGuess=True,
             flags=cv2.SOLVEPNP_ITERATIVE
         )
@@ -252,16 +267,25 @@ def brute_match(
 
         proj_ref, _ = cv2.projectPoints(
             led_positions[inlier_l],
-            rvec_ref, tvec_ref,
+            rvec_ref,
+            tvec_ref,
             self.camera.camera_matrix,
             self.camera.dist_coeffs
         )
 
         proj_ref = proj_ref.reshape(-1, 2)
+
         final_err = np.linalg.norm(
             proj_ref - blobs[inlier_b], axis=1
         ).mean()
 
+        is_better = (
+            len(inlier_b) > best_inliers or
+            (len(inlier_b) == best_inliers and final_err < best_error)
+        )
+
+        if not is_better:
+            continue
 
         best_solution = {
             "rvec": rvec_ref,
@@ -269,7 +293,7 @@ def brute_match(
             "inliers": len(inlier_b),
             "error": float(final_err),
             "assignment": list(zip(inlier_b.tolist(), inlier_l.tolist())),
-            "method": "ransac_brute"
+            "method": "ransac_normals_local"
         }
 
         best_inliers = len(inlier_b)
