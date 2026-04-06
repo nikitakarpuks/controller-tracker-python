@@ -150,16 +150,19 @@ class SingleViewTracker:
             solution = None
 
             if n_blobs >= 3:
-                solution = self.proximity_match(blobs, self.prev_pose)
+                # Pass the previous assignment so proximity_match can use the
+                # fast locked path (nearest-neighbour per LED) instead of full
+                # Hungarian, which can flip to an alternative assignment.
+                solution = self.proximity_match(
+                    blobs, self.prev_pose,
+                    prior_assignment=self.prev_assignment,
+                )
 
-                if not solution or solution["error"] > 12.0:
-                    alt = self.p2p_solver(
-                        blobs,
-                        self.prev_pose,
-                        proximity_result=solution
-                    )
-                    if alt and alt["error"] < 10.0:
-                        solution = alt
+                # # If quality is poor, re-initialise with brute_match.
+                # # 2.0 px is a safe threshold: correct tracking gives < 0.5 px,
+                # # wrong-assignment local minima sit around 2–3 px.
+                # if not solution or solution["error"] > 2.0:
+                #     solution = self.brute_match(blobs)
 
             elif n_blobs >= 1:
                 solution = self.p1p_solver(blobs, self.prev_pose)
@@ -167,7 +170,7 @@ class SingleViewTracker:
         # -----------------------------
         # State update
         # -----------------------------
-        if solution and solution["error"] < 15.0:
+        if solution and solution["error"] < 5.0:
             self.prev_pose = (solution["rvec"], solution["tvec"])
             self.prev_assignment = solution["assignment"]
             return solution
