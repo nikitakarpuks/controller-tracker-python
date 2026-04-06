@@ -23,6 +23,9 @@ VIS_CONFIG = {
     "show_image_plane": True,
     "show_camera_frame":True,
     "fps":              30,        # playback speed
+    "frustum_z":        0.05,      # depth of the virtual projection screen (metres).
+                                   # Must be less than the closest expected controller depth.
+                                   # Pure display parameter — has no effect on matching.
 }
 
 
@@ -92,6 +95,12 @@ def compute_frustum_corners(cam, z: float):
 
 
 def backproject_to_plane(blobs: np.ndarray, cam, z: float = 0.2) -> np.ndarray:
+    """
+    Convert 2D pixel blob positions to 3D points on the visualization plane.
+
+    Uses normalized image coordinates so the result is independent of z
+    (changing z just scales the whole plane uniformly, ratios preserved).
+    """
     pts = []
     for u, v in blobs:
         x = (u - cam.cx) / cam.fx * z
@@ -99,6 +108,26 @@ def backproject_to_plane(blobs: np.ndarray, cam, z: float = 0.2) -> np.ndarray:
         pts.append([x, y, z])
     return np.array(pts, dtype=np.float32)
 
+
+def project_to_plane(pts_cam: np.ndarray, z: float = 0.2) -> np.ndarray:
+    """
+    Project 3D camera-space LED positions onto the visualization plane at depth z.
+
+    Divides by Z to get normalized coords, then scales by z — same formula
+    as backproject_to_plane, so blobs and projected LEDs are comparable.
+    Filters points behind the camera.
+    """
+    out = []
+    indices = []
+    for i, (X, Y, Z) in enumerate(pts_cam):
+        if Z <= 1e-6:
+            continue
+        x_n = X / Z   # normalized image coords
+        y_n = Y / Z
+        out.append([x_n * z, y_n * z, z])
+        indices.append(i)
+
+    return np.array(out, dtype=np.float32), indices
 
 # =========================================================
 # Static one-shot visualization (frame 0 equivalent)
@@ -202,7 +231,7 @@ class ControllerAnimatorRerun:
         self.vis_cfg         = vis_cfg if vis_cfg is not None else dict(VIS_CONFIG)
 
         self._trimesh        = load_trimesh(mesh_path)
-        self.visual_offset   = np.array([0.0, 0.0, 0.3])
+        self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -258,7 +287,7 @@ class ControllerAnimatorRerun:
 
     def _log_static_camera(self, cam):
         """Camera frustum and image-plane outline — static, logged once."""
-        frustum_z = 0.2
+        frustum_z = self.vis_cfg.get("frustum_z", 0.05)
 
         corners = compute_frustum_corners(cam, z=frustum_z)
         origin  = np.zeros(3)
@@ -316,8 +345,10 @@ class ControllerAnimatorRerun:
         R      = T_cam_model.R
         t      = T_cam_model.t
 
-        # ---- transformed positions of model LEDs in camera space ----
-        pts_cam = (R @ self.model_positions.T).T + t + offset
+        # Real camera-space positions (no visual offset) — used for projection
+        pts_cam_real = (R @ self.model_positions.T).T + t
+        # Offset positions for 3-D display only
+        pts_cam = pts_cam_real + offset
 
         # ---- 4x4 matrix for mesh ----
         T4 = np.eye(4)
@@ -352,89 +383,88 @@ class ControllerAnimatorRerun:
                 )
             )
 
+        # normals_cam needed for both display and projection — compute unconditionally
+        normals_cam = (R @ self.model_normals.T).T   # (N_leds, 3)
+
         # ---- normals ----
         if self.vis_cfg.get("show_normals", True):
-            normals_cam   = (R @ self.model_normals.T).T
-            normal_starts = pts_cam
-            normal_ends   = pts_cam + normals_cam * 0.03
-
             rr.log(
                 "world/normals",
                 rr.LineStrips3D(
-                    strips=[[s, e] for s, e in zip(normal_starts, normal_ends)],
+                    strips=[[s, e] for s, e in zip(pts_cam,
+                                                    pts_cam + normals_cam * 0.03)],
                     colors=[255, 0, 255],
                 )
             )
 
-        # ---- rays ----
-        if self.vis_cfg.get("show_rays", True) and assignment:
-            led_ids  = [lid for _, lid in assignment]
-            pts_sel  = pts_cam[led_ids]
-            origin   = np.zeros(3)
-            ray_strips = [[origin, p] for p in pts_sel]
-
-            rr.log(
-                "world/rays",
-                rr.LineStrips3D(
-                    strips=ray_strips,
-                    colors=[0, 0, 255],
-                    radii=0.0005
-                )
-            )
-
-        # ---- blobs & projections & errors ----
+        # ---- blobs, projections, rays (LED→proj), errors ----
+        # proj_pt = pinhole projection of the LED's 3D position onto the frustum plane at z=frustum_z.
+        # Formula: proj_pt = (X/Z * fz,  Y/Z * fz,  fz)  — same geometry as backproject_to_plane.
+        # The red error lines therefore show actual reprojection error, matching the console output.
+        # (The LED emission direction / beam-aim is shown separately by world/normals arrows.)
         frustum_z = self._frustum_z
 
         if blobs is not None and len(blobs) > 0:
             pts_plane = backproject_to_plane(blobs, camera, z=frustum_z)
 
             if self.vis_cfg.get("show_blobs", True):
-                rr.log(
-                    "world/blobs",
-                    rr.Points3D(
-                        positions=pts_plane,
-                        colors=np.tile([255, 255, 0], (len(pts_plane), 1)),
+                rr.log("world/blobs", rr.Points3D(
+                    positions=pts_plane,
+                    colors=np.tile([255, 255, 0], (len(pts_plane), 1)),
+                    radii=0.0015,
+                ))
+
+            if assignment:
+                ray_strips   = []
+                error_strips = []
+                proj_matched = []
+
+                for bid, lid in assignment:
+                    if bid >= len(pts_plane):
+                        continue
+                    real_pos = pts_cam_real[lid]
+
+                    # Pinhole projection of LED onto the frustum plane:
+                    # same formula as backproject_to_plane (inverse pinhole at depth fz)
+                    X, Y, Z = real_pos
+                    if Z <= 1e-6:
+                        continue
+                    proj_pt = np.array([X / Z * frustum_z,
+                                        Y / Z * frustum_z,
+                                        frustum_z])
+                    proj_matched.append(proj_pt)
+
+                    # Ray: displayed LED (with offset) → projection green dot
+                    # Ray: real (unshifted) LED position → its pinhole projection on the frustum plane.
+                    # Using real position (not display position) keeps this segment on the true
+                    # viewing ray, which passes through the camera origin [0,0,0].
+                    if self.vis_cfg.get("show_rays", True):
+                        ray_strips.append([pts_cam_real[lid], proj_pt])
+
+                    # Error: projection → blob (shows matching residual on image plane)
+                    if self.vis_cfg.get("show_errors", True):
+                        error_strips.append([proj_pt, pts_plane[bid]])
+
+                if self.vis_cfg.get("show_projected", True) and proj_matched:
+                    rr.log("world/projected_leds", rr.Points3D(
+                        positions=np.array(proj_matched),
+                        colors=np.tile([0, 255, 0], (len(proj_matched), 1)),
                         radii=0.0015,
-                    )
-                )
+                    ))
 
-            # projected LED positions onto image plane
-            proj_plane = []
-            for X, Y, Z in pts_cam:
-                if Z <= 1e-6:
-                    continue
-                scale = frustum_z / Z
-                proj_plane.append([X * scale, Y * scale, frustum_z])
-            proj_plane = np.array(proj_plane, dtype=np.float32)
+                if ray_strips:
+                    rr.log("world/rays", rr.LineStrips3D(
+                        strips=ray_strips,
+                        colors=[0, 0, 255],
+                        radii=0.0005,
+                    ))
 
-            if self.vis_cfg.get("show_projected", True) and len(proj_plane):
-                rr.log(
-                    "world/projected_leds",
-                    rr.Points3D(
-                        positions=proj_plane,
-                        colors=np.tile([0, 255, 0], (len(proj_plane), 1)),
-                        radii=0.0015,
-                    )
-                )
-
-            # error lines between projected LEDs and blobs
-            if (self.vis_cfg.get("show_errors", True)
-                    and len(proj_plane)
-                    and len(pts_plane)):
-
-                n = min(len(proj_plane), len(pts_plane))
-                error_strips = [
-                    [proj_plane[i], pts_plane[i]]
-                    for i in range(n)
-                ]
-                rr.log(
-                    "world/errors",
-                    rr.LineStrips3D(
+                if error_strips:
+                    rr.log("world/errors", rr.LineStrips3D(
                         strips=error_strips,
                         colors=[255, 0, 0],
-                        radii=0.0005
-                    )
-                )
+                        radii=0.0005,
+                    ))
 
 
 # =========================================================
