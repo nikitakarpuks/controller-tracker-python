@@ -1,5 +1,5 @@
 data:
-  root: "./data/cam0_controller_20260316/mav0/cam0/data/test_subset"
+  root: "./data/datasets/1_simple_zooming_right_ctrl/mav0/cam0/data/test_subset"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -12,11 +12,13 @@ data:
 #    min_inliers: 5.0
 
 cameras:
-  intrinsics_path: "./data/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
+  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
 
 controllers:
   right_controller:
-    config_path: "./data/controller_A85K6081930636R.json"
+    config_path: "./data/controllers/right_controller_A85K6081930636R.json"
+  left_controller:
+    config_path: "./data/controllers/left_controller_A85K5091630091L.json"
 
 blob_detection:
   min_threshold: 10
@@ -24,28 +26,15 @@ blob_detection:
   max_area: 150
 
 visualization:
-  3d_model_path: "./data/reverb_g2_controller.stp"
+  3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   initial_position_change:
-    translation: # in meters
-#      x: 0.1962 # red opposite
-#      y: 0.0148 # green correct
-#      z: -0.0935 # blue
+    right:
+      translation: # in meters
+        x: 0.19616
+        y: 0.015559
+        z: -0.093833
 
-      x: 0.19616 # red opposite
-      y: 0.015559 # green correct
-      z: -0.093833 # blue
-
-#      [0.19616422114507376, 0.015559300510207623, -0.09383367098789361]
-
-
-#      three points (old): (0.2565, 0.03, -0.095), (0.1640, -0.02, -0.1054), (0.2040, 0.079, -0.0903)
-#      three points (new with zero euler angles):
-  # (0.2697, 0.0234, -0.0486), (0.1810, -0.0299, -0.0690), (0.2078, 0.072, -0.0628)
-
-
-    rotation: # in radians
-      rx: -0.0005
-      ry: 0.226
-      rz: 2.8
-
-
+      rotation: # in radians
+        rx: -0.0005
+        ry: 0.226
+        rz: 3.1
