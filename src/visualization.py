@@ -50,14 +50,14 @@ def transform_to_matrix(T: Transform) -> np.ndarray:
 # =========================================================
 
 def build_alignment_transform(cfg) -> Transform:
-    rx = cfg["initial_position_change"]["rotation"]["rx"]
-    ry = cfg["initial_position_change"]["rotation"]["ry"]
-    rz = cfg["initial_position_change"]["rotation"]["rz"]
+    rx = cfg["rotation"]["rx"]
+    ry = cfg["rotation"]["ry"]
+    rz = cfg["rotation"]["rz"]
 
     t = np.array([
-        cfg["initial_position_change"]["translation"]["x"],
-        cfg["initial_position_change"]["translation"]["y"],
-        cfg["initial_position_change"]["translation"]["z"]
+        cfg["translation"]["x"],
+        cfg["translation"]["y"],
+        cfg["translation"]["z"]
     ])
 
     R_rz = trimesh.transformations.euler_matrix(0, 0, rz)[:3, :3]
@@ -107,6 +107,47 @@ def backproject_to_plane(blobs: np.ndarray, cam, z: float = 0.2) -> np.ndarray:
         y = (v - cam.cy) / cam.fy * z
         pts.append([x, y, z])
     return np.array(pts, dtype=np.float32)
+
+
+def make_disk_mesh(positions: np.ndarray, normals: np.ndarray,
+                   colors: np.ndarray, radius: float = 0.003,
+                   n_segments: int = 12, surface_offset: float = 0.0005):
+    """
+    Build a combined triangle mesh of flat disks, one per LED.
+    Each disk is centered at position + surface_offset*normal and lies
+    perpendicular to the normal (so it sits flush on the controller surface).
+
+    Returns (vertices, faces, vertex_colors).
+    """
+    all_verts   = []
+    all_faces   = []
+    all_colors  = []
+    vert_offset = 0
+
+    for pos, normal, color in zip(positions, normals, colors):
+        n = normal / (np.linalg.norm(normal) + 1e-9)
+        center = pos + n * surface_offset
+
+        # Local tangent frame perpendicular to n
+        ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(n, ref);  u /= np.linalg.norm(u)
+        v = np.cross(n, u)
+
+        angles = np.linspace(0, 2 * np.pi, n_segments, endpoint=False)
+        rim = [center + radius * (np.cos(a) * u + np.sin(a) * v) for a in angles]
+
+        all_verts.extend([center] + rim)
+        all_colors.extend([color] * (1 + n_segments))
+
+        for i in range(n_segments):
+            j = (i + 1) % n_segments
+            all_faces.append([vert_offset, vert_offset + 1 + i, vert_offset + 1 + j])
+
+        vert_offset += 1 + n_segments
+
+    return (np.array(all_verts,  dtype=np.float32),
+            np.array(all_faces,  dtype=np.int32),
+            np.array(all_colors, dtype=np.uint8))
 
 
 def project_to_plane(pts_cam: np.ndarray, z: float = 0.2) -> np.ndarray:
@@ -160,12 +201,14 @@ def show_initial_alignment(model_positions: np.ndarray,
         )
 
     if vis_cfg.get("show_leds", True):
+        colors = np.tile([255, 0, 0], (len(model_positions), 1))
+        verts, faces, vcols = make_disk_mesh(model_positions, model_normals, colors)
         rr.log(
             "world/leds",
-            rr.Points3D(
-                positions=model_positions,
-                colors=np.tile([255, 0, 0], (len(model_positions), 1)),
-                radii=0.005,
+            rr.Mesh3D(
+                vertex_positions=verts,
+                triangle_indices=faces,
+                vertex_colors=vcols,
             )
         )
 
@@ -357,34 +400,37 @@ class ControllerAnimatorRerun:
 
         # ---- mesh ----
         if self.vis_cfg.get("show_mesh", True):
-            verts_world = (T4[:3, :3] @ self._trimesh.vertices.T).T + T4[:3, 3]
+            verts_world   = (T4[:3, :3] @ self._trimesh.vertices.T).T + T4[:3, 3]
+            normals_world = (T4[:3, :3] @ self._trimesh.vertex_normals.T).T
             rr.log(
                 "world/mesh",
                 rr.Mesh3D(
                     vertex_positions=verts_world,
                     triangle_indices=self._trimesh.faces,
+                    vertex_normals=normals_world,
                     albedo_factor=[0.7, 0.7, 0.7, 1.0],
                 )
             )
 
-        # ---- LEDs ----
+        # normals_cam needed for both display and projection — compute unconditionally
+        normals_cam = (R @ self.model_normals.T).T   # (N_leds, 3)
+
+        # ---- LEDs (flat disks lying on the controller surface) ----
         if self.vis_cfg.get("show_leds", True):
             colors = np.tile([255, 0, 0], (len(pts_cam), 1))
             if assignment:
                 for _, lid in assignment:
                     colors[lid] = [0, 255, 0]
 
+            verts, faces, vcols = make_disk_mesh(pts_cam, normals_cam, colors)
             rr.log(
                 "world/leds",
-                rr.Points3D(
-                    positions=pts_cam,
-                    colors=colors,
-                    radii=0.003,
+                rr.Mesh3D(
+                    vertex_positions=verts,
+                    triangle_indices=faces,
+                    vertex_colors=vcols,
                 )
             )
-
-        # normals_cam needed for both display and projection — compute unconditionally
-        normals_cam = (R @ self.model_normals.T).T   # (N_leds, 3)
 
         # ---- normals ----
         if self.vis_cfg.get("show_normals", True):
@@ -475,7 +521,7 @@ def prepare_model_geometry(leds, cfg):
     positions = np.array([led.position for led in leds], dtype=np.float64)
     normals   = np.array([led.normal   for led in leds], dtype=np.float64)
 
-    T_model_ctrl = build_alignment_transform(cfg)
+    T_model_ctrl = build_alignment_transform(cfg["initial_position_change"]["right"])
 
     positions_model = T_model_ctrl.apply(positions)
     normals_model   = (T_model_ctrl.R @ normals.T).T
