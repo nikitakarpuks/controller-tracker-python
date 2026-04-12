@@ -4,6 +4,7 @@ from src.blobs_detection import get_centroids
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config
 from src.visualization import ControllerAnimatorRerun, prepare_model_geometry, show_initial_alignment
+from time import time
 
 
 def main():
@@ -37,9 +38,14 @@ def main():
         blob_centroids = get_centroids(image, config["blob_detection"], visualize=True, img_path=img_path)
         blobs.append(blob_centroids.copy())
 
+        t0 = time()
+
         # Track controller
         solution_ = tracking_system.update({0: blob_centroids})
+
         solution = solution_.get(("right_controller", camera_0.camera_idx))
+
+        t1 = time()
 
         if solution:
 
@@ -48,9 +54,10 @@ def main():
 
             print(f"Tracking method: {solution['method']}")
             print(f"Reprojection error: {solution['error']:.2f} pixels")
-            print(f"Rotation vector: {solution['rvec'].flatten()}")
-            print(f"Translation vector: {solution['tvec'].flatten()}")
-            print(f"Assignment: {solution['assignment']}")
+            print(f"Matching took {t1 - t0:.2f} seconds\n")
+            # print(f"Rotation vector: {solution['rvec'].flatten()}")
+            # print(f"Translation vector: {solution['tvec'].flatten()}")
+            # print(f"Assignment: {solution['assignment']}")
         else:
             poses.append(None)
             print("Tracking lost")

@@ -1,5 +1,5 @@
 data:
-  root: "./data/datasets/1_simple_zooming_right_ctrl/mav0/cam0/data/test_subset"
+  root: "./data/datasets/1_simple_zooming_right_ctrl/mav0/cam0/data"#/test_subset"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
