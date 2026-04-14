@@ -5,7 +5,6 @@ from scipy.spatial import KDTree
 from scipy.spatial.distance import cdist
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
-from time import time
 
 
 # ---------------------------------------------------------------------------
@@ -102,280 +101,209 @@ def _project_points(rvec, tvec, points: np.ndarray, K, dc) -> np.ndarray:
 
 def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   positions: np.ndarray, normals: np.ndarray,
-                  is_inner: Optional[np.ndarray] = None,
-                  radial_out: Optional[np.ndarray] = None,
-                  ring_axis: Optional[np.ndarray] = None,
-                  h_corpus: Optional[np.ndarray] = None,
-                  h_ax: float = 0.0,
-                  ring_center_ax: float = 0.0,
-                  R_ring: float = 0.0,
-                  angular_threshold: float = -1.0,
-                  ring_centroid: Optional[np.ndarray] = None,
-                  R_frustum_center: Optional[float] = None,
-                  frustum_slope: Optional[float] = None,
-                  z_frustum_top: Optional[float] = None,
-                  z_frustum_bot: Optional[float] = None) -> np.ndarray:
+                  is_inner: np.ndarray,
+                  radial_out: np.ndarray,
+                  ring_axis: np.ndarray,
+                  ring_centroid: np.ndarray,
+                  R_frustum_center: float,
+                  frustum_slope: float,
+                  z_frustum_top: float,
+                  z_frustum_bot: float) -> np.ndarray:
     """
-    Boolean mask of LEDs that are (approximately) camera-facing and unoccluded.
-
-    Standard check (all LEDs)
-    ─────────────────────────
-    dot(R @ normal, normalize(R @ pos + t)) < 0  →  LED faces camera  →  visible
-    Threshold 0.0 = 90° half-angle emission cone (matches OpenHMD facing_dot > 0.0).
-
-    Extra check for inner LEDs (frustum cone occlusion test)
-    ─────────────────────────────────────────────────────────
-    An inner LED passes the normal check but the outer frustum (truncated cone) wall
-    may still block the line of sight.  We solve for the intersection of the
-    camera→LED ray with the frustum's lateral conical surface and block the LED if
-    an intersection falls strictly between the camera and LED within the frustum's
-    axial extent.
-
-    The frustum is parametrised as:
-        R_outer(z_rel) = R_frustum_center + frustum_slope * z_rel
-    where z_rel = (pos · ring_axis) − ring_center_ax, and ring_axis is oriented
-    toward the larger-radius base (frustum_slope ≥ 0).
-
-    The frustum axial extent [z_frustum_bot, z_frustum_top] is intentionally
-    asymmetric around the LED centroid because the larger-radius base is typically
-    much closer to the centroid than the smaller base.  Using these asymmetric bounds
-    avoids incorrectly blocking inner LEDs seen from cameras above the large base.
-
-    A secondary far-rim angular check suppresses inner LEDs that are diametrically
-    opposite the camera in the ring plane — these would require the ray to pass
-    through the far outer wall, handled cheaply by a dot-product threshold.
+    Boolean mask: True for each LED that is camera-facing and not occluded.
+    Outer LEDs: facing-dot check (normal vs. view direction, 90° emission cone).
+    Inner LEDs: additionally tested against the outer frustum (truncated cone) wall.
     """
-    led_cam     = (R @ positions.T).T + tvec              # (N, 3)
-    z_ok        = led_cam[:, 2] > 0.01
-    view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
-    normals_cam = (R @ normals.T).T
-    dot         = (normals_cam * view_dir).sum(axis=1)
-    mask        = z_ok & (dot < 0.0)                      # 90° half-angle emission cone
 
-    if (is_inner is None or radial_out is None or ring_axis is None
-            or h_corpus is None or not np.any(is_inner)):
+    # ── Check 1: LED must be in front of the camera (positive depth) ─────────────
+    # Transform LED positions to camera space: led_cam = R @ pos + t.
+    # Anything with z ≤ 0 is behind the image plane — physically impossible to see.
+    led_cam = (R @ positions.T).T + tvec              # LED positions in camera coords (N, 3)
+    z_ok    = led_cam[:, 2] > 0.01
+
+    # ── Check 2: LED must face the camera (emission-cone test) ───────────────────
+    # Each LED emits into a 90° half-angle cone in the direction of its surface normal.
+    # We check whether the camera lies inside that cone.
+    #
+    # Geometry: view_dir points FROM camera TO the LED (same direction as led_cam).
+    #           normals_cam is the LED surface normal in camera space — it points AWAY
+    #           from the LED surface. For the camera to be inside the emission cone,
+    #           normal and view_dir must oppose each other → dot product < 0.
+    #           Threshold 0.0 = exactly 90° half-angle, matching OpenHMD.
+    view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)  # unit vector TO led
+    normals_cam = (R @ normals.T).T                                                    # normals in camera space
+    dot         = (normals_cam * view_dir).sum(axis=1)   # < 0 → normal opposes view → LED faces camera
+    mask        = z_ok & (dot < 0.0)
+
+    # Outer LEDs have no occlusion geometry to test — return early.
+    if is_inner is None or radial_out is None or ring_axis is None or not np.any(is_inner):
         return mask
 
-    cam_world = -(R.T @ tvec)                             # camera in world space
+    # ── Inner LEDs: frustum wall occlusion test ───────────────────────────────────
+    # Inner LEDs sit inside the controller body. Even if they face the camera, the
+    # outer conical wall (the frustum) can block the line of sight from outside.
+    # We model the wall as a truncated cone: R_outer(z) = R_fc + slope * z_rel,
+    # where z_rel is the axial distance from the ring centroid along ring_axis.
+    #
+    # Test: cast a ray from camera to each inner LED. If the ray intersects the
+    # cone surface at a point that is (a) strictly between camera and LED (t ∈ (0,1))
+    # AND (b) within the frustum's axial extent [z_frustum_bot, z_frustum_top],
+    # the LED is blocked.
 
-    # ── Far-rim angular check (cross-ring blocking) ──────────────────────────
-    cam_proj     = cam_world - (cam_world @ ring_axis) * ring_axis
-    cam_proj_len = float(np.linalg.norm(cam_proj))
-    if cam_proj_len > R_ring * 0.1:                       # camera not on ring axis
-        cam_dir  = cam_proj / cam_proj_len
-        far_ok   = (radial_out @ cam_dir) > angular_threshold  # (N,) bool
-        mask     = mask & (~is_inner | far_ok)
+    cam_world    = -(R.T @ tvec)          # camera position in world space
+    inner_active = np.where(is_inner)[0]  # indices of inner LEDs within the input array
+    P            = positions[inner_active]  # (M, 3) positions of inner LEDs only
 
-    inner_active = np.where(mask & is_inner)[0]
-    if len(inner_active) == 0:
-        return mask
+    # ── Step A: decompose into axial + radial components (ring-centroid frame) ──
+    # ring_axis defines the symmetry axis of the frustum (pointing toward larger base).
+    # Splitting each point into its axial projection and radial remainder lets us
+    # work with the cone equation in a clean cylindrical-like coordinate system.
+    C_rel = cam_world - ring_centroid       # camera offset from ring centroid
+    P_rel = P - ring_centroid               # LED offsets from ring centroid (M, 3)
 
-    if (ring_centroid is not None
-            and R_frustum_center is not None
-            and frustum_slope is not None):
-        # ── Frustum cone intersection ────────────────────────────────────────
-        # Ray: Q(t) = cam_world + t*(P - cam_world),  t ∈ (0, 1)
-        # Frustum lateral surface: |Q_rad(t)| = R_fc + slope * Q_ax_rel(t)
-        # where Q_ax_rel = Q · ring_axis − ring_center_ax,
-        #       Q_rad = Q − (Q · ring_axis)*ring_axis − ring_centroid_rad
-        P = positions[inner_active]            # (M, 3)
+    C_ax  = float(C_rel @ ring_axis)          # camera's axial coordinate (scalar)
+    P_ax  = (P_rel * ring_axis).sum(axis=1)   # each LED's axial coordinate (M,)
 
-        # Decompose camera and LEDs relative to ring centroid
-        C_rel = cam_world - ring_centroid      # (3,)
-        P_rel = P - ring_centroid              # (M, 3)
+    C_rad = C_rel - C_ax * ring_axis          # camera radial vector (perpendicular to axis)
+    P_rad = P_rel - np.outer(P_ax, ring_axis) # LED radial vectors (M, 3)
 
-        C_ax  = float(C_rel @ ring_axis)       # scalar axial coord of camera
-        P_ax  = (P_rel * ring_axis).sum(axis=1)  # (M,) axial coords of LEDs
+    # ── Step B: parametrize the camera→LED ray ────────────────────────────────────
+    # Q(t) = camera + t * (LED - camera),  t ∈ (0, 1) is strictly between them.
+    # Split the ray direction into axial and radial parts as well.
+    d_ax  = P_ax - C_ax    # rate of change of axial coord along the ray (M,)
+    d_rad = P_rad - C_rad  # rate of change of radial vector along the ray (M, 3)
 
-        C_rad = C_rel - C_ax * ring_axis       # (3,)  radial vec of camera
-        P_rad = P_rel - np.outer(P_ax, ring_axis)  # (M,3) radial vecs of LEDs
+    # ── Step C: express the outer-wall radius limit as a linear function of t ─────
+    # At parameter t the ray is at axial position C_ax + t*d_ax, so the outer wall
+    # radius at that point is: R(t) = (R_fc + slope*C_ax) + slope*d_ax*t = A0 + Ad*t.
+    A0 = float(R_frustum_center) + float(frustum_slope) * C_ax  # wall radius at t=0 (camera pos)
+    Ad = float(frustum_slope) * d_ax                             # how wall radius changes along ray (M,)
 
-        d_ax  = P_ax - C_ax                   # (M,) axial ray component
-        d_rad = P_rad - C_rad                 # (M,3) radial ray component
+    # ── Step D: find t where the ray touches the cone wall → solve quadratic ──────
+    # Intersection condition: |Q_rad(t)| = A0 + Ad*t
+    # Squaring both sides and rearranging:
+    #   (|d_rad|² - Ad²) t²  +  2(C_rad·d_rad - A0·Ad) t  +  (|C_rad|² - A0²) = 0
+    #       a                         b/2                             c
+    a     = (d_rad ** 2).sum(axis=1) - Ad ** 2                  # (M,)
+    b     = 2.0 * ((C_rad * d_rad).sum(axis=1) - A0 * Ad)      # (M,)
+    c_val = float(np.dot(C_rad, C_rad)) - A0 ** 2               # scalar (same camera for all LEDs)
 
-        # Outer radius varies linearly along the ray:
-        #   R(t) = A0 + Ad * t
-        A0 = float(R_frustum_center) + float(frustum_slope) * C_ax  # scalar
-        Ad = float(frustum_slope) * d_ax                              # (M,)
+    disc    = b ** 2 - 4.0 * a * c_val   # discriminant (M,); disc < 0 → ray misses cone entirely
+    blocked = np.zeros(len(inner_active), dtype=bool)
 
-        # |C_rad + t*d_rad|² = (A0 + Ad*t)²
-        # (|d_rad|² − Ad²)·t² + 2·(C_rad·d_rad − A0·Ad)·t + (|C_rad|² − A0²) = 0
-        a     = (d_rad ** 2).sum(axis=1) - Ad ** 2                    # (M,)
-        b     = 2.0 * ((C_rad * d_rad).sum(axis=1) - A0 * Ad)        # (M,)
-        c_val = float(np.dot(C_rad, C_rad)) - A0 ** 2                 # scalar
+    def _in_axial(z: np.ndarray) -> np.ndarray:
+        # True if the intersection axial position falls within the physical frustum extent.
+        return (z >= z_frustum_bot) & (z <= z_frustum_top)
 
-        disc    = b ** 2 - 4.0 * a * c_val                            # (M,)
-        blocked = np.zeros(len(inner_active), dtype=bool)
+    # ── Step E: evaluate both roots and check whether either blocks the ray ───────
+    # For each root t: blocking requires t ∈ (0, 1) AND axial pos inside frustum.
+    # t < 0 → intersection behind camera; t > 1 → beyond LED; both are non-blocking.
+    has_roots = disc >= 0.0
+    if np.any(has_roots):
+        sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
+        safe_2a   = np.where(np.abs(a) > 1e-12, 2.0 * a, 1.0)
+        for sign in (-1.0, 1.0):
+            t = np.where(np.abs(a) > 1e-12,
+                         (-b + sign * sqrt_disc) / safe_2a,
+                         2.0)             # a≈0 handled below; 2.0 keeps t outside (0,1)
+            in_range = has_roots & (t > 1e-4) & (t < 1.0 - 1e-4)
+            if not np.any(in_range):
+                continue
+            z_rel_t = C_ax + t * d_ax    # axial position of intersection point (M,)
+            blocked |= in_range & _in_axial(z_rel_t)
 
-        # Asymmetric axial bounds: frustum does NOT extend symmetrically around
-        # the LED centroid.  Use [z_frustum_bot, z_frustum_top] when available,
-        # otherwise fall back to the symmetric ±h_ax estimate.
-        use_asym = (z_frustum_top is not None and z_frustum_bot is not None)
-
-        def _in_axial(z: np.ndarray) -> np.ndarray:
-            if use_asym:
-                return (z >= z_frustum_bot) & (z <= z_frustum_top)
-            return np.abs(z) <= h_ax
-
-        # Quadratic roots
-        has_roots = disc >= 0.0
-        if np.any(has_roots):
-            sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
-            safe_2a   = np.where(np.abs(a) > 1e-12, 2.0 * a, 1.0)
-            for sign in (-1.0, 1.0):
-                t = np.where(np.abs(a) > 1e-12,
-                             (-b + sign * sqrt_disc) / safe_2a,
-                             2.0)             # 2.0 is outside (0,1) → not blocking
-                in_range = has_roots & (t > 1e-4) & (t < 1.0 - 1e-4)
-                if not np.any(in_range):
-                    continue
-                z_rel_t = C_ax + t * d_ax    # axial pos at intersection (M,)
-                blocked |= in_range & _in_axial(z_rel_t)
-
-        # Linear fallback: ray nearly tangent to cone surface (a ≈ 0)
-        lin_case = np.abs(a) <= 1e-12
-        if np.any(lin_case):
-            t_lin = np.where(np.abs(b) > 1e-12, -c_val / b, 2.0)
-            in_range_lin = lin_case & (t_lin > 1e-4) & (t_lin < 1.0 - 1e-4)
-            if np.any(in_range_lin):
-                blocked |= in_range_lin & _in_axial(C_ax + t_lin * d_ax)
-
-    else:
-        # ── Fallback: cylinder approximation (no frustum geometry available) ─
-        P   = positions[inner_active]
-        r   = radial_out[inner_active]
-        h   = h_corpus[inner_active]
-
-        d       = P - cam_world
-        d_rad   = (d * r).sum(axis=1)
-        safe    = d_rad != 0
-        d_rad_s = np.where(safe, d_rad, 1.0)
-        t_Q     = np.where(safe, 1.0 + h / d_rad_s, 2.0)
-
-        between = (t_Q > 0.0) & (t_Q < 1.0)
-        blocked = np.zeros(len(inner_active), dtype=bool)
-        if np.any(between):
-            cam_ax_val = float(cam_world @ ring_axis)
-            P_ax       = (P * ring_axis).sum(axis=1)
-            z_tQ       = cam_ax_val + t_Q * (P_ax - cam_ax_val)
-            blocked    = between & (np.abs(z_tQ - ring_center_ax) <= h_ax)
+    # ── Step F: linear fallback when a ≈ 0 (ray nearly tangent to cone) ──────────
+    # When a ≈ 0 the quadratic degenerates to b*t + c = 0 → single root t = -c/b.
+    lin_case = np.abs(a) <= 1e-12
+    if np.any(lin_case):
+        t_lin = np.where(np.abs(b) > 1e-12, -c_val / b, 2.0)
+        in_range_lin = lin_case & (t_lin > 1e-4) & (t_lin < 1.0 - 1e-4)
+        if np.any(in_range_lin):
+            blocked |= in_range_lin & _in_axial(C_ax + t_lin * d_ax)
 
     mask[inner_active[blocked]] = False
     return mask
 
 
-def _compute_torus_geometry(positions: np.ndarray, normals: np.ndarray):
+def _compute_frustum_geometry(positions: np.ndarray, normals: np.ndarray):
     """
-    Fit a frustum (truncated cone) to the LED ring and derive all geometry
-    needed for inner-LED visibility testing.
-
-    Returns
-    -------
-    ring_axis         : (3,) unit vector  – normal to ring plane, oriented so that
-                                            it points toward the larger-radius base
-                                            (outer LED normals have negative dot with
-                                            ring_axis because they tilt toward the
-                                            narrow end)
-    is_inner          : (N,) bool         – True for inner-surface LEDs
-    radial_out        : (N, 3)            – unit outward-radial direction per LED
-    h_corpus          : (N,) float        – for each inner LED: radial gap from the
-                                            LED to the outer frustum wall at the
-                                            same axial position (0 for outer LEDs)
-    h_ax              : float             – frustum axial half-height; estimated from
-                                            the outermost outer LED's radial position
-                                            and the fitted cone slope
-    ring_center_ax    : float             – ring centroid projected onto ring_axis
-    R_ring            : float             – mean LED radial distance from ring axis
-    angular_threshold : float             – dot(radial_out, cam_dir) threshold for
-                                            cross-ring far-wall blocking
-    ring_centroid     : (3,) float        – 3-D centroid of all LED positions
-    R_frustum_center  : float             – outer frustum radius at ring_center_ax
-    frustum_slope     : float             – dR_outer/dz_rel; positive because
-                                            ring_axis points toward the larger base
+    Fit a truncated cone to the LED ring; return all geometry needed for
+    inner-LED occlusion testing in _visible_mask. Called once at tracker init.
     """
+    # ── Step 1: find ring_axis via SVD ────────────────────────────────────────────
+    # The LEDs lie approximately on a ring (a circle tilted in 3D space).
+    # SVD of the centered positions gives a set of principal axes; the axis with
+    # the *smallest* singular value is the one with the least variance — that is
+    # the normal to the ring plane, i.e. the symmetry axis of the frustum.
     centroid  = positions.mean(axis=0)
     _, _, Vt  = np.linalg.svd(positions - centroid)
-    ring_axis = Vt[-1]                                      # smallest singular value
+    ring_axis = Vt[-1]    # last row of Vt → direction of minimum spread
 
+    # ── Step 2: compute per-LED radial direction (outward from ring center) ───────
+    # Project each LED position onto the ring plane (remove the axial component),
+    # then normalise. This gives the unit vector pointing outward from the ring axis
+    # to the LED — used to classify inner vs. outer and for the frustum geometry.
     rel        = positions - centroid
-    rel_proj   = rel - np.outer(rel @ ring_axis, ring_axis) # project to ring plane
+    rel_proj   = rel - np.outer(rel @ ring_axis, ring_axis)  # radial component only (axial removed)
     radial_out = rel_proj / (np.linalg.norm(rel_proj, axis=1, keepdims=True) + 1e-8)
 
-    # Inner LED: normal points toward ring centre (opposite to radial_out)
+    # ── Step 3: classify inner vs. outer LEDs ─────────────────────────────────────
+    # Outer LEDs face outward (normal aligned with radial_out → dot > 0).
+    # Inner LEDs face inward toward the ring center (normal opposes radial_out → dot < 0).
     is_inner = (normals * radial_out).sum(axis=1) < 0
 
-    # --- Orient ring_axis toward the larger-radius base ---
-    # The outer frustum surface normal tilts toward the narrow end.  When
-    # ring_axis points toward the larger base, outer normals have a *negative*
-    # axial component.  Flip if the mean is positive.
+    # ── Step 4: orient ring_axis toward the larger-radius base ───────────────────
+    # The frustum has two bases: a wide end and a narrow end. We want ring_axis to
+    # point toward the wide (large-radius) end so that frustum_slope > 0 by convention.
+    # Intuition: outer LED normals tilt toward the narrow end to face outward on a cone.
+    # When ring_axis points toward the large base, the axial component of outer normals
+    # is negative (normals tilt away from ring_axis). If it's positive, flip.
     outer_mask = ~is_inner
-    if outer_mask.any():
-        if float((normals[outer_mask] @ ring_axis).mean()) > 0:
-            ring_axis = -ring_axis
+    if float((normals[outer_mask] @ ring_axis).mean()) > 0:
+        big_ring_axis = -ring_axis   # flip so outer normals have negative axial component
+    else:
+        big_ring_axis = ring_axis
 
-    # --- Axial positions relative to centroid ---
-    axial_projs    = positions @ ring_axis        # (N,)
+    # ── Step 5: compute per-LED axial positions (z_rel) ──────────────────────────
+    # z_rel is each LED's signed distance along big_ring_axis from the ring centroid.
+    # Large-base LEDs have z_rel > 0; narrow-base LEDs have z_rel < 0.
+    axial_projs    = positions @ big_ring_axis        # (N,) raw axial projections
     ring_center_ax = float(axial_projs.mean())
-    z_rel          = axial_projs - ring_center_ax  # (N,) relative axial positions
+    z_rel          = axial_projs - ring_center_ax     # centred: 0 at ring centroid (N,)
 
-    # --- Fit outer frustum: R_outer(z_rel) = R_fc + slope * z_rel ---
-    # Larger radius is at +z_rel end (ring_axis points toward larger base → slope > 0).
+    # ── Step 6: fit the outer frustum as a linear cone ───────────────────────────
+    # Model: R_outer(z_rel) = R_fc + slope * z_rel
+    # We fit this line through the outer LEDs using least squares, where:
+    #   - outer_radial is the measured distance from each outer LED to the ring axis
+    #   - outer_z_rel  is its axial position
+    # slope > 0 because ring_axis points toward the wider base (radius increases with z).
     outer_idx    = np.where(outer_mask)[0]
-    outer_radial = np.linalg.norm(rel_proj[outer_idx], axis=1)
+    outer_radial = np.linalg.norm(rel_proj[outer_idx], axis=1)  # radial distance per outer LED
     outer_z_rel  = z_rel[outer_idx]
 
-    if len(outer_idx) >= 2:
-        A = np.column_stack([np.ones(len(outer_idx)), outer_z_rel])
-        coeffs, _, _, _ = np.linalg.lstsq(A, outer_radial, rcond=None)
-        R_fc          = float(coeffs[0])
-        frustum_slope = float(coeffs[1])
-    else:
-        R_fc          = float(np.linalg.norm(rel_proj, axis=1).mean())
-        frustum_slope = 0.0
+    A = np.column_stack([np.ones(len(outer_idx)), outer_z_rel])
+    coeffs, _, _, _ = np.linalg.lstsq(A, outer_radial, rcond=None)
+    R_fc          = float(coeffs[0])  # outer wall radius at ring centroid (z_rel = 0)
+    frustum_slope = float(coeffs[1])  # dR/dz_rel; > 0 since ring_axis → large base
 
-    # --- Asymmetric frustum axial bounds ---
-    # The frustum is typically NOT centred at the LED centroid: the larger-radius
-    # base can be much closer to the centroid than the smaller base.
-    # Use the outer LED z_rel extremes as the bounds — they are data-driven and
-    # require no hardcoded physical dimensions.
-    #
-    # z_frustum_top : axial position (along ring_axis) of the outermost outer LED
-    #                 ≈ the large-radius base (ring_axis points toward larger base,
-    #                   so this is positive)
-    # z_frustum_bot : axial position of the innermost outer LED
-    #                 ≈ the small-radius base (negative)
-    #
-    # Note: inner LEDs face inward AND toward the large base (+z), so they are
-    # never visible from below the small base — any false-negative from z_frustum_bot
-    # not reaching the true small base is suppressed by the normal-facing check.
-    led_axial_half = float((axial_projs.max() - axial_projs.min()) / 2)
-    if len(outer_idx) >= 2:
-        z_frustum_top = float(outer_z_rel.max())
-        z_frustum_bot = float(outer_z_rel.min())
-    else:
-        z_frustum_top =  led_axial_half
-        z_frustum_bot = -led_axial_half
+    # ── Step 7: asymmetric axial bounds for the frustum ──────────────────────────
+    # The frustum is NOT symmetric around the centroid — the wide base is typically
+    # much closer to the centroid than the narrow base. Using data-driven bounds
+    # (outer LED z_rel extremes ± small margin) avoids hardcoding any dimensions.
+    # A 5 mm margin on each side accounts for the physical LED-to-edge gap.
+    z_frustum_top = float(outer_z_rel.max()) + 0.005   # just beyond the wide-base LEDs
+    z_frustum_bot = float(outer_z_rel.min()) - 0.005   # just beyond the narrow-base LEDs
 
-    # h_ax kept for backward-compatible cylinder fallback
-    h_ax = max(abs(z_frustum_top), abs(z_frustum_bot))
+    # # --- h_corpus: radial gap from each inner LED to the outer frustum wall ---
+    # n = len(positions)
+    # h_corpus = np.zeros(n, dtype=np.float64)
+    # for i in np.where(is_inner)[0]:
+    #     R_out_i    = R_fc + frustum_slope * z_rel[i]  # outer wall radius at this z
+    #     r_led_i    = float(np.linalg.norm(rel_proj[i]))
+    #     h_corpus[i] = max(0.0, R_out_i - r_led_i)
 
-    # --- h_corpus: radial gap from each inner LED to the outer frustum wall ---
-    n = len(positions)
-    h_corpus = np.zeros(n, dtype=np.float64)
-    for i in np.where(is_inner)[0]:
-        R_out_i    = R_fc + frustum_slope * z_rel[i]  # outer wall radius at this z
-        r_led_i    = float(np.linalg.norm(rel_proj[i]))
-        h_corpus[i] = max(0.0, R_out_i - r_led_i)
-
-    # --- Ring radius and angular threshold ---
-    R_ring    = float(np.linalg.norm(rel_proj, axis=1).mean())
-    inner_idx = np.where(is_inner)[0]
-    r_tube    = float(h_corpus[inner_idx].mean() / 2) if len(inner_idx) else 0.005
-    angular_threshold = -float(np.sqrt(max(0.0, 1.0 - (r_tube / R_ring) ** 2))) if R_ring > 0 else -1.0
-
-    return (ring_axis, is_inner, radial_out, h_corpus, h_ax, ring_center_ax, R_ring,
-            angular_threshold, centroid, R_fc, frustum_slope,
-            z_frustum_top, z_frustum_bot)
+    return (big_ring_axis, is_inner, radial_out, centroid,
+            R_fc, frustum_slope, z_frustum_top, z_frustum_bot)
 
 
 def _build_led_neighbor_lists(positions: np.ndarray, normals: np.ndarray, k: int) -> List[np.ndarray]:
@@ -454,12 +382,17 @@ def _precompute_led_quads(
     """
     idx_rows: List[Tuple] = []
     ang_rows: List[Tuple] = []
+    seen: set = set()   # canonical sorted-4-tuple → skip quads already emitted from a different anchor
     n = len(positions)
     for anchor in range(n):
         nbrs = led_nbr[anchor][:k]
         if len(nbrs) < 3:
             continue
         for l1, l2, l3 in combinations(nbrs, 3):
+            canonical = tuple(sorted((anchor, int(l1), int(l2), int(l3))))
+            if canonical in seen:
+                continue
+            seen.add(canonical)
             for perm in (
                 (anchor, int(l1), int(l2), int(l3)),
                 (anchor, int(l2), int(l1), int(l3)),
@@ -490,12 +423,17 @@ def _build_blob_quads(
     """
     idx_rows: List[Tuple] = []
     ang_rows: List[Tuple] = []
+    seen: set = set()   # canonical sorted-4-tuple → skip quads already emitted from a different anchor
     n = len(blobs)
     for anchor in range(n):
         nbrs = blob_nbr[anchor][:k]
         if len(nbrs) < 3:
             continue
         for b1, b2, b3 in combinations(nbrs, 3):
+            canonical = tuple(sorted((anchor, int(b1), int(b2), int(b3))))
+            if canonical in seen:
+                continue
+            seen.add(canonical)
             for perm in (
                 (anchor, int(b1), int(b2), int(b3)),
                 (anchor, int(b2), int(b1), int(b3)),
@@ -511,6 +449,34 @@ def _build_blob_quads(
         np.array(idx_rows, dtype=np.int32),
         np.array(ang_rows, dtype=np.float32),
     )
+
+
+# ---------------------------------------------------------------------------
+# brute_match helpers
+# ---------------------------------------------------------------------------
+
+def _check_z_range(tvec_h: np.ndarray, z_min: float = 0.05, z_max: float = 15.0) -> bool:
+    """Return True if the hypothesis depth is within plausible range (OpenHMD: 0.05–15 m)."""
+    return z_min < tvec_h[2] < z_max
+
+
+def _gate_fourth_point(
+    R_h: np.ndarray, tvec_h: np.ndarray,
+    obj4: np.ndarray, img4: np.ndarray,
+    fx: float, fy: float, cx: float, cy: float,
+    p4_thresh_sq: float,
+) -> bool:
+    """
+    Fast single-point reprojection gate (no distortion, inline perspective divide).
+    Return True if the 4th LED projects within sqrt(p4_thresh_sq) pixels of img4.
+    """
+    p4_cam = R_h @ obj4 + tvec_h
+    if p4_cam[2] <= 0:
+        return False
+    iz = 1.0 / p4_cam[2]
+    dx = fx * p4_cam[0] * iz + cx - img4[0]
+    dy = fy * p4_cam[1] * iz + cy - img4[1]
+    return dx * dx + dy * dy <= p4_thresh_sq
 
 
 # ---------------------------------------------------------------------------
@@ -545,28 +511,10 @@ def proximity_match(
     K  = self.camera.camera_matrix
     dc = self.camera.dist_coeffs
 
-    # Ensure torus geometry is available for visibility checks below.
-    # (Normally computed lazily by brute_match on first call, but
-    # proximity_match may be called first on warm-start frames.)
-    if not hasattr(self, "_is_inner"):
-        (self._ring_axis, self._is_inner, self._radial_out,
-         self._h_corpus, self._h_ax, self._ring_center_ax,
-         self._R_ring, self._angular_threshold,
-         self._ring_centroid, self._R_frustum_center, self._frustum_slope,
-         self._z_frustum_top, self._z_frustum_bot,
-         ) = _compute_torus_geometry(
-            self.model.positions.astype(np.float32),
-            self.model.normals.astype(np.float32),
-        )
-
+    # Frustum geometry is precomputed once in SingleViewTracker.__init__.
     is_inner_pm          = self._is_inner
     radial_out_pm        = self._radial_out
     ring_axis_pm         = self._ring_axis
-    h_corpus_pm          = self._h_corpus
-    h_ax_pm              = self._h_ax
-    ring_center_ax_pm    = self._ring_center_ax
-    R_ring_pm            = self._R_ring
-    angular_thresh_pm    = self._angular_threshold
     ring_centroid_pm     = self._ring_centroid
     R_frustum_center_pm  = self._R_frustum_center
     frustum_slope_pm     = self._frustum_slope
@@ -616,9 +564,8 @@ def proximity_match(
                     R_new, tvec_new,
                     self.model.positions, self.model.normals,
                     is_inner_pm, radial_out_pm, ring_axis_pm,
-                    h_corpus_pm, h_ax_pm, ring_center_ax_pm,
-                    R_ring_pm, angular_thresh_pm,
-                    ring_centroid_pm, R_frustum_center_pm, frustum_slope_pm,
+                    ring_centroid_pm,
+                    R_frustum_center_pm, frustum_slope_pm,
                     z_frustum_top_pm, z_frustum_bot_pm,
                 )
 
@@ -650,10 +597,8 @@ def proximity_match(
     vis_mask  = _visible_mask(R_pred, tvec_pred,
                               self.model.positions, self.model.normals,
                               is_inner_pm, radial_out_pm, ring_axis_pm,
-                              h_corpus_pm, h_ax_pm, ring_center_ax_pm,
-                              R_ring_pm, angular_thresh_pm,
-                              ring_centroid_pm, R_frustum_center_pm, frustum_slope_pm,
-                              z_frustum_top_pm, z_frustum_bot_pm)
+                              ring_centroid_pm, R_frustum_center_pm,
+                              frustum_slope_pm, z_frustum_top_pm, z_frustum_bot_pm)
     vis_ids   = np.where(vis_mask)[0]
     if len(vis_ids) < 3:
         return None
@@ -705,39 +650,29 @@ def proximity_match(
 def brute_match(
     self,
     blobs: np.ndarray,
-    led_neighbor_depth: int = 6,        # k nearest LED neighbours to enumerate
     blob_neighbor_depth: int = 5,       # k nearest blob neighbours to enumerate
-    p4_threshold_px: float = 8.0,       # 4th-point pre-filter gate (pixels)
+    p4_threshold_px: float = 2.0,       # 4th-point pre-filter gate (pixels)
     reprojection_threshold: float = 5.0,
     min_inliers: int = 4,
-    min_inlier_fraction: float = 0.6,   # min fraction of visible blobs that must be inliers
+    min_inlier_fraction: float = 0.8,   # min fraction of visible blobs that must be inliers
     strong_match_inliers: int = 7,      # stop immediately when this many inliers …
     strong_match_error_px: float = 1.5, # … and mean reprojection error is below this
-    angle_tolerance_deg: float = 20.0,  # triangle-angle pre-filter tolerance (degrees)
+    angle_tolerance_deg: float = 10.0,  # triangle-angle pre-filter tolerance (degrees)
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,  # (rvec, tvec) of previous pose
+    rng_seed: Optional[int] = 42,     # fixed seed for reproducible LED quad ordering (None = random)
 ) -> Optional[Dict]:
     """
-    Systematic correspondence search, ported from OpenHMD's approach.
+    Exhaustive pose search via P3P over LED/blob quadruple correspondences.
 
-    Speed strategy
-    --------------
-    All LED quadruples are precomputed once and cached on *self*.  All blob
-    quadruples are built once per call.  For each LED quad the matching blob
-    quads are selected via a vectorised triangle-angle comparison
-    (±angle_tolerance_deg per vertex).  Under perspective, triangle angles are
-    nearly preserved for co-planar nearby LEDs (depth variation <10% → <8°
-    angle error), so the filter rejects ~98% of blob quads before P3P,
-    reducing solver calls ~30–50× compared to exhaustive enumeration.
+    LED quads are precomputed once at tracker init; blob quads are rebuilt each call.
+    For each LED quad, a vectorised triangle-angle filter selects compatible blob quads
+    (±angle_tolerance_deg), reducing P3P calls
 
-    Structure
-    ---------
-    Outer loop : every cached LED quad [anchor, l1, l2, l3]
-                   → numpy angle filter selects compatible blob quads
-
-    Inner loop : compatible blob quads [a, b1, b2, b3]
-                   → P3P on (anchor→a, l1→b1, l2→b2)
-                   → 4th-point gate (l3 → b3)
-                   → full inlier count + PnP refinement
+    Per hypothesis (P3P output):
+      1. Depth range check (0.05–15 m).
+      2. Fast 4th-point pixel gate — avoids calling the expensive full inlier count.
+      3. Full visible-LED inlier count + RANSAC PnP refinement.
+      4. Visibility recheck on inliers with the refined pose.
     """
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
@@ -750,39 +685,21 @@ def brute_match(
 
     positions = self.model.positions.astype(np.float32)
     normals   = self.model.normals.astype(np.float32)
-    n_leds    = len(positions)
     K         = self.camera.camera_matrix
     dc        = self.camera.dist_coeffs
 
-    # ── Build / reuse geometry and LED quad cache ─────────────────────────────
-    if not hasattr(self, "_led_nbr") or len(self._led_nbr) != n_leds:
-        (self._ring_axis, self._is_inner, self._radial_out,
-         self._h_corpus, self._h_ax, self._ring_center_ax,
-         self._R_ring, self._angular_threshold,
-         self._ring_centroid, self._R_frustum_center, self._frustum_slope,
-         self._z_frustum_top, self._z_frustum_bot,
-         ) = _compute_torus_geometry(positions, normals)
-        self._led_nbr = _build_led_neighbor_lists(positions, normals, k=led_neighbor_depth)
-        self._led_quad_idx, self._led_quad_ang = _precompute_led_quads(
-            positions, self._led_nbr, led_neighbor_depth
-        )
-
+    # LED quad cache and frustum geometry are precomputed in SingleViewTracker.__init__.
     led_quad_idx = self._led_quad_idx   # (N_LQ, 4) int32
     led_quad_ang = self._led_quad_ang   # (N_LQ, 2) float32
 
-    is_inner          = self._is_inner
-    radial_out        = self._radial_out
-    ring_axis         = self._ring_axis
-    h_corpus          = self._h_corpus
-    h_ax              = self._h_ax
-    ring_center_ax    = self._ring_center_ax
-    R_ring            = self._R_ring
-    angular_threshold = self._angular_threshold
-    ring_centroid     = self._ring_centroid
-    R_frustum_center  = self._R_frustum_center
-    frustum_slope     = self._frustum_slope
-    z_frustum_top     = self._z_frustum_top
-    z_frustum_bot     = self._z_frustum_bot
+    is_inner         = self._is_inner
+    radial_out       = self._radial_out
+    ring_axis        = self._ring_axis
+    ring_centroid    = self._ring_centroid
+    R_frustum_center = self._R_frustum_center
+    frustum_slope    = self._frustum_slope
+    z_frustum_top    = self._z_frustum_top
+    z_frustum_bot    = self._z_frustum_bot
 
     # ── Per-frame blob quad precomputation ────────────────────────────────────
     blob_nbr = _build_blob_neighbor_lists(blobs, k=blob_neighbor_depth)
@@ -806,35 +723,59 @@ def brute_match(
     best_error       = np.inf
     best_orient_err  = np.inf   # angular distance to prior (for tiebreaking)
     strong_found     = False
-    counter          = 0
+
+    # Instrumentation counters (printed at end).
+    n_led_quads_tried      = 0   # LED quads that passed the angle filter and entered the inner loop
+    n_blob_quads_considered = 0  # total blob quads selected by the angle filter across all LED quads
+    n_p3p_calls            = 0   # actual cv2.solveP3P calls
+
+    # Shuffle the LED quad evaluation order each call so that quads with many
+    # angle-filter matches (which tend to hold the true correspondence) are not
+    # always reached last.  This improves average time-to-strong_found without
+    # changing which solution is ultimately returned.
+    rng          = np.random.default_rng(rng_seed)
+    eval_order   = rng.permutation(len(led_quad_idx))
 
     # ── Main search ───────────────────────────────────────────────────────────
-    for lq_i in range(len(led_quad_idx)):
+    for lq_i in eval_order:
         if strong_found:
             break
 
         l_ids = led_quad_idx[lq_i]   # [anchor, l1, l2, l3]
 
-        # Vectorised angle filter: keep only blob quads whose triangle angles
-        # are within ANGLE_TOL of this LED quad's triangle angles.
+        # ── Triangle-angle pre-filter ─────────────────────────────────────────────
+        # Intuition: perspective projection nearly preserves triangle angles for
+        # co-planar points whose depth variation is small relative to distance
+        # (the LED ring at ~1 m with ~3 cm spread → depth error < 3% → < 5° angle
+        # distortion). So the triangle formed by [anchor, l1, l2] in 3D should have
+        # roughly the same angles as the triangle formed by the corresponding blobs
+        # in the image.
+        #
+        # led_quad_ang[lq_i] : (2,) angles for this LED triple in world space
+        # blob_quad_ang       : (M, 2) angles for all blob triples in image space
+        # ang_diff            : element-wise absolute difference, shape (M, 2)
+        # match_idxs          : blob quads where BOTH angles are within tolerance
         ang_diff   = np.abs(blob_quad_ang - led_quad_ang[lq_i])   # (M, 2)
         match_idxs = np.where(np.all(ang_diff <= ANGLE_TOL, axis=1))[0]
         if len(match_idxs) == 0:
             continue
 
-        obj3 = positions[l_ids[:3]]   # (3,3)  P3P world points
-        obj4 = positions[l_ids[3]]    # (3,)   4th-point gate
+        n_led_quads_tried      += 1
+        n_blob_quads_considered += len(match_idxs)
+
+        obj3 = positions[l_ids[:3]]   # (3, 3) world points for P3P (anchor, l1, l2)
+        obj4 = positions[l_ids[3]]    # (3,)   world point for 4th-point gate
 
         for mi in match_idxs:
             if strong_found:
                 break
 
             b_ids = blob_quad_idx[mi]   # [anchor, b1, b2, b3]
-            img3  = blobs[b_ids[:3]]     # (3,2)
-            img4  = blobs[b_ids[3]]      # (2,)
+            img3  = blobs[b_ids[:3]]    # (3, 2) image points for P3P
+            img4  = blobs[b_ids[3]]     # (2,)   image point for 4th-point gate
 
             # ── 1. P3P → up to 4 pose hypotheses ─────────────────────────────
-            counter += 1
+            n_p3p_calls += 1
             n_sols, rvecs, tvecs = cv2.solveP3P(
                 obj3.reshape(3, 1, 3),
                 img3.reshape(3, 1, 2),
@@ -848,38 +789,26 @@ def brute_match(
                 rvec_h = rvec_h.reshape(3, 1).astype(np.float32)
                 tvec_h = tvec_h.reshape(3).astype(np.float32)
 
-                # Z-range sanity check (OpenHMD: 0.05 m – 15 m)
-                if tvec_h[2] < 0.05 or tvec_h[2] > 15.0:
+                # ── 1. Depth range check (OpenHMD: 0.05 m – 15 m) ────────────
+                if not _check_z_range(tvec_h):
                     continue
 
                 R_h, _ = cv2.Rodrigues(rvec_h)
 
-                # ── 2. Pre-filter A: all P3P LEDs in front of camera ─────────
-                # _build_led_neighbor_lists already constrains normals to ±90°,
-                # so all 3 LEDs face the same direction — if one is behind the
-                # camera the hypothesis is wrong.
-                led_cam3 = (R_h @ obj3.T).T + tvec_h   # (3,3)
-                if np.any(led_cam3[:, 2] <= 0):
+                # ── 2. 4th-point pixel gate ───────────────────────────────────
+                # Fast single-point check (inline perspective divide, no distortion).
+                # Rejects most wrong hypotheses before the expensive visibility + inlier count.
+                if not _gate_fourth_point(R_h, tvec_h, obj4, img4, fx, fy, cx, cy, p4_thresh_sq):
                     continue
 
-                # ── 3. Pre-filter B: 4th-point pixel gate ────────────────────
-                # Inline perspective divide (no distortion) — fast single-point
-                # check; full projection only needed when this passes.
-                p4_cam = R_h @ obj4 + tvec_h
-                if p4_cam[2] <= 0:
-                    continue
-                iz = 1.0 / p4_cam[2]
-                dx = fx * p4_cam[0] * iz + cx - img4[0]
-                dy = fy * p4_cam[1] * iz + cy - img4[1]
-                if dx * dx + dy * dy > p4_thresh_sq:
-                    continue
-
-                # ── 4. Full inlier count on all visible LEDs ──────────────────
+                # ── 3. Full inlier count on all visible LEDs ──────────────────
+                # _visible_mask handles the z > 0 check internally, so no separate
+                # pre-filter is needed for the P3P LEDs here.
                 vis_mask = _visible_mask(
                     R_h, tvec_h, positions, normals,
                     is_inner, radial_out, ring_axis,
-                    h_corpus, h_ax, ring_center_ax, R_ring, angular_threshold,
-                    ring_centroid, R_frustum_center, frustum_slope,
+                    ring_centroid,
+                    R_frustum_center, frustum_slope,
                     z_frustum_top, z_frustum_bot,
                 )
                 vis_ids = np.where(vis_mask)[0]
@@ -897,9 +826,9 @@ def brute_match(
                 if len(ib) < min_inliers_eff:
                     continue
 
-                # ── 5. RANSAC PnP refinement on inliers ───────────────────────
-                # _ransac_pnp undistorts first (Monado approach), uses SQPNP as
-                # the minimal solver, and may tighten the inlier set further.
+                # ── 4. RANSAC PnP refinement on inliers ───────────────────────
+                # Undistorts first (Monado approach), uses SQPNP minimal solver.
+                # May tighten the inlier set further.
                 ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
                     positions[il], blobs[ib], K, dc,
                     rvec_h, tvec_h.reshape(3, 1),
@@ -910,24 +839,23 @@ def brute_match(
                 # Narrow inliers to what RANSAC confirmed.
                 il = il[ransac_inliers]
                 ib = ib[ransac_inliers]
+
                 if len(ib) < min_inliers_eff:
                     continue
 
-                # Re-check visibility with the *refined* pose.
-                # The hypothesis pose (rvec_h, tvec_h) may differ enough from
-                # (rvec_r, tvec_r) that some LEDs are no longer camera-facing or
-                # are now occluded — they must be removed from the assignment.
+                # ── 5. Visibility recheck with the refined pose ───────────────
+                # Run only on the current inlier subset (not all N LEDs) — the
+                # refined pose may shift enough to occlude borderline inner LEDs.
                 R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
-                vis_mask_r = _visible_mask(
-                    R_r, tvec_r.reshape(3), positions, normals,
-                    is_inner, radial_out, ring_axis,
-                    h_corpus, h_ax, ring_center_ax, R_ring, angular_threshold,
-                    ring_centroid, R_frustum_center, frustum_slope,
+                vis_sub = _visible_mask(
+                    R_r, tvec_r.reshape(3), positions[il], normals[il],
+                    is_inner[il], radial_out[il], ring_axis,
+                    ring_centroid,
+                    R_frustum_center, frustum_slope,
                     z_frustum_top, z_frustum_bot,
                 )
-                keep = vis_mask_r[il]
-                il = il[keep]
-                ib = ib[keep]
+                il = il[vis_sub]
+                ib = ib[vis_sub]
                 if len(ib) < min_inliers_eff:
                     continue
 
@@ -976,5 +904,9 @@ def brute_match(
                     if best_inliers >= strong_match_inliers and best_error <= strong_match_error_px:
                         strong_found = True
 
-    print(f"Brute-force matching evaluated {counter} P3P hypotheses")
+    print(
+        f"Brute-force: {n_p3p_calls} P3P calls | "
+        f"{n_led_quads_tried}/{len(led_quad_idx)} LED quads had angle matches | "
+        f"{n_blob_quads_considered} blob quads considered"
+    )
     return best_solution

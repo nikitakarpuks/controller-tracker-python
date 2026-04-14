@@ -66,6 +66,26 @@ class SingleViewTracker:
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
 
+        # Pre-compute frustum geometry and LED quad cache once from the fixed model.
+        # These depend only on LED positions/normals, which never change at runtime.
+        from src._matching import (
+            _compute_frustum_geometry,
+            _build_led_neighbor_lists,
+            _precompute_led_quads,
+        )
+        _LED_NEIGHBOR_DEPTH = 6
+        positions = model.positions.astype("float32")
+        normals   = model.normals.astype("float32")
+        (self._ring_axis, self._is_inner, self._radial_out,
+         self._ring_centroid,
+         self._R_frustum_center, self._frustum_slope,
+         self._z_frustum_top, self._z_frustum_bot,
+         ) = _compute_frustum_geometry(positions, normals)
+        self._led_nbr = _build_led_neighbor_lists(positions, normals, k=_LED_NEIGHBOR_DEPTH)
+        self._led_quad_idx, self._led_quad_ang = _precompute_led_quads(
+            positions, self._led_nbr, _LED_NEIGHBOR_DEPTH,
+        )
+
         # Bind strategies
         from src._matching import proximity_match, brute_match
         from src._pnp_solver import p2p_solver, p1p_solver
