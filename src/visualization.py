@@ -5,7 +5,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from src.transformations import Transform
-from src._matching import _visible_mask, _compute_torus_geometry
+from src._matching import _visible_mask, _compute_frustum_geometry
 
 
 # =========================================================
@@ -23,6 +23,7 @@ VIS_CONFIG = {
     "show_frustum":     True,
     "show_image_plane": True,
     "show_camera_frame": False, # unit vector lines
+    "show_led_ids":     True,   # LED index labels next to projected disks
     "fps":              30,        # playback speed
     "frustum_z":        0.05,      # depth of the virtual projection screen (metres).
                                    # Must be less than the closest expected controller depth.
@@ -34,6 +35,10 @@ VIS_CONFIG = {
     "matched_proj_z_offset": 0.000,  # how far matched projection disks sit in front of frustum_z (metres)
     "error_z_offset":        0.0005, # how far the 2-D error-line plane sits in front of frustum_z (metres)
     "error_radius":          0.0001, # thickness of reprojection error lines (metres)
+    # LED ID label appearance
+    "led_id_label_size":     12,            # point marker size that anchors the label (Rerun units)
+    "led_id_label_color":    [180, 0, 255], # RGB — violet by default
+    "led_id_label_offset":   [0.0006, -0.0006],  # [dx, dy] shift in frustum-plane metres
 }
 
 
@@ -326,12 +331,10 @@ class ControllerAnimatorRerun:
 
         # Precompute torus geometry for per-frame visibility testing
         (self._geo_ring_axis, self._geo_is_inner, self._geo_radial_out,
-         self._geo_h_corpus, self._geo_h_ax, self._geo_ring_center_ax,
-         self._geo_R_ring, self._geo_angular_threshold,
          self._geo_ring_centroid, self._geo_R_frustum_center,
          self._geo_frustum_slope, self._geo_z_frustum_top,
          self._geo_z_frustum_bot,
-         ) = _compute_torus_geometry(self.model_positions, self.model_normals)
+         ) = _compute_frustum_geometry(self.model_positions, self.model_normals)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -554,8 +557,6 @@ class ControllerAnimatorRerun:
             R, t,
             self.model_positions, self.model_normals,
             self._geo_is_inner, self._geo_radial_out, self._geo_ring_axis,
-            self._geo_h_corpus, self._geo_h_ax, self._geo_ring_center_ax,
-            self._geo_R_ring, self._geo_angular_threshold,
             self._geo_ring_centroid, self._geo_R_frustum_center,
             self._geo_frustum_slope, self._geo_z_frustum_top,
             self._geo_z_frustum_bot,
@@ -615,6 +616,22 @@ class ControllerAnimatorRerun:
                 vertex_positions=pv,
                 triangle_indices=pf,
                 vertex_colors=pc,
+            ))
+
+        # ---- LED ID labels on the frustum plane ----
+        if self.vis_cfg.get("show_led_ids", True) and all_proj_pts:
+            label_size   = self.vis_cfg.get("led_id_label_size",   12)
+            label_color  = self.vis_cfg.get("led_id_label_color",  [180, 0, 255])
+            label_offset = self.vis_cfg.get("led_id_label_offset", [0.0006, -0.0006])
+            dx, dy = label_offset[0], label_offset[1]
+            label_pts = np.array(all_proj_pts, dtype=np.float32).copy()
+            label_pts[:, 0] += dx
+            label_pts[:, 1] += dy
+            rr.log("world/led_ids", rr.Points3D(
+                positions=label_pts,
+                labels=[str(lid) for lid in all_proj_lids],
+                colors=[label_color] * len(all_proj_lids),
+                radii=0.0,  # invisible anchor point; only the label text is shown
             ))
 
         # ---- rays: matched (blue) and unmatched-but-visible (orange-red) ----

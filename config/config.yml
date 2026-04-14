@@ -1,5 +1,6 @@
 data:
-  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/simple_zooming/start"
+#  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/simple_zooming"#/start"
+  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/start_on_a_side/start"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -51,4 +52,4 @@ visualization:
       rotation: # in radians
         rx: -0.00523160
         ry: 0.22553752
-        rz: 3.1
+        rz: 3.15
