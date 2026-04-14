@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 from typing import List, Tuple, Optional, Dict
 
@@ -49,9 +50,18 @@ class SingleViewTracker:
         # Cached transform (Camera -> VRH IMU)
         self.T_imu_cam: Transform = camera.T_imu_cam
 
-        # Tracking state
+        # Tracking state — current frame
         self.prev_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.prev_assignment = None
+
+        # Last frame where tracking was confirmed good.
+        # Retained across loss events so brute re-acquisition can be
+        # validated for plausibility (pose-jump guard).
+        self.last_good_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.last_good_assignment = None
+
+        # Consecutive frames without a valid solution.
+        self.consecutive_failures: int = 0
 
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
@@ -122,15 +132,57 @@ class SingleViewTracker:
     #     return projected
 
     # -----------------------------------------------------
+    # Pose-jump guard
+    # -----------------------------------------------------
+    @staticmethod
+    def _pose_jump_too_large(
+        rvec_new, tvec_new,
+        rvec_ref, tvec_ref,
+        max_dist_m: float = 0.15,
+        max_angle_deg: float = 25.0,
+    ) -> bool:
+        """
+        Return True if the new pose is implausibly far from the reference.
+
+        Position:  Euclidean distance between translation vectors.
+        Rotation:  angle of the relative rotation R_new @ R_ref^T,
+                   computed as arccos((trace - 1) / 2).
+        """
+        tvec_new = np.asarray(tvec_new, dtype=np.float64).reshape(3)
+        tvec_ref = np.asarray(tvec_ref, dtype=np.float64).reshape(3)
+        if np.linalg.norm(tvec_new - tvec_ref) > max_dist_m:
+            return True
+
+        R_new, _ = cv2.Rodrigues(np.asarray(rvec_new, dtype=np.float32).reshape(3, 1))
+        R_ref, _ = cv2.Rodrigues(np.asarray(rvec_ref, dtype=np.float32).reshape(3, 1))
+        cos_a = np.clip((np.trace(R_new @ R_ref.T) - 1.0) / 2.0, -1.0, 1.0)
+        return float(np.degrees(np.arccos(cos_a))) > max_angle_deg
+
+    # -----------------------------------------------------
     # Tracking
     # -----------------------------------------------------
     def track(self, blobs: np.ndarray) -> Optional[Dict]:
+        """
+        State machine:
 
-        # blobs are in camera coordinates (pixels), shape (N, 2)
-        blobs = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
+        Have prev_pose?
+          Yes → proximity_match (fast locked path)
+                  if error > 2.5 px or no result → brute_match fallback
+          No  → brute_match (cold start or re-acquisition)
+
+        After any candidate solution:
+          1. Pose-jump check against prev_pose (tight: 15 cm / 25°).
+             If jump is too large → try brute_match; reject if still jumping.
+          2. Error threshold (< 5 px accepted).
+
+        On success: update prev_pose AND last_good_pose.
+        On failure: clear prev_pose (trigger brute next frame)
+                    but KEEP last_good_pose for re-acquisition plausibility check.
+        """
+        blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
 
-        # Normalize previous pose format todo
+        # Normalise prev_pose shapes
         if self.prev_pose is not None:
             rvec, tvec = self.prev_pose
             self.prev_pose = (
@@ -138,45 +190,94 @@ class SingleViewTracker:
                 np.asarray(tvec, dtype=np.float32).reshape(3),
             )
 
-        # -----------------------------
-        # State machine
-        # -----------------------------
-        if self.prev_pose is None:
-            if n_blobs >= 4:
-                solution = self.brute_match(blobs)
-            else:
-                return None
-        else:
-            solution = None
+        # ------------------------------------------------------------------
+        # Candidate search
+        # ------------------------------------------------------------------
+        solution = None
 
+        if self.prev_pose is not None:
+            # --- Primary: proximity (fast, assignment-locked) ---
             if n_blobs >= 3:
-                # Pass the previous assignment so proximity_match can use the
-                # fast locked path (nearest-neighbour per LED) instead of full
-                # Hungarian, which can flip to an alternative assignment.
                 solution = self.proximity_match(
                     blobs, self.prev_pose,
                     prior_assignment=self.prev_assignment,
                 )
 
-                # # If quality is poor, re-initialise with brute_match.
-                # # 2.0 px is a safe threshold: correct tracking gives < 0.5 px,
-                # # wrong-assignment local minima sit around 2–3 px.
-                # if not solution or solution["error"] > 2.0:
-                #     solution = self.brute_match(blobs)
+            # --- Fallback: brute when proximity is absent or degraded ---
+            # Threshold 2.5 px: correct tracking gives < 0.5–1 px; values
+            # above this indicate drifting or a wrong assignment lock.
+            proximity_poor = solution is None or solution["error"] > 2.5
+            if proximity_poor and n_blobs >= 4:
+                brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+                if brute is not None:
+                    prox_n   = len(solution["assignment"]) if solution else 0
+                    brute_n  = brute.get("inliers", len(brute["assignment"]))
+                    brute_better = (
+                        solution is None or
+                        brute_n > prox_n or
+                        (brute_n == prox_n and brute["error"] < solution["error"])
+                    )
+                    if brute_better:
+                        solution = brute
 
-            elif n_blobs >= 1:
+            elif n_blobs >= 1 and solution is None:
                 solution = self.p1p_solver(blobs, self.prev_pose)
 
-        # -----------------------------
-        # State update
-        # -----------------------------
-        if solution and solution["error"] < 5.0:
-            self.prev_pose = (solution["rvec"], solution["tvec"])
+        else:
+            # --- No prior pose: brute-force re-acquisition ---
+            if n_blobs >= 4:
+                solution = self.brute_match(blobs, pose_prior=self.last_good_pose)
+
+                # Validate against last known good pose (loose thresholds —
+                # the controller could have moved significantly while lost,
+                # but not teleported across the room).
+                if solution is not None and self.last_good_pose is not None:
+                    rvec_lg, tvec_lg = self.last_good_pose
+                    if self._pose_jump_too_large(
+                        solution["rvec"], solution["tvec"],
+                        rvec_lg, tvec_lg,
+                        max_dist_m=0.5,
+                        max_angle_deg=60.0,
+                    ):
+                        print("[tracking] Brute re-acquisition rejected: "
+                              "too far from last known good pose.")
+                        solution = None
+
+        # ------------------------------------------------------------------
+        # Pose-jump guard against prev_pose (tight, per-frame)
+        # ------------------------------------------------------------------
+        if solution is not None and self.prev_pose is not None:
+            rvec_p, tvec_p = self.prev_pose
+            if self._pose_jump_too_large(
+                solution["rvec"], solution["tvec"],
+                rvec_p, tvec_p,
+            ):
+                print(f"[tracking] Pose jump detected "
+                      f"(method={solution.get('method','?')}, "
+                      f"err={solution['error']:.2f} px) — "
+                      f"attempting brute recovery.")
+                solution = None
+                if n_blobs >= 4:
+                    brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+                    if brute is not None and not self._pose_jump_too_large(
+                        brute["rvec"], brute["tvec"], rvec_p, tvec_p,
+                    ):
+                        solution = brute
+
+        # ------------------------------------------------------------------
+        # Accept / reject
+        # ------------------------------------------------------------------
+        if solution is not None and solution["error"] < 5.0:
+            self.prev_pose       = (solution["rvec"], solution["tvec"])
             self.prev_assignment = solution["assignment"]
+            self.last_good_pose       = self.prev_pose
+            self.last_good_assignment = self.prev_assignment
+            self.consecutive_failures = 0
             return solution
 
-        # Lost tracking
-        self.prev_pose = None
+        # Tracking lost — keep last_good_pose for re-acquisition plausibility
+        self.consecutive_failures += 1
+        self.prev_pose       = None
         self.prev_assignment = None
         return None
 

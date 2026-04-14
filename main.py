@@ -3,7 +3,8 @@ from src.preprocess_data import get_data
 from src.blobs_detection import get_centroids
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config
-from src.visualization import ControllerAnimatorRerun, prepare_model_geometry, show_initial_alignment
+from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
+                               show_initial_alignment, fine_tune_alignment, load_trimesh)
 from time import time
 
 
@@ -27,16 +28,25 @@ def main():
     poses = []
     assignments = []
     blobs = []
+    contours_all = []
 
     positions_model, normals_model, T_model_ctrl = prepare_model_geometry(right_controller_leds, config["visualization"])
+
+    if config["visualization"].get("fine_tune_alignment"):
+        mesh = load_trimesh(config["visualization"]["3d_model_path"])
+        fine_tune_alignment(right_controller_leds, mesh, config["visualization"])
 
     # show_initial_alignment(positions_model, normals_model, config["visualization"]["3d_model_path"])
 
     # Iterate
     for batch in dataloader:
         img_path, image = batch[0][0], batch[0][1]
-        blob_centroids = get_centroids(image, config["blob_detection"], visualize=True, img_path=img_path)
+
+        print(f"image name: {img_path.name}")
+
+        blob_centroids, blob_contours = get_centroids(image, config["blob_detection"], visualize=True, img_path=img_path)
         blobs.append(blob_centroids.copy())
+        contours_all.append(blob_contours)
 
         t0 = time()
 
@@ -74,7 +84,9 @@ def main():
         normals_model
     )
 
-    controler_animator.start(poses, assignments, blobs, camera_0, T_model_ctrl)
+    save_path = config["visualization"].get("save_recording")
+    controler_animator.start(poses, assignments, blobs, camera_0, T_model_ctrl,
+                             contours_all=contours_all, save_path=save_path)
 
 
 
