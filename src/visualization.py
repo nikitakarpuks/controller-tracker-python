@@ -5,6 +5,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from src.transformations import Transform
+from src._matching import _visible_mask, _compute_torus_geometry
 
 
 # =========================================================
@@ -14,18 +15,25 @@ from src.transformations import Transform
 VIS_CONFIG = {
     "show_mesh":        True,
     "show_leds":        True,
-    "show_normals":     True,
+    "show_normals":     False,
     "show_rays":        True,
     "show_blobs":       True,
     "show_projected":   True,
     "show_errors":      True,
     "show_frustum":     True,
     "show_image_plane": True,
-    "show_camera_frame":True,
+    "show_camera_frame": False, # unit vector lines
     "fps":              30,        # playback speed
     "frustum_z":        0.05,      # depth of the virtual projection screen (metres).
                                    # Must be less than the closest expected controller depth.
                                    # Pure display parameter — has no effect on matching.
+    "ray_radius":       0.0002,    # thickness of all rays and normals (metres)
+    "led_disk_radius":  0.0015,     # radius of LED disks on the controller body (metres)
+    "proj_disk_radius": 0.0004,    # radius of projection disks on the frustum plane (metres)
+    "blob_z_offset":         0.001,  # how far blob plane sits in front of frustum_z (metres)
+    "matched_proj_z_offset": 0.000,  # how far matched projection disks sit in front of frustum_z (metres)
+    "error_z_offset":        0.0005, # how far the 2-D error-line plane sits in front of frustum_z (metres)
+    "error_radius":          0.0001, # thickness of reprojection error lines (metres)
 }
 
 
@@ -150,6 +158,46 @@ def make_disk_mesh(positions: np.ndarray, normals: np.ndarray,
             np.array(all_colors, dtype=np.uint8))
 
 
+def make_contour_mesh_3d(contours_px: list, cam, frustum_z: float,
+                          colors: np.ndarray):
+    """
+    Back-project blob pixel contours onto the frustum plane and triangulate.
+
+    contours_px : list of (M_i, 2) float32 pixel arrays, one per blob.
+    colors      : (N_blobs, 3or4) uint8 colour per blob.
+    Returns (vertices, faces, vertex_colors) or (None, None, None) if empty.
+    """
+    all_verts  = []
+    all_faces  = []
+    all_colors = []
+    vert_offset = 0
+
+    for cnt, color in zip(contours_px, colors):
+        n = len(cnt)
+        if n < 3:
+            continue
+        pts = np.column_stack([
+            (cnt[:, 0] - cam.cx) / cam.fx * frustum_z,
+            (cnt[:, 1] - cam.cy) / cam.fy * frustum_z,
+            np.full(n, frustum_z, dtype=np.float32),
+        ]).astype(np.float32)
+
+        center = pts.mean(axis=0)
+        all_verts.append(center)
+        all_verts.extend(pts)
+        all_colors.extend([color] * (1 + n))
+        for i in range(n):
+            j = (i + 1) % n
+            all_faces.append([vert_offset, vert_offset + 1 + i, vert_offset + 1 + j])
+        vert_offset += 1 + n
+
+    if not all_verts:
+        return None, None, None
+    return (np.array(all_verts,  dtype=np.float32),
+            np.array(all_faces,  dtype=np.int32),
+            np.array(all_colors, dtype=np.uint8))
+
+
 def project_to_plane(pts_cam: np.ndarray, z: float = 0.2) -> np.ndarray:
     """
     Project 3D camera-space LED positions onto the visualization plane at depth z.
@@ -269,23 +317,47 @@ class ControllerAnimatorRerun:
                  vis_cfg: dict = None):
 
         self.mesh_path       = mesh_path
-        self.model_positions = model_positions   # (N,3) in model space
-        self.model_normals   = model_normals     # (N,3) in model space
+        self.model_positions = model_positions.astype(np.float32)
+        self.model_normals   = model_normals.astype(np.float32)
         self.vis_cfg         = vis_cfg if vis_cfg is not None else dict(VIS_CONFIG)
 
         self._trimesh        = load_trimesh(mesh_path)
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
+        # Precompute torus geometry for per-frame visibility testing
+        (self._geo_ring_axis, self._geo_is_inner, self._geo_radial_out,
+         self._geo_h_corpus, self._geo_h_ax, self._geo_ring_center_ax,
+         self._geo_R_ring, self._geo_angular_threshold,
+         self._geo_ring_centroid, self._geo_R_frustum_center,
+         self._geo_frustum_slope, self._geo_z_frustum_top,
+         self._geo_z_frustum_bot,
+         ) = _compute_torus_geometry(self.model_positions, self.model_normals)
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
-    def start(self, poses, assignments, blobs_all, camera, T_model_ctrl):
+    def start(self, poses, assignments, blobs_all, camera, T_model_ctrl,
+              contours_all=None, save_path: str = None):
         """
         Log all frames to rerun.
         Opens the viewer automatically (spawn=True).
+
+        Args:
+            save_path: Optional path for an .rrd recording file.
+                       When set, the session is saved to disk so it can be
+                       replayed later with:  rerun <save_path>
         """
-        rr.init("controller_animator", spawn=True)
+        # When a file is being saved the viewer is not spawned — replay manually.
+        spawn_viewer = save_path is None
+        rr.init("controller_animator", spawn=spawn_viewer)
+
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            rr.save(save_path)
+            print(f"[rerun] Saving recording to: {save_path}  (no live viewer)")
+            print(f"[rerun] Replay later with:   rerun {save_path}")
 
         # Set up a blueprint so the viewer looks reasonable on first open
         blueprint = rrb.Blueprint(
@@ -319,10 +391,17 @@ class ControllerAnimatorRerun:
             blobs = (blobs_all[idx]
                      if blobs_all is not None and idx < len(blobs_all)
                      else None)
+            contours = (contours_all[idx]
+                        if contours_all is not None and idx < len(contours_all)
+                        else None)
 
-            self._log_frame(idx, T_cam_model, assignment, blobs, camera)
+            self._log_frame(idx, T_cam_model, assignment, blobs, camera, contours)
 
-        print(f"[rerun] Logged {n_frames} frames. Open the Rerun viewer to inspect.")
+        msg = f"[rerun] Logged {n_frames} frames."
+        if save_path:
+            msg += f" Recording saved to: {save_path}"
+            msg += f"\n[rerun] Replay with:  rerun {save_path}"
+        print(msg)
 
     # ------------------------------------------------------------------
     # Static geometry (logged once, no timeline)
@@ -382,11 +461,18 @@ class ControllerAnimatorRerun:
     # ------------------------------------------------------------------
 
     def _log_frame(self, idx: int, T_cam_model: Transform,
-                   assignment, blobs, camera):
+                   assignment, blobs, camera, contours=None):
 
-        offset = self.visual_offset
-        R      = T_cam_model.R
-        t      = T_cam_model.t
+        offset           = self.visual_offset
+        R                = T_cam_model.R
+        t                = T_cam_model.t
+        ray_radius            = self.vis_cfg.get("ray_radius",            0.0002)
+        led_disk_radius       = self.vis_cfg.get("led_disk_radius",       0.003)
+        proj_disk_radius      = self.vis_cfg.get("proj_disk_radius",      0.0008)
+        blob_z_offset         = self.vis_cfg.get("blob_z_offset",         0.002)
+        matched_proj_z_offset = self.vis_cfg.get("matched_proj_z_offset", 0.001)
+        error_z_offset        = self.vis_cfg.get("error_z_offset",        0.0015)
+        error_radius          = self.vis_cfg.get("error_radius",          0.0001)
 
         # Real camera-space positions (no visual offset) — used for projection
         pts_cam_real = (R @ self.model_positions.T).T + t
@@ -422,7 +508,8 @@ class ControllerAnimatorRerun:
                 for _, lid in assignment:
                     colors[lid] = [0, 255, 0]
 
-            verts, faces, vcols = make_disk_mesh(pts_cam, normals_cam, colors)
+            verts, faces, vcols = make_disk_mesh(pts_cam, normals_cam, colors,
+                                                 radius=led_disk_radius)
             rr.log(
                 "world/leds",
                 rr.Mesh3D(
@@ -440,77 +527,413 @@ class ControllerAnimatorRerun:
                     strips=[[s, e] for s, e in zip(pts_cam,
                                                     pts_cam + normals_cam * 0.03)],
                     colors=[255, 0, 255],
+                    radii=ray_radius,
                 )
             )
 
         # ---- blobs, projections, rays (LED→proj), errors ----
-        # proj_pt = pinhole projection of the LED's 3D position onto the frustum plane at z=frustum_z.
-        # Formula: proj_pt = (X/Z * fz,  Y/Z * fz,  fz)  — same geometry as backproject_to_plane.
-        # The red error lines therefore show actual reprojection error, matching the console output.
-        # (The LED emission direction / beam-aim is shown separately by world/normals arrows.)
-        frustum_z = self._frustum_z
+        # Z-layer ordering (front → back):
+        #   blob contours        : frustum_z - blob_z_offset
+        #   matched projections  : frustum_z - matched_proj_z_offset
+        #   unmatched projections: frustum_z
+        frustum_z        = self._frustum_z
+        blob_z           = frustum_z - blob_z_offset
+        matched_proj_z   = frustum_z - matched_proj_z_offset
+        error_z          = frustum_z - error_z_offset
 
+        # Matched indices
+        matched_bids = set()
+        matched_lids = set()
+        if assignment:
+            for bid, lid in assignment:
+                matched_bids.add(bid)
+                matched_lids.add(lid)
+
+        # ---- per-frame visibility mask (same logic as brute_match) ----
+        vis_mask = _visible_mask(
+            R, t,
+            self.model_positions, self.model_normals,
+            self._geo_is_inner, self._geo_radial_out, self._geo_ring_axis,
+            self._geo_h_corpus, self._geo_h_ax, self._geo_ring_center_ax,
+            self._geo_R_ring, self._geo_angular_threshold,
+            self._geo_ring_centroid, self._geo_R_frustum_center,
+            self._geo_frustum_slope, self._geo_z_frustum_top,
+            self._geo_z_frustum_bot,
+        )
+        vis_set = set(np.where(vis_mask)[0].tolist())
+
+        # ---- blobs as actual contour shapes ----
         if blobs is not None and len(blobs) > 0:
-            pts_plane = backproject_to_plane(blobs, camera, z=frustum_z)
+            # pts_plane at error_z: both error-line endpoints live on this plane
+            pts_plane = backproject_to_plane(blobs, camera, z=error_z)
 
-            if self.vis_cfg.get("show_blobs", True):
-                rr.log("world/blobs", rr.Points3D(
-                    positions=pts_plane,
-                    colors=np.tile([255, 255, 0], (len(pts_plane), 1)),
-                    radii=0.0015,
-                ))
-
-            if assignment:
-                ray_strips   = []
-                error_strips = []
-                proj_matched = []
-
-                for bid, lid in assignment:
-                    if bid >= len(pts_plane):
-                        continue
-                    real_pos = pts_cam_real[lid]
-
-                    # Pinhole projection of LED onto the frustum plane:
-                    # same formula as backproject_to_plane (inverse pinhole at depth fz)
-                    X, Y, Z = real_pos
-                    if Z <= 1e-6:
-                        continue
-                    proj_pt = np.array([X / Z * frustum_z,
-                                        Y / Z * frustum_z,
-                                        frustum_z])
-                    proj_matched.append(proj_pt)
-
-                    # Ray: displayed LED (with offset) → projection green dot
-                    # Ray: real (unshifted) LED position → its pinhole projection on the frustum plane.
-                    # Using real position (not display position) keeps this segment on the true
-                    # viewing ray, which passes through the camera origin [0,0,0].
-                    if self.vis_cfg.get("show_rays", True):
-                        ray_strips.append([pts_cam_real[lid], proj_pt])
-
-                    # Error: projection → blob (shows matching residual on image plane)
-                    if self.vis_cfg.get("show_errors", True):
-                        error_strips.append([proj_pt, pts_plane[bid]])
-
-                if self.vis_cfg.get("show_projected", True) and proj_matched:
-                    rr.log("world/projected_leds", rr.Points3D(
-                        positions=np.array(proj_matched),
-                        colors=np.tile([0, 255, 0], (len(proj_matched), 1)),
-                        radii=0.0015,
+            if self.vis_cfg.get("show_blobs", True) and contours is not None:
+                blob_colors = np.array(
+                    [[255, 210, 0] if i in matched_bids else [130, 100, 0]
+                     for i in range(len(contours))],
+                    dtype=np.uint8,
+                )
+                bv, bf, bc = make_contour_mesh_3d(contours, camera, blob_z,
+                                                   blob_colors)
+                if bv is not None:
+                    rr.log("world/blobs", rr.Mesh3D(
+                        vertex_positions=bv,
+                        triangle_indices=bf,
+                        vertex_colors=bc,
                     ))
+        else:
+            pts_plane = None
 
-                if ray_strips:
-                    rr.log("world/rays", rr.LineStrips3D(
-                        strips=ray_strips,
-                        colors=[0, 0, 255],
-                        radii=0.0005,
-                    ))
+        # ---- visible LED projections (matched + physically visible unmatched) ----
+        # Matched LEDs use matched_proj_z, unmatched use frustum_z.
+        # lid_to_proj_pt maps lid → 3D point for rays and error lines.
+        all_proj_pts   = []
+        all_proj_lids  = []
+        lid_to_proj_pt = {}
+        for i, (px, py, pz) in enumerate(pts_cam_real):
+            if pz > 1e-6 and (i in matched_lids or i in vis_set):
+                z_val = matched_proj_z if i in matched_lids else frustum_z
+                proj_pt = np.array([px / pz * z_val, py / pz * z_val, z_val])
+                all_proj_pts.append(proj_pt)
+                all_proj_lids.append(i)
+                lid_to_proj_pt[i] = proj_pt
 
-                if error_strips:
-                    rr.log("world/errors", rr.LineStrips3D(
-                        strips=error_strips,
-                        colors=[255, 0, 0],
-                        radii=0.0005,
-                    ))
+        if self.vis_cfg.get("show_projected", True) and all_proj_pts:
+            proj_colors = np.array(
+                [[70, 130, 255] if lid in matched_lids else [230, 80, 50]
+                 for lid in all_proj_lids],
+                dtype=np.uint8,
+            )
+            proj_normals = np.tile([0.0, 0.0, -1.0],
+                                   (len(all_proj_pts), 1)).astype(np.float32)
+            pv, pf, pc = make_disk_mesh(
+                np.array(all_proj_pts, dtype=np.float32),
+                proj_normals, proj_colors,
+                radius=proj_disk_radius, n_segments=16, surface_offset=0.0,
+            )
+            rr.log("world/projected_leds", rr.Mesh3D(
+                vertex_positions=pv,
+                triangle_indices=pf,
+                vertex_colors=pc,
+            ))
+
+        # ---- rays: matched (blue) and unmatched-but-visible (orange-red) ----
+        matched_ray_strips   = []
+        unmatched_ray_strips = []
+        error_strips         = []
+
+        if assignment and pts_plane is not None:
+            for bid, lid in assignment:
+                if bid >= len(pts_plane) or lid not in lid_to_proj_pt:
+                    continue
+                if self.vis_cfg.get("show_rays", True):
+                    matched_ray_strips.append([pts_cam_real[lid], lid_to_proj_pt[lid]])
+                if self.vis_cfg.get("show_errors", True):
+                    # Both endpoints on the flat error plane at error_z
+                    px, py, pz = pts_cam_real[lid]
+                    if pz > 1e-6:
+                        proj_flat = np.array([px / pz * error_z, py / pz * error_z, error_z])
+                        error_strips.append([proj_flat, pts_plane[bid]])
+
+        # Unmatched rays: only LEDs that are physically visible per _visible_mask
+        if self.vis_cfg.get("show_rays", True):
+            for lid, proj_pt in lid_to_proj_pt.items():
+                if lid not in matched_lids:
+                    unmatched_ray_strips.append([pts_cam_real[lid], proj_pt])
+
+        if matched_ray_strips:
+            rr.log("world/rays", rr.LineStrips3D(
+                strips=matched_ray_strips,
+                colors=[70, 130, 255],
+                radii=ray_radius,
+            ))
+
+        if unmatched_ray_strips:
+            rr.log("world/rays_unmatched", rr.LineStrips3D(
+                strips=unmatched_ray_strips,
+                colors=[230, 80, 50],
+                radii=ray_radius,
+            ))
+
+        if error_strips:
+            rr.log("world/errors", rr.LineStrips3D(
+                strips=error_strips,
+                colors=[255, 0, 0],
+                radii=error_radius,
+            ))
+
+
+# =========================================================
+# Alignment fine-tuning
+# =========================================================
+
+def fine_tune_alignment(leds, mesh, cfg) -> dict:
+    """
+    Refine the 6 alignment parameters so every LED disk sits exactly on the
+    mesh surface with its normal pointing outward.
+
+    Key corrections over the naive approach
+    ----------------------------------------
+    1. **Signed distance** — we distinguish LEDs that are INSIDE the mesh
+       (wrong side) from those that are outside.  Being inside is penalised
+       20× more than being the same distance outside, so the optimiser is
+       forced to push LEDs to the correct (outer) side of the surface.
+
+    2. **Oriented normal alignment** — abs() is NOT used.  LED normals are
+       expected to point outward (same direction as mesh face normals).
+       Using the raw dot product gives a real gradient signal: a normal
+       pointing 180° the wrong way (into the surface) now has maximum loss
+       rather than zero.
+
+    3. **Tight search bounds** — the optimiser is constrained to ±5° / ±5 mm
+       from the initial estimate so it cannot diverge when the landscape
+       is non-smooth near mesh edges.
+
+    Starting point is taken from cfg["initial_position_change"]["right"].
+    Refined parameters are printed in copy-paste YAML format and returned.
+    """
+    from scipy.optimize import minimize, differential_evolution
+
+    # Work on a copy and ensure face normals are consistently outward-pointing.
+    mesh = mesh.copy()
+    trimesh.repair.fix_normals(mesh, multibody=True)
+
+    positions = np.array([led.position for led in leds], dtype=np.float64)
+    normals   = np.array([led.normal   for led in leds], dtype=np.float64)
+    normals  /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9
+
+    cfg_r = cfg["initial_position_change"]["right"]
+    x0 = np.array([
+        cfg_r["rotation"]["rx"],
+        cfg_r["rotation"]["ry"],
+        cfg_r["rotation"]["rz"],
+        cfg_r["translation"]["x"],
+        cfg_r["translation"]["y"],
+        cfg_r["translation"]["z"],
+    ])
+
+    def _build_R_t(params):
+        rx, ry, rz, tx, ty, tz = params
+        R_rz   = trimesh.transformations.euler_matrix(0, 0, rz)[:3, :3]
+        R_base = trimesh.transformations.euler_matrix(rx, ry, 0)[:3, :3]
+        R      = R_base.T @ R_rz
+        t      = -R_base.T @ np.array([tx, ty, tz])
+        return R, t
+
+    # ------------------------------------------------------------------
+    # Determine whether LED normals are outward or inward at the initial
+    # solution, so the normal loss is oriented correctly regardless.
+    # ------------------------------------------------------------------
+    R0, t0 = _build_R_t(x0)
+    pos0   = (R0 @ positions.T).T + t0
+    nor0   = (R0 @ normals.T).T
+    nor0  /= np.linalg.norm(nor0, axis=1, keepdims=True) + 1e-9
+    _, _, fids0   = trimesh.proximity.closest_point(mesh, pos0)
+    mean_cos_init = np.mean((nor0 * mesh.face_normals[fids0]).sum(axis=1))
+    normal_sign   = 1.0 if mean_cos_init >= 0.0 else -1.0
+    print(f"[alignment] LED normals are "
+          f"{'outward' if normal_sign > 0 else 'INWARD'}-facing "
+          f"(mean cos at initial pose = {mean_cos_init:.3f})")
+
+    # ------------------------------------------------------------------
+    # Diagnostic: how many LEDs are currently inside the mesh?
+    # ------------------------------------------------------------------
+    diff0        = pos0 - trimesh.proximity.closest_point(mesh, pos0)[0]
+    signed_dot0  = (diff0 * mesh.face_normals[fids0]).sum(axis=1)
+    n_inside_init = int((signed_dot0 < 0).sum())
+    print(f"[alignment] LEDs inside mesh at start: "
+          f"{n_inside_init} / {len(leds)}")
+
+    # ------------------------------------------------------------------
+    # Search bounds: ±5° / ±5 mm from the initial estimate.
+    # ------------------------------------------------------------------
+    delta_rot = np.deg2rad(5.0)   # 5 degrees
+    delta_t   = 0.005             # 5 mm
+    bounds = [
+        (x0[0] - delta_rot, x0[0] + delta_rot),
+        (x0[1] - delta_rot, x0[1] + delta_rot),
+        (x0[2] - delta_rot, x0[2] + delta_rot),
+        (x0[3] - delta_t,   x0[3] + delta_t),
+        (x0[4] - delta_t,   x0[4] + delta_t),
+        (x0[5] - delta_t,   x0[5] + delta_t),
+    ]
+    bounds_lo = np.array([b[0] for b in bounds])
+    bounds_hi = np.array([b[1] for b in bounds])
+
+    # ------------------------------------------------------------------
+    # Loss function
+    # A large out-of-bounds penalty keeps Nelder-Mead (which does not
+    # accept bounds natively) inside the valid search region.
+    # ------------------------------------------------------------------
+    def _loss(params):
+        # Hard wall for any method that ignores bounds (e.g. Nelder-Mead).
+        if np.any(params < bounds_lo) or np.any(params > bounds_hi):
+            return 1e12
+
+        R, t = _build_R_t(params)
+        pos_model = (R @ positions.T).T + t
+        nor_model = (R @ normals.T).T
+        nor_model /= np.linalg.norm(nor_model, axis=1, keepdims=True) + 1e-9
+
+        closest, distances, face_ids = trimesh.proximity.closest_point(mesh, pos_model)
+        mesh_normals = mesh.face_normals[face_ids]
+
+        # --- signed distance ---
+        # dot(pos - closest, face_normal):
+        #   > 0  →  LED is on the OUTSIDE  (correct)
+        #   < 0  →  LED is on the INSIDE   (penalise 20×)
+        diff       = pos_model - closest
+        signed_dot = (diff * mesh_normals).sum(axis=1)
+        inside     = signed_dot < 0
+
+        # Distances are in metres (≈1e-3); ×1e6 puts them in mm² range
+        # so the term is O(1) and comparable to the normal term.
+        dist_loss = np.mean(
+            np.where(inside, 20.0 * distances ** 2, distances ** 2)
+        ) * 1e6
+
+        # --- oriented normal alignment (no abs) ---
+        # LED normals should point the SAME way as mesh face normals (both outward).
+        # 1 - cos = 0 when perfectly aligned, 2 when anti-parallel.
+        cos_sim     = normal_sign * (nor_model * mesh_normals).sum(axis=1)
+        normal_loss = np.mean(1.0 - cos_sim)
+
+        return dist_loss + normal_loss
+
+    # ------------------------------------------------------------------
+    # Helper: run one full stage-cascade from a given starting point,
+    # returning (best_x, best_f).
+    #
+    # Stage order (derivative-free methods are preferred because the
+    # closest-point function is non-smooth at mesh face edges):
+    #   1. L-BFGS-B      — fast gradient descent near smooth regions
+    #   2. Powell        — direction-set, bounded, handles mild non-smoothness
+    #   3. Nelder-Mead   — simplex, fully derivative-free, tightest tolerances
+    #   4. L-BFGS-B      — final gradient polish from Nelder-Mead result
+    # ------------------------------------------------------------------
+    def _run_cascade(start, f_start):
+        best_x, best_f = start.copy(), f_start
+
+        # --- Stage 1: L-BFGS-B (bounded) ---
+        r = minimize(
+            _loss, best_x,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 100_000, "ftol": 1e-15, "gtol": 1e-12},
+        )
+        if r.fun < best_f:
+            best_x, best_f = r.x.copy(), r.fun
+
+        # --- Stage 2: Powell (bounded, scipy ≥ 1.7) ---
+        r = minimize(
+            _loss, best_x,
+            method="Powell",
+            bounds=bounds,
+            options={"maxiter": 100_000, "xtol": 1e-12, "ftol": 1e-12},
+        )
+        if r.fun < best_f:
+            best_x, best_f = r.x.copy(), r.fun
+
+        # --- Stage 3: Nelder-Mead (adaptive simplex, very tight tolerances) ---
+        r = minimize(
+            _loss, best_x,
+            method="Nelder-Mead",
+            options={
+                "maxiter": 500_000,
+                "xatol": 1e-12,
+                "fatol": 1e-12,
+                "adaptive": True,   # rescales simplex for 6-D parameter space
+            },
+        )
+        if r.fun < best_f:
+            best_x, best_f = r.x.copy(), r.fun
+
+        # --- Stage 4: final L-BFGS-B polish ---
+        r = minimize(
+            _loss, best_x,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 100_000, "ftol": 1e-15, "gtol": 1e-12},
+        )
+        if r.fun < best_f:
+            best_x, best_f = r.x.copy(), r.fun
+
+        return best_x, best_f
+
+    # ------------------------------------------------------------------
+    # Optimise
+    # ------------------------------------------------------------------
+    loss_before = _loss(x0)
+    print(f"[alignment] Optimising …  initial loss = {loss_before:.6f}")
+
+    # Primary run from the given initial estimate.
+    best_x, best_f = _run_cascade(x0, loss_before)
+    print(f"[alignment] Primary cascade → loss = {best_f:.10f}")
+
+    # Multi-start: perturb the current best and re-run the cascade.
+    # This helps escape local minima created by mesh face discontinuities.
+    rng = np.random.default_rng(42)
+    n_restarts = 2
+    for i in range(n_restarts):
+        # Gaussian perturbation (σ = 10 % of the allowed range)
+        sigma = np.array([delta_rot, delta_rot, delta_rot,
+                          delta_t,   delta_t,   delta_t]) * 0.10
+        perturbed = best_x + rng.normal(0.0, sigma)
+        perturbed = np.clip(perturbed, bounds_lo, bounds_hi)
+        f_start   = _loss(perturbed)
+        cx, cf    = _run_cascade(perturbed, f_start)
+        if cf < best_f:
+            best_x, best_f = cx, cf
+            print(f"[alignment] Restart {i+1:2d}/{n_restarts} improved → "
+                  f"loss = {best_f:.10f}")
+        else:
+            print(f"[alignment] Restart {i+1:2d}/{n_restarts} no improvement "
+                  f"(loss = {cf:.10f})")
+
+    if best_f >= loss_before:
+        print("[alignment] WARNING: optimiser could not improve the initial estimate.")
+        print("[alignment] Returning initial parameters — no change recommended.")
+        rx, ry, rz, tx, ty, tz = x0
+        loss_after = loss_before
+    else:
+        rx, ry, rz, tx, ty, tz = best_x
+        loss_after = best_f
+
+    # ------------------------------------------------------------------
+    # Post-opt diagnostics
+    # ------------------------------------------------------------------
+    R1, t1 = _build_R_t(np.array([rx, ry, rz, tx, ty, tz]))
+    pos1 = (R1 @ positions.T).T + t1
+    closest1, _, fids1 = trimesh.proximity.closest_point(mesh, pos1)
+    diff1       = pos1 - closest1
+    signed_dot1 = (diff1 * mesh.face_normals[fids1]).sum(axis=1)
+    n_inside_final = int((signed_dot1 < 0).sum())
+    mean_dist_mm   = float(np.mean(np.abs(signed_dot1)) * 1000)
+
+    print(f"[alignment] Done.  loss {loss_before:.6f} → {loss_after:.6f}")
+    print(f"[alignment] LEDs inside mesh after opt: {n_inside_final} / {len(leds)}")
+    print(f"[alignment] Mean signed distance to surface: {mean_dist_mm:.3f} mm")
+    print()
+    print("=" * 52)
+    print("  Copy-paste into config.yml:")
+    print("=" * 52)
+    print("  initial_position_change:")
+    print("    right:")
+    print("      translation: # in meters")
+    print(f"        x: {tx:.8f}")
+    print(f"        y: {ty:.8f}")
+    print(f"        z: {tz:.8f}")
+    print("      rotation: # in radians")
+    print(f"        rx: {rx:.8f}")
+    print(f"        ry: {ry:.8f}")
+    print(f"        rz: {rz:.8f}")
+    print("=" * 52)
+    print()
+
+    return {
+        "translation": {"x": float(tx), "y": float(ty), "z": float(tz)},
+        "rotation":    {"rx": float(rx), "ry": float(ry), "rz": float(rz)},
+    }
 
 
 # =========================================================

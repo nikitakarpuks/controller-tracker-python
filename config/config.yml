@@ -1,5 +1,5 @@
 data:
-  root: "./data/datasets/1_simple_zooming_right_ctrl/mav0/cam0/data"#/test_subset"
+  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/simple_zooming/start"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -21,20 +21,34 @@ controllers:
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
 
 blob_detection:
-  min_threshold: 10
+  min_threshold: 10       # pixels >= this are included in a blob
+  required_threshold: 20  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 2
   max_area: 150
+  max_wh: 35              # max bounding-box width or height in pixels
 
 visualization:
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
+  save_recording: "./visualization/recording.rrd"  # set to null to disable saving
+  fine_tune_alignment: false  # set to true to run alignment optimiser and print refined params
+#  initial_position_change:
+#    right:
+#      translation: # in meters
+#        x: 0.19616
+#        y: 0.015559
+#        z: -0.093833
+#
+#      rotation: # in radians
+#        rx: -0.0005
+#        ry: 0.226
+#        rz: 3.1
   initial_position_change:
     right:
       translation: # in meters
-        x: 0.19616
-        y: 0.015559
-        z: -0.093833
-
+        x: 0.19610239
+        y: 0.01522315
+        z: -0.09380996
       rotation: # in radians
-        rx: -0.0005
-        ry: 0.226
+        rx: -0.00523160
+        ry: 0.22553752
         rz: 3.1
