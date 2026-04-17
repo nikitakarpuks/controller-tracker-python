@@ -363,6 +363,7 @@ def _precompute_led_quads(
     idx_rows:   List[Tuple]       = []
     depth_rows: List[int]         = []
     gate_rows:  List[np.ndarray]  = []
+    seen_led:   set               = set()
     n = len(positions)
     for anchor in range(n):
         nbrs   = led_nbr[anchor][:k]
@@ -371,6 +372,10 @@ def _precompute_led_quads(
             continue
         for i1, i2 in combinations(range(nb_len), 2):
             l1, l2 = int(nbrs[i1]), int(nbrs[i2])
+            key = tuple(sorted((anchor, l1, l2)))
+            if key in seen_led:
+                continue
+            seen_led.add(key)
             depth  = i2 + 1
             gates  = np.array(
                 [int(nbrs[j]) for j in range(nb_len) if j != i1 and j != i2],
@@ -628,11 +633,13 @@ def brute_match(
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
     shallow_led_depth: int = 4,
-    shallow_blob_depth: int = 4,
+    shallow_blob_depth: int = 6,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
     debug_led_ids: Optional[List[int]] = None,    # ordered [anchor, l1, l2]
     debug_blob_ids: Optional[List[int]] = None,   # ordered [b_anchor, b1, b2]
+    # debug_led_ids: Optional[List[int]] = [29, 24, 23],  # ordered [anchor, l1, l2]
+    # debug_blob_ids: Optional[List[int]] = [9, 6, 10],  # ordered [b_anchor, b1, b2]
     debug_count_duplicates: bool = True,
 ) -> Optional[Dict]:
     """
@@ -721,6 +728,7 @@ def brute_match(
     debug_blob_list = list(debug_blob_ids) if debug_active else None
 
     bijection_counts: Dict[frozenset, int] = {} if debug_count_duplicates else None
+    # seen_bijections:  set                  = set()
 
     for pass_idx, (lq_mask, max_blob_d) in enumerate((
         (shallow_mask, shallow_blob_depth),
@@ -781,10 +789,14 @@ def brute_match(
 
                         img3 = blobs[[b_anchor, b1_ord, b2_ord]]
 
+                        bij = frozenset(((int(l_ids[0]), b_anchor),
+                                         (int(l_ids[1]), b1_ord),
+                                         (int(l_ids[2]), b2_ord)))
+                        # if bij in seen_bijections:
+                        #     continue
+                        # seen_bijections.add(bij)
+
                         if bijection_counts is not None:
-                            bij = frozenset(((int(l_ids[0]), b_anchor),
-                                             (int(l_ids[1]), b1_ord),
-                                             (int(l_ids[2]), b2_ord)))
                             bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
 
                         # ── 1. P3P → up to 4 pose hypotheses ─────────────────
