@@ -98,3 +98,93 @@
 
   When the deep pass runs after shallow fails, OpenHMD sets min_led_depth = 3 so the combinatorial generator skips the first 2 neighbour-depth levels that the shallow pass already
   exhausted. Your code has no depth continuation — if you were to add a two-phase approach, you would also need this to avoid double-counting combinations.
+
+
+
+
+--------------------------
+ Duplicate Bijection Report
+
+  Root Cause
+
+  A duplicate bijection requires the exact same frozenset of (LED, blob) pairs to be passed to P3P twice. For a fixed LED triple, each (b_anchor, b1_ord, b2_ord) produces a unique
+  frozenset, so duplicates can only come from different LED triples that share the same unordered LED set {A, B, C}.
+
+  _precompute_led_quads generates, for example:
+  - anchor=A → triple (A, B, C) (because B, C ∈ A's k-neighbors)
+  - anchor=B → triple (B, A, C) (because A, C ∈ B's k-neighbors)
+  - anchor=C → triple (C, A, B) (because A, B ∈ C's k-neighbors)
+
+  In the brute-force loop, triple (A,B,C) with blob call (bA, bB, bC) produces {(A,bA),(B,bB),(C,bC)}. Triple (B,A,C) with blob call (bB, bA, bC) produces the same frozenset. Both fire
+  simultaneously when bB,bC ∈ bA's neighbors AND bA,bC ∈ bB's neighbors — i.e., mutual blob neighbors. Hence max 3× (all three blobs mutual neighbors).
+
+  Why it grows with shallow_blob_depth
+
+  Larger blob depth → longer neighbor lists → mutual blob neighborhood is more common → more bijections reachable from multiple LED triples simultaneously.
+
+  ---
+  Fix Options
+
+  Option A — Runtime bijection skip (zero coverage loss, simplest)
+
+  Add a seen_bijections set before the P3P call and skip if already visited:
+
+  seen_bijections: set = set()
+
+  # ... inside the b1_ord/b2_ord loop, before P3P:
+  bij = frozenset(((int(l_ids[0]), b_anchor),
+                   (int(l_ids[1]), b1_ord),
+                   (int(l_ids[2]), b2_ord)))
+  if bij in seen_bijections:
+      continue
+  seen_bijections.add(bij)
+
+  Pros: eliminates 100% of duplicates, zero coverage loss, minimal code change.
+  Cons: ~21749 Python set lookups per image; memory grows linearly with P3P calls; the set is rebuilt each frame.
+
+  ---
+  Option B — Deduplicate LED triples at precomputation
+
+  Add a seen set in _precompute_led_quads keyed by tuple(sorted((anchor, l1, l2))).
+
+  Coverage analysis:
+  Bijection {(A,bY),(B,bX),(C,bZ)} is covered by canonical triple (A,B,C) when bX,bZ ∈ bY's neighbors, and by (B,A,C) when bY,bZ ∈ bX's neighbors. After dedup, the case "bY,bZ ∈ bX's
+  neighbors but bX ∉ bY's neighbors" is lost — i.e., when bY is in bX's top-k but not vice versa (asymmetric ranking).
+
+  This is a real but bounded coverage loss. Crucially, asymmetric pairs only exist when bX has ≥k blobs nearer to it than bY — exactly the regime where the two blobs are on the edge of each
+   other's neighborhoods. As shallow_blob_depth grows (making duplicates worse), asymmetric pairs shrink, so coverage loss decreases as the duplication problem increases — they're
+  anti-correlated.
+
+  Pros: reduces LED triple count at init-time, lowers total P3P budget, no per-frame overhead.
+  Cons: small coverage loss for asymmetric blob neighborhoods; gate LEDs for a dropped triple may have been more discriminative than the canonical one's gates.
+
+  ---
+  Option C — Restructured blob loop (full coverage, zero duplicates, no precomputation change)
+
+  Keep canonical LED triples but iterate all three "anchor roles" in the blob loop explicitly, tracking and skipping seen bijections:
+
+  For canonical triple (A,B,C), instead of always mapping l_ids[0]→b_anchor, try all three permutations of which LED gets assigned to b_anchor:
+
+  for role in range(3):
+      perm_ids = np.roll(l_ids, -role)   # rotate: role=0→(A,B,C), role=1→(B,C,A), role=2→(C,A,B)
+      obj3_perm = positions[perm_ids]
+      for b_anchor in range(n_blobs):
+          for b1_ord, b2_ord in ...:
+              bij = frozenset(zip(perm_ids, [b_anchor, b1_ord, b2_ord]))
+              if bij in seen:
+                  continue
+              seen.add(bij)
+              # P3P with obj3_perm, img3
+
+  Pros: zero duplicates, full coverage, no LED triple changes.
+  Cons: requires meaningful refactor of the inner loop structure; same total work as current (3 roles × 1/3 unique bijections each), so the gain is purely from skipping duplicates.
+
+  ---
+  Recommendation
+
+  Simplest + safest: Option A (runtime skip). Drop it in just before the P3P call — one set, one if/continue, set.add. The 12% duplicate rate at current depth justifies it, and it's
+  unconditionally correct.
+
+  If you want to reduce the total P3P budget (not just skip duplicates): Option B alone, accepting minimal coverage loss that shrinks as blob depth grows.
+
+  Best of both worlds: Option B + Option A together — B reduces the LED triple count, A catches any residual duplicates from blob-side asymmetry.
