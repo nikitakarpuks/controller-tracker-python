@@ -103,7 +103,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             cv2.putText(
                 vis,
                 str(idx),
-                (pt[0] + 20, pt[1] + 5),
+                (pt[0] + 10, pt[1] + 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (0, 255, 0),
