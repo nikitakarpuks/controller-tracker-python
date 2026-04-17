@@ -349,38 +349,46 @@ def _build_blob_neighbor_lists(blobs: np.ndarray, k: int) -> List[np.ndarray]:
 
 def _precompute_led_quads(
     positions: np.ndarray, led_nbr: List[np.ndarray], k: int = 8
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
     """
-    Enumerate all LED quadruples. Called once and cached.
-    No deduplication across anchors — every LED is tried as anchor,
-    matching OpenHMD's structure where each LED can be the P3P anchor.
+    Enumerate LED triples for P3P. Each unique (anchor, l1, l2) appears exactly once,
+    eliminating the duplicate P3P calls caused by varying the gate LED under C(k,3).
 
     Returns
     -------
-    indices : (N, 4) int32  — [anchor, l1, l2, l3]; anchor/l1/l2 → P3P triple, l3 → 4th-point gate
-    depths  : (N,) int32   — max neighbor rank used (1-based); used to split shallow vs deep passes
+    triple_idx   : (N, 3) int32      — [anchor, l1, l2]; all three used for P3P
+    triple_depth : (N,) int32        — max neighbour rank used (1-based); shallow/deep split
+    triple_gates : List[np.ndarray]  — for each triple, remaining neighbour LED indices (gate pool)
     """
-    idx_rows:   List[Tuple] = []
-    depth_rows: List[int]   = []
+    idx_rows:   List[Tuple]       = []
+    depth_rows: List[int]         = []
+    gate_rows:  List[np.ndarray]  = []
     n = len(positions)
     for anchor in range(n):
-        nbrs = led_nbr[anchor][:k]
-        if len(nbrs) < 3:
+        nbrs   = led_nbr[anchor][:k]
+        nb_len = len(nbrs)
+        if nb_len < 2:
             continue
-        for i1, i2, i3 in combinations(range(len(nbrs)), 3):
-            l1, l2, l3 = int(nbrs[i1]), int(nbrs[i2]), int(nbrs[i3])
-            depth = i3 + 1  # i3 is always the largest index (combinations are sorted)
-            for perm in (
-                (anchor, l1, l2, l3),
-                (anchor, l2, l1, l3),
-            ):
-                idx_rows.append(perm)
-                depth_rows.append(depth)
+        for i1, i2 in combinations(range(nb_len), 2):
+            l1, l2 = int(nbrs[i1]), int(nbrs[i2])
+            depth  = i2 + 1
+            gates  = np.array(
+                [int(nbrs[j]) for j in range(nb_len) if j != i1 and j != i2],
+                dtype=np.int32,
+            )
+            idx_rows.append((anchor, l1, l2))
+            depth_rows.append(depth)
+            gate_rows.append(gates)
     if not idx_rows:
-        return np.zeros((0, 4), dtype=np.int32), np.zeros(0, dtype=np.int32)
+        return (
+            np.zeros((0, 3), dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+            [],
+        )
     return (
         np.array(idx_rows,   dtype=np.int32),
         np.array(depth_rows, dtype=np.int32),
+        gate_rows,
     )
 
 
@@ -392,6 +400,34 @@ def _precompute_led_quads(
 def _check_z_range(tvec_h: np.ndarray, z_min: float = 0.05, z_max: float = 15.0) -> bool:
     """Return True if the hypothesis depth is within plausible range (OpenHMD: 0.05–15 m)."""
     return z_min < tvec_h[2] < z_max
+
+
+def _gate_any_point(
+    R_h: np.ndarray, tvec_h: np.ndarray,
+    gate_obj: np.ndarray,
+    gate_img: np.ndarray,
+    fx: float, fy: float, cx: float, cy: float,
+    thresh_sq: float,
+) -> bool:
+    """
+    Return True if ANY gate LED projects within sqrt(thresh_sq) pixels of ANY gate blob.
+    If either pool is empty, returns True (no gate to fail).
+    """
+    if len(gate_obj) == 0 or len(gate_img) == 0:
+        return True
+    for obj in gate_obj:
+        p = R_h @ obj + tvec_h
+        if p[2] <= 0:
+            continue
+        iz = 1.0 / p[2]
+        px = fx * p[0] * iz + cx
+        py = fy * p[1] * iz + cy
+        for img in gate_img:
+            dx = px - img[0]
+            dy = py - img[1]
+            if dx * dx + dy * dy <= thresh_sq:
+                return True
+    return False
 
 
 def _gate_fourth_point(
@@ -584,41 +620,36 @@ def proximity_match(
 def brute_match(
     self,
     blobs: np.ndarray,
-    blob_neighbor_depth: int = 6,       # k nearest blob neighbours to enumerate (full depth)
-    p4_threshold_px: float = 2.0,       # 4th-point pre-filter gate (pixels)
+    blob_neighbor_depth: int = 6,
+    p4_threshold_px: float = 2.0,
     reprojection_threshold: float = 5.0,
     min_inliers: int = 4,
-    min_inlier_fraction: float = 0.8,   # min fraction of visible blobs that must be inliers
-    strong_match_inliers: int = 7,      # stop immediately when this many inliers …
-    strong_match_error_px: float = 1.5, # … and mean reprojection error is below this
-    shallow_led_depth: int = 4,         # pass 1: LED quads using only the first N neighbors
-    shallow_blob_depth: int = 4,        # pass 1: blob combinations up to this neighbor rank
+    min_inlier_fraction: float = 0.8,
+    strong_match_inliers: int = 7,
+    strong_match_error_px: float = 1.5,
+    shallow_led_depth: int = 4,
+    shallow_blob_depth: int = 4,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
-    debug_led_ids: Optional[List[int]]=None,   # exact ordered [anchor, l1, l2, l3] to watch
-    debug_blob_ids: Optional[List[int]]=None,  # exact ordered [b_anchor, b1, b2, b3] to watch
+    debug_led_ids: Optional[List[int]] = None,    # ordered [anchor, l1, l2]
+    debug_blob_ids: Optional[List[int]] = None,   # ordered [b_anchor, b1, b2]
+    debug_count_duplicates: bool = True,
 ) -> Optional[Dict]:
     """
-    Exhaustive pose search via P3P over LED/blob quadruple correspondences.
-    Follows OpenHMD's correspondence_search structure exactly:
-      - Outer loop: LED quad (precomputed; anchor fixed, 2 permutations of the P3P triple)
+    Exhaustive pose search via P3P over LED/blob triple correspondences.
+    Follows OpenHMD's correspondence_search structure:
+      - Outer loop: LED triple (anchor + 2 neighbours, precomputed; no duplicates)
       - Middle loop: every blob as a potential blob anchor
-      - Inner loop: combinations of 3 from the blob anchor's neighbor list
+      - Inner loop: C(k,2) blob pairs × 2 orderings (covers all LED–blob assignments)
 
-    Two passes (OpenHMD shallow/deep split):
-      Pass 1 — shallow: LED quads whose deepest neighbor rank ≤ shallow_led_depth,
-               blob combos up to shallow_blob_depth.  Exits on strong match.
-      Pass 2 — deep: LED quads whose deepest neighbor rank > shallow_led_depth,
-               blob combos up to full blob_neighbor_depth.
+    Each unique (anchor, l1, l2) ↔ (b_anchor, b1, b2) bijection is evaluated exactly once.
+    Gate check: any remaining gate LED projecting near any remaining gate blob.
 
-    Per hypothesis (P3P output):
-      1. Depth range check (0.05–15 m).
-      2. Fast 4th-point pixel gate — rejects most wrong hypotheses cheaply.
-      3. Full visible-LED inlier count + RANSAC PnP refinement.
-      4. Visibility recheck on inliers with the refined pose.
-
-    Debug: set debug_led_ids and debug_blob_ids (both ordered [anchor, p1, p2, gate]) to
-    trace exactly what happens when that specific LED/blob quad is evaluated.
+    Two passes (shallow/deep):
+      Pass 1 — shallow: LED triples with deepest rank ≤ shallow_led_depth,
+               blob pairs up to shallow_blob_depth.  Exits on strong match.
+      Pass 2 — deep: LED triples with deepest rank > shallow_led_depth,
+               blob pairs up to full blob_neighbor_depth.
     """
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
@@ -633,8 +664,9 @@ def brute_match(
     K         = self.camera.camera_matrix
     dc        = self.camera.dist_coeffs
 
-    led_quad_idx   = self._led_quad_idx    # (N_LQ, 4) int32
-    led_quad_depth = self._led_quad_depth  # (N_LQ,) int32
+    led_triple_idx   = self._led_triple_idx    # (N_LT, 3) int32
+    led_triple_depth = self._led_triple_depth  # (N_LT,) int32
+    led_triple_gates = self._led_triple_gates  # List[np.ndarray] gate LED indices per triple
 
     is_inner         = self._is_inner
     radial_out       = self._radial_out
@@ -645,7 +677,6 @@ def brute_match(
     z_frustum_top    = self._z_frustum_top
     z_frustum_bot    = self._z_frustum_bot
 
-    # ── Per-frame blob neighbor lists ─────────────────────────────────────────
     blob_nbr = _build_blob_neighbor_lists(blobs, k=blob_neighbor_depth)
 
     p4_thresh_sq = p4_threshold_px ** 2
@@ -662,21 +693,18 @@ def brute_match(
     best_error      = np.inf
     best_orient_err = np.inf
     strong_found    = False
-    solution_pass   = None  # "shallow" or "deep"
+    solution_pass   = None
 
-    # Shallow LED quads: max neighbor rank ≤ shallow_led_depth.
-    # Deep LED quads: max neighbor rank > shallow_led_depth (no overlap, no redundancy).
-    shallow_mask = led_quad_depth <= shallow_led_depth
-    deep_mask    = led_quad_depth >  shallow_led_depth
+    shallow_mask = led_triple_depth <= shallow_led_depth
+    deep_mask    = led_triple_depth >  shallow_led_depth
     n_shallow_lq = int(shallow_mask.sum())
     n_deep_lq    = int(deep_mask.sum())
 
-    # Exact total P3P calls possible per pass.
-    def _c3(n: int) -> int:
-        return n * (n - 1) * (n - 2) // 6 if n >= 3 else 0
+    def _c2(n: int) -> int:
+        return n * (n - 1) // 2 if n >= 2 else 0
 
     def _total_blob_combos(max_blob_d: int) -> int:
-        return sum(_c3(min(len(blob_nbr[b]), max_blob_d)) for b in range(n_blobs))
+        return sum(2 * _c2(min(len(blob_nbr[b]), max_blob_d)) for b in range(n_blobs))
 
     total_blob_combos_shallow = _total_blob_combos(shallow_blob_depth)
     total_blob_combos_deep    = _total_blob_combos(blob_neighbor_depth)
@@ -685,15 +713,15 @@ def brute_match(
 
     rng = np.random.default_rng(rng_seed)
 
-    # Per-pass counters.
-    pass_p3p_calls   = [0, 0]
-    pass_lq_tried    = [0, 0]
+    pass_p3p_calls = [0, 0]
+    pass_lq_tried  = [0, 0]
 
-    debug_active = debug_led_ids is not None and debug_blob_ids is not None
+    debug_active    = debug_led_ids is not None and debug_blob_ids is not None
     debug_led_list  = list(debug_led_ids)  if debug_active else None
     debug_blob_list = list(debug_blob_ids) if debug_active else None
 
-    # ── Two-pass search (shallow then deep) ───────────────────────────────────
+    bijection_counts: Dict[frozenset, int] = {} if debug_count_duplicates else None
+
     for pass_idx, (lq_mask, max_blob_d) in enumerate((
         (shallow_mask, shallow_blob_depth),
         (deep_mask,    blob_neighbor_depth),
@@ -710,9 +738,10 @@ def brute_match(
             if strong_found:
                 break
 
-            l_ids = led_quad_idx[lq_i]   # [anchor, l1, l2, l3]
-            obj3  = positions[l_ids[:3]]  # (3, 3) world points for P3P
-            obj4  = positions[l_ids[3]]   # (3,)   world point for 4th-point gate
+            l_ids    = led_triple_idx[lq_i]          # [anchor, l1, l2]
+            obj3     = positions[l_ids]               # (3, 3) world points for P3P
+            gate_led = led_triple_gates[lq_i]
+            gate_obj = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
 
             had_p3p = False
 
@@ -721,195 +750,208 @@ def brute_match(
                     break
                 nbrs   = blob_nbr[b_anchor]
                 n_nbrs = min(len(nbrs), max_blob_d)
-                if n_nbrs < 3:
+                if n_nbrs < 2:
                     continue
 
-                for i1, i2, i3 in combinations(range(n_nbrs), 3):
+                for i1, i2 in combinations(range(n_nbrs), 2):
                     if strong_found:
                         break
                     b1 = int(nbrs[i1])
                     b2 = int(nbrs[i2])
-                    b3 = int(nbrs[i3])
 
-                    # ── Debug trigger ─────────────────────────────────────────
-                    dbg = (
-                        debug_active and
-                        list(l_ids) == debug_led_list and
-                        [b_anchor, b1, b2, b3] == debug_blob_list
-                    )
-                    if dbg:
-                        print(
-                            f"\n[DEBUG] Target quad reached — "
-                            f"LEDs {list(l_ids)}  blobs [{b_anchor},{b1},{b2},{b3}]  "
-                            f"pass={'shallow' if pass_idx == 0 else 'deep'}"
-                        )
+                    gate_blob_idx = [int(nbrs[j]) for j in range(n_nbrs) if j != i1 and j != i2]
+                    gate_img = blobs[gate_blob_idx].astype(np.float32) if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
 
-                    img3 = blobs[[b_anchor, b1, b2]]  # (3, 2) image points for P3P
-                    img4 = blobs[b3]                  # (2,)   image point for 4th-point gate
-
-                    # ── 1. P3P → up to 4 pose hypotheses ─────────────────────
-                    pass_p3p_calls[pass_idx] += 1
-                    had_p3p = True
-                    n_sols, rvecs, tvecs = cv2.solveP3P(
-                        obj3.reshape(3, 1, 3),
-                        img3.reshape(3, 1, 2),
-                        K, dc,
-                        flags=cv2.SOLVEPNP_P3P,
-                    )
-                    if dbg:
-                        print(f"  [DEBUG] P3P returned {n_sols} solutions")
-                    if not n_sols or rvecs is None:
-                        continue
-
-                    for sol_i, (rvec_h, tvec_h) in enumerate(zip(rvecs, tvecs)):
+                    for b1_ord, b2_ord in ((b1, b2), (b2, b1)):
                         if strong_found:
                             break
-                        rvec_h = rvec_h.reshape(3, 1).astype(np.float32)
-                        tvec_h = tvec_h.reshape(3).astype(np.float32)
 
-                        # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ────
-                        z_ok = _check_z_range(tvec_h)
-                        if dbg:
-                            print(f"  [DEBUG] sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
-                        if not z_ok:
-                            continue
-
-                        R_h, _ = cv2.Rodrigues(rvec_h)
-
-                        # ── 3. 4th-point pixel gate ───────────────────────────
-                        p4_ok = _gate_fourth_point(R_h, tvec_h, obj4, img4, fx, fy, cx, cy, p4_thresh_sq)
-                        if dbg:
-                            p4_cam = R_h @ obj4 + tvec_h
-                            if p4_cam[2] > 0:
-                                iz = 1.0 / p4_cam[2]
-                                p4_px = np.array([fx * p4_cam[0] * iz + cx, fy * p4_cam[1] * iz + cy])
-                                p4_err = float(np.linalg.norm(p4_px - img4))
-                            else:
-                                p4_err = float('inf')
-                            print(f"  [DEBUG] sol {sol_i}: 4th-point err={p4_err:.2f} px  gate_ok={p4_ok}")
-                        if not p4_ok:
-                            continue
-
-                        # ── 4. Full inlier count on all visible LEDs ──────────
-                        vis_mask_h = _visible_mask(
-                            R_h, tvec_h, positions, normals,
-                            is_inner, radial_out, ring_axis,
-                            ring_centroid,
-                            R_frustum_center, frustum_slope,
-                            z_frustum_top, z_frustum_bot,
-                        )
-                        vis_ids = np.where(vis_mask_h)[0]
-                        if dbg:
-                            print(f"  [DEBUG] sol {sol_i}: {len(vis_ids)} visible LEDs")
-                        if len(vis_ids) < min_inliers:
-                            continue
-
-                        proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc)
-                        cost     = cdist(blobs, proj_all)
-                        ri, ci   = linear_sum_assignment(cost)
-
-                        inlier_mask = cost[ri, ci] < reprojection_threshold
-                        ib = ri[inlier_mask]
-                        il = vis_ids[ci[inlier_mask]]
-
-                        if dbg:
-                            print(f"  [DEBUG] sol {sol_i}: {len(ib)} inliers after Hungarian "
-                                  f"(need {min_inliers_eff})")
-                        if len(ib) < min_inliers_eff:
-                            continue
-
-                        # ── 5. RANSAC PnP refinement on inliers ───────────────
-                        ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
-                            positions[il], blobs[ib], K, dc,
-                            rvec_h, tvec_h.reshape(3, 1),
+                        # ── Debug trigger ─────────────────────────────────────
+                        dbg = (
+                            debug_active and
+                            list(l_ids) == debug_led_list and
+                            [b_anchor, b1_ord, b2_ord] == debug_blob_list
                         )
                         if dbg:
-                            print(f"  [DEBUG] sol {sol_i}: RANSAC ok={ok_r}, "
-                                  f"inliers={len(ransac_inliers) if ok_r else 0}")
-                        if not ok_r:
-                            continue
+                            print(
+                                f"\n[DEBUG] Target triple reached — "
+                                f"LEDs {list(l_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
+                                f"pass={'shallow' if pass_idx == 0 else 'deep'}"
+                            )
 
-                        il = il[ransac_inliers]
-                        ib = ib[ransac_inliers]
+                        img3 = blobs[[b_anchor, b1_ord, b2_ord]]
 
-                        if len(ib) < min_inliers_eff:
-                            continue
+                        if bijection_counts is not None:
+                            bij = frozenset(((int(l_ids[0]), b_anchor),
+                                             (int(l_ids[1]), b1_ord),
+                                             (int(l_ids[2]), b2_ord)))
+                            bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
 
-                        # ── 6. Visibility recheck with the refined pose ───────
-                        R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
-                        vis_sub = _visible_mask(
-                            R_r, tvec_r.reshape(3), positions[il], normals[il],
-                            is_inner[il], radial_out[il], ring_axis,
-                            ring_centroid,
-                            R_frustum_center, frustum_slope,
-                            z_frustum_top, z_frustum_bot,
+                        # ── 1. P3P → up to 4 pose hypotheses ─────────────────
+                        pass_p3p_calls[pass_idx] += 1
+                        had_p3p = True
+                        n_sols, rvecs, tvecs = cv2.solveP3P(
+                            obj3.reshape(3, 1, 3),
+                            img3.reshape(3, 1, 2),
+                            K, dc,
+                            flags=cv2.SOLVEPNP_P3P,
                         )
-                        il = il[vis_sub]
-                        ib = ib[vis_sub]
                         if dbg:
-                            print(f"  [DEBUG] sol {sol_i}: {len(ib)} inliers after vis recheck")
-                        if len(ib) < min_inliers_eff:
+                            print(f"  [DEBUG] P3P returned {n_sols} solutions")
+                        if not n_sols or rvecs is None:
                             continue
 
-                        proj_r = _project_points(rvec_r, tvec_r, positions[il], K, dc)
-                        err    = float(np.mean(np.linalg.norm(proj_r - blobs[ib], axis=1)))
-                        n_ib   = len(ib)
+                        for sol_i, (rvec_h, tvec_h) in enumerate(zip(rvecs, tvecs)):
+                            if strong_found:
+                                break
+                            rvec_h = rvec_h.reshape(3, 1).astype(np.float32)
+                            tvec_h = tvec_h.reshape(3).astype(np.float32)
 
-                        orient_err = np.inf
-                        if R_prior is not None:
-                            cos_a = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
-                            orient_err = float(np.arccos(cos_a))
+                            # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
+                            z_ok = _check_z_range(tvec_h)
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
+                            if not z_ok:
+                                continue
 
-                        err_per  = err  / max(n_ib, 1)
-                        best_per = best_error / max(best_inliers, 1)
+                            R_h, _ = cv2.Rodrigues(rvec_h)
 
-                        is_better = (
-                            (n_ib > best_inliers and err_per < best_per) or
-                            (n_ib >= best_inliers + 2 and err_per < best_per * 1.1) or
-                            (n_ib == best_inliers and err < best_error) or
-                            (n_ib == best_inliers and
-                             abs(err - best_error) < 0.5 and
-                             orient_err < best_orient_err)
-                        )
+                            # ── 3. Gate check (any gate LED near any gate blob) ─
+                            gate_ok = _gate_any_point(R_h, tvec_h, gate_obj, gate_img, fx, fy, cx, cy, p4_thresh_sq)
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: gate_ok={gate_ok}")
+                            if not gate_ok:
+                                continue
 
-                        if dbg:
-                            print(f"  [DEBUG] sol {sol_i}: err={err:.3f} px  inliers={n_ib}  "
-                                  f"is_better={is_better}")
+                            # ── 4. Full inlier count on all visible LEDs ───────
+                            vis_mask_h = _visible_mask(
+                                R_h, tvec_h, positions, normals,
+                                is_inner, radial_out, ring_axis,
+                                ring_centroid,
+                                R_frustum_center, frustum_slope,
+                                z_frustum_top, z_frustum_bot,
+                            )
+                            vis_ids = np.where(vis_mask_h)[0]
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: {len(vis_ids)} visible LEDs")
+                            if len(vis_ids) < min_inliers:
+                                continue
 
-                        if is_better:
-                            best_solution = {
-                                "rvec":       rvec_r,
-                                "tvec":       tvec_r,
-                                "inliers":    n_ib,
-                                "error":      err,
-                                "assignment": list(zip(ib.tolist(), il.tolist())),
-                                "method":     "p3p_systematic",
-                            }
-                            best_inliers    = n_ib
-                            best_error      = err
-                            best_orient_err = orient_err
-                            solution_pass   = "shallow" if pass_idx == 0 else "deep"
+                            proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc)
+                            cost     = cdist(blobs, proj_all)
+                            ri, ci   = linear_sum_assignment(cost)
 
-                            if best_inliers >= strong_inliers_eff and best_error <= strong_match_error_px:
-                                strong_found = True
+                            inlier_mask = cost[ri, ci] < reprojection_threshold
+                            ib = ri[inlier_mask]
+                            il = vis_ids[ci[inlier_mask]]
+
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: {len(ib)} inliers after Hungarian "
+                                      f"(need {min_inliers_eff})")
+                            if len(ib) < min_inliers_eff:
+                                continue
+
+                            # ── 5. RANSAC PnP refinement on inliers ───────────
+                            ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
+                                positions[il], blobs[ib], K, dc,
+                                rvec_h, tvec_h.reshape(3, 1),
+                            )
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: RANSAC ok={ok_r}, "
+                                      f"inliers={len(ransac_inliers) if ok_r else 0}")
+                            if not ok_r:
+                                continue
+
+                            il = il[ransac_inliers]
+                            ib = ib[ransac_inliers]
+
+                            if len(ib) < min_inliers_eff:
+                                continue
+
+                            # ── 6. Visibility recheck with the refined pose ────
+                            R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
+                            vis_sub = _visible_mask(
+                                R_r, tvec_r.reshape(3), positions[il], normals[il],
+                                is_inner[il], radial_out[il], ring_axis,
+                                ring_centroid,
+                                R_frustum_center, frustum_slope,
+                                z_frustum_top, z_frustum_bot,
+                            )
+                            il = il[vis_sub]
+                            ib = ib[vis_sub]
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: {len(ib)} inliers after vis recheck")
+                            if len(ib) < min_inliers_eff:
+                                continue
+
+                            proj_r = _project_points(rvec_r, tvec_r, positions[il], K, dc)
+                            err    = float(np.mean(np.linalg.norm(proj_r - blobs[ib], axis=1)))
+                            n_ib   = len(ib)
+
+                            orient_err = np.inf
+                            if R_prior is not None:
+                                cos_a = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
+                                orient_err = float(np.arccos(cos_a))
+
+                            err_per  = err  / max(n_ib, 1)
+                            best_per = best_error / max(best_inliers, 1)
+
+                            is_better = (
+                                (n_ib > best_inliers and err_per < best_per) or
+                                (n_ib >= best_inliers + 2 and err_per < best_per * 1.1) or
+                                (n_ib == best_inliers and err < best_error) or
+                                (n_ib == best_inliers and
+                                 abs(err - best_error) < 0.5 and
+                                 orient_err < best_orient_err)
+                            )
+
+                            if dbg:
+                                print(f"  [DEBUG] sol {sol_i}: err={err:.3f} px  inliers={n_ib}  "
+                                      f"is_better={is_better}")
+
+                            if is_better:
+                                best_solution = {
+                                    "rvec":       rvec_r,
+                                    "tvec":       tvec_r,
+                                    "inliers":    n_ib,
+                                    "error":      err,
+                                    "assignment": list(zip(ib.tolist(), il.tolist())),
+                                    "method":     "p3p_systematic",
+                                }
+                                best_inliers    = n_ib
+                                best_error      = err
+                                best_orient_err = orient_err
+                                solution_pass   = "shallow" if pass_idx == 0 else "deep"
+
+                                if best_inliers >= strong_inliers_eff and best_error <= strong_match_error_px:
+                                    strong_found = True
 
             if had_p3p:
                 pass_lq_tried[pass_idx] += 1
 
-    # ── Summary print ─────────────────────────────────────────────────────────
-    total_p3p_tried = pass_p3p_calls[0] + pass_p3p_calls[1]
+    total_p3p_tried    = pass_p3p_calls[0] + pass_p3p_calls[1]
     total_p3p_possible = total_p3p_shallow + total_p3p_deep
     result_str = (
         f"found in {solution_pass} pass  "
         f"({best_inliers} inliers, {best_error:.2f} px)"
         if best_solution is not None else "not found"
     )
+    dup_line = ""
+    if bijection_counts is not None:
+        n_unique = len(bijection_counts)
+        n_dup    = total_p3p_tried - n_unique
+        max_dup  = max(bijection_counts.values(), default=0)
+        dup_line = (
+            f"\n  bijections — {n_unique} unique / {total_p3p_tried} calls  "
+            f"({n_dup} duplicate calls, max {max_dup}× same bijection)"
+        )
     print(
         f"Brute-force: {result_str}\n"
         f"  shallow — {pass_p3p_calls[0]:>7} / {total_p3p_shallow:>7} P3P calls  "
-        f"({pass_lq_tried[0]}/{n_shallow_lq} LED quads reached inner loop)\n"
+        f"({pass_lq_tried[0]}/{n_shallow_lq} LED triples reached inner loop)\n"
         f"  deep    — {pass_p3p_calls[1]:>7} / {total_p3p_deep:>7} P3P calls  "
-        f"({pass_lq_tried[1]}/{n_deep_lq} LED quads reached inner loop)\n"
+        f"({pass_lq_tried[1]}/{n_deep_lq} LED triples reached inner loop)\n"
         f"  total   — {total_p3p_tried:>7} / {total_p3p_possible:>7} P3P calls"
+        f"{dup_line}"
     )
     return best_solution
