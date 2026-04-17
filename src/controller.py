@@ -81,7 +81,7 @@ class SingleViewTracker:
          self._z_frustum_top, self._z_frustum_bot,
          ) = _compute_frustum_geometry(positions, normals)
         self._led_nbr = _build_led_neighbor_lists(positions, normals)
-        self._led_quad_idx, self._led_quad_depth = _precompute_led_quads(
+        self._led_triple_idx, self._led_triple_depth, self._led_triple_gates = _precompute_led_quads(
             positions, self._led_nbr,
         )
 
