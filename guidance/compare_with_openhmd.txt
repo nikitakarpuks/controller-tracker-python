@@ -1,0 +1,100 @@
+---
+  OpenHMD Correspondence Search — Ideas Your Python Code Lacks
+
+  ---
+  1. Two-Phase Tiered Search (Shallow → Deep)
+
+  OpenHMD splits the search into two passes. The shallow pass uses small neighbor depth (max=4, min=1) and exits immediately on a strong match. Only if it fails does the deep pass run —
+  starting at depth 3 (skipping what shallow already checked) and going up to depth 8. This means cheap cases are solved in microseconds and the full combinatorial budget is spent only when
+   needed.
+
+  Your code always runs a single flat pass over all LED quads. There is no progressive depth budget, no early-exit on STRONG while LED quads are still being enumerated, and no concept of
+  "start where the shallow pass stopped."
+
+  ---
+  2. Per-Blob Ownership / Multi-Device Filtering
+
+  Each blob in OpenHMD carries a led_id field encoding the device ID it was previously assigned to. Before building neighbor lists for a model, unassigned blobs and blobs already claimed by
+   another device are filtered out. This prevents a controller's blob from accidentally anchoring a quad for a different controller, and it collapses the search space significantly when
+  multiple devices share the view.
+
+  Your code has no blob-ownership concept. Every blob is always considered by every LED quad regardless of prior frame assignments.
+
+  ---
+  3. P3P Anchor Reprojection Sanity Check
+
+  After calling the P3P solver, OpenHMD explicitly re-projects all 3 anchor LEDs and checks that each lands within ~2.5 mm in normalized coordinates of the corresponding blob. This catches
+  silent numerical failures inside the solver (lambdatwist occasionally produces a valid-looking result that is off). The check costs almost nothing (3 perspective divides) and discards bad
+   hypotheses before the expensive inlier count.
+
+  Your code calls cv2.solveP3P and proceeds directly to the 4th-point gate without verifying the 3 anchor points themselves.
+
+  ---
+  4. LED Facing-Check Before Full Inlier Evaluation
+
+  In check_led_against_model_subset, OpenHMD verifies that each of the 3 P3P anchor LEDs is facing the camera (facing_dot ≤ 0) immediately after P3P and before the 4th-point gate and full
+  inlier count. This is separate from the visibility mask run later. It rejects poses where the P3P geometry is technically consistent but physically impossible (controller is upside-down
+  relative to the chosen anchors).
+
+  Your _visible_mask only runs after the 4th-point gate, so hypotheses with back-facing P3P anchors survive to the expensive inlier step.
+
+  ---
+  5. Gravity / IMU Alignment Gate
+
+  OpenHMD can take an IMU-derived gravity vector and a tolerance (radians). Any candidate pose whose orientation swing component differs from the prior's swing by more than the tolerance is
+   rejected before the inlier count via a cheap quaternion decompose-swing-twist computation. This is the single most effective pre-filter when IMU data is available: it eliminates entire
+  families of poses that are geometrically consistent but physically impossible.
+
+  Your code has no gravity or IMU path.
+
+  ---
+  6. Bounding-Box Acceleration for Blob–LED Matching
+
+  In pose_metrics_match_pose_to_blobs, OpenHMD projects all visible LEDs, computes their 2D bounding box, and then only considers blobs that fall inside that box. For a controller that
+  covers 15% of the image, this skips 85% of blobs entirely before any distance computation.
+
+  Your code calls cdist(blobs, proj_all) over all blobs × all visible LEDs every time, then Hungarian-assigns the full cost matrix. For scenes with many unrelated blobs this is
+  significantly more expensive.
+
+  ---
+  7. Blob Size Filter Using Physical LED Radius
+
+  OpenHMD stores a radius_mm for each LED in the model. During blob–LED matching, if a blob's pixel width or height is more than 4× the expected LED pixel radius at that depth, the match is
+   rejected. This prevents large blobs (specular reflections, LED clusters) from consuming small LED projections.
+
+  Your code matches blobs to projected LEDs purely by pixel distance, with no reference to expected physical size.
+
+  ---
+  8. Depth Tiebreaker for Overlapping LED Projections
+
+  When multiple LEDs project onto the same blob (leds_within_range > 1), OpenHMD prefers the one with smaller Z (closer to the camera). The intuition: a closer LED is larger in the image
+  and more likely to be the correct match for an observed blob; a farther LED is smaller and may be partially occluded.
+
+  Your Hungarian assignment will arbitrarily assign among distance-tied candidates without considering 3D depth.
+
+  ---
+  9. STRONG vs GOOD Pose Quality with Downgrade Protection
+
+  OpenHMD defines two quality levels:
+  - GOOD: ≥3 matched blobs, loose error threshold (≤3 px/LED without prior, ≤2 px/LED with prior), and unmatched-blob fraction ≤25% or matched/visible ≥2/3.
+  - STRONG: ≥7 matched blobs, ≤1.5 px/LED error.
+
+  The key behavior: once the best pose is STRONG, pose_metrics_score_is_better_pose refuses to replace it with a non-STRONG candidate even if the non-STRONG candidate has more raw inliers
+  or lower error. This prevents lucky-but-wrong poses from displacing a verified strong match during the rest of the search.
+
+  Your code has strong_found for early exit but no analogous downgrade protection in the is_better comparator. A non-strong pose can still displace a strong one via rules 3 or 4.
+
+  ---
+  10. Relaxed Prior-Based Good Threshold
+
+  With a valid pose prior, OpenHMD uses separate (looser) thresholds: error_per_led < 2.0 (vs 3.0 without prior), and it accepts a pose as GOOD if it satisfies position AND orientation
+  bounds even with only 3+ matches, without needing the ≥7-blob STRONG path. The logic is: if the pose is geometrically close to where we expect it, lower confidence in reprojection quality
+   is acceptable.
+
+  Your code uses the prior only for tiebreaking (orient_err) and as an rvec_init/tvec_init hint to the solver, not as a path with different acceptance criteria.
+
+  ---
+  11. Continuation of Deep Search from Shallow Stopping Point (min_led_depth)
+
+  When the deep pass runs after shallow fails, OpenHMD sets min_led_depth = 3 so the combinatorial generator skips the first 2 neighbour-depth levels that the shallow pass already
+  exhausted. Your code has no depth continuation — if you were to add a two-phase approach, you would also need this to avoid double-counting combinations.

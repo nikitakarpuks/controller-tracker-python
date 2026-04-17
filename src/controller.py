@@ -73,7 +73,6 @@ class SingleViewTracker:
             _build_led_neighbor_lists,
             _precompute_led_quads,
         )
-        _LED_NEIGHBOR_DEPTH = 6
         positions = model.positions.astype("float32")
         normals   = model.normals.astype("float32")
         (self._ring_axis, self._is_inner, self._radial_out,
@@ -81,9 +80,9 @@ class SingleViewTracker:
          self._R_frustum_center, self._frustum_slope,
          self._z_frustum_top, self._z_frustum_bot,
          ) = _compute_frustum_geometry(positions, normals)
-        self._led_nbr = _build_led_neighbor_lists(positions, normals, k=_LED_NEIGHBOR_DEPTH)
-        self._led_quad_idx, self._led_quad_ang = _precompute_led_quads(
-            positions, self._led_nbr, _LED_NEIGHBOR_DEPTH,
+        self._led_nbr = _build_led_neighbor_lists(positions, normals)
+        self._led_quad_idx, self._led_quad_depth = _precompute_led_quads(
+            positions, self._led_nbr,
         )
 
         # Bind strategies
@@ -215,53 +214,53 @@ class SingleViewTracker:
         # ------------------------------------------------------------------
         solution = None
 
-        if self.prev_pose is not None:
-            # --- Primary: proximity (fast, assignment-locked) ---
-            if n_blobs >= 3:
-                solution = self.proximity_match(
-                    blobs, self.prev_pose,
-                    prior_assignment=self.prev_assignment,
-                )
+        # if self.prev_pose is not None:
+        #     # --- Primary: proximity (fast, assignment-locked) ---
+        #     if n_blobs >= 3:
+        #         solution = self.proximity_match(
+        #             blobs, self.prev_pose,
+        #             prior_assignment=self.prev_assignment,
+        #         )
+        #
+        #     # --- Fallback: brute when proximity is absent or degraded ---
+        #     # Threshold 2.5 px: correct tracking gives < 0.5–1 px; values
+        #     # above this indicate drifting or a wrong assignment lock.
+        #     proximity_poor = solution is None or solution["error"] > 2.5
+        #     if proximity_poor and n_blobs >= 4:
+        #         brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+        #         if brute is not None:
+        #             prox_n   = len(solution["assignment"]) if solution else 0
+        #             brute_n  = brute.get("inliers", len(brute["assignment"]))
+        #             brute_better = (
+        #                 solution is None or
+        #                 brute_n > prox_n or
+        #                 (brute_n == prox_n and brute["error"] < solution["error"])
+        #             )
+        #             if brute_better:
+        #                 solution = brute
+        #
+        #     elif n_blobs >= 1 and solution is None:
+        #         solution = self.p1p_solver(blobs, self.prev_pose)
 
-            # --- Fallback: brute when proximity is absent or degraded ---
-            # Threshold 2.5 px: correct tracking gives < 0.5–1 px; values
-            # above this indicate drifting or a wrong assignment lock.
-            proximity_poor = solution is None or solution["error"] > 2.5
-            if proximity_poor and n_blobs >= 4:
-                brute = self.brute_match(blobs, pose_prior=self.prev_pose)
-                if brute is not None:
-                    prox_n   = len(solution["assignment"]) if solution else 0
-                    brute_n  = brute.get("inliers", len(brute["assignment"]))
-                    brute_better = (
-                        solution is None or
-                        brute_n > prox_n or
-                        (brute_n == prox_n and brute["error"] < solution["error"])
-                    )
-                    if brute_better:
-                        solution = brute
+        # else:
+        # --- No prior pose: brute-force re-acquisition ---
+        if n_blobs >= 4:
+            solution = self.brute_match(blobs, pose_prior=self.last_good_pose)
 
-            elif n_blobs >= 1 and solution is None:
-                solution = self.p1p_solver(blobs, self.prev_pose)
-
-        else:
-            # --- No prior pose: brute-force re-acquisition ---
-            if n_blobs >= 4:
-                solution = self.brute_match(blobs, pose_prior=self.last_good_pose)
-
-                # Validate against last known good pose (loose thresholds —
-                # the controller could have moved significantly while lost,
-                # but not teleported across the room).
-                if solution is not None and self.last_good_pose is not None:
-                    rvec_lg, tvec_lg = self.last_good_pose
-                    if self._pose_jump_too_large(
-                        solution["rvec"], solution["tvec"],
-                        rvec_lg, tvec_lg,
-                        max_dist_m=0.5,
-                        max_angle_deg=60.0,
-                    ):
-                        print("[tracking] Brute re-acquisition rejected: "
-                              "too far from last known good pose.")
-                        solution = None
+            # Validate against last known good pose (loose thresholds —
+            # the controller could have moved significantly while lost,
+            # but not teleported across the room).
+            if solution is not None and self.last_good_pose is not None:
+                rvec_lg, tvec_lg = self.last_good_pose
+                if self._pose_jump_too_large(
+                    solution["rvec"], solution["tvec"],
+                    rvec_lg, tvec_lg,
+                    max_dist_m=0.5,
+                    max_angle_deg=60.0,
+                ):
+                    print("[tracking] Brute re-acquisition rejected: "
+                          "too far from last known good pose.")
+                    solution = None
 
         # ------------------------------------------------------------------
         # Pose-jump guard against prev_pose (tight, per-frame)

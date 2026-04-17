@@ -24,6 +24,7 @@ VIS_CONFIG = {
     "show_image_plane": True,
     "show_camera_frame": False, # unit vector lines
     "show_led_ids":     True,   # LED index labels next to projected disks
+    "show_blob_ids":    True,   # blob index labels next to blob contours
     "fps":              30,        # playback speed
     "frustum_z":        0.05,      # depth of the virtual projection screen (metres).
                                    # Must be less than the closest expected controller depth.
@@ -39,6 +40,10 @@ VIS_CONFIG = {
     "led_id_label_size":     12,            # point marker size that anchors the label (Rerun units)
     "led_id_label_color":    [180, 0, 255], # RGB — violet by default
     "led_id_label_offset":   [0.0006, -0.0006],  # [dx, dy] shift in frustum-plane metres
+    # Blob ID label appearance
+    "blob_id_label_size":    12,            # point marker size that anchors the label (Rerun units)
+    "blob_id_label_color":   [255, 210, 0], # RGB — yellow, matching blob colour
+    "blob_id_label_offset":  [-0.0013, 0.0008],  # [dx, dy] shift in blob-plane metres
 }
 
 
@@ -582,6 +587,22 @@ class ControllerAnimatorRerun:
                         triangle_indices=bf,
                         vertex_colors=bc,
                     ))
+
+            # ---- blob ID labels on the blob plane ----
+            if self.vis_cfg.get("show_blob_ids", True):
+                blabel_size   = self.vis_cfg.get("blob_id_label_size",   12)
+                blabel_color  = self.vis_cfg.get("blob_id_label_color",  [255, 210, 0])
+                blabel_offset = self.vis_cfg.get("blob_id_label_offset", [0.0006, -0.0006])
+                bdx, bdy = blabel_offset[0], blabel_offset[1]
+                blob_label_pts = backproject_to_plane(blobs, camera, z=blob_z).copy()
+                blob_label_pts[:, 0] += bdx
+                blob_label_pts[:, 1] += bdy
+                rr.log("world/blob_ids", rr.Points3D(
+                    positions=blob_label_pts,
+                    labels=[str(i) for i in range(len(blobs))],
+                    colors=[blabel_color] * len(blobs),
+                    radii=0.0,  # invisible anchor point; only the label text is shown
+                ))
         else:
             pts_plane = None
 
