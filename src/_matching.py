@@ -6,6 +6,8 @@ from scipy.spatial.distance import cdist
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
+import math
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers (module-level, not methods)
@@ -413,13 +415,19 @@ def _gate_any_point(
     gate_img: np.ndarray,
     fx: float, fy: float, cx: float, cy: float,
     thresh_sq: float,
-) -> bool:
+    debug_distance: bool = False,
+) -> Tuple[bool, float]:
     """
     Return True if ANY gate LED projects within sqrt(thresh_sq) pixels of ANY gate blob.
     If either pool is empty, returns True (no gate to fail).
     """
     if len(gate_obj) == 0 or len(gate_img) == 0:
-        return True
+        return True, 0.0
+
+    if debug_distance:
+        min_dist = np.inf
+    else:
+        min_dist = 0.0
     for obj in gate_obj:
         p = R_h @ obj + tvec_h
         if p[2] <= 0:
@@ -430,9 +438,13 @@ def _gate_any_point(
         for img in gate_img:
             dx = px - img[0]
             dy = py - img[1]
+
+            if debug_distance:
+                min_dist = min(min_dist, math.sqrt(dx * dx + dy * dy))
+
             if dx * dx + dy * dy <= thresh_sq:
-                return True
-    return False
+                return True, min_dist
+    return False, min_dist
 
 
 def _gate_fourth_point(
@@ -625,21 +637,19 @@ def proximity_match(
 def brute_match(
     self,
     blobs: np.ndarray,
-    blob_neighbor_depth: int = 6,
+    depth_tiers: Tuple[Tuple[int, int], ...] = ((2, 3), (2, 4), (3, 5), (4,6)),  # (LED neighbor size, blob neighbor size) minimum is (2, 3)
     p4_threshold_px: float = 2.0,
     reprojection_threshold: float = 5.0,
     min_inliers: int = 4,
     min_inlier_fraction: float = 0.8,
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
-    shallow_led_depth: int = 4,
-    shallow_blob_depth: int = 6,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
     debug_led_ids: Optional[List[int]] = None,    # ordered [anchor, l1, l2]
     debug_blob_ids: Optional[List[int]] = None,   # ordered [b_anchor, b1, b2]
-    # debug_led_ids: Optional[List[int]] = [29, 24, 23],  # ordered [anchor, l1, l2]
-    # debug_blob_ids: Optional[List[int]] = [9, 6, 10],  # ordered [b_anchor, b1, b2]
+    # debug_led_ids: Optional[List[int]] = [7, 13, 11],  # ordered [anchor, l1, l2]
+    # debug_blob_ids: Optional[List[int]] = [3, 1, 4],  # ordered [b_anchor, b1, b2]
     debug_count_duplicates: bool = True,
 ) -> Optional[Dict]:
     """
@@ -652,11 +662,11 @@ def brute_match(
     Each unique (anchor, l1, l2) ↔ (b_anchor, b1, b2) bijection is evaluated exactly once.
     Gate check: any remaining gate LED projecting near any remaining gate blob.
 
-    Two passes (shallow/deep):
-      Pass 1 — shallow: LED triples with deepest rank ≤ shallow_led_depth,
-               blob pairs up to shallow_blob_depth.  Exits on strong match.
-      Pass 2 — deep: LED triples with deepest rank > shallow_led_depth,
-               blob pairs up to full blob_neighbor_depth.
+    Progressive 2D deepening via depth_tiers — each (led_max, blob_max) pair defines a tier.
+    Each tier evaluates only the (LED triple, blob pair) combinations not covered by prior tiers:
+      - LED triples newly eligible because depth ≤ led_max but depth > prev led_max
+      - Blob pairs newly eligible because i2 ≥ prev blob_max for already-eligible triples
+    Exits on strong match at the end of any tier's LED triple.
     """
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
@@ -684,7 +694,14 @@ def brute_match(
     z_frustum_top    = self._z_frustum_top
     z_frustum_bot    = self._z_frustum_bot
 
-    blob_nbr = _build_blob_neighbor_lists(blobs, k=blob_neighbor_depth)
+    max_blob_depth = max(blob_max for _, blob_max in depth_tiers)
+    blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
+
+    # Undistort blobs once (mirrors OpenHMD's correspondence_search_set_blobs).
+    # Gate check uses pinhole projection which is valid in undistorted space.
+    blobs_undist = cv2.undistortPoints(
+        blobs.reshape(-1, 1, 2), K, dc, P=K
+    ).reshape(-1, 2).astype(np.float32)
 
     p4_thresh_sq = p4_threshold_px ** 2
     fx, fy       = float(K[0, 0]), float(K[1, 1])
@@ -700,75 +717,70 @@ def brute_match(
     best_error      = np.inf
     best_orient_err = np.inf
     strong_found    = False
-    solution_pass   = None
+    solution_tier   = None
 
-    shallow_mask = led_triple_depth <= shallow_led_depth
-    deep_mask    = led_triple_depth >  shallow_led_depth
-    n_shallow_lq = int(shallow_mask.sum())
-    n_deep_lq    = int(deep_mask.sum())
-
-    def _c2(n: int) -> int:
-        return n * (n - 1) // 2 if n >= 2 else 0
-
-    def _total_blob_combos(max_blob_d: int) -> int:
-        return sum(2 * _c2(min(len(blob_nbr[b]), max_blob_d)) for b in range(n_blobs))
-
-    total_blob_combos_shallow = _total_blob_combos(shallow_blob_depth)
-    total_blob_combos_deep    = _total_blob_combos(blob_neighbor_depth)
-    total_p3p_shallow = n_shallow_lq * total_blob_combos_shallow
-    total_p3p_deep    = n_deep_lq    * total_blob_combos_deep
+    # Per-triple: how far blob depth has been explored (the blob_max of the last tier
+    # that processed this triple). Enables delta coverage across tiers.
+    prev_blob_max_per_triple = np.zeros(len(led_triple_idx), dtype=np.int32)
 
     rng = np.random.default_rng(rng_seed)
 
-    pass_p3p_calls = [0, 0]
-    pass_lq_tried  = [0, 0]
+    tier_p3p_calls = [0] * len(depth_tiers)
+    tier_lq_tried  = [0] * len(depth_tiers)
+    tier_lq_total  = [0] * len(depth_tiers)
 
     debug_active    = debug_led_ids is not None and debug_blob_ids is not None
     debug_led_list  = list(debug_led_ids)  if debug_active else None
     debug_blob_list = list(debug_blob_ids) if debug_active else None
 
     bijection_counts: Dict[frozenset, int] = {} if debug_count_duplicates else None
-    # seen_bijections:  set                  = set()
 
-    for pass_idx, (lq_mask, max_blob_d) in enumerate((
-        (shallow_mask, shallow_blob_depth),
-        (deep_mask,    blob_neighbor_depth),
-    )):
+    for tier_idx, (led_max, blob_max) in enumerate(depth_tiers):
         if strong_found:
             break
 
-        lq_indices = np.where(lq_mask)[0]
+        eligible_mask = led_triple_depth <= led_max
+        lq_all = np.where(eligible_mask)[0]
+
+        # Keep only triples that have new blob pairs to explore at this tier.
+        has_new    = prev_blob_max_per_triple[lq_all] < blob_max
+        lq_indices = lq_all[has_new]
+        tier_lq_total[tier_idx] = len(lq_indices)
+
         if len(lq_indices) == 0:
             continue
+
         lq_indices = lq_indices[rng.permutation(len(lq_indices))]
 
         for lq_i in lq_indices:
-            if strong_found:
-                break
-
             l_ids    = led_triple_idx[lq_i]          # [anchor, l1, l2]
             obj3     = positions[l_ids]               # (3, 3) world points for P3P
             gate_led = led_triple_gates[lq_i]
             gate_obj = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
 
+            # Start blob-pair enumeration from where the previous tier left off for
+            # this triple; avoids re-evaluating combinations already covered earlier.
+            min_blob_i2 = int(prev_blob_max_per_triple[lq_i])
             had_p3p = False
 
             for b_anchor in range(n_blobs):
                 if strong_found:
                     break
                 nbrs   = blob_nbr[b_anchor]
-                n_nbrs = min(len(nbrs), max_blob_d)
+                n_nbrs = min(len(nbrs), blob_max)
                 if n_nbrs < 2:
                     continue
 
                 for i1, i2 in combinations(range(n_nbrs), 2):
                     if strong_found:
                         break
+                    if i2 < min_blob_i2:
+                        continue
                     b1 = int(nbrs[i1])
                     b2 = int(nbrs[i2])
 
                     gate_blob_idx = [int(nbrs[j]) for j in range(n_nbrs) if j != i1 and j != i2]
-                    gate_img = blobs[gate_blob_idx].astype(np.float32) if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
+                    gate_img = blobs_undist[gate_blob_idx] if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
 
                     for b1_ord, b2_ord in ((b1, b2), (b2, b1)):
                         if strong_found:
@@ -784,7 +796,7 @@ def brute_match(
                             print(
                                 f"\n[DEBUG] Target triple reached — "
                                 f"LEDs {list(l_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
-                                f"pass={'shallow' if pass_idx == 0 else 'deep'}"
+                                f"tier={tier_idx} (led≤{led_max}, blob≤{blob_max})"
                             )
 
                         img3 = blobs[[b_anchor, b1_ord, b2_ord]]
@@ -792,15 +804,12 @@ def brute_match(
                         bij = frozenset(((int(l_ids[0]), b_anchor),
                                          (int(l_ids[1]), b1_ord),
                                          (int(l_ids[2]), b2_ord)))
-                        # if bij in seen_bijections:
-                        #     continue
-                        # seen_bijections.add(bij)
 
                         if bijection_counts is not None:
                             bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
 
                         # ── 1. P3P → up to 4 pose hypotheses ─────────────────
-                        pass_p3p_calls[pass_idx] += 1
+                        tier_p3p_calls[tier_idx] += 1
                         had_p3p = True
                         n_sols, rvecs, tvecs = cv2.solveP3P(
                             obj3.reshape(3, 1, 3),
@@ -829,9 +838,9 @@ def brute_match(
                             R_h, _ = cv2.Rodrigues(rvec_h)
 
                             # ── 3. Gate check (any gate LED near any gate blob) ─
-                            gate_ok = _gate_any_point(R_h, tvec_h, gate_obj, gate_img, fx, fy, cx, cy, p4_thresh_sq)
+                            gate_ok, gate_error = _gate_any_point(R_h, tvec_h, gate_obj, gate_img, fx, fy, cx, cy, p4_thresh_sq, dbg)
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: gate_ok={gate_ok}")
+                                print(f"  [DEBUG] sol {sol_i}: gate_ok={gate_ok}, error:{gate_error}")
                             if not gate_ok:
                                 continue
 
@@ -933,18 +942,20 @@ def brute_match(
                                 best_inliers    = n_ib
                                 best_error      = err
                                 best_orient_err = orient_err
-                                solution_pass   = "shallow" if pass_idx == 0 else "deep"
+                                solution_tier   = tier_idx
 
                                 if best_inliers >= strong_inliers_eff and best_error <= strong_match_error_px:
                                     strong_found = True
 
+            prev_blob_max_per_triple[lq_i] = blob_max
             if had_p3p:
-                pass_lq_tried[pass_idx] += 1
+                tier_lq_tried[tier_idx] += 1
+            if strong_found:
+                break
 
-    total_p3p_tried    = pass_p3p_calls[0] + pass_p3p_calls[1]
-    total_p3p_possible = total_p3p_shallow + total_p3p_deep
+    total_p3p_tried = sum(tier_p3p_calls)
     result_str = (
-        f"found in {solution_pass} pass  "
+        f"found in tier_{solution_tier} (led≤{depth_tiers[solution_tier][0]}, blob≤{depth_tiers[solution_tier][1]})  "
         f"({best_inliers} inliers, {best_error:.2f} px)"
         if best_solution is not None else "not found"
     )
@@ -957,13 +968,16 @@ def brute_match(
             f"\n  bijections — {n_unique} unique / {total_p3p_tried} calls  "
             f"({n_dup} duplicate calls, max {max_dup}× same bijection)"
         )
-    print(
-        f"Brute-force: {result_str}\n"
-        f"  shallow — {pass_p3p_calls[0]:>7} / {total_p3p_shallow:>7} P3P calls  "
-        f"({pass_lq_tried[0]}/{n_shallow_lq} LED triples reached inner loop)\n"
-        f"  deep    — {pass_p3p_calls[1]:>7} / {total_p3p_deep:>7} P3P calls  "
-        f"({pass_lq_tried[1]}/{n_deep_lq} LED triples reached inner loop)\n"
-        f"  total   — {total_p3p_tried:>7} / {total_p3p_possible:>7} P3P calls"
-        f"{dup_line}"
+    tier_lines = "\n".join(
+        f"  tier_{i} (led≤{depth_tiers[i][0]}, blob≤{depth_tiers[i][1]}) — "
+        f"{tier_p3p_calls[i]:>7} P3P calls  "
+        f"({tier_lq_tried[i]}/{tier_lq_total[i]} LED triples reached inner loop)"
+        for i in range(len(depth_tiers))
     )
+    # print(
+    #     f"Brute-force: {result_str}\n"
+    #     f"{tier_lines}\n"
+    #     f"  total — {total_p3p_tried:>7} P3P calls"
+    #     f"{dup_line}"
+    # )
     return best_solution
