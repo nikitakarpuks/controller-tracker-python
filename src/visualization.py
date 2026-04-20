@@ -36,6 +36,11 @@ VIS_CONFIG = {
     "matched_proj_z_offset": 0.000,  # how far matched projection disks sit in front of frustum_z (metres)
     "error_z_offset":        0.0005, # how far the 2-D error-line plane sits in front of frustum_z (metres)
     "error_radius":          0.0001, # thickness of reprojection error lines (metres)
+    # Error value label appearance
+    "show_error_values":       True,
+    "error_value_label_size":  12,
+    "error_value_label_color": [255, 0, 0],          # RGB — red
+    "error_value_label_offset": [0.0006, 0.0006],    # [dx, dy] shift in error-plane metres
     # LED ID label appearance
     "led_id_label_size":     12,            # point marker size that anchors the label (Rerun units)
     "led_id_label_color":    [180, 0, 255], # RGB — violet by default
@@ -587,10 +592,13 @@ class ControllerAnimatorRerun:
                         triangle_indices=bf,
                         vertex_colors=bc,
                     ))
+                else:
+                    rr.log("world/blobs", rr.Clear(recursive=False))
+            elif self.vis_cfg.get("show_blobs", True):
+                rr.log("world/blobs", rr.Clear(recursive=False))
 
             # ---- blob ID labels on the blob plane ----
             if self.vis_cfg.get("show_blob_ids", True):
-                blabel_size   = self.vis_cfg.get("blob_id_label_size",   12)
                 blabel_color  = self.vis_cfg.get("blob_id_label_color",  [255, 210, 0])
                 blabel_offset = self.vis_cfg.get("blob_id_label_offset", [0.0006, -0.0006])
                 bdx, bdy = blabel_offset[0], blabel_offset[1]
@@ -601,10 +609,12 @@ class ControllerAnimatorRerun:
                     positions=blob_label_pts,
                     labels=[str(i) for i in range(len(blobs))],
                     colors=[blabel_color] * len(blobs),
-                    radii=0.0,  # invisible anchor point; only the label text is shown
+                    radii=0.0,
                 ))
         else:
             pts_plane = None
+            rr.log("world/blobs",    rr.Clear(recursive=False))
+            rr.log("world/blob_ids", rr.Clear(recursive=False))
 
         # ---- visible LED projections (matched + physically visible unmatched) ----
         # Matched LEDs use matched_proj_z, unmatched use frustum_z.
@@ -620,85 +630,122 @@ class ControllerAnimatorRerun:
                 all_proj_lids.append(i)
                 lid_to_proj_pt[i] = proj_pt
 
-        if self.vis_cfg.get("show_projected", True) and all_proj_pts:
-            proj_colors = np.array(
-                [[70, 130, 255] if lid in matched_lids else [230, 80, 50]
-                 for lid in all_proj_lids],
-                dtype=np.uint8,
-            )
-            proj_normals = np.tile([0.0, 0.0, -1.0],
-                                   (len(all_proj_pts), 1)).astype(np.float32)
-            pv, pf, pc = make_disk_mesh(
-                np.array(all_proj_pts, dtype=np.float32),
-                proj_normals, proj_colors,
-                radius=proj_disk_radius, n_segments=16, surface_offset=0.0,
-            )
-            rr.log("world/projected_leds", rr.Mesh3D(
-                vertex_positions=pv,
-                triangle_indices=pf,
-                vertex_colors=pc,
-            ))
+        if self.vis_cfg.get("show_projected", True):
+            if all_proj_pts:
+                proj_colors = np.array(
+                    [[70, 130, 255] if lid in matched_lids else [230, 80, 50]
+                     for lid in all_proj_lids],
+                    dtype=np.uint8,
+                )
+                proj_normals = np.tile([0.0, 0.0, -1.0],
+                                       (len(all_proj_pts), 1)).astype(np.float32)
+                pv, pf, pc = make_disk_mesh(
+                    np.array(all_proj_pts, dtype=np.float32),
+                    proj_normals, proj_colors,
+                    radius=proj_disk_radius, n_segments=16, surface_offset=0.0,
+                )
+                rr.log("world/projected_leds", rr.Mesh3D(
+                    vertex_positions=pv,
+                    triangle_indices=pf,
+                    vertex_colors=pc,
+                ))
+            else:
+                rr.log("world/projected_leds", rr.Clear(recursive=False))
 
         # ---- LED ID labels on the frustum plane ----
-        if self.vis_cfg.get("show_led_ids", True) and all_proj_pts:
-            label_size   = self.vis_cfg.get("led_id_label_size",   12)
-            label_color  = self.vis_cfg.get("led_id_label_color",  [180, 0, 255])
-            label_offset = self.vis_cfg.get("led_id_label_offset", [0.0006, -0.0006])
-            dx, dy = label_offset[0], label_offset[1]
-            label_pts = np.array(all_proj_pts, dtype=np.float32).copy()
-            label_pts[:, 0] += dx
-            label_pts[:, 1] += dy
-            rr.log("world/led_ids", rr.Points3D(
-                positions=label_pts,
-                labels=[str(lid) for lid in all_proj_lids],
-                colors=[label_color] * len(all_proj_lids),
-                radii=0.0,  # invisible anchor point; only the label text is shown
-            ))
+        if self.vis_cfg.get("show_led_ids", True):
+            if all_proj_pts:
+                label_color  = self.vis_cfg.get("led_id_label_color",  [180, 0, 255])
+                label_offset = self.vis_cfg.get("led_id_label_offset", [0.0006, -0.0006])
+                dx, dy = label_offset[0], label_offset[1]
+                label_pts = np.array(all_proj_pts, dtype=np.float32).copy()
+                label_pts[:, 0] += dx
+                label_pts[:, 1] += dy
+                rr.log("world/led_ids", rr.Points3D(
+                    positions=label_pts,
+                    labels=[str(lid) for lid in all_proj_lids],
+                    colors=[label_color] * len(all_proj_lids),
+                    radii=0.0,
+                ))
+            else:
+                rr.log("world/led_ids", rr.Clear(recursive=False))
 
         # ---- rays: matched (blue) and unmatched-but-visible (orange-red) ----
-        matched_ray_strips   = []
-        unmatched_ray_strips = []
-        error_strips         = []
+        # Both sets are merged into one path so there is never a stale second
+        # path persisting from a previous frame with a leftover color.
+        ray_strips = []
+        ray_colors = []
+        error_strips    = []
+        error_values    = []   # pixel reprojection errors, one per matched pair
+        error_label_pts = []   # 3-D positions for error value labels
 
+        # Pre-project all matched LEDs at once using the real K + distortion,
+        # matching exactly how _matching.py computes its reported error.
+        rvec_model, _ = cv2.Rodrigues(R)
         if assignment and pts_plane is not None:
-            for bid, lid in assignment:
+            matched_lids_ord = [lid for _, lid in assignment]
+            proj_matched, _ = cv2.projectPoints(
+                self.model_positions[matched_lids_ord].astype(np.float32),
+                rvec_model,
+                t.astype(np.float32).reshape(3, 1),
+                camera.camera_matrix,
+                camera.dist_coeffs,
+            )
+            proj_matched = proj_matched.reshape(-1, 2)
+
+            for pair_i, (bid, lid) in enumerate(assignment):
                 if bid >= len(pts_plane) or lid not in lid_to_proj_pt:
                     continue
                 if self.vis_cfg.get("show_rays", True):
-                    matched_ray_strips.append([pts_cam_real[lid], lid_to_proj_pt[lid]])
-                if self.vis_cfg.get("show_errors", True):
-                    # Both endpoints on the flat error plane at error_z
-                    px, py, pz = pts_cam_real[lid]
-                    if pz > 1e-6:
-                        proj_flat = np.array([px / pz * error_z, py / pz * error_z, error_z])
+                    ray_strips.append([pts_cam_real[lid], lid_to_proj_pt[lid]])
+                    ray_colors.append([70, 130, 255])
+                px, py, pz = pts_cam_real[lid]
+                if pz > 1e-6:
+                    proj_flat = np.array([px / pz * error_z, py / pz * error_z, error_z])
+                    if self.vis_cfg.get("show_errors", True):
                         error_strips.append([proj_flat, pts_plane[bid]])
+                    u, v = blobs[bid]
+                    pu, pv = proj_matched[pair_i]
+                    err_px = np.sqrt((u - pu) ** 2 + (v - pv) ** 2)
+                    error_values.append(err_px)
+                    error_label_pts.append((proj_flat + pts_plane[bid]) / 2)
 
-        # Unmatched rays: only LEDs that are physically visible per _visible_mask
+        # Unmatched rays: visible LEDs not in the assignment
         if self.vis_cfg.get("show_rays", True):
             for lid, proj_pt in lid_to_proj_pt.items():
                 if lid not in matched_lids:
-                    unmatched_ray_strips.append([pts_cam_real[lid], proj_pt])
+                    ray_strips.append([pts_cam_real[lid], proj_pt])
+                    ray_colors.append([230, 80, 50])
 
-        if matched_ray_strips:
-            rr.log("world/rays", rr.LineStrips3D(
-                strips=matched_ray_strips,
-                colors=[70, 130, 255],
-                radii=ray_radius,
-            ))
+        # Always log every frame — empty strips clears the path, preventing
+        # stale geometry from a previous frame bleeding through.
+        rr.log("world/rays", rr.LineStrips3D(
+            strips=ray_strips,
+            colors=ray_colors if ray_strips else [[0, 0, 0]],
+            radii=ray_radius,
+        ) if ray_strips else rr.Clear(recursive=False))
 
-        if unmatched_ray_strips:
-            rr.log("world/rays_unmatched", rr.LineStrips3D(
-                strips=unmatched_ray_strips,
-                colors=[230, 80, 50],
-                radii=ray_radius,
-            ))
+        rr.log("world/errors", rr.LineStrips3D(
+            strips=error_strips,
+            colors=[255, 0, 0],
+            radii=error_radius,
+        ) if error_strips else rr.Clear(recursive=False))
 
-        if error_strips:
-            rr.log("world/errors", rr.LineStrips3D(
-                strips=error_strips,
-                colors=[255, 0, 0],
-                radii=error_radius,
-            ))
+        if self.vis_cfg.get("show_error_values", True):
+            if error_label_pts:
+                ev_color  = self.vis_cfg.get("error_value_label_color",  [255, 0, 0])
+                ev_offset = self.vis_cfg.get("error_value_label_offset", [0.0006, 0.0006])
+                ev_pts = np.array(error_label_pts, dtype=np.float32).copy()
+                ev_pts[:, 0] += ev_offset[0]
+                ev_pts[:, 1] += ev_offset[1]
+                rr.log("world/error_values", rr.Points3D(
+                    positions=ev_pts,
+                    labels=[f"{e:.2f}" for e in error_values],
+                    colors=[ev_color] * len(ev_pts),
+                    radii=0.0,
+                ))
+            else:
+                rr.log("world/error_values", rr.Clear(recursive=False))
 
 
 # =========================================================
