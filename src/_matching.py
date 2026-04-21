@@ -1,12 +1,15 @@
+import math
+
 import cv2
 import numpy as np
+from loguru import logger
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import KDTree
 from scipy.spatial.distance import cdist
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
-import math
+from src.debug_config import is_deep, get_debug_triple, is_verbose_all, log_best
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +27,7 @@ def _ransac_pnp(
     K, dc,
     rvec_init=None,
     tvec_init=None,
-    reprojection_px: float = 3.0,
+    reprojection_px: float = 2.0,
     iterations: int = 100,
     confidence: float = 0.99,
 ) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -135,7 +138,7 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)  # unit vector TO led
     normals_cam = (R @ normals.T).T                                                    # normals in camera space
     dot         = (normals_cam * view_dir).sum(axis=1)   # < 0 → normal opposes view → LED faces camera
-    mask        = z_ok & (dot < 0.0)
+    mask        = z_ok & (dot < -0.01)
 
     # Outer LEDs have no occlusion geometry to test — return early.
     if is_inner is None or radial_out is None or ring_axis is None or not np.any(is_inner):
@@ -237,9 +240,12 @@ def _compute_frustum_geometry(positions: np.ndarray, normals: np.ndarray):
     # SVD of the centered positions gives a set of principal axes; the axis with
     # the *smallest* singular value is the one with the least variance — that is
     # the normal to the ring plane, i.e. the symmetry axis of the frustum.
-    centroid  = positions.mean(axis=0)
-    _, _, Vt  = np.linalg.svd(positions - centroid)
-    ring_axis = Vt[-1]    # last row of Vt → direction of minimum spread
+
+    # centroid  = positions.mean(axis=0)
+    centroid = np.array([0.0, 0.0, 0.0])
+    # _, _, Vt  = np.linalg.svd(positions - centroid)
+    # ring_axis = Vt[-1]    # last row of Vt → direction of minimum spread
+    ring_axis = np.array([0.0, 0.0, -1.0])
 
     # ── Step 2: compute per-LED radial direction (outward from ring center) ───────
     # Project each LED position onto the ring plane (remove the axial component),
@@ -294,7 +300,8 @@ def _compute_frustum_geometry(positions: np.ndarray, normals: np.ndarray):
     # (outer LED z_rel extremes ± small margin) avoids hardcoding any dimensions.
     # A 5 mm margin on each side accounts for the physical LED-to-edge gap.
     z_frustum_top = float(outer_z_rel.max()) + 0.004   # just beyond the wide-base LEDs
-    z_frustum_bot = float(outer_z_rel.min()) - 0.005   # just beyond the narrow-base LEDs
+    # z_frustum_bot = float(outer_z_rel.min()) - 0.005   # just beyond the narrow-base LEDs
+    z_frustum_bot = -z_frustum_top
 
     # # --- h_corpus: radial gap from each inner LED to the outer frustum wall ---
     # n = len(positions)
@@ -305,7 +312,7 @@ def _compute_frustum_geometry(positions: np.ndarray, normals: np.ndarray):
     #     h_corpus[i] = max(0.0, R_out_i - r_led_i)
 
     return (big_ring_axis, is_inner, radial_out, centroid,
-            R_fc, frustum_slope, z_frustum_top, z_frustum_bot)
+            R_fc, frustum_slope, z_frustum_top, z_frustum_bot, z_rel)
 
 
 def _build_led_neighbor_lists(positions: np.ndarray, normals: np.ndarray, k: int = 8) -> List[np.ndarray]:
@@ -332,6 +339,81 @@ def _build_led_neighbor_lists(positions: np.ndarray, normals: np.ndarray, k: int
             continue
         order = np.argsort(dists[i, candidates])
         result.append(candidates[order[:k_act]])
+    return result
+
+
+def _build_led_neighbor_lists_edge(
+    positions: np.ndarray,
+    normals: np.ndarray,
+    is_inner: np.ndarray,
+    z_rel: np.ndarray,
+    k: int = 8,
+) -> List[np.ndarray]:
+    """
+    Alternative neighbourhood for grazing-angle views (~30° to the frustum base plane)
+    where both inner and outer LEDs are simultaneously visible.
+
+    For each anchor LED the k neighbours are filled with a strict split:
+      - n_same  = min(k // 2, 2): at most 2 nearest same-type LEDs (outer→outer or
+                                   inner→inner) with dot >= 0, sorted by distance.
+      - n_cross = k - n_same     : cross-type LEDs (outer→inner or inner→outer)
+                                   with dot >= 0, sorted by normal similarity descending.
+
+    The two halves are interleaved with cross-type first:
+      cross[0], same[0], cross[1], same[1], …
+    so rank 0 is always the best cross-type match (the grazing-view target), rank 1 the
+    nearest same-type, and deeper ranks continue alternating.  Depth-2 triple (0,1)
+    therefore pairs the best cross LED with the nearest same LED.
+
+    debug_led_ids: if provided, print the chosen neighbours for each listed LED id.
+    """
+    n       = len(positions)
+    n_same  = min(k // 2, 2)
+    n_cross = k - n_same
+
+    dists = cdist(positions, positions)   # (N,N) Euclidean distances
+    dots  = normals @ normals.T           # (N,N) pairwise normal cosines
+
+    result = []
+    for i in range(n):
+        # ── same-type: nearest by distance, dot >= 0, capped at 2 ────────────────
+        same_valid = (is_inner == is_inner[i]) & (dots[i] >= 0.0)
+        same_valid[i] = False
+        same_cands = np.where(same_valid)[0]
+        if len(same_cands):
+            same_nbrs = same_cands[np.argsort(dists[i, same_cands])[:n_same]]
+        else:
+            same_nbrs = np.array([], dtype=int)
+
+        # ── cross-type: most normal-similar, dot >= 0 ────────────────────────────
+        cross_valid = (is_inner != is_inner[i]) & (dots[i] >= 0.0)
+        cross_cands = np.where(cross_valid)[0]
+        if len(cross_cands):
+            cross_nbrs = cross_cands[np.argsort(-dots[i, cross_cands])[:n_cross]]
+        else:
+            cross_nbrs = np.array([], dtype=int)
+
+        # ── interleave: cross[0], same[0], cross[1], same[1], … ─────────────────
+        nbrs = []
+        for slot in range(max(len(same_nbrs), len(cross_nbrs))):
+            if slot < len(cross_nbrs):
+                nbrs.append(cross_nbrs[slot])
+            if slot < len(same_nbrs):
+                nbrs.append(same_nbrs[slot])
+        nbrs = np.array(nbrs, dtype=int)
+        result.append(nbrs)
+
+        if is_deep():
+            kind = "inner" if is_inner[i] else "outer"
+            lines = [f"LED {i:2d} ({kind}, z_rel={z_rel[i]:+.5f})  →  neighbours:"]
+            for rank, j in enumerate(nbrs):
+                jkind = "inner" if is_inner[j] else "outer"
+                src   = "same " if is_inner[j] == is_inner[i] else "cross"
+                lines.append(f"  rank {rank}: LED {j:2d} ({jkind}/{src}, "
+                              f"z_rel={z_rel[j]:+.5f}, dot={dots[i,j]:.4f}, "
+                              f"dist={dists[i,j]*1000:.1f} mm)")
+            # logger.debug("\n".join(lines))
+
     return result
 
 
@@ -415,19 +497,17 @@ def _gate_any_point(
     gate_img: np.ndarray,
     fx: float, fy: float, cx: float, cy: float,
     thresh_sq: float,
-    debug_distance: bool = False,
 ) -> Tuple[bool, float]:
     """
     Return True if ANY gate LED projects within sqrt(thresh_sq) pixels of ANY gate blob.
     If either pool is empty, returns True (no gate to fail).
+    Returns (passed, min_dist_px); min_dist is only tracked in deep-debug mode.
     """
     if len(gate_obj) == 0 or len(gate_img) == 0:
         return True, 0.0
 
-    if debug_distance:
-        min_dist = np.inf
-    else:
-        min_dist = 0.0
+    track_dist = is_deep()
+    min_dist   = np.inf if track_dist else 0.0
     for obj in gate_obj:
         p = R_h @ obj + tvec_h
         if p[2] <= 0:
@@ -438,10 +518,8 @@ def _gate_any_point(
         for img in gate_img:
             dx = px - img[0]
             dy = py - img[1]
-
-            if debug_distance:
+            if track_dist:
                 min_dist = min(min_dist, math.sqrt(dx * dx + dy * dy))
-
             if dx * dx + dy * dy <= thresh_sq:
                 return True, min_dist
     return False, min_dist
@@ -629,6 +707,9 @@ def proximity_match(
         "method":     "proximity",
     }
 
+def _tier_label(t):
+    nbr = t[2] if len(t) > 2 else 'standard'
+    return f"led≤{t[0]}, blob≤{t[1]}, nbr={nbr}"
 
 # ---------------------------------------------------------------------------
 # brute_match
@@ -637,20 +718,16 @@ def proximity_match(
 def brute_match(
     self,
     blobs: np.ndarray,
-    depth_tiers: Tuple[Tuple[int, int], ...] = ((2, 3), (2, 4), (3, 5), (4,6)),  # (LED neighbor size, blob neighbor size) minimum is (2, 3)
+    depth_tiers: Tuple[Tuple, ...] = ((2, 3), (2, 4), (2, 4, 'edge'), (3, 5), (3, 5, 'edge'), (4, 6)),  # (led_max, blob_max[, 'standard'|'edge'])
     p4_threshold_px: float = 2.0,
-    reprojection_threshold: float = 5.0,
+    reprojection_threshold: float = 2.0,
     min_inliers: int = 4,
     min_inlier_fraction: float = 0.8,
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
+    min_vis_coverage: float = 0.5,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
-    debug_led_ids: Optional[List[int]] = None,    # ordered [anchor, l1, l2]
-    debug_blob_ids: Optional[List[int]] = None,   # ordered [b_anchor, b1, b2]
-    # debug_led_ids: Optional[List[int]] = [7, 13, 11],  # ordered [anchor, l1, l2]
-    # debug_blob_ids: Optional[List[int]] = [3, 1, 4],  # ordered [b_anchor, b1, b2]
-    debug_count_duplicates: bool = True,
 ) -> Optional[Dict]:
     """
     Exhaustive pose search via P3P over LED/blob triple correspondences.
@@ -685,6 +762,10 @@ def brute_match(
     led_triple_depth = self._led_triple_depth  # (N_LT,) int32
     led_triple_gates = self._led_triple_gates  # List[np.ndarray] gate LED indices per triple
 
+    led_triple_idx_edge   = self._led_triple_idx_edge
+    led_triple_depth_edge = self._led_triple_depth_edge
+    led_triple_gates_edge = self._led_triple_gates_edge
+
     is_inner         = self._is_inner
     radial_out       = self._radial_out
     ring_axis        = self._ring_axis
@@ -694,7 +775,7 @@ def brute_match(
     z_frustum_top    = self._z_frustum_top
     z_frustum_bot    = self._z_frustum_bot
 
-    max_blob_depth = max(blob_max for _, blob_max in depth_tiers)
+    max_blob_depth = max(t[1] for t in depth_tiers)
     blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
 
     # Undistort blobs once (mirrors OpenHMD's correspondence_search_set_blobs).
@@ -721,7 +802,9 @@ def brute_match(
 
     # Per-triple: how far blob depth has been explored (the blob_max of the last tier
     # that processed this triple). Enables delta coverage across tiers.
-    prev_blob_max_per_triple = np.zeros(len(led_triple_idx), dtype=np.int32)
+    # Maintained separately for each neighbourhood type so delta tracking is consistent.
+    prev_blob_max_per_triple      = np.zeros(len(led_triple_idx),      dtype=np.int32)
+    prev_blob_max_per_triple_edge = np.zeros(len(led_triple_idx_edge), dtype=np.int32)
 
     rng = np.random.default_rng(rng_seed)
 
@@ -729,21 +812,36 @@ def brute_match(
     tier_lq_tried  = [0] * len(depth_tiers)
     tier_lq_total  = [0] * len(depth_tiers)
 
-    debug_active    = debug_led_ids is not None and debug_blob_ids is not None
-    debug_led_list  = list(debug_led_ids)  if debug_active else None
-    debug_blob_list = list(debug_blob_ids) if debug_active else None
+    _dbg_leds, _dbg_blobs = get_debug_triple()
+    debug_active    = _dbg_leds is not None and _dbg_blobs is not None
+    debug_led_list  = list(_dbg_leds)  if debug_active else None
+    debug_blob_list = list(_dbg_blobs) if debug_active else None
 
-    bijection_counts: Dict[frozenset, int] = {} if debug_count_duplicates else None
+    bijection_counts: Dict[frozenset, int] = {} if is_deep() else None
 
-    for tier_idx, (led_max, blob_max) in enumerate(depth_tiers):
+    for tier_idx, tier_spec in enumerate(depth_tiers):
         if strong_found:
             break
 
-        eligible_mask = led_triple_depth <= led_max
+        led_max, blob_max = tier_spec[0], tier_spec[1]
+        nbr_type = tier_spec[2] if len(tier_spec) > 2 else 'standard'
+
+        if nbr_type == 'edge':
+            cur_triple_idx   = led_triple_idx_edge
+            cur_triple_depth = led_triple_depth_edge
+            cur_triple_gates = led_triple_gates_edge
+            cur_prev_blob    = prev_blob_max_per_triple_edge
+        else:
+            cur_triple_idx   = led_triple_idx
+            cur_triple_depth = led_triple_depth
+            cur_triple_gates = led_triple_gates
+            cur_prev_blob    = prev_blob_max_per_triple
+
+        eligible_mask = cur_triple_depth <= led_max
         lq_all = np.where(eligible_mask)[0]
 
         # Keep only triples that have new blob pairs to explore at this tier.
-        has_new    = prev_blob_max_per_triple[lq_all] < blob_max
+        has_new    = cur_prev_blob[lq_all] < blob_max
         lq_indices = lq_all[has_new]
         tier_lq_total[tier_idx] = len(lq_indices)
 
@@ -753,14 +851,14 @@ def brute_match(
         lq_indices = lq_indices[rng.permutation(len(lq_indices))]
 
         for lq_i in lq_indices:
-            l_ids    = led_triple_idx[lq_i]          # [anchor, l1, l2]
+            l_ids    = cur_triple_idx[lq_i]          # [anchor, l1, l2]
             obj3     = positions[l_ids]               # (3, 3) world points for P3P
-            gate_led = led_triple_gates[lq_i]
+            gate_led = cur_triple_gates[lq_i]
             gate_obj = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
 
             # Start blob-pair enumeration from where the previous tier left off for
             # this triple; avoids re-evaluating combinations already covered earlier.
-            min_blob_i2 = int(prev_blob_max_per_triple[lq_i])
+            min_blob_i2 = int(cur_prev_blob[lq_i])
             had_p3p = False
 
             for b_anchor in range(n_blobs):
@@ -787,16 +885,16 @@ def brute_match(
                             break
 
                         # ── Debug trigger ─────────────────────────────────────
-                        dbg = (
+                        dbg = is_verbose_all() or (
                             debug_active and
                             list(l_ids) == debug_led_list and
                             [b_anchor, b1_ord, b2_ord] == debug_blob_list
                         )
                         if dbg:
-                            print(
-                                f"\n[DEBUG] Target triple reached — "
+                            logger.debug(
+                                f"Target triple reached — "
                                 f"LEDs {list(l_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
-                                f"tier={tier_idx} (led≤{led_max}, blob≤{blob_max})"
+                                f"tier={tier_idx} ({_tier_label(tier_spec)})"
                             )
 
                         img3 = blobs[[b_anchor, b1_ord, b2_ord]]
@@ -818,7 +916,7 @@ def brute_match(
                             flags=cv2.SOLVEPNP_P3P,
                         )
                         if dbg:
-                            print(f"  [DEBUG] P3P returned {n_sols} solutions")
+                            logger.debug(f"  P3P returned {n_sols} solutions")
                         if not n_sols or rvecs is None:
                             continue
 
@@ -831,16 +929,16 @@ def brute_match(
                             # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
                             z_ok = _check_z_range(tvec_h)
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
+                                logger.debug(f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
                             if not z_ok:
                                 continue
 
                             R_h, _ = cv2.Rodrigues(rvec_h)
 
                             # ── 3. Gate check (any gate LED near any gate blob) ─
-                            gate_ok, gate_error = _gate_any_point(R_h, tvec_h, gate_obj, gate_img, fx, fy, cx, cy, p4_thresh_sq, dbg)
+                            gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_obj, gate_img, fx, fy, cx, cy, p4_thresh_sq)
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: gate_ok={gate_ok}, error:{gate_error}")
+                                logger.debug(f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
                             if not gate_ok:
                                 continue
 
@@ -854,7 +952,7 @@ def brute_match(
                             )
                             vis_ids = np.where(vis_mask_h)[0]
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: {len(vis_ids)} visible LEDs")
+                                logger.debug(f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
                             if len(vis_ids) < min_inliers:
                                 continue
 
@@ -867,8 +965,11 @@ def brute_match(
                             il = vis_ids[ci[inlier_mask]]
 
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: {len(ib)} inliers after Hungarian "
-                                      f"(need {min_inliers_eff})")
+                                outlier_mask = cost[ri, ci] >= reprojection_threshold
+                                x = ri[outlier_mask]
+                                y = vis_ids[ci[outlier_mask]]
+                                logger.debug(f"  sol {sol_i}: {len(ib)} inliers after Hungarian "
+                                             f"(need {min_inliers_eff})")
                             if len(ib) < min_inliers_eff:
                                 continue
 
@@ -878,8 +979,8 @@ def brute_match(
                                 rvec_h, tvec_h.reshape(3, 1),
                             )
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: RANSAC ok={ok_r}, "
-                                      f"inliers={len(ransac_inliers) if ok_r else 0}")
+                                logger.debug(f"  sol {sol_i}: RANSAC ok={ok_r}, "
+                                             f"inliers={len(ransac_inliers) if ok_r else 0}")
                             if not ok_r:
                                 continue
 
@@ -901,13 +1002,23 @@ def brute_match(
                             il = il[vis_sub]
                             ib = ib[vis_sub]
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: {len(ib)} inliers after vis recheck")
+                                logger.debug(f"  sol {sol_i}: {len(ib)} inliers after vis recheck")
                             if len(ib) < min_inliers_eff:
+                                continue
+
+                            # ── 7. Visibility coverage check ──────────────────
+                            n_vis = len(vis_ids)
+                            n_ib  = len(ib)
+                            if n_vis > 0 and n_ib < min_vis_coverage * n_vis:
+                                if dbg:
+                                    logger.debug(
+                                        f"  sol {sol_i}: vis coverage {n_ib}/{n_vis}"
+                                        f"={n_ib/n_vis:.2f} < {min_vis_coverage:.2f}"
+                                    )
                                 continue
 
                             proj_r = _project_points(rvec_r, tvec_r, positions[il], K, dc)
                             err    = float(np.mean(np.linalg.norm(proj_r - blobs[ib], axis=1)))
-                            n_ib   = len(ib)
 
                             orient_err = np.inf
                             if R_prior is not None:
@@ -927,8 +1038,8 @@ def brute_match(
                             )
 
                             if dbg:
-                                print(f"  [DEBUG] sol {sol_i}: err={err:.3f} px  inliers={n_ib}  "
-                                      f"is_better={is_better}")
+                                logger.debug(f"  sol {sol_i}: err={err:.3f} px  inliers={n_ib}  "
+                                             f"is_better={is_better}")
 
                             if is_better:
                                 best_solution = {
@@ -944,18 +1055,29 @@ def brute_match(
                                 best_orient_err = orient_err
                                 solution_tier   = tier_idx
 
-                                if best_inliers >= strong_inliers_eff and best_error <= strong_match_error_px:
+                                if log_best():
+                                    logger.debug(
+                                        f"  ★ new best — tier={tier_idx} "
+                                        f"LEDs{list(l_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
+                                        f"sol={sol_i}  inliers={n_ib}  err={err:.3f}px  "
+                                        f"vis={n_ib}/{n_vis}"
+                                    )
+
+                                if (best_inliers >= strong_inliers_eff
+                                        and best_error <= strong_match_error_px
+                                        and (n_vis == 0 or n_ib >= min_vis_coverage * n_vis)):
                                     strong_found = True
 
-            prev_blob_max_per_triple[lq_i] = blob_max
+            cur_prev_blob[lq_i] = blob_max
             if had_p3p:
                 tier_lq_tried[tier_idx] += 1
             if strong_found:
                 break
 
     total_p3p_tried = sum(tier_p3p_calls)
+
     result_str = (
-        f"found in tier_{solution_tier} (led≤{depth_tiers[solution_tier][0]}, blob≤{depth_tiers[solution_tier][1]})  "
+        f"found in tier_{solution_tier} ({_tier_label(depth_tiers[solution_tier])})  "
         f"({best_inliers} inliers, {best_error:.2f} px)"
         if best_solution is not None else "not found"
     )
@@ -969,15 +1091,15 @@ def brute_match(
             f"({n_dup} duplicate calls, max {max_dup}× same bijection)"
         )
     tier_lines = "\n".join(
-        f"  tier_{i} (led≤{depth_tiers[i][0]}, blob≤{depth_tiers[i][1]}) — "
+        f"  tier_{i} ({_tier_label(depth_tiers[i])}) — "
         f"{tier_p3p_calls[i]:>7} P3P calls  "
         f"({tier_lq_tried[i]}/{tier_lq_total[i]} LED triples reached inner loop)"
         for i in range(len(depth_tiers))
     )
-    # print(
-    #     f"Brute-force: {result_str}\n"
-    #     f"{tier_lines}\n"
-    #     f"  total — {total_p3p_tried:>7} P3P calls"
-    #     f"{dup_line}"
-    # )
+    logger.debug(
+        f"Brute-force: {result_str}\n"
+        f"{tier_lines}\n"
+        f"  total — {total_p3p_tried:>7} P3P calls"
+        f"{dup_line}"
+    )
     return best_solution
