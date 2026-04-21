@@ -1,8 +1,10 @@
 import cv2
 import numpy as np
+from loguru import logger
 from typing import List, Tuple, Optional, Dict
 
 from src.camera import Camera
+from src.debug_config import is_deep
 from src.transformations import Transform
 
 
@@ -71,6 +73,7 @@ class SingleViewTracker:
         from src._matching import (
             _compute_frustum_geometry,
             _build_led_neighbor_lists,
+            _build_led_neighbor_lists_edge,
             _precompute_led_quads,
         )
         positions = model.positions.astype("float32")
@@ -79,10 +82,17 @@ class SingleViewTracker:
          self._ring_centroid,
          self._R_frustum_center, self._frustum_slope,
          self._z_frustum_top, self._z_frustum_bot,
+         self._z_rel,
          ) = _compute_frustum_geometry(positions, normals)
         self._led_nbr = _build_led_neighbor_lists(positions, normals)
         self._led_triple_idx, self._led_triple_depth, self._led_triple_gates = _precompute_led_quads(
             positions, self._led_nbr,
+        )
+        self._led_nbr_edge = _build_led_neighbor_lists_edge(
+            positions, normals, self._is_inner, self._z_rel
+        )
+        self._led_triple_idx_edge, self._led_triple_depth_edge, self._led_triple_gates_edge = (
+            _precompute_led_quads(positions, self._led_nbr_edge)
         )
 
         # Bind strategies
@@ -245,12 +255,11 @@ class SingleViewTracker:
         # else:
         # --- No prior pose: brute-force re-acquisition ---
         if n_blobs >= 4:
-            solution = self.brute_match(blobs, pose_prior=self.last_good_pose)
+            solution = self.brute_match(blobs)
 
-            # Validate against last known good pose (loose thresholds —
-            # the controller could have moved significantly while lost,
-            # but not teleported across the room).
-            if solution is not None and self.last_good_pose is not None:
+            # In deep-debug mode frames are non-consecutive, so the last_good_pose
+            # plausibility check is skipped — the controller can be anywhere.
+            if solution is not None and self.last_good_pose is not None and not is_deep():
                 rvec_lg, tvec_lg = self.last_good_pose
                 if self._pose_jump_too_large(
                     solution["rvec"], solution["tvec"],
@@ -258,30 +267,29 @@ class SingleViewTracker:
                     max_dist_m=0.5,
                     max_angle_deg=60.0,
                 ):
-                    print("[tracking] Brute re-acquisition rejected: "
-                          "too far from last known good pose.")
+                    logger.debug("Brute re-acquisition rejected: too far from last known good pose.")
                     solution = None
 
-        # ------------------------------------------------------------------
-        # Pose-jump guard against prev_pose (tight, per-frame)
-        # ------------------------------------------------------------------
-        if solution is not None and self.prev_pose is not None:
-            rvec_p, tvec_p = self.prev_pose
-            if self._pose_jump_too_large(
-                solution["rvec"], solution["tvec"],
-                rvec_p, tvec_p,
-            ):
-                print(f"[tracking] Pose jump detected "
-                      f"(method={solution.get('method','?')}, "
-                      f"err={solution['error']:.2f} px) — "
-                      f"attempting brute recovery.")
-                solution = None
-                if n_blobs >= 4:
-                    brute = self.brute_match(blobs, pose_prior=self.prev_pose)
-                    if brute is not None and not self._pose_jump_too_large(
-                        brute["rvec"], brute["tvec"], rvec_p, tvec_p,
-                    ):
-                        solution = brute
+        # # ------------------------------------------------------------------
+        # # Pose-jump guard against prev_pose (tight, per-frame)
+        # # ------------------------------------------------------------------
+        # if solution is not None and self.prev_pose is not None:
+        #     rvec_p, tvec_p = self.prev_pose
+        #     if self._pose_jump_too_large(
+        #         solution["rvec"], solution["tvec"],
+        #         rvec_p, tvec_p,
+        #     ):
+        #         print(f"[tracking] Pose jump detected "
+        #               f"(method={solution.get('method','?')}, "
+        #               f"err={solution['error']:.2f} px) — "
+        #               f"attempting brute recovery.")
+        #         solution = None
+        #         if n_blobs >= 4:
+        #             brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+        #             if brute is not None and not self._pose_jump_too_large(
+        #                 brute["rvec"], brute["tvec"], rvec_p, tvec_p,
+        #             ):
+        #                 solution = brute
 
         # ------------------------------------------------------------------
         # Accept / reject

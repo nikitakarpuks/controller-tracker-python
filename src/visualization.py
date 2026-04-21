@@ -174,12 +174,14 @@ def make_disk_mesh(positions: np.ndarray, normals: np.ndarray,
 
 
 def make_contour_mesh_3d(contours_px: list, cam, frustum_z: float,
-                          colors: np.ndarray):
+                          colors: np.ndarray, undistort: bool = False):
     """
     Back-project blob pixel contours onto the frustum plane and triangulate.
 
     contours_px : list of (M_i, 2) float32 pixel arrays, one per blob.
     colors      : (N_blobs, 3or4) uint8 colour per blob.
+    undistort   : if True, undistort contour points before backprojecting so
+                  they align with the pinhole LED projections in the 3-D view.
     Returns (vertices, faces, vertex_colors) or (None, None, None) if empty.
     """
     all_verts  = []
@@ -191,6 +193,12 @@ def make_contour_mesh_3d(contours_px: list, cam, frustum_z: float,
         n = len(cnt)
         if n < 3:
             continue
+        if undistort:
+            cnt = cv2.undistortPoints(
+                cnt.reshape(-1, 1, 2).astype(np.float32),
+                cam.camera_matrix, cam.dist_coeffs,
+                P=cam.camera_matrix,
+            ).reshape(-1, 2)
         pts = np.column_stack([
             (cnt[:, 0] - cam.cx) / cam.fx * frustum_z,
             (cnt[:, 1] - cam.cy) / cam.fy * frustum_z,
@@ -343,7 +351,7 @@ class ControllerAnimatorRerun:
         (self._geo_ring_axis, self._geo_is_inner, self._geo_radial_out,
          self._geo_ring_centroid, self._geo_R_frustum_center,
          self._geo_frustum_slope, self._geo_z_frustum_top,
-         self._geo_z_frustum_bot,
+         self._geo_z_frustum_bot, _
          ) = _compute_frustum_geometry(self.model_positions, self.model_normals)
 
     # ------------------------------------------------------------------
@@ -380,6 +388,18 @@ class ControllerAnimatorRerun:
         rr.send_blueprint(blueprint)
 
         self._log_static_camera(camera)
+
+        if self.vis_cfg.get("show_mesh", True):
+            rr.log(
+                "world/mesh",
+                rr.Mesh3D(
+                    vertex_positions=self._trimesh.vertices,
+                    triangle_indices=self._trimesh.faces,
+                    vertex_normals=self._trimesh.vertex_normals if hasattr(self._trimesh, "vertex_normals") else None,
+                    albedo_factor=[0.7, 0.7, 0.7, 1.0],
+                ),
+                static=True,
+            )
 
         n_frames = len(poses)
 
@@ -497,17 +517,13 @@ class ControllerAnimatorRerun:
         T4[:3, :3] = R
         T4[:3,  3] = t + offset
 
-        # ---- mesh ----
+        # ---- mesh (transform only — geometry is logged once as static) ----
         if self.vis_cfg.get("show_mesh", True):
-            verts_world   = (T4[:3, :3] @ self._trimesh.vertices.T).T + T4[:3, 3]
-            normals_world = (T4[:3, :3] @ self._trimesh.vertex_normals.T).T
             rr.log(
                 "world/mesh",
-                rr.Mesh3D(
-                    vertex_positions=verts_world,
-                    triangle_indices=self._trimesh.faces,
-                    vertex_normals=normals_world,
-                    albedo_factor=[0.7, 0.7, 0.7, 1.0],
+                rr.Transform3D(
+                    translation=T4[:3, 3],
+                    mat3x3=T4[:3, :3],
                 )
             )
 
@@ -575,8 +591,19 @@ class ControllerAnimatorRerun:
 
         # ---- blobs as actual contour shapes ----
         if blobs is not None and len(blobs) > 0:
+            # Undistort blob centroids so they live in the same space as the
+            # pinhole LED projections (proj_flat = px/pz * z).  The raw
+            # distorted pixel coordinate must not be used for 3-D display
+            # because backproject_to_plane applies a pinhole model, which only
+            # matches the LED projection when distortion has been removed first.
+            blobs_undist_disp = cv2.undistortPoints(
+                blobs.reshape(-1, 1, 2).astype(np.float32),
+                camera.camera_matrix, camera.dist_coeffs,
+                P=camera.camera_matrix,
+            ).reshape(-1, 2)
+
             # pts_plane at error_z: both error-line endpoints live on this plane
-            pts_plane = backproject_to_plane(blobs, camera, z=error_z)
+            pts_plane = backproject_to_plane(blobs_undist_disp, camera, z=error_z)
 
             if self.vis_cfg.get("show_blobs", True) and contours is not None:
                 blob_colors = np.array(
@@ -584,8 +611,10 @@ class ControllerAnimatorRerun:
                      for i in range(len(contours))],
                     dtype=np.uint8,
                 )
-                bv, bf, bc = make_contour_mesh_3d(contours, camera, blob_z,
-                                                   blob_colors)
+                bv, bf, bc = make_contour_mesh_3d(
+                    contours, camera, blob_z, blob_colors,
+                    undistort=True,
+                )
                 if bv is not None:
                     rr.log("world/blobs", rr.Mesh3D(
                         vertex_positions=bv,
@@ -602,7 +631,7 @@ class ControllerAnimatorRerun:
                 blabel_color  = self.vis_cfg.get("blob_id_label_color",  [255, 210, 0])
                 blabel_offset = self.vis_cfg.get("blob_id_label_offset", [0.0006, -0.0006])
                 bdx, bdy = blabel_offset[0], blabel_offset[1]
-                blob_label_pts = backproject_to_plane(blobs, camera, z=blob_z).copy()
+                blob_label_pts = backproject_to_plane(blobs_undist_disp, camera, z=blob_z).copy()
                 blob_label_pts[:, 0] += bdx
                 blob_label_pts[:, 1] += bdy
                 rr.log("world/blob_ids", rr.Points3D(
