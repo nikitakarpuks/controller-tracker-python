@@ -5,7 +5,8 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from src.transformations import Transform
-from src._matching import _visible_mask, _compute_frustum_geometry
+from src._matching import _visible_mask
+from src.controller import _compute_geometry
 
 
 # =========================================================
@@ -347,12 +348,7 @@ class ControllerAnimatorRerun:
         self._trimesh        = load_trimesh(mesh_path)
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
-        # Precompute torus geometry for per-frame visibility testing
-        (self._geo_ring_axis, self._geo_is_inner, self._geo_radial_out,
-         self._geo_ring_centroid, self._geo_R_frustum_center,
-         self._geo_frustum_slope, self._geo_z_frustum_top,
-         self._geo_z_frustum_bot, _
-         ) = _compute_frustum_geometry(self.model_positions, self.model_normals)
+        self._geom = _compute_geometry(self.model_positions, self.model_normals)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -582,10 +578,7 @@ class ControllerAnimatorRerun:
         vis_mask = _visible_mask(
             R, t,
             self.model_positions, self.model_normals,
-            self._geo_is_inner, self._geo_radial_out, self._geo_ring_axis,
-            self._geo_ring_centroid, self._geo_R_frustum_center,
-            self._geo_frustum_slope, self._geo_z_frustum_top,
-            self._geo_z_frustum_bot,
+            self._geom,
         )
         vis_set = set(np.where(vis_mask)[0].tolist())
 

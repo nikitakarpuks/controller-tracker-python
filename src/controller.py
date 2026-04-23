@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional, Dict
 
 from src.camera import Camera
 from src.debug_config import is_deep
+from src.geometry import Box3D, Cylinder3D, ControllerGeometry
 from src.transformations import Transform
 
 
@@ -41,7 +42,96 @@ def create_leds_from_config(cfg) -> List[ControllerLED]:
 
 
 # =========================================================
-# 2. TRACKER (per camera + controller)
+# 2. GEOMETRY — fit frustum + bake handle primitives
+# =========================================================
+
+def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerGeometry:
+    """
+    Fit the LED-ring frustum and bundle it with the hardcoded handle body
+    primitives (finalized in handle_vis.py) into one ControllerGeometry object.
+
+    This replaces _compute_frustum_geometry which is now retired from _matching.
+    """
+    # ── Frustum: ring axis, inner/outer classification, cone fit ─────────────
+    centroid  = np.array([0.0, 0.0, 0.0])
+    ring_axis = np.array([0.0, 0.0, -1.0])
+
+    rel        = positions - centroid
+    rel_proj   = rel - np.outer(rel @ ring_axis, ring_axis)
+    radial_out = rel_proj / (np.linalg.norm(rel_proj, axis=1, keepdims=True) + 1e-8)
+
+    is_inner   = (normals * radial_out).sum(axis=1) < 0
+    outer_mask = ~is_inner
+
+    # orient axis toward the wider (large-radius) base → frustum_slope > 0
+    big_ring_axis = -ring_axis if float((normals[outer_mask] @ ring_axis).mean()) > 0 else ring_axis
+
+    axial_projs    = positions @ big_ring_axis
+    ring_center_ax = float(axial_projs.mean())
+    z_rel          = axial_projs - ring_center_ax
+
+    outer_idx    = np.where(outer_mask)[0]
+    outer_radial = np.linalg.norm(rel_proj[outer_idx], axis=1)
+    outer_z_rel  = z_rel[outer_idx]
+
+    A = np.column_stack([np.ones(len(outer_idx)), outer_z_rel])
+    coeffs, _, _, _ = np.linalg.lstsq(A, outer_radial, rcond=None)
+    R_fc          = float(coeffs[0])
+    frustum_slope = float(coeffs[1])
+
+    z_frustum_top = float(outer_z_rel.max()) + 0.004
+    z_frustum_bot = float(outer_z_rel.min()) - 0.0055
+
+    # ── Handle body primitives (values finalized via handle_vis.py) ───────────
+    boxes = [
+        Box3D(
+            name="box_vertical",
+            center=np.array([-0.009, -0.012, -0.015]),
+            half_dims=np.array([0.021, 0.0028, 0.013]),
+        ),
+        Box3D(
+            name="box_horizontal",
+            center=np.array([-0.009, -0.029, -0.0048]),
+            half_dims=np.array([0.021, 0.0032, 0.015]),
+            axes=np.column_stack([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).astype(float),
+        ),
+    ]
+    cylinders = [
+        Cylinder3D(
+            name="control_panel",
+            center=np.array([-0.008, 0.0, -0.05]),
+            axis=np.array([0.0, 1.0, 0.0]),
+            radius=0.031,
+            radius_v=0.033,
+            half_length=0.017,
+            angle=np.pi / 10,
+        ),
+        Cylinder3D(
+            name="handle",
+            center=np.array([0.001, 0.022, -0.098]),
+            axis=np.array([0.0, 1.0, -1.5]),
+            radius=0.021,
+            half_length=0.037,
+        ),
+    ]
+
+    return ControllerGeometry(
+        ring_axis=big_ring_axis,
+        is_inner=is_inner,
+        radial_out=radial_out,
+        ring_centroid=centroid,
+        R_fc=R_fc,
+        frustum_slope=frustum_slope,
+        z_frustum_top=z_frustum_top,
+        z_frustum_bot=z_frustum_bot,
+        z_rel=z_rel,
+        boxes=boxes,
+        cylinders=cylinders,
+    )
+
+
+# =========================================================
+# 3. TRACKER (per camera + controller)
 # =========================================================
 
 class SingleViewTracker:
@@ -68,28 +158,23 @@ class SingleViewTracker:
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
 
-        # Pre-compute frustum geometry and LED quad cache once from the fixed model.
-        # These depend only on LED positions/normals, which never change at runtime.
+        # Pre-compute body geometry and LED quad cache once from the fixed model.
         from src._matching import (
-            _compute_frustum_geometry,
             _build_led_neighbor_lists,
             _build_led_neighbor_lists_edge,
             _precompute_led_quads,
         )
         positions = model.positions.astype("float32")
         normals   = model.normals.astype("float32")
-        (self._ring_axis, self._is_inner, self._radial_out,
-         self._ring_centroid,
-         self._R_frustum_center, self._frustum_slope,
-         self._z_frustum_top, self._z_frustum_bot,
-         self._z_rel,
-         ) = _compute_frustum_geometry(positions, normals)
+
+        self._geometry: ControllerGeometry = _compute_geometry(positions, normals)
+
         self._led_nbr = _build_led_neighbor_lists(positions, normals)
         self._led_triple_idx, self._led_triple_depth, self._led_triple_gates = _precompute_led_quads(
             positions, self._led_nbr,
         )
         self._led_nbr_edge = _build_led_neighbor_lists_edge(
-            positions, normals, self._is_inner, self._z_rel
+            positions, normals, self._geometry.is_inner, self._geometry.z_rel
         )
         self._led_triple_idx_edge, self._led_triple_depth_edge, self._led_triple_gates_edge = (
             _precompute_led_quads(positions, self._led_nbr_edge)
