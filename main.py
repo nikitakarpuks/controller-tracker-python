@@ -44,7 +44,7 @@ def main():
     #   debug_led_ids / debug_blob_ids → also log a specific triple in detail
     # debug_config.configure(mode)
     # debug_config.configure(mode, verbose_all=True)
-    debug_config.configure(mode, debug_led_ids=[2, 16, 3], debug_blob_ids=[8, 7, 10])
+    debug_config.configure(mode, debug_led_ids=[0, 14, 3], debug_blob_ids=[5, 8, 2])
 
     logger.info(f"mode={mode.value}  data={data_root}")
 
@@ -77,19 +77,23 @@ def main():
         fine_tune_alignment(right_controller_leds, mesh, config["visualization"])
 
     # ── Tracking loop ──────────────────────────────────────────────────────
-    poses        = []
-    assignments  = []
-    blobs        = []
-    contours_all = []
+    poses             = []
+    assignments       = []
+    blobs             = []
+    contours_all      = []
+    raw_blobs         = []
+    raw_contours_all  = []
 
     for batch in tqdm(get_data(config["data"])):
         img_path, image = batch[0][0], batch[0][1]
 
-        blob_centroids, blob_contours = get_centroids(
+        blob_centroids, blob_contours, raw_centroids, raw_contours = get_centroids(
             image, config["blob_detection"], visualize=True, img_path=img_path
         )
         blobs.append(blob_centroids.copy())
         contours_all.append(blob_contours)
+        raw_blobs.append(raw_centroids.copy())
+        raw_contours_all.append(raw_contours)
 
         t0       = time()
         solution = tracking_system.update({0: blob_centroids}).get(
@@ -126,6 +130,8 @@ def main():
     animator.start(
         poses, assignments, blobs, camera_0, T_model_ctrl,
         contours_all=contours_all,
+        raw_blobs_all=raw_blobs,
+        raw_contours_all=raw_contours_all,
         save_path=config["visualization"].get("save_recording"),
     )
 
