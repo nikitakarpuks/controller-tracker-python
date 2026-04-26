@@ -27,7 +27,7 @@ def main():
     # DEEP:       tracking_lost or deep_search_required → verbose matching logs
     data_root = Path(config["data"]["root"])
     mode = (DebugMode.DEEP
-            if data_root.name in ("tracking_lost", "deep_search_required")
+            if config["debug_mode"]
             else DebugMode.SEQUENTIAL)
 
     logger.remove()
@@ -44,13 +44,13 @@ def main():
     #   debug_led_ids / debug_blob_ids → also log a specific triple in detail
     # debug_config.configure(mode)
     # debug_config.configure(mode, verbose_all=True)
-    debug_config.configure(mode, debug_led_ids=[2, 13, 16], debug_blob_ids=[7, 2, 5])
+    debug_config.configure(mode, debug_led_ids=[2, 16, 3], debug_blob_ids=[8, 7, 10])
 
     logger.info(f"mode={mode.value}  data={data_root}")
 
     # ── Output directories (sequential mode only) ──────────────────────────
     out_slow = out_tracking_lost = None
-    if mode == DebugMode.SEQUENTIAL:
+    if config["split_to_folders"]:
         out_slow          = data_root / "deep_search_required"
         out_tracking_lost = data_root / "tracking_lost"
         out_slow.mkdir(parents=True, exist_ok=True)

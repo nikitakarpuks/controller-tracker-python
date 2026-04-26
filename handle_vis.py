@@ -34,6 +34,7 @@ Colour conventions
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
@@ -56,12 +57,12 @@ from src._matching import _visible_mask
 #
 # Shift the precise 3-D mesh along X so it sits beside the primitives.
 # Set to 0.0 to overlap both objects for a direct comparison.
-MESH_X_OFFSET: float = 0.15   # metres
+MESH_X_OFFSET: float = 0#0.15   # metres
 
 # Debug visibility overlay: set to a camera position (controller-local, metres)
 # to see green=visible / red=occluded rays from that viewpoint.
 # Set to None to disable.
-DEBUG_CAM_POS: Optional[np.ndarray] = np.array([0.1, -0.2, -0.35])
+DEBUG_CAM_POS: Optional[np.ndarray] = None #np.array([0.0, 0.0, 0.0])  # np.array([0.2, -0.2, -0.20])
 # Try also: np.array([0.2, 0.2, -0.2]) for diagonal, or None to disable.
 #
 # Tips:
@@ -421,48 +422,53 @@ def main():
     # Colors each LED green (visible) or red (occluded) from DEBUG_CAM_POS.
     # Also draws rays and marks the virtual camera so you can verify the shapes
     # transferred from PRIMITIVES to _compute_geometry match.
-    if DEBUG_CAM_POS is not None:
-        from src._matching import _rays_blocked_by_box, _rays_blocked_by_cylinder
-        R_dbg    = np.eye(3, dtype=np.float64)
-        t_dbg    = -DEBUG_CAM_POS.astype(np.float64)   # cam_world = -R^T t = cam_pos
-        cam_world = DEBUG_CAM_POS.astype(np.float64)
-        vis      = _visible_mask(R_dbg, t_dbg, positions, normals, geom)
+    # if DEBUG_CAM_POS is not None:
+    from src._matching import _rays_blocked_by_box, _rays_blocked_by_cylinder
 
-        dbg_colors = np.where(
-            vis[:, None],
-            np.array([[0, 220, 80]],  dtype=np.uint8),   # green  = visible
-            np.array([[220, 40, 40]], dtype=np.uint8),   # red    = occluded
-        )
-        dv, df, dc = make_disk_mesh(positions, normals, dbg_colors.astype(np.uint8),
-                                    radius=0.003, surface_offset=0.0015)
-        _log_mesh("world/debug/led_visibility", dv, df, dc)
+    R_dbg = cv2.Rodrigues(np.array([[0.26485262], [1.42825671], [-2.72708413]]))[0]
+    t_dbg = np.array([0.05591549, -0.08879955, 0.29305191])
 
-        rr.log("world/debug/camera", rr.Points3D(
-            positions=[DEBUG_CAM_POS.tolist()],
-            colors=[[255, 255, 0]],
-            radii=0.006,
-            labels=["cam"],
-        ), static=True)
+    # R_dbg    = np.eye(3, dtype=np.float64)
+    # t_dbg    = -DEBUG_CAM_POS.astype(np.float64)   # cam_world = -R^T t = cam_pos
+    cam_world = -(R_dbg.T @ t_dbg)
 
-        rr.log("world/debug/rays", rr.LineStrips3D(
-            strips=[[DEBUG_CAM_POS.tolist(), p.tolist()] for p in positions],
-            colors=[[0, 200, 80] if v else [200, 40, 40] for v in vis],
-            radii=0.00018,
-        ), static=True)
+    vis = _visible_mask(R_dbg, t_dbg, positions, normals, geom)
 
-        n_vis = int(vis.sum())
-        print(f"\n[debug] camera at {DEBUG_CAM_POS}")
-        print(f"  total visible: {n_vis} / {len(vis)}")
+    dbg_colors = np.where(
+        vis[:, None],
+        np.array([[0, 220, 80]],  dtype=np.uint8),   # green  = visible
+        np.array([[220, 40, 40]], dtype=np.uint8),   # red    = occluded
+    )
+    dv, df, dc = make_disk_mesh(positions, normals, dbg_colors.astype(np.uint8),
+                                radius=0.003, surface_offset=0.0015)
+    _log_mesh("world/debug/led_visibility", dv, df, dc)
 
-        # Per-shape breakdown (run each blocker independently on ALL LEDs)
-        for box in geom.boxes:
-            blocked_idx = np.where(_rays_blocked_by_box(cam_world, positions, box))[0]
-            if len(blocked_idx):
-                print(f"  [{box.name}] blocks LEDs: {blocked_idx.tolist()}")
-        for cy in geom.cylinders:
-            blocked_idx = np.where(_rays_blocked_by_cylinder(cam_world, positions, cy))[0]
-            if len(blocked_idx):
-                print(f"  [{cy.name}] blocks LEDs: {blocked_idx.tolist()}")
+    rr.log("world/debug/camera", rr.Points3D(
+        positions=[cam_world.tolist()],#[DEBUG_CAM_POS.tolist()],
+        colors=[[255, 255, 0]],
+        radii=0.006,
+        labels=["cam"],
+    ), static=True)
+
+    rr.log("world/debug/rays", rr.LineStrips3D(
+        strips=[[cam_world.tolist(), p.tolist()] for p in positions], # [[DEBUG_CAM_POS.tolist(), p.tolist()] for p in positions],
+        colors=[[0, 200, 80] if v else [200, 40, 40] for v in vis],
+        radii=0.00018,
+    ), static=True)
+
+    n_vis = int(vis.sum())
+    # print(f"\n[debug] camera at {DEBUG_CAM_POS}")
+    print(f"  total visible: {n_vis} / {len(vis)}")
+
+    # Per-shape breakdown (run each blocker independently on ALL LEDs)
+    for box in geom.boxes:
+        blocked_idx = np.where(_rays_blocked_by_box(cam_world, positions, box))[0]
+        if len(blocked_idx):
+            print(f"  [{box.name}] blocks LEDs: {blocked_idx.tolist()}")
+    for cy in geom.cylinders:
+        blocked_idx = np.where(_rays_blocked_by_cylinder(cam_world, positions, cy))[0]
+        if len(blocked_idx):
+            print(f"  [{cy.name}] blocks LEDs: {blocked_idx.tolist()}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n[handle_vis] {len(positions)} LEDs  |  "
