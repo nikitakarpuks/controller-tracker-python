@@ -24,8 +24,8 @@ VIS_CONFIG = {
     "show_frustum":     True,
     "show_image_plane": True,
     "show_camera_frame": False, # unit vector lines
-    "show_led_ids":     True,   # LED index labels next to projected disks
-    "show_blob_ids":    True,   # blob index labels next to blob contours
+    "show_led_ids":       True,   # LED index labels next to projected disks
+    "show_blob_ids":      True,   # blob index labels next to blob contours
     "fps":              30,        # playback speed
     "frustum_z":        0.05,      # depth of the virtual projection screen (metres).
                                    # Must be less than the closest expected controller depth.
@@ -355,7 +355,8 @@ class ControllerAnimatorRerun:
     # ------------------------------------------------------------------
 
     def start(self, poses, assignments, blobs_all, camera, T_model_ctrl,
-              contours_all=None, save_path: str = None):
+              contours_all=None, raw_blobs_all=None, raw_contours_all=None,
+              save_path: str = None):
         """
         Log all frames to rerun.
         Opens the viewer automatically (spawn=True).
@@ -429,8 +430,15 @@ class ControllerAnimatorRerun:
             contours = (contours_all[idx]
                         if contours_all is not None and idx < len(contours_all)
                         else None)
+            raw_blobs = (raw_blobs_all[idx]
+                         if raw_blobs_all is not None and idx < len(raw_blobs_all)
+                         else None)
+            raw_contours = (raw_contours_all[idx]
+                            if raw_contours_all is not None and idx < len(raw_contours_all)
+                            else None)
 
-            self._log_frame(idx, T_cam_model, assignment, blobs, camera, contours)
+            self._log_frame(idx, T_cam_model, assignment, blobs, camera, contours,
+                            raw_blobs=raw_blobs, raw_contours=raw_contours)
 
         msg = f"[rerun] Logged {n_frames} frames."
         if save_path:
@@ -496,7 +504,8 @@ class ControllerAnimatorRerun:
     # ------------------------------------------------------------------
 
     def _log_frame(self, idx: int, T_cam_model: Transform,
-                   assignment, blobs, camera, contours=None):
+                   assignment, blobs, camera, contours=None,
+                   raw_blobs=None, raw_contours=None):
 
         offset           = self.visual_offset
         R                = T_cam_model.R
@@ -646,6 +655,27 @@ class ControllerAnimatorRerun:
             pts_plane = None
             rr.log("world/blobs",    rr.Clear(recursive=False))
             rr.log("world/blob_ids", rr.Clear(recursive=False))
+
+        # ---- raw (pre-filter) blobs ----
+        if self.vis_cfg.get("show_raw_blobs", True) and raw_blobs is not None and len(raw_blobs) > 0:
+            if raw_contours is not None:
+                raw_colors = np.array([[255,192,203]] * len(raw_contours), dtype=np.uint8)
+                rv, rf, rc = make_contour_mesh_3d(
+                    raw_contours, camera, blob_z - 0.001, raw_colors,
+                    undistort=True,
+                )
+                if rv is not None:
+                    rr.log("world/blobs_raw", rr.Mesh3D(
+                        vertex_positions=rv,
+                        triangle_indices=rf,
+                        vertex_colors=rc,
+                    ))
+                else:
+                    rr.log("world/blobs_raw", rr.Clear(recursive=False))
+            else:
+                rr.log("world/blobs_raw", rr.Clear(recursive=False))
+        else:
+            rr.log("world/blobs_raw", rr.Clear(recursive=False))
 
         # ---- visible LED projections (matched + physically visible unmatched) ----
         # Matched LEDs use matched_proj_z, unmatched use frustum_z.

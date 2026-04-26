@@ -121,9 +121,12 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         mean_nn = _mean_knn_distances(centroids_arr, neighbor_k)
         keep_mask = mean_nn <= outlier_factor * np.median(mean_nn)
 
-    kept_indices = np.where(keep_mask)[0] if keep_mask is not None else np.arange(len(centroids_arr))
-    filtered_centroids = centroids_arr[kept_indices]
-    filtered_contours  = [blob_contours[i] for i in kept_indices]
+    kept_indices     = np.where(keep_mask)[0] if keep_mask is not None else np.arange(len(centroids_arr))
+    rejected_indices = np.where(~keep_mask)[0] if keep_mask is not None else np.array([], dtype=int)
+    filtered_centroids  = centroids_arr[kept_indices]
+    filtered_contours   = [blob_contours[i] for i in kept_indices]
+    rejected_centroids  = centroids_arr[rejected_indices]
+    rejected_contours   = [blob_contours[i] for i in rejected_indices]
 
     # ── 4. Visualization ──────────────────────────────────────────────────────
     if visualize:
@@ -157,4 +160,4 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             img_out_path = out_dir / f"{Path(img_path).stem}_blobs.png"
             cv2.imwrite(str(img_out_path), vis)
 
-    return filtered_centroids, filtered_contours
+    return filtered_centroids, filtered_contours, rejected_centroids, rejected_contours

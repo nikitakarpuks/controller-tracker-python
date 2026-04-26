@@ -59,6 +59,12 @@ from src._matching import _visible_mask
 # Set to 0.0 to overlap both objects for a direct comparison.
 MESH_X_OFFSET: float = 0#0.15   # metres
 
+# LED ID label appearance
+LED_LABEL_SHOW:          bool  = True
+LED_LABEL_COLOR:         list  = [255, 220, 0]   # RGB — bright yellow
+LED_LABEL_NORMAL_OFFSET: float = 0.010           # metres above LED surface along its normal
+LED_LABEL_RADIUS:        float = 0.0005             # anchor dot radius (0 = invisible, text only)
+
 # Debug visibility overlay: set to a camera position (controller-local, metres)
 # to see green=visible / red=occluded rays from that viewpoint.
 # Set to None to disable.
@@ -222,6 +228,8 @@ def build_frustum_mesh(ring_axis: np.ndarray, ring_centroid: np.ndarray,
     else:
         wall_thickness = 0.003   # 3 mm fallback
 
+    wall_thickness = 0.007
+
     R_fc_inner     = R_fc - wall_thickness
     ring_center_ax = float((positions @ ax).mean())   # z_rel=0 offset in world space
 
@@ -384,12 +392,13 @@ def main():
     ), static=True)
 
     # LED index labels (useful for debugging specific LEDs)
-    rr.log("world/led_ids", rr.Points3D(
-        positions=positions + normals * 0.004,
-        labels=[str(i) for i in range(len(positions))],
-        colors=[[200, 200, 200]] * len(positions),
-        radii=0.0,
-    ), static=True)
+    if LED_LABEL_SHOW:
+        rr.log("world/led_ids", rr.Points3D(
+            positions=positions + normals * LED_LABEL_NORMAL_OFFSET,
+            labels=[str(i) for i in range(len(positions))],
+            colors=[LED_LABEL_COLOR] * len(positions),
+            radii=LED_LABEL_RADIUS,
+        ), static=True)
 
     # 3-D mesh (semi-transparent grey), optionally shifted along X for comparison
     if mesh_verts is not None:
@@ -425,8 +434,11 @@ def main():
     # if DEBUG_CAM_POS is not None:
     from src._matching import _rays_blocked_by_box, _rays_blocked_by_cylinder
 
-    R_dbg = cv2.Rodrigues(np.array([[0.26485262], [1.42825671], [-2.72708413]]))[0]
-    t_dbg = np.array([0.05591549, -0.08879955, 0.29305191])
+    # R_dbg = cv2.Rodrigues(np.array([[0.26485262], [1.42825671], [-2.72708413]]))[0]
+    # t_dbg = np.array([0.05591549, -0.08879955, 0.29305191])
+
+    R_dbg = cv2.Rodrigues(np.array([[0.0], [0.0], [0.0]]))[0]
+    t_dbg = np.array([0.0, 0.0, -0.1])
 
     # R_dbg    = np.eye(3, dtype=np.float64)
     # t_dbg    = -DEBUG_CAM_POS.astype(np.float64)   # cam_world = -R^T t = cam_pos

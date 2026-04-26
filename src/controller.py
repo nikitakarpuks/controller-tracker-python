@@ -84,11 +84,12 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
 
     # ── Inner cone radius (wall thickness from inner LED h_corpus) ────────────
     r_led = np.linalg.norm(rel_proj, axis=1)
-    if is_inner.any():
-        h_corpus       = np.maximum(0.0, R_fc + frustum_slope * z_rel[is_inner] - r_led[is_inner])
-        wall_thickness = float(h_corpus.mean())
-    else:
-        wall_thickness = 0.003
+    # if is_inner.any():
+    #     h_corpus       = np.maximum(0.0, R_fc + frustum_slope * z_rel[is_inner] - r_led[is_inner])
+    #     wall_thickness = float(h_corpus.mean())
+    # else:
+    #     wall_thickness = 0.007
+    wall_thickness = 0.007  # hardcode so inner leds would not be inside frustum and hence always occluded
     R_fc_inner = R_fc - wall_thickness
 
     # ── Handle body primitives (values finalized via handle_vis.py) ───────────

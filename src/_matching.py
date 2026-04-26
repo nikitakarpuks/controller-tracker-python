@@ -195,6 +195,73 @@ def _rays_blocked_by_cylinder(cam: np.ndarray, leds: np.ndarray, cy) -> np.ndarr
     return blocked
 
 
+def _box_entry_t(cam: np.ndarray, led: np.ndarray, box) -> Optional[float]:
+    """Return the entry t in (0,1) of ray cam→led through box, or None if not blocked."""
+    M  = np.asarray(box.axes, float) if box.axes is not None else np.eye(3)
+    c  = np.asarray(box.center, float)
+    h  = np.asarray(box.half_dims, float)
+    D  = led - cam
+    oc = c - cam
+    e  = M.T @ oc
+    f  = M.T @ D
+    t_min, t_max = 1e-4, 1.0 - 1e-4
+    for i in range(3):
+        if abs(f[i]) > 1e-12:
+            t1, t2 = (e[i] - h[i]) / f[i], (e[i] + h[i]) / f[i]
+            if t1 > t2:
+                t1, t2 = t2, t1
+            t_min = max(t_min, t1)
+            t_max = min(t_max, t2)
+        elif abs(e[i]) > h[i]:
+            return None
+    return t_min if t_min < t_max else None
+
+
+def _cylinder_entry_t(cam: np.ndarray, led: np.ndarray, cy) -> Optional[float]:
+    """Return the entry t in (0,1) of ray cam→led through cylinder, or None if not blocked."""
+    ax = np.asarray(cy.axis, float); ax /= np.linalg.norm(ax) + 1e-9
+    u, v = tangent_frame(ax)
+    if cy.angle:
+        ca, sa = np.cos(cy.angle), np.sin(cy.angle)
+        u, v = ca * u + sa * v, -sa * u + ca * v
+    r_u = float(cy.radius)
+    r_v = float(cy.radius_v) if cy.radius_v is not None else r_u
+    c   = np.asarray(cy.center, float)
+    hl  = float(cy.half_length)
+    D   = led - cam
+    oc  = cam - c
+    oc_ax = float(np.dot(oc, ax))
+    oc_u  = float(np.dot(oc, u))
+    oc_v  = float(np.dot(oc, v))
+    D_ax  = float(np.dot(D, ax))
+    D_u   = float(np.dot(D, u))
+    D_v   = float(np.dot(D, v))
+    eps = 1e-4
+    t_entry = np.inf
+
+    a     = (D_u / r_u) ** 2 + (D_v / r_v) ** 2
+    b     = 2.0 * (oc_u * D_u / r_u ** 2 + oc_v * D_v / r_v ** 2)
+    c_val = oc_u ** 2 / r_u ** 2 + oc_v ** 2 / r_v ** 2 - 1.0
+    disc  = b ** 2 - 4.0 * a * c_val
+    if disc >= 0.0 and abs(a) > 1e-12:
+        sq = np.sqrt(disc)
+        for sign in (-1.0, 1.0):
+            t = (-b + sign * sq) / (2.0 * a)
+            if eps < t < 1.0 - eps and abs(oc_ax + t * D_ax) <= hl:
+                t_entry = min(t_entry, t)
+
+    for z_cap in (-hl, hl):
+        if abs(D_ax) > 1e-12:
+            t = (z_cap - oc_ax) / D_ax
+            if eps < t < 1.0 - eps:
+                xu = oc_u + t * D_u
+                xv = oc_v + t * D_v
+                if (xu / r_u) ** 2 + (xv / r_v) ** 2 <= 1.0:
+                    t_entry = min(t_entry, t)
+
+    return t_entry if t_entry < np.inf else None
+
+
 def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   positions: np.ndarray, normals: np.ndarray,
                   geom: ControllerGeometry,
@@ -286,6 +353,26 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
         EPS     = 1e-4
         blocked = np.zeros(len(inner_active), dtype=bool)
 
+        # Detect LEDs whose static position is inside the cone wall material —
+        # a linear-cone approximation artifact (the real surface is curved).
+        # For these LEDs the trailing open interval [last_crossing, 1-EPS] would
+        # always fire because the LED endpoint is inside the wall; dropping the
+        # 1-EPS sentinel for them means only real pass-through intervals (bounded
+        # by actual crossings on both sides) can trigger blocking.
+        z_led_arr   = C_ax_rel + D_ax                        # (N,) LED axial z-rel
+        r_led_arr   = np.linalg.norm(P_rad, axis=1)          # (N,) LED radial distance
+        r_out_led   = R_fc       + slope * z_led_arr
+        r_in_led    = R_fc_inner + slope * z_led_arr
+        led_in_wall = ((r_in_led  <= r_led_arr) & (r_led_arr <= r_out_led) &
+                       (z_bot     <= z_led_arr) & (z_led_arr <= z_top))
+
+        if debug and led_in_wall.any():
+            for i in np.where(led_in_wall)[0]:
+                excess = r_led_arr[i] - r_in_led[i]
+                print(f"  [frustum] LED {inner_active[i]:2d}: inside cone wall"
+                      f"  (r={r_led_arr[i]*1000:.2f}mm  r_in={r_in_led[i]*1000:.2f}mm"
+                      f"  excess={excess*1000:.2f}mm) — trailing sentinel suppressed")
+
         for i in range(len(inner_active)):
             t_cands = []
 
@@ -331,7 +418,17 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
 
             # Check midpoint of each interval between consecutive boundary crossings.
             # A midpoint inside the wall region means the ray passes through the wall.
-            intervals = [EPS] + sorted(t_cands) + [1.0 - EPS]
+            # For LEDs whose position is inside the cone wall (model artifact), drop
+            # the trailing 1-EPS sentinel so only intervals bounded by real crossings
+            # on both sides can trigger blocking.
+            t_cands_sorted = sorted(t_cands)
+            # if led_in_wall[i]:
+            #     intervals = [EPS] + t_cands_sorted
+            # else:
+            #     intervals = [EPS] + t_cands_sorted + [1.0 - EPS]
+
+            intervals = [EPS] + t_cands_sorted + [1.0 - EPS]
+
             for j in range(len(intervals) - 1):
                 t_mid     = 0.5 * (intervals[j] + intervals[j + 1])
                 z_mid     = C_ax_rel + t_mid * D_ax[i]
@@ -340,6 +437,11 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                 r_mid     = float(np.linalg.norm(C_rad + t_mid * D_rad[i]))
                 if z_bot <= z_mid <= z_top and r_in_mid <= r_mid <= r_out_mid:
                     blocked[i] = True
+                    if debug:
+                        seg_len_cm = float(np.linalg.norm(P_rel[i] - C_rel)) * 100.0
+                        dist_cm    = (1.0 - intervals[j]) * seg_len_cm
+                        print(f"  [frustum] LED {inner_active[i]:2d}: BLOCKED by frustum wall"
+                              f"  ({dist_cm:.1f}cm behind wall)")
                     break
 
             if debug and not blocked[i]:
@@ -371,6 +473,24 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
         for cy in geom.cylinders:
             body_blocked |= _rays_blocked_by_cylinder(cam_world, positions[active], cy)
         mask[active[body_blocked]] = False
+
+        if debug:
+            for k, led_id in enumerate(active):
+                if not body_blocked[k]:
+                    continue
+                led_pos = positions[led_id]
+                seg_len_cm = float(np.linalg.norm(led_pos - cam_world)) * 100.0
+                blockers = []
+                for bi, box in enumerate(geom.boxes):
+                    t = _box_entry_t(cam_world, led_pos, box)
+                    if t is not None:
+                        blockers.append(f"box_{bi}(dist={((1.0 - t) * seg_len_cm):.1f}cm)")
+                for ci, cy in enumerate(geom.cylinders):
+                    t = _cylinder_entry_t(cam_world, led_pos, cy)
+                    if t is not None:
+                        blockers.append(f"cylinder_{ci}(dist={((1.0 - t) * seg_len_cm):.1f}cm)")
+                label = ", ".join(blockers) if blockers else "unknown"
+                print(f"  [body]    LED {led_id:2d}: BLOCKED by {label}")
 
     return mask
 
@@ -767,9 +887,10 @@ def brute_match(
     blobs: np.ndarray,
     depth_tiers: Tuple[Tuple, ...] = ((2, 3), (2, 4), (2, 4, 'edge'), (3, 5), (3, 5, 'edge'), (4, 6)),  # (led_max, blob_max[, 'standard'|'edge'])
     p4_threshold_px: float = 2.0,
-    reprojection_threshold: float = 2.0,
+    hungarian_threshold_px: float = 5.0,  # pre-filter on the raw P3P hypothesis pose. Loose because P3P poses can be noisy; RANSAC does the real filtering after this
+    reprojection_threshold: float = 2.0,  # passed to RANSAC, controls which blobs make it into the final assignment. This is now what the visualization reflects: all shown errors will be ≤ this
     min_inliers: int = 4,
-    min_inlier_fraction: float = 0.5,
+    min_inlier_fraction: float = 0.6,
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
     min_vis_coverage: float = 0.7,
@@ -998,12 +1119,12 @@ def brute_match(
                             cost     = cdist(blobs, proj_all)
                             ri, ci   = linear_sum_assignment(cost)
 
-                            inlier_mask = cost[ri, ci] < reprojection_threshold
+                            inlier_mask = cost[ri, ci] < hungarian_threshold_px
                             ib = ri[inlier_mask]
                             il = vis_ids[ci[inlier_mask]]
 
                             if dbg:
-                                outlier_mask = cost[ri, ci] >= reprojection_threshold
+                                outlier_mask = cost[ri, ci] >= hungarian_threshold_px
                                 x = ri[outlier_mask]
                                 y = vis_ids[ci[outlier_mask]]
                                 logger.debug(f"  sol {sol_i}: {len(ib)} inliers after Hungarian "
@@ -1015,6 +1136,7 @@ def brute_match(
                             ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
                                 positions[il], blobs[ib], K, dc,
                                 rvec_h, tvec_h.reshape(3, 1),
+                                reprojection_px=reprojection_threshold,
                             )
                             if dbg:
                                 logger.debug(f"  sol {sol_i}: RANSAC ok={ok_r}, "
@@ -1047,13 +1169,34 @@ def brute_match(
                                 continue
 
                             # ── 7. Visibility coverage check ──────────────────
-                            n_vis = int(vis_mask_r.sum())
-                            n_ib  = len(ib)
-                            if n_vis > 0 and n_ib < min_vis_coverage * n_vis:
+                            # Weight each visible LED by cos(θ) — the dot product
+                            # of its normal with the view direction.  LEDs at
+                            # grazing angles (θ → 90°) may be theoretically
+                            # visible but are rarely detected reliably, so they
+                            # contribute less to both numerator and denominator.
+                            # This prevents those LEDs from unfairly failing the
+                            # coverage gate when they simply aren't bright enough.
+                            vis_ids_r = np.where(vis_mask_r)[0]
+                            n_vis     = len(vis_ids_r)
+                            n_ib      = len(ib)
+
+                            pts_vis  = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
+                            nrm_vis  = (R_r @ normals[vis_ids_r].T).T
+                            view_vis = -pts_vis / (np.linalg.norm(pts_vis, axis=1, keepdims=True) + 1e-9)
+                            vis_w    = np.clip((nrm_vis * view_vis).sum(axis=1), 0.0, 1.0)
+
+                            # il ⊂ vis_ids_r is guaranteed by step 6
+                            il_pos    = np.searchsorted(vis_ids_r, il)
+                            n_vis_eff = float(vis_w.sum())
+                            n_ib_eff  = float(vis_w[il_pos].sum())
+
+                            if n_vis_eff > 0 and n_ib_eff < min_vis_coverage * n_vis_eff:
                                 if dbg:
                                     logger.debug(
-                                        f"  sol {sol_i}: vis coverage {n_ib}/{n_vis}"
-                                        f"={n_ib/n_vis:.2f} < {min_vis_coverage:.2f}"
+                                        f"  sol {sol_i}: weighted vis coverage "
+                                        f"{n_ib_eff:.2f}/{n_vis_eff:.2f}"
+                                        f"={n_ib_eff/n_vis_eff:.2f} < {min_vis_coverage:.2f}"
+                                        f"  (raw {n_ib}/{n_vis})"
                                     )
                                 continue
 
@@ -1100,12 +1243,12 @@ def brute_match(
                                         f"  ★ new best — tier={tier_idx} "
                                         f"LEDs{list(l_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
                                         f"sol={sol_i}  inliers={n_ib}  err={err:.3f}px  "
-                                        f"vis={n_ib}/{n_vis}"
+                                        f"vis={n_ib_eff:.1f}/{n_vis_eff:.1f} (raw {n_ib}/{n_vis})"
                                     )
 
                                 if (best_inliers >= strong_inliers_eff
                                         and best_error <= strong_match_error_px
-                                        and (n_vis == 0 or n_ib >= min_vis_coverage * n_vis)):
+                                        and (n_vis_eff == 0 or n_ib_eff >= min_vis_coverage * n_vis_eff)):
                                     strong_found = True
 
             cur_prev_blob[lq_i] = blob_max
