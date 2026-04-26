@@ -55,7 +55,7 @@ class Camera:
     def T_imu_cam(self):
 
         R_imu_cam = R.from_quat([self.qx, self.qy, self.qz, self.qw]).as_matrix()
-        t_imu_cam = np.array([[self.px, self.py, self.pz]]).T
+        t_imu_cam = np.array([self.px, self.py, self.pz])
 
         return R_imu_cam, t_imu_cam
 

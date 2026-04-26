@@ -3,6 +3,19 @@ import numpy as np
 from pathlib import Path
 
 
+def _mean_knn_distances(centroids, k):
+    """For each point return mean Euclidean distance to its k nearest neighbors."""
+    n = len(centroids)
+    diff = centroids[:, None, :] - centroids[None, :, :]   # (n, n, 2)
+    dists = np.sqrt((diff ** 2).sum(axis=-1))               # (n, n)
+    mean_nn = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        row = dists[i].copy()
+        row[i] = np.inf                     # exclude self
+        mean_nn[i] = np.sort(row)[:k].mean()
+    return mean_nn
+
+
 def get_centroids(image, cfg, visualize=False, img_path=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
@@ -31,12 +44,21 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     Uses 1-based coordinates internally (matching blobwatch.c greysum) to
     prevent the first row/column from never contributing — the result is then
     shifted back to 0-based.
+
+    Distance-based outlier filter
+    ─────────────────────────────
+    After detection, each blob's mean distance to its neighbor_k nearest
+    neighbors is computed.  Blobs whose mean exceeds outlier_factor × median
+    of all such means are dropped as spatially isolated noise.
+    Skipped when fewer than neighbor_k + 1 blobs are detected.
     """
-    pixel_threshold   = int(cfg["min_threshold"])
+    pixel_threshold    = int(cfg["min_threshold"])
     required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
-    min_area          = float(cfg["min_area"])
-    max_area          = float(cfg["max_area"])
-    max_wh            = int(cfg.get("max_wh", 35))   # blobwatch default
+    min_area           = float(cfg["min_area"])
+    max_area           = float(cfg["max_area"])
+    max_wh             = int(cfg.get("max_wh", 35))
+    neighbor_k         = int(cfg.get("neighbor_k", 3))
+    outlier_factor     = float(cfg.get("outlier_factor", 3.0))
 
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
     _, mask = cv2.threshold(image, pixel_threshold, 255, cv2.THRESH_BINARY)
@@ -47,11 +69,6 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     centroids = []
     blob_contours = []
     intensities = image.astype(np.float32)
-
-    if visualize:
-        vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-    idx = 0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -96,8 +113,31 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         centroids.append((cx, cy))
         blob_contours.append(cnt.reshape(-1, 2).astype(np.float32))
 
-        if visualize:
-            pt = (int(round(cx)), int(round(cy)))
+    centroids_arr = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
+
+    # ── 3. Distance-based outlier filter ─────────────────────────────────────
+    keep_mask = None
+    if len(centroids_arr) > neighbor_k:
+        mean_nn = _mean_knn_distances(centroids_arr, neighbor_k)
+        keep_mask = mean_nn <= outlier_factor * np.median(mean_nn)
+
+    kept_indices = np.where(keep_mask)[0] if keep_mask is not None else np.arange(len(centroids_arr))
+    filtered_centroids = centroids_arr[kept_indices]
+    filtered_contours  = [blob_contours[i] for i in kept_indices]
+
+    # ── 4. Visualization ──────────────────────────────────────────────────────
+    if visualize:
+        vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+        # Rejected blobs in red
+        if keep_mask is not None:
+            for i in np.where(~keep_mask)[0]:
+                pt = (int(round(centroids_arr[i, 0])), int(round(centroids_arr[i, 1])))
+                cv2.circle(vis, pt, 4, (0, 0, 255), 1)
+
+        # Kept blobs
+        for idx, pt_f in enumerate(filtered_centroids):
+            pt = (int(round(pt_f[0])), int(round(pt_f[1])))
             cv2.circle(vis, pt, 2, (255, 0, 0), -1)
             cv2.circle(vis, pt, 3, (255, 255, 255), 1)
             cv2.putText(
@@ -111,15 +151,10 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
                 cv2.LINE_AA,
             )
 
-        idx += 1
+        if img_path is not None:
+            out_dir = Path("./visualization/blobs")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            img_out_path = out_dir / f"{Path(img_path).stem}_blobs.png"
+            cv2.imwrite(str(img_out_path), vis)
 
-    centroids = np.array(centroids) if centroids else np.empty((0, 2), dtype=np.float32)
-    # blob_contours: list of (M_i, 2) float32 pixel coordinate arrays, one per blob
-
-    if visualize and img_path is not None:
-        out_dir = Path("./visualization/blobs")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        img_out_path = out_dir / f"{Path(img_path).stem}_blobs.png"
-        cv2.imwrite(str(img_out_path), vis)
-
-    return centroids, blob_contours
+    return filtered_centroids, filtered_contours

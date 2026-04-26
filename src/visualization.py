@@ -348,7 +348,7 @@ class ControllerAnimatorRerun:
         self._trimesh        = load_trimesh(mesh_path)
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
-        self._geom = _compute_geometry(self.model_positions, self.model_normals)
+        self._geom = None  # computed in start() once ctrl-space positions are available
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -382,6 +382,12 @@ class ControllerAnimatorRerun:
             collapse_panels=False,
         )
         rr.send_blueprint(blueprint)
+
+        T_ctrl_model = T_model_ctrl.inverse()
+        self._ctrl_positions = T_ctrl_model.apply(self.model_positions.astype(np.float64)).astype(np.float32)
+        self._ctrl_normals   = (T_ctrl_model.R @ self.model_normals.astype(np.float64).T).T.astype(np.float32)
+        self._T_model_ctrl   = T_model_ctrl
+        self._geom           = _compute_geometry(self._ctrl_positions, self._ctrl_normals)
 
         self._log_static_camera(camera)
 
@@ -574,10 +580,13 @@ class ControllerAnimatorRerun:
                 matched_bids.add(bid)
                 matched_lids.add(lid)
 
-        # ---- per-frame visibility mask (same logic as brute_match) ----
+        # ---- per-frame visibility mask ----
+        # Primitives (boxes/cylinders) inside _geom are hardcoded in controller
+        # space, so _visible_mask must receive controller-space R, t and positions.
+        T_cam_ctrl = T_cam_model.compose(self._T_model_ctrl)
         vis_mask = _visible_mask(
-            R, t,
-            self.model_positions, self.model_normals,
+            T_cam_ctrl.R, T_cam_ctrl.t,
+            self._ctrl_positions, self._ctrl_normals,
             self._geom,
         )
         vis_set = set(np.where(vis_mask)[0].tolist())

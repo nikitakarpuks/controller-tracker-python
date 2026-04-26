@@ -64,7 +64,8 @@ class ControllerGeometry:
 
     __slots__ = (
         "ring_axis", "is_inner", "radial_out", "ring_centroid",
-        "R_fc", "frustum_slope", "z_frustum_top", "z_frustum_bot", "z_rel",
+        "R_fc", "R_fc_inner", "frustum_slope", "z_frustum_top", "z_frustum_bot", "z_rel",
+        "ring_center_ax",
         "boxes", "cylinders",
     )
 
@@ -75,21 +76,25 @@ class ControllerGeometry:
         radial_out:     np.ndarray,
         ring_centroid:  np.ndarray,
         R_fc:           float,
+        R_fc_inner:     float,
         frustum_slope:  float,
         z_frustum_top:  float,
         z_frustum_bot:  float,
         z_rel:          np.ndarray,
+        ring_center_ax: float,
         boxes:          List[Box3D],
         cylinders:      List[Cylinder3D],
     ):
-        self.ring_axis     = ring_axis
-        self.is_inner      = is_inner
-        self.radial_out    = radial_out
-        self.ring_centroid = ring_centroid
-        self.R_fc          = R_fc
-        self.frustum_slope = frustum_slope
-        self.z_frustum_top = z_frustum_top
-        self.z_frustum_bot = z_frustum_bot
-        self.z_rel         = z_rel
-        self.boxes         = boxes
-        self.cylinders     = cylinders
+        self.ring_axis      = ring_axis
+        self.is_inner       = is_inner
+        self.radial_out     = radial_out
+        self.ring_centroid  = ring_centroid
+        self.R_fc           = R_fc
+        self.R_fc_inner     = R_fc_inner
+        self.frustum_slope  = frustum_slope
+        self.z_frustum_top  = z_frustum_top
+        self.z_frustum_bot  = z_frustum_bot
+        self.z_rel          = z_rel
+        self.ring_center_ax = ring_center_ax
+        self.boxes          = boxes
+        self.cylinders      = cylinders

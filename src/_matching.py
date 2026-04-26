@@ -198,7 +198,8 @@ def _rays_blocked_by_cylinder(cam: np.ndarray, leds: np.ndarray, cy) -> np.ndarr
 def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   positions: np.ndarray, normals: np.ndarray,
                   geom: ControllerGeometry,
-                  is_inner: Optional[np.ndarray] = None) -> np.ndarray:
+                  is_inner: Optional[np.ndarray] = None,
+                  debug: bool = False) -> np.ndarray:
     """
     Boolean mask: True for each LED that is camera-facing and not occluded.
 
@@ -222,62 +223,142 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
     normals_cam = (R @ normals.T).T
     dot         = (normals_cam * view_dir).sum(axis=1)
-    mask        = z_ok & (dot < -0.00)
+    mask        = z_ok & (dot < -0.05)
 
     cam_world = -(R.T @ tvec)
 
-    # ── Check 3: frustum cone occlusion (inner LEDs only) ────────────────────
+    # ── Check 3: thick-frustum occlusion (inner LEDs only) ───────────────────
+    # Tests all four wall surfaces: outer cone, inner cone, top cap, bottom cap.
+    # A ray is blocked if any midpoint of the segments between boundary crossings
+    # lies inside the solid wall region (r_inner ≤ r ≤ r_outer, z_bot ≤ z ≤ z_top).
     _is_inner = is_inner if is_inner is not None else geom.is_inner
+    if debug and _is_inner is not None:
+        inner_ids = np.where(_is_inner)[0].tolist()
+        outer_ids = np.where(~_is_inner)[0].tolist()
+        print(f"[frustum debug] inner LEDs ({len(inner_ids)}): {inner_ids}")
+        print(f"[frustum debug] outer LEDs ({len(outer_ids)}): {outer_ids}")
     if _is_inner is not None and np.any(_is_inner):
-        ring_axis     = geom.ring_axis
-        ring_centroid = geom.ring_centroid
-        R_fc          = geom.R_fc
-        slope         = geom.frustum_slope
-        z_top         = geom.z_frustum_top
-        z_bot         = geom.z_frustum_bot
+        ring_axis      = geom.ring_axis
+        ring_centroid  = geom.ring_centroid
+        R_fc           = geom.R_fc
+        R_fc_inner     = geom.R_fc_inner
+        slope          = geom.frustum_slope
+        z_top          = geom.z_frustum_top
+        z_bot          = geom.z_frustum_bot
+        ring_center_ax = geom.ring_center_ax
 
         inner_active = np.where(_is_inner)[0]
-        P     = positions[inner_active]
+        P     = positions[inner_active]           # (N, 3)
         C_rel = cam_world - ring_centroid
         P_rel = P - ring_centroid
 
         C_ax  = float(C_rel @ ring_axis)
-        P_ax  = (P_rel * ring_axis).sum(axis=1)
-        C_rad = C_rel - C_ax * ring_axis
-        P_rad = P_rel - np.outer(P_ax, ring_axis)
+        P_ax  = (P_rel * ring_axis).sum(axis=1)   # (N,)
+        C_rad = C_rel - C_ax * ring_axis           # (3,)
+        P_rad = P_rel - np.outer(P_ax, ring_axis)  # (N, 3)
 
-        d_ax  = P_ax - C_ax
-        d_rad = P_rad - C_rad
+        D_ax  = P_ax - C_ax                        # (N,)
+        D_rad = P_rad - C_rad                      # (N, 3)
 
-        A0    = float(R_fc) + float(slope) * C_ax
-        Ad    = float(slope) * d_ax
-        a     = (d_rad ** 2).sum(axis=1) - Ad ** 2
-        b     = 2.0 * ((C_rad * d_rad).sum(axis=1) - A0 * Ad)
-        c_val = float(np.dot(C_rad, C_rad)) - A0 ** 2
+        C_ax_rel  = C_ax - ring_center_ax
+        A0_out    = R_fc       + slope * C_ax_rel
+        A0_in     = R_fc_inner + slope * C_ax_rel
+        Ad        = slope * D_ax                   # (N,)
+        C_rad_sq  = float(np.dot(C_rad, C_rad))
+        CdotD_rad = (C_rad * D_rad).sum(axis=1)    # (N,)
+        D_rad_sq  = (D_rad ** 2).sum(axis=1)       # (N,)
 
-        disc    = b ** 2 - 4.0 * a * c_val
+        # Quadratic coefficients for outer and inner cone (vectorised over N)
+        a      = D_rad_sq - Ad ** 2
+        b_out  = 2.0 * (CdotD_rad - A0_out * Ad)
+        b_in   = 2.0 * (CdotD_rad - A0_in  * Ad)
+        c_out  = C_rad_sq - A0_out ** 2
+        c_in   = C_rad_sq - A0_in  ** 2
+
+        disc_out = b_out ** 2 - 4.0 * a * c_out   # (N,)
+        disc_in  = b_in  ** 2 - 4.0 * a * c_in    # (N,)
+
+        # Top / bottom plane t-values (one per LED; inf when ray is axially parallel)
+        safe_D_ax = np.where(np.abs(D_ax) > 1e-12, D_ax, np.inf)
+        t_top_arr = (z_top - C_ax_rel) / safe_D_ax  # (N,)
+        t_bot_arr = (z_bot - C_ax_rel) / safe_D_ax  # (N,)
+
+        EPS     = 1e-4
         blocked = np.zeros(len(inner_active), dtype=bool)
 
-        def _in_axial(z):
-            return (z >= z_bot) & (z <= z_top)
+        for i in range(len(inner_active)):
+            t_cands = []
 
-        has_roots = disc >= 0.0
-        if np.any(has_roots):
-            sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
-            safe_2a   = np.where(np.abs(a) > 1e-12, 2.0 * a, 1.0)
-            for sign in (-1.0, 1.0):
-                t = np.where(np.abs(a) > 1e-12,
-                             (-b + sign * sqrt_disc) / safe_2a, 2.0)
-                in_range = has_roots & (t > 1e-4) & (t < 1.0 - 1e-4)
-                if np.any(in_range):
-                    blocked |= in_range & _in_axial(C_ax + t * d_ax)
+            # Outer cone crossings
+            if disc_out[i] >= 0.0:
+                sq  = np.sqrt(max(disc_out[i], 0.0))
+                ai2 = 2.0 * a[i]
+                if abs(a[i]) > 1e-12:
+                    for sign in (-1.0, 1.0):
+                        tc = (-b_out[i] + sign * sq) / ai2
+                        if EPS < tc < 1.0 - EPS:
+                            t_cands.append(tc)
+                elif abs(b_out[i]) > 1e-12:
+                    tc = -c_out / b_out[i]
+                    if EPS < tc < 1.0 - EPS:
+                        t_cands.append(tc)
 
-        lin_case = np.abs(a) <= 1e-12
-        if np.any(lin_case):
-            t_lin        = np.where(np.abs(b) > 1e-12, -c_val / b, 2.0)
-            in_range_lin = lin_case & (t_lin > 1e-4) & (t_lin < 1.0 - 1e-4)
-            if np.any(in_range_lin):
-                blocked |= in_range_lin & _in_axial(C_ax + t_lin * d_ax)
+            # Inner cone crossings
+            if disc_in[i] >= 0.0:
+                sq  = np.sqrt(max(disc_in[i], 0.0))
+                ai2 = 2.0 * a[i]
+                if abs(a[i]) > 1e-12:
+                    for sign in (-1.0, 1.0):
+                        tc = (-b_in[i] + sign * sq) / ai2
+                        if EPS < tc < 1.0 - EPS:
+                            t_cands.append(tc)
+                elif abs(b_in[i]) > 1e-12:
+                    tc = -c_in / b_in[i]
+                    if EPS < tc < 1.0 - EPS:
+                        t_cands.append(tc)
+
+            # Top / bottom cap crossings
+            for tc in (t_top_arr[i], t_bot_arr[i]):
+                if EPS < tc < 1.0 - EPS:
+                    t_cands.append(tc)
+
+            if not t_cands:
+                if debug:
+                    print(f"  [frustum] LED {inner_active[i]:2d}: NO t_cands"
+                          f"  disc_out={disc_out[i]:+.5f}  disc_in={disc_in[i]:+.5f}"
+                          f"  t_top={t_top_arr[i]:.4f}  t_bot={t_bot_arr[i]:.4f}")
+                continue
+
+            # Check midpoint of each interval between consecutive boundary crossings.
+            # A midpoint inside the wall region means the ray passes through the wall.
+            intervals = [EPS] + sorted(t_cands) + [1.0 - EPS]
+            for j in range(len(intervals) - 1):
+                t_mid     = 0.5 * (intervals[j] + intervals[j + 1])
+                z_mid     = C_ax_rel + t_mid * D_ax[i]
+                r_out_mid = R_fc       + slope * z_mid
+                r_in_mid  = R_fc_inner + slope * z_mid
+                r_mid     = float(np.linalg.norm(C_rad + t_mid * D_rad[i]))
+                if z_bot <= z_mid <= z_top and r_in_mid <= r_mid <= r_out_mid:
+                    blocked[i] = True
+                    break
+
+            if debug and not blocked[i]:
+                tc_strs = "  ".join(f"{tc:.4f}" for tc in sorted(t_cands))
+                print(f"  [frustum] LED {inner_active[i]:2d}: NOT blocked"
+                      f"  t_cands=[{tc_strs}]"
+                      f"  t_top={t_top_arr[i]:.4f}  t_bot={t_bot_arr[i]:.4f}"
+                      f"  C_ax_rel={C_ax_rel:.4f}  D_ax={D_ax[i]:.4f}"
+                      f"  z_range=[{z_bot:.4f},{z_top:.4f}]")
+                for j in range(len(intervals) - 1):
+                    t_mid     = 0.5 * (intervals[j] + intervals[j + 1])
+                    z_mid     = C_ax_rel + t_mid * D_ax[i]
+                    r_out_mid = R_fc       + slope * z_mid
+                    r_in_mid  = R_fc_inner + slope * z_mid
+                    r_mid     = float(np.linalg.norm(C_rad + t_mid * D_rad[i]))
+                    z_ok_s = "z_ok" if z_bot <= z_mid <= z_top else f"z_FAIL({z_mid:.4f})"
+                    r_ok_s = "r_ok" if r_in_mid <= r_mid <= r_out_mid else f"r_FAIL(in={r_in_mid:.4f} r={r_mid:.4f} out={r_out_mid:.4f})"
+                    print(f"    [{intervals[j]:.4f},{intervals[j+1]:.4f}]"
+                          f"  t_mid={t_mid:.4f}  {z_ok_s}  {r_ok_s}")
 
         mask[inner_active[blocked]] = False
 
@@ -688,10 +769,10 @@ def brute_match(
     p4_threshold_px: float = 2.0,
     reprojection_threshold: float = 2.0,
     min_inliers: int = 4,
-    min_inlier_fraction: float = 0.8,
+    min_inlier_fraction: float = 0.5,
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
-    min_vis_coverage: float = 0.5,
+    min_vis_coverage: float = 0.7,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
 ) -> Optional[Dict]:
@@ -948,11 +1029,16 @@ def brute_match(
                                 continue
 
                             # ── 6. Visibility recheck with the refined pose ────
+                            # Recompute on ALL LEDs so that:
+                            #   (a) the denominator for coverage is accurate,
+                            #   (b) inliers occluded under the refined pose are dropped.
                             R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
-                            vis_sub = _visible_mask(
-                                R_r, tvec_r.reshape(3), positions[il], normals[il],
-                                geom, is_inner[il],
+                            tvec_r_flat = tvec_r.reshape(3)
+                            vis_mask_r = _visible_mask(
+                                R_r, tvec_r_flat, positions, normals,
+                                geom,
                             )
+                            vis_sub = vis_mask_r[il]
                             il = il[vis_sub]
                             ib = ib[vis_sub]
                             if dbg:
@@ -961,7 +1047,7 @@ def brute_match(
                                 continue
 
                             # ── 7. Visibility coverage check ──────────────────
-                            n_vis = len(vis_ids)
+                            n_vis = int(vis_mask_r.sum())
                             n_ib  = len(ib)
                             if n_vis > 0 and n_ib < min_vis_coverage * n_vis:
                                 if dbg:
@@ -1056,4 +1142,13 @@ def brute_match(
         f"  total — {total_p3p_tried:>7} P3P calls"
         f"{dup_line}"
     )
+
+    # if best_solution is not None:
+    #     R_best, _ = cv2.Rodrigues(best_solution["rvec"])
+    #     tvec_best = best_solution["tvec"].reshape(3)
+    #     cam_dbg = -(R_best.T @ tvec_best)
+    #     print(f"[vis check] cam_world = {cam_dbg.round(4)}")
+    #     print("[frustum debug] inner LED occlusion check for best solution:")
+    #     _visible_mask(R_best, tvec_best, positions, normals, geom, debug=True)
+
     return best_solution

@@ -82,6 +82,15 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
     z_frustum_top = float(outer_z_rel.max()) + 0.004
     z_frustum_bot = float(outer_z_rel.min()) - 0.0055
 
+    # ── Inner cone radius (wall thickness from inner LED h_corpus) ────────────
+    r_led = np.linalg.norm(rel_proj, axis=1)
+    if is_inner.any():
+        h_corpus       = np.maximum(0.0, R_fc + frustum_slope * z_rel[is_inner] - r_led[is_inner])
+        wall_thickness = float(h_corpus.mean())
+    else:
+        wall_thickness = 0.003
+    R_fc_inner = R_fc - wall_thickness
+
     # ── Handle body primitives (values finalized via handle_vis.py) ───────────
     boxes = [
         Box3D(
@@ -121,10 +130,12 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
         radial_out=radial_out,
         ring_centroid=centroid,
         R_fc=R_fc,
+        R_fc_inner=R_fc_inner,
         frustum_slope=frustum_slope,
         z_frustum_top=z_frustum_top,
         z_frustum_bot=z_frustum_bot,
         z_rel=z_rel,
+        ring_center_ax=ring_center_ax,
         boxes=boxes,
         cylinders=cylinders,
     )

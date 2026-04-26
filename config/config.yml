@@ -21,8 +21,8 @@ controllers:
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
 
 blob_detection:
-  min_threshold: 10       # pixels >= this are included in a blob
-  required_threshold: 20  # blob must contain at least one pixel >= this (filters dim noise)
+  min_threshold: 5       # pixels >= this are included in a blob
+  required_threshold: 10  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 2
   max_area: 150
   max_wh: 35              # max bounding-box width or height in pixels
@@ -52,3 +52,6 @@ visualization:
         rx: -0.00523160
         ry: 0.22553752
         rz: 3.15
+
+debug_mode: true
+split_to_folders: false
