@@ -1,5 +1,6 @@
 data:
-  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/deep_search_required/deep_search_required"
+  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/deep_search_required/a/a"
+#  root: "./data/datasets/bad_visibility/a"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -21,10 +22,10 @@ controllers:
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
 
 blob_detection:
-  min_threshold: 5       # pixels >= this are included in a blob
-  required_threshold: 10  # blob must contain at least one pixel >= this (filters dim noise)
-  min_area: 2
-  max_area: 150
+  min_threshold: 10       # pixels >= this are included in a blob
+  required_threshold: 15  # blob must contain at least one pixel >= this (filters dim noise)
+  min_area: 4
+  max_area: 200
   max_wh: 35              # max bounding-box width or height in pixels
 
 visualization:

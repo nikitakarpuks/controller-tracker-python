@@ -266,6 +266,11 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   positions: np.ndarray, normals: np.ndarray,
                   geom: ControllerGeometry,
                   is_inner: Optional[np.ndarray] = None,
+                  cam_K: Optional[np.ndarray] = None,
+                  cam_dc: Optional[np.ndarray] = None,
+                  cam_w: int = 0,
+                  cam_h: int = 0,
+                  cam_rpmax: float = 0.0,
                   debug: bool = False) -> np.ndarray:
     """
     Boolean mask: True for each LED that is camera-facing and not occluded.
@@ -273,14 +278,21 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     Checks (in order):
       1. LED is in front of the camera (positive depth).
       2. LED faces the camera (emission-cone test, 90° half-angle).
+      2b. LED projects within image bounds (distorted projection via cam_K/cam_dc).
+          rpmax culls LEDs beyond the valid distortion model radius.
       3. Inner LEDs blocked by the frustum truncated-cone wall.
       4. All LEDs blocked by any handle body primitive (boxes + cylinders).
 
     Parameters
     ----------
-    is_inner : optional subset mask — pass when positions/normals are a subset
-               of the full model (e.g. positions[il]).  If None, geom.is_inner
-               is used (assumes positions == full model).
+    is_inner  : optional subset mask — pass when positions/normals are a subset
+                of the full model (e.g. positions[il]).  If None, geom.is_inner
+                is used (assumes positions == full model).
+    cam_K     : 3×3 camera intrinsic matrix; if None, the in-frame check is skipped.
+    cam_dc    : distortion coefficients (radtan8: k1,k2,p1,p2,k3,k4,k5,k6).
+    cam_w, cam_h : image dimensions in pixels.
+    cam_rpmax : maximum valid normalised radius for the distortion model;
+                LEDs beyond this are culled.  0 disables the check.
     """
     # ── Check 1: positive depth ───────────────────────────────────────────────
     led_cam = (R @ positions.T).T + tvec
@@ -291,6 +303,34 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     normals_cam = (R @ normals.T).T
     dot         = (normals_cam * view_dir).sum(axis=1)
     mask        = z_ok & (dot < -0.05)
+
+    # ── Check 2b: within image frame ─────────────────────────────────────────
+    # Must use distorted projection (cv2.projectPoints), not pinhole, because
+    # wide-angle lenses with barrel distortion compress large-angle points back
+    # into the image — pinhole would incorrectly cull those LEDs.
+    if cam_K is not None and cam_w > 0 and cam_h > 0:
+        active = np.where(mask)[0]
+        if len(active) > 0:
+            dc = cam_dc if cam_dc is not None else np.zeros(4, dtype=np.float32)
+            pts, _ = cv2.projectPoints(
+                positions[active].astype(np.float32).reshape(-1, 1, 3),
+                _to_rvec(R),
+                tvec.astype(np.float32).reshape(3, 1),
+                cam_K, dc,
+            )
+            pts      = pts.reshape(-1, 2)
+            in_frame = (pts[:, 0] >= 0) & (pts[:, 0] < cam_w) & \
+                       (pts[:, 1] >= 0) & (pts[:, 1] < cam_h)
+            if cam_rpmax > 0.0:
+                z_a      = led_cam[active, 2]
+                rp       = np.hypot(led_cam[active, 0] / z_a, led_cam[active, 1] / z_a)
+                in_frame &= rp <= cam_rpmax
+            mask[active[~in_frame]] = False
+            if debug:
+                for k, led_id in enumerate(active):
+                    if not in_frame[k]:
+                        print(f"  [frame]   LED {led_id:2d}: OUT OF FRAME  "
+                              f"proj=({pts[k,0]:.1f}, {pts[k,1]:.1f})")
 
     cam_world = -(R.T @ tvec)
 
@@ -801,6 +841,8 @@ def proximity_match(
                     R_new, tvec_new,
                     self.model.positions, self.model.normals,
                     geom,
+                    cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+                    cam_rpmax=self.camera.rpmax,
                 )
 
                 # Final pairs: must be a RANSAC inlier AND visible with new pose.
@@ -830,7 +872,9 @@ def proximity_match(
     R_pred, _ = cv2.Rodrigues(rvec_pred)
     vis_mask  = _visible_mask(R_pred, tvec_pred,
                               self.model.positions, self.model.normals,
-                              geom)
+                              geom,
+                              cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+                              cam_rpmax=self.camera.rpmax)
     vis_ids   = np.where(vis_mask)[0]
     if len(vis_ids) < 3:
         return None
@@ -975,9 +1019,11 @@ def brute_match(
     tier_lq_total  = [0] * len(depth_tiers)
 
     _dbg_leds, _dbg_blobs = get_debug_triple()
-    debug_active    = _dbg_leds is not None and _dbg_blobs is not None
-    debug_led_list  = list(_dbg_leds)  if debug_active else None
-    debug_blob_list = list(_dbg_blobs) if debug_active else None
+    debug_active      = _dbg_leds is not None or _dbg_blobs is not None
+    debug_led_anchor  = int(_dbg_leds[0])     if _dbg_leds  is not None else None
+    debug_led_set     = frozenset(_dbg_leds)  if _dbg_leds  is not None else None
+    debug_blob_anchor = int(_dbg_blobs[0])    if _dbg_blobs is not None else None
+    debug_blob_set    = frozenset(_dbg_blobs) if _dbg_blobs is not None else None
 
     bijection_counts: Dict[frozenset, int] = {} if is_deep() else None
 
@@ -1047,10 +1093,18 @@ def brute_match(
                             break
 
                         # ── Debug trigger ─────────────────────────────────────
+                        # Anchors are matched positionally (first element of each
+                        # debug triple); l1/l2 and b1/b2 are matched as sets so
+                        # their internal ordering doesn't matter.  This gives at
+                        # most 2 prints per frame: one per b1↔b2 swap.
                         dbg = is_verbose_all() or (
                             debug_active and
-                            list(l_ids) == debug_led_list and
-                            [b_anchor, b1_ord, b2_ord] == debug_blob_list
+                            (debug_led_set  is None or (
+                                int(l_ids[0]) == debug_led_anchor and
+                                frozenset(l_ids) == debug_led_set)) and
+                            (debug_blob_set is None or (
+                                b_anchor == debug_blob_anchor and
+                                frozenset([b_anchor, b1_ord, b2_ord]) == debug_blob_set))
                         )
                         if dbg:
                             logger.debug(
@@ -1108,6 +1162,8 @@ def brute_match(
                             vis_mask_h = _visible_mask(
                                 R_h, tvec_h, positions, normals,
                                 geom,
+                                cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+                                cam_rpmax=self.camera.rpmax,
                             )
                             vis_ids = np.where(vis_mask_h)[0]
                             if dbg:
@@ -1159,6 +1215,8 @@ def brute_match(
                             vis_mask_r = _visible_mask(
                                 R_r, tvec_r_flat, positions, normals,
                                 geom,
+                                cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+                                cam_rpmax=self.camera.rpmax,
                             )
                             vis_sub = vis_mask_r[il]
                             il = il[vis_sub]

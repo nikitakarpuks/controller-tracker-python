@@ -97,25 +97,33 @@ def build_alignment_transform(cfg) -> Transform:
 # Geometry helpers
 # =========================================================
 
-def compute_frustum_corners(cam, z: float):
+def compute_frustum_boundary(cam, z: float, edge_samples: int = 20):
     """
-    Returns the 4 corner points of the image plane at depth z,
-    in camera frame.
+    Returns (N, 3) points tracing the full image boundary at depth z, in camera
+    frame, with distortion correctly inverted.  Each of the 4 edges is sampled
+    at `edge_samples` points (endpoint=False), so N = 4 * edge_samples.
+    Corners are at indices 0, edge_samples, 2*edge_samples, 3*edge_samples.
+
+    Sampling the edges (not just corners) captures the curvature introduced by
+    lens distortion: with barrel distortion the edges bow inward, with pincushion
+    they bow outward — straight-line corner interpolation misses this.
     """
-    corners_px = np.array([
-        [0,          0         ],
-        [cam.width,  0         ],
-        [cam.width,  cam.height],
-        [0,          cam.height],
-    ], dtype=np.float32)
+    w, h = float(cam.width), float(cam.height)
+    t = np.linspace(0.0, 1.0, edge_samples, endpoint=False, dtype=np.float32)
+    edges_px = np.concatenate([
+        np.column_stack([t * w,            np.zeros_like(t)]),   # top
+        np.column_stack([np.full_like(t, w), t * h]),             # right
+        np.column_stack([(1.0 - t) * w,   np.full_like(t, h)]), # bottom
+        np.column_stack([np.zeros_like(t), (1.0 - t) * h]),     # left
+    ], axis=0)
 
-    pts = []
-    for u, v in corners_px:
-        x = (u - cam.cx) / cam.fx * z
-        y = (v - cam.cy) / cam.fy * z
-        pts.append([x, y, z])
+    norm = cv2.undistortPoints(
+        edges_px.reshape(-1, 1, 2),
+        cam.camera_matrix, cam.dist_coeffs,
+    ).reshape(-1, 2)
 
-    return np.array(pts, dtype=np.float32)
+    pts = np.column_stack([norm[:, 0] * z, norm[:, 1] * z, np.full(len(norm), z)])
+    return pts.astype(np.float32)
 
 
 def backproject_to_plane(blobs: np.ndarray, cam, z: float = 0.2) -> np.ndarray:
@@ -454,17 +462,16 @@ class ControllerAnimatorRerun:
         """Camera frustum and image-plane outline — static, logged once."""
         frustum_z = self.vis_cfg.get("frustum_z", 0.05)
 
-        corners = compute_frustum_corners(cam, z=frustum_z)
-        origin  = np.zeros(3)
+        edge_samples = 20
+        boundary = compute_frustum_boundary(cam, z=frustum_z, edge_samples=edge_samples)
+        origin   = np.zeros(3)
 
-        # Frustum edges: 4 rays from origin + 4 edges of the image plane
-        frustum_strips = [
-            [origin, corners[0]],
-            [origin, corners[1]],
-            [origin, corners[2]],
-            [origin, corners[3]],
-        ]
-        plane_strip = [corners[0], corners[1], corners[2], corners[3], corners[0]]
+        # 4 corner points for the frustum rays (one ray per corner)
+        corners = boundary[[0, edge_samples, 2 * edge_samples, 3 * edge_samples]]
+        frustum_strips = [[origin, c] for c in corners]
+
+        # Full curved boundary loop for the image plane outline
+        plane_strip = np.concatenate([boundary, boundary[:1]], axis=0).tolist()
 
         if self.vis_cfg.get("show_frustum", True):
             rr.log(
@@ -597,6 +604,9 @@ class ControllerAnimatorRerun:
             T_cam_ctrl.R, T_cam_ctrl.t,
             self._ctrl_positions, self._ctrl_normals,
             self._geom,
+            cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
+            cam_w=camera.width, cam_h=camera.height,
+            cam_rpmax=camera.rpmax,
         )
         vis_set = set(np.where(vis_mask)[0].tolist())
 
