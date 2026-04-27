@@ -44,7 +44,7 @@ def main():
     #   debug_led_ids / debug_blob_ids → also log a specific triple in detail
     # debug_config.configure(mode)
     # debug_config.configure(mode, verbose_all=True)
-    debug_config.configure(mode, debug_led_ids=[0, 14, 3], debug_blob_ids=[5, 8, 2])
+    debug_config.configure(mode, debug_led_ids=[19, 31, 28], debug_blob_ids=[4, 1, 3])
 
     logger.info(f"mode={mode.value}  data={data_root}")
 
