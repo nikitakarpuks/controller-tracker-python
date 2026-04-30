@@ -16,6 +16,81 @@ def _mean_knn_distances(centroids, k):
     return mean_nn
 
 
+def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
+    """
+    Find local maxima within a blob (pixel coords given by ys, xs).
+
+    A pixel is a local maximum if its value is >= all 8-connected neighbors
+    AND >= peak_threshold.  NMS then suppresses weaker maxima within
+    min_split_dist pixels of a stronger one.  Returns a list of (y, x).
+    """
+    vals = image[ys, xs].astype(np.int32)
+    is_max = vals >= peak_threshold
+
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            if dy == 0 and dx == 0:
+                continue
+            ny = np.clip(ys + dy, 0, image.shape[0] - 1)
+            nx = np.clip(xs + dx, 0, image.shape[1] - 1)
+            is_max &= vals >= image[ny, nx].astype(np.int32)
+
+    if not np.any(is_max):
+        return []
+
+    max_ys  = ys[is_max]
+    max_xs  = xs[is_max]
+    max_vals = vals[is_max]
+
+    # NMS: process strongest first, suppress within min_split_dist
+    order = np.argsort(max_vals)[::-1]
+    kept = []
+    for i in order:
+        y, x = int(max_ys[i]), int(max_xs[i])
+        if all(np.hypot(y - ky, x - kx) >= min_split_dist for ky, kx in kept):
+            kept.append((y, x))
+
+    return kept
+
+
+def _split_blob_at_seeds(image, intensities, ys, xs, seed_a, seed_b):
+    """
+    Split blob pixels by Voronoi partition around seed_a and seed_b (y, x tuples).
+    Returns two ((cx, cy), contour) pairs, or None if either partition is empty.
+    """
+    dist_a = (ys - seed_a[0]) ** 2 + (xs - seed_a[1]) ** 2
+    dist_b = (ys - seed_b[0]) ** 2 + (xs - seed_b[1]) ** 2
+    part_masks = [dist_a <= dist_b, dist_a > dist_b]
+
+    results = []
+    for part_bool in part_masks:
+        p_ys = ys[part_bool]
+        p_xs = xs[part_bool]
+        if len(p_ys) == 0:
+            return None
+
+        w = intensities[p_ys, p_xs]
+        total_w = w.sum()
+        if total_w > 0:
+            pcx = float(np.sum((p_xs + 1) * w) / total_w) - 1.0
+            pcy = float(np.sum((p_ys + 1) * w) / total_w) - 1.0
+        else:
+            pcx = float(p_xs.mean())
+            pcy = float(p_ys.mean())
+
+        part_img = np.zeros(image.shape[:2], dtype=np.uint8)
+        part_img[p_ys, p_xs] = 255
+        cnts, _ = cv2.findContours(part_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if cnts:
+            cnt = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+        else:
+            cnt = np.column_stack([p_xs, p_ys]).astype(np.float32)
+
+        results.append(((pcx, pcy), cnt))
+
+    return results
+
+
 def get_centroids(image, cfg, visualize=False, img_path=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
@@ -51,6 +126,17 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     neighbors is computed.  Blobs whose mean exceeds outlier_factor × median
     of all such means are dropped as spatially isolated noise.
     Skipped when fewer than neighbor_k + 1 blobs are detected.
+
+    Merged-blob splitting (optional)
+    ────────────────────────────────
+    Enabled with split_merged=true.  For each blob, local maxima are found
+    among its pixels (pixels >= all 8 neighbors AND >= required_threshold).
+    NMS suppresses weaker maxima within min_split_dist pixels of a stronger
+    one.  If exactly 2 maxima survive, the blob is split: pixels are assigned
+    to the nearest seed by Voronoi partition, producing two centroids and two
+    contours.  Blobs with 1 maximum are kept as-is.  Blobs with 3+ maxima are
+    also kept as-is (treated as noise rather than 3 merged LEDs).
+    Split blobs are drawn in cyan with their partition contours visible.
     """
     pixel_threshold    = int(cfg["min_threshold"])
     required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
@@ -59,6 +145,8 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     max_wh             = int(cfg.get("max_wh", 35))
     neighbor_k         = int(cfg.get("neighbor_k", 3))
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
+    split_merged       = bool(cfg.get("split_merged", False))
+    min_split_dist     = float(cfg.get("min_split_dist", 4.0))
 
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
     _, mask = cv2.threshold(image, pixel_threshold, 255, cv2.THRESH_BINARY)
@@ -68,6 +156,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
 
     centroids = []
     blob_contours = []
+    blob_pixels_list = []
     intensities = image.astype(np.float32)
 
     for cnt in contours:
@@ -112,8 +201,39 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
 
         centroids.append((cx, cy))
         blob_contours.append(cnt.reshape(-1, 2).astype(np.float32))
+        blob_pixels_list.append((ys, xs))
 
-    centroids_arr = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
+    # ── 2b. Merged-blob splitting ─────────────────────────────────────────────
+    blob_is_split = [False] * len(centroids)
+
+    if split_merged:
+        new_centroids     = []
+        new_blob_contours = []
+        new_blob_is_split = []
+
+        for i in range(len(centroids)):
+            ys_b, xs_b = blob_pixels_list[i]
+            maxima = _find_split_maxima(image, ys_b, xs_b, required_threshold, min_split_dist)
+
+            if len(maxima) == 2:
+                split_result = _split_blob_at_seeds(image, intensities, ys_b, xs_b, maxima[0], maxima[1])
+                if split_result is not None:
+                    for (pcx, pcy), part_cnt in split_result:
+                        new_centroids.append((pcx, pcy))
+                        new_blob_contours.append(part_cnt)
+                        new_blob_is_split.append(True)
+                    continue
+
+            new_centroids.append(centroids[i])
+            new_blob_contours.append(blob_contours[i])
+            new_blob_is_split.append(False)
+
+        centroids     = new_centroids
+        blob_contours = new_blob_contours
+        blob_is_split = new_blob_is_split
+
+    centroids_arr     = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
+    blob_is_split_arr = np.array(blob_is_split, dtype=bool)
 
     # ── 3. Distance-based outlier filter ─────────────────────────────────────
     keep_mask = None
@@ -125,6 +245,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     rejected_indices = np.where(~keep_mask)[0] if keep_mask is not None else np.array([], dtype=int)
     filtered_centroids  = centroids_arr[kept_indices]
     filtered_contours   = [blob_contours[i] for i in kept_indices]
+    filtered_is_split   = blob_is_split_arr[kept_indices] if len(blob_is_split_arr) else np.zeros(0, dtype=bool)
     rejected_centroids  = centroids_arr[rejected_indices]
     rejected_contours   = [blob_contours[i] for i in rejected_indices]
 
@@ -141,8 +262,18 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         # Kept blobs
         for idx, pt_f in enumerate(filtered_centroids):
             pt = (int(round(pt_f[0])), int(round(pt_f[1])))
-            cv2.circle(vis, pt, 2, (255, 0, 0), -1)
-            cv2.circle(vis, pt, 3, (255, 255, 255), 1)
+            is_split = bool(filtered_is_split[idx]) if idx < len(filtered_is_split) else False
+
+            if is_split:
+                # Cyan: draw the partition contour so the split boundary is visible
+                cnt_draw = filtered_contours[idx].astype(np.int32).reshape(-1, 1, 2)
+                cv2.drawContours(vis, [cnt_draw], -1, (255, 255, 0), 1)
+                cv2.circle(vis, pt, 2, (255, 255, 0), -1)
+                cv2.circle(vis, pt, 3, (255, 255, 0), 1)
+            else:
+                cv2.circle(vis, pt, 2, (255, 0, 0), -1)
+                cv2.circle(vis, pt, 3, (255, 255, 255), 1)
+
             cv2.putText(
                 vis,
                 str(idx),

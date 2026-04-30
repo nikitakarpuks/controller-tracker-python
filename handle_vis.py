@@ -57,7 +57,7 @@ from src._matching import _visible_mask
 #
 # Shift the precise 3-D mesh along X so it sits beside the primitives.
 # Set to 0.0 to overlap both objects for a direct comparison.
-MESH_X_OFFSET: float = 0#0.15   # metres
+MESH_X_OFFSET: float = 0.0  # metres
 
 # LED ID label appearance
 LED_LABEL_SHOW:          bool  = True

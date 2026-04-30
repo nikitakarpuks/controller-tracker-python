@@ -302,7 +302,7 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
     normals_cam = (R @ normals.T).T
     dot         = (normals_cam * view_dir).sum(axis=1)
-    mask        = z_ok & (dot < -0.05)
+    mask        = z_ok & (dot < -0.07)
 
     # ── Check 2b: within image frame ─────────────────────────────────────────
     # Must use distorted projection (cv2.projectPoints), not pinhole, because
@@ -932,12 +932,12 @@ def brute_match(
     depth_tiers: Tuple[Tuple, ...] = ((2, 3), (2, 4), (2, 4, 'edge'), (3, 5), (3, 5, 'edge'), (4, 6)),  # (led_max, blob_max[, 'standard'|'edge'])
     p4_threshold_px: float = 2.0,
     hungarian_threshold_px: float = 5.0,  # pre-filter on the raw P3P hypothesis pose. Loose because P3P poses can be noisy; RANSAC does the real filtering after this
-    reprojection_threshold: float = 2.0,  # passed to RANSAC, controls which blobs make it into the final assignment. This is now what the visualization reflects: all shown errors will be ≤ this
+    reprojection_threshold: float = 1.5,  # passed to RANSAC, controls which blobs make it into the final assignment. This is now what the visualization reflects: all shown errors will be ≤ this
     min_inliers: int = 4,
     min_inlier_fraction: Optional[float] = None,
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
-    min_vis_coverage: float = 0.7,
+    min_vis_coverage: float = 0.75,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
 ) -> Optional[Dict]:
@@ -1232,6 +1232,45 @@ def brute_match(
                             if len(inlier_blobs) < min_inliers_eff:
                                 continue
 
+                            vis_ids_r = np.where(vis_mask_r)[0]
+
+                            # ── 6.5. Post-RANSAC blob recovery ────────────────
+                            # Blobs outside hungarian_threshold_px on the coarse
+                            # P3P pose may land within reprojection_threshold
+                            # under the refined pose.  One greedy nearest-
+                            # neighbour pass recovers them (one cdist, no PnP).
+                            matched_blob_set  = set(inlier_blobs.tolist())
+                            matched_led_set   = set(inlier_leds.tolist())
+                            unmatched_blobs   = np.array([b for b in range(n_blobs) if b not in matched_blob_set], dtype=np.int32)
+                            unmatched_col_idx = np.array([j for j, lid in enumerate(vis_ids_r) if int(lid) not in matched_led_set], dtype=np.int32)
+
+                            if len(unmatched_blobs) > 0 and len(unmatched_col_idx) > 0:
+                                proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc)
+                                cost_r     = cdist(blobs, proj_vis_r)
+                                sub_min    = cost_r[np.ix_(unmatched_blobs, unmatched_col_idx)].min(axis=0)
+                                extra_blobs: List[int] = []
+                                extra_leds:  List[int] = []
+                                for order_j in np.argsort(sub_min):
+                                    if sub_min[order_j] >= reprojection_threshold:
+                                        break
+                                    col    = int(unmatched_col_idx[order_j])
+                                    led_id = int(vis_ids_r[col])
+                                    for row_i in np.argsort(cost_r[unmatched_blobs, col]):
+                                        b = int(unmatched_blobs[row_i])
+                                        if b in matched_blob_set:
+                                            continue
+                                        if cost_r[b, col] >= reprojection_threshold:
+                                            break
+                                        matched_blob_set.add(b)
+                                        extra_blobs.append(b)
+                                        extra_leds.append(led_id)
+                                        break
+                                if extra_blobs:
+                                    inlier_blobs = np.concatenate([inlier_blobs, np.array(extra_blobs, dtype=inlier_blobs.dtype)])
+                                    inlier_leds  = np.concatenate([inlier_leds,  np.array(extra_leds,  dtype=inlier_leds.dtype)])
+                                    if dbg:
+                                        logger.debug(f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
+
                             # ── 7. Visibility coverage check ──────────────────
                             # Weight each visible LED by cos(θ) — the dot product
                             # of its normal with the view direction.  LEDs at
@@ -1240,7 +1279,6 @@ def brute_match(
                             # contribute less to both numerator and denominator.
                             # This prevents those LEDs from unfairly failing the
                             # coverage gate when they simply aren't bright enough.
-                            vis_ids_r      = np.where(vis_mask_r)[0]
                             n_visible_leds = len(vis_ids_r)
                             n_inlier_blobs = len(inlier_blobs)
 
