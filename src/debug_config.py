@@ -13,7 +13,6 @@ _debug_blob_ids: Optional[List[int]] = None   # target blob triple [b_anchor, b1
 _verbose_all:    bool                = False  # log every P3P hypothesis, not just the target triple
 _log_best:       bool                = True   # log each time a new best solution is found
 
-
 def configure(
     mode: DebugMode,
     debug_led_ids:  Optional[List[int]] = None,

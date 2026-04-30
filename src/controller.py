@@ -45,7 +45,7 @@ def create_leds_from_config(cfg) -> List[ControllerLED]:
 # 2. GEOMETRY — fit frustum + bake handle primitives
 # =========================================================
 
-def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerGeometry:
+def _compute_geometry(positions: np.ndarray, normals: np.ndarray, geometry_cfg: dict = None) -> ControllerGeometry:
     """
     Fit the LED-ring frustum and bundle it with the hardcoded handle body
     primitives (finalized in handle_vis.py) into one ControllerGeometry object.
@@ -79,17 +79,18 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
     R_fc          = float(coeffs[0])
     frustum_slope = float(coeffs[1])
 
-    z_frustum_top = float(outer_z_rel.max()) + 0.0045
-    z_frustum_bot = float(outer_z_rel.min()) - 0.0055
+    cfg = geometry_cfg or {}
+    z_frustum_top = float(outer_z_rel.max()) + float(cfg.get("z_frustum_top_padding", 0.0045))
+    z_frustum_bot = float(outer_z_rel.min()) - float(cfg.get("z_frustum_bot_padding", 0.0055))
 
-    # ── Inner cone radius (wall thickness from inner LED h_corpus) ────────────
-    r_led = np.linalg.norm(rel_proj, axis=1)
+    ## ── Inner cone radius (wall thickness from inner LED h_corpus) ────────────
+    # r_led = np.linalg.norm(rel_proj, axis=1)
     # if is_inner.any():
     #     h_corpus       = np.maximum(0.0, R_fc + frustum_slope * z_rel[is_inner] - r_led[is_inner])
     #     wall_thickness = float(h_corpus.mean())
     # else:
     #     wall_thickness = 0.007
-    wall_thickness = 0.007  # hardcode so inner leds would not be inside frustum and hence always occluded
+    wall_thickness = float(cfg.get("wall_thickness", 0.007))
     R_fc_inner = R_fc - wall_thickness
 
     # ── Handle body primitives (values finalized via handle_vis.py) ───────────
@@ -98,12 +99,14 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
             name="box_vertical",
             center=np.array([-0.009, -0.012, -0.015]),
             half_dims=np.array([0.021, 0.0028, 0.013]),
+            color=[220, 130, 60],
         ),
         Box3D(
             name="box_horizontal",
             center=np.array([-0.009, -0.029, -0.0048]),
             half_dims=np.array([0.021, 0.0032, 0.015]),
             axes=np.column_stack([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).astype(float),
+            color=[130, 60, 220],
         ),
     ]
     cylinders = [
@@ -115,6 +118,7 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
             radius_v=0.033,
             half_length=0.017,
             angle=np.pi / 10,
+            color=[100, 180, 255],
         ),
         Cylinder3D(
             name="handle",
@@ -122,6 +126,7 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
             axis=np.array([0.0, 1.0, -1.5]),
             radius=0.021,
             half_length=0.037,
+            color=[255, 55, 55],
         ),
     ]
 
@@ -147,7 +152,7 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
 # =========================================================
 
 class SingleViewTracker:
-    def __init__(self, camera: Camera, model: ControllerModel):
+    def __init__(self, camera: Camera, model: ControllerModel, matching_cfg: dict = None, geometry_cfg: dict = None):
         self.camera = camera
         self.model = model
 
@@ -167,6 +172,8 @@ class SingleViewTracker:
         # Consecutive frames without a valid solution.
         self.consecutive_failures: int = 0
 
+        self._matching_cfg = matching_cfg or {}
+
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
 
@@ -179,7 +186,7 @@ class SingleViewTracker:
         positions = model.positions.astype("float32")
         normals   = model.normals.astype("float32")
 
-        self._geometry: ControllerGeometry = _compute_geometry(positions, normals)
+        self._geometry: ControllerGeometry = _compute_geometry(positions, normals, geometry_cfg)
 
         self._led_nbr = _build_led_neighbor_lists(positions, normals)
         self._led_triple_idx, self._led_triple_depth, self._led_triple_gates = _precompute_led_quads(
@@ -321,72 +328,66 @@ class SingleViewTracker:
         # ------------------------------------------------------------------
         solution = None
 
-        # if self.prev_pose is not None:
-        #     # --- Primary: proximity (fast, assignment-locked) ---
-        #     if n_blobs >= 3:
-        #         solution = self.proximity_match(
-        #             blobs, self.prev_pose,
-        #             prior_assignment=self.prev_assignment,
-        #         )
-        #
-        #     # --- Fallback: brute when proximity is absent or degraded ---
-        #     # Threshold 2.5 px: correct tracking gives < 0.5–1 px; values
-        #     # above this indicate drifting or a wrong assignment lock.
-        #     proximity_poor = solution is None or solution["error"] > 2.5
-        #     if proximity_poor and n_blobs >= 4:
-        #         brute = self.brute_match(blobs, pose_prior=self.prev_pose)
-        #         if brute is not None:
-        #             prox_n   = len(solution["assignment"]) if solution else 0
-        #             brute_n  = brute.get("inliers", len(brute["assignment"]))
-        #             brute_better = (
-        #                 solution is None or
-        #                 brute_n > prox_n or
-        #                 (brute_n == prox_n and brute["error"] < solution["error"])
-        #             )
-        #             if brute_better:
-        #                 solution = brute
-        #
-        #     elif n_blobs >= 1 and solution is None:
-        #         solution = self.p1p_solver(blobs, self.prev_pose)
+        if self.prev_pose is not None:
+            # --- Primary: proximity (fast, assignment-locked) ---
+            if n_blobs >= 3:
+                solution = self.proximity_match(
+                    blobs, self.prev_pose,
+                    prior_assignment=self.prev_assignment,
+                )
 
-        # else:
-        # --- No prior pose: brute-force re-acquisition ---
-        if n_blobs >= 4:
-            solution = self.brute_match(blobs)
+            # --- Fallback: brute when proximity is absent or degraded ---
+            # Threshold 2.5 px: correct tracking gives < 0.5–1 px; values
+            # above this indicate drifting or a wrong assignment lock.
+            proximity_poor = solution is None or solution["error"] > 2.5
+            if proximity_poor and n_blobs >= 4:
+                brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+                if brute is not None:
+                    prox_n  = len(solution["assignment"]) if solution else 0
+                    brute_n = brute.get("inliers", len(brute["assignment"]))
+                    if (solution is None or
+                            brute_n > prox_n or
+                            (brute_n == prox_n and brute["error"] < solution["error"])):
+                        solution = brute
 
-            # In deep-debug mode frames are non-consecutive, so the last_good_pose
-            # plausibility check is skipped — the controller can be anywhere.
-            if solution is not None and self.last_good_pose is not None and not is_deep():
-                rvec_lg, tvec_lg = self.last_good_pose
-                if self._pose_jump_too_large(
-                    solution["rvec"], solution["tvec"],
-                    rvec_lg, tvec_lg,
-                    max_dist_m=0.5,
-                    max_angle_deg=60.0,
-                ):
-                    logger.debug("Brute re-acquisition rejected: too far from last known good pose.")
-                    solution = None
+        else:
+            # --- No prior pose: brute-force re-acquisition ---
+            if n_blobs >= 4:
+                solution = self.brute_match(blobs)
 
-        # # ------------------------------------------------------------------
-        # # Pose-jump guard against prev_pose (tight, per-frame)
-        # # ------------------------------------------------------------------
-        # if solution is not None and self.prev_pose is not None:
-        #     rvec_p, tvec_p = self.prev_pose
-        #     if self._pose_jump_too_large(
-        #         solution["rvec"], solution["tvec"],
-        #         rvec_p, tvec_p,
-        #     ):
-        #         print(f"[tracking] Pose jump detected "
-        #               f"(method={solution.get('method','?')}, "
-        #               f"err={solution['error']:.2f} px) — "
-        #               f"attempting brute recovery.")
-        #         solution = None
-        #         if n_blobs >= 4:
-        #             brute = self.brute_match(blobs, pose_prior=self.prev_pose)
-        #             if brute is not None and not self._pose_jump_too_large(
-        #                 brute["rvec"], brute["tvec"], rvec_p, tvec_p,
-        #             ):
-        #                 solution = brute
+                # In deep-debug mode frames are non-consecutive, so the last_good_pose
+                # plausibility check is skipped — the controller can be anywhere.
+                if solution is not None and self.last_good_pose is not None and not is_deep():
+                    rvec_lg, tvec_lg = self.last_good_pose
+                    if self._pose_jump_too_large(
+                        solution["rvec"], solution["tvec"],
+                        rvec_lg, tvec_lg,
+                        max_dist_m=0.5,
+                        max_angle_deg=60.0,
+                    ):
+                        logger.debug("Brute re-acquisition rejected: too far from last known good pose.")
+                        solution = None
+
+        # ------------------------------------------------------------------
+        # Pose-jump guard against prev_pose (tight, per-frame)
+        # ------------------------------------------------------------------
+        if solution is not None and self.prev_pose is not None:
+            rvec_p, tvec_p = self.prev_pose
+            if self._pose_jump_too_large(
+                solution["rvec"], solution["tvec"],
+                rvec_p, tvec_p,
+            ):
+                print(f"[tracking] Pose jump detected "
+                      f"(method={solution.get('method','?')}, "
+                      f"err={solution['error']:.2f} px) — "
+                      f"attempting brute recovery.")
+                solution = None
+                if n_blobs >= 4:
+                    brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+                    if brute is not None and not self._pose_jump_too_large(
+                        brute["rvec"], brute["tvec"], rvec_p, tvec_p,
+                    ):
+                        solution = brute
 
         # ------------------------------------------------------------------
         # Accept / reject
@@ -411,14 +412,15 @@ class SingleViewTracker:
 # =========================================================
 
 class TrackingSystem:
-    def __init__(self, controllers: List[ControllerModel], cameras: List[Camera]):
+    def __init__(self, controllers: List[ControllerModel], cameras: List[Camera],
+                 matching_cfg: dict = None, geometry_cfg: dict = None):
 
         self.trackers: Dict[Tuple[str, int], SingleViewTracker] = {}
 
         for ctrl in controllers:
             for cam in cameras:
                 key = (ctrl.name, cam.camera_idx)
-                self.trackers[key] = SingleViewTracker(cam, ctrl)
+                self.trackers[key] = SingleViewTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geometry_cfg)
 
     def update(self, observations_per_camera: Dict[int, np.ndarray]):
 
