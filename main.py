@@ -42,9 +42,9 @@ def main():
     #   verbose_all=True  → log every P3P hypothesis (no LED/blob filter needed)
     #   log_best=True     → log each new best solution update  (default: on)
     #   debug_led_ids / debug_blob_ids → also log a specific triple in detail
-    # debug_config.configure(mode)
+    debug_config.configure(mode)
     # debug_config.configure(mode, verbose_all=True)
-    debug_config.configure(mode, debug_led_ids=[19, 31, 28], debug_blob_ids=[4, 1, 3])
+    # debug_config.configure(mode, debug_led_ids=[19, 31, 28], debug_blob_ids=[4, 1, 3])
 
     logger.info(f"mode={mode.value}  data={data_root}")
 
