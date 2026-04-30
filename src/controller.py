@@ -79,7 +79,7 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray) -> ControllerG
     R_fc          = float(coeffs[0])
     frustum_slope = float(coeffs[1])
 
-    z_frustum_top = float(outer_z_rel.max()) + 0.004
+    z_frustum_top = float(outer_z_rel.max()) + 0.0015
     z_frustum_bot = float(outer_z_rel.min()) - 0.0055
 
     # ── Inner cone radius (wall thickness from inner LED h_corpus) ────────────

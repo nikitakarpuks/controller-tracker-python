@@ -934,7 +934,7 @@ def brute_match(
     hungarian_threshold_px: float = 5.0,  # pre-filter on the raw P3P hypothesis pose. Loose because P3P poses can be noisy; RANSAC does the real filtering after this
     reprojection_threshold: float = 2.0,  # passed to RANSAC, controls which blobs make it into the final assignment. This is now what the visualization reflects: all shown errors will be ≤ this
     min_inliers: int = 4,
-    min_inlier_fraction: float = 0.6,
+    min_inlier_fraction: Optional[float] = None,
     strong_match_inliers: int = 7,
     strong_match_error_px: float = 1.5,
     min_vis_coverage: float = 0.7,
@@ -962,8 +962,13 @@ def brute_match(
     if n_blobs < 4:
         return None
 
-    min_inliers_eff    = max(min_inliers, int(np.ceil(min_inlier_fraction * n_blobs)))
-    strong_inliers_eff = min(strong_match_inliers, int(np.ceil(min_inlier_fraction * n_blobs)))
+    if min_inlier_fraction is not None:
+        fraction_floor     = int(np.ceil(min_inlier_fraction * n_blobs))
+        min_inliers_eff    = max(min_inliers, fraction_floor)
+        strong_inliers_eff = min(strong_match_inliers, fraction_floor)
+    else:
+        min_inliers_eff    = min_inliers
+        strong_inliers_eff = strong_match_inliers
 
     positions = self.model.positions.astype(np.float32)
     normals   = self.model.normals.astype(np.float32)
@@ -1046,47 +1051,47 @@ def brute_match(
             cur_prev_blob    = prev_blob_max_per_triple
 
         eligible_mask = cur_triple_depth <= led_max
-        lq_all = np.where(eligible_mask)[0]
+        eligible_triple_idx = np.where(eligible_mask)[0]
 
         # Keep only triples that have new blob pairs to explore at this tier.
-        has_new    = cur_prev_blob[lq_all] < blob_max
-        lq_indices = lq_all[has_new]
-        tier_lq_total[tier_idx] = len(lq_indices)
+        has_new_blob_pairs = cur_prev_blob[eligible_triple_idx] < blob_max
+        active_triple_idx  = eligible_triple_idx[has_new_blob_pairs]
+        tier_lq_total[tier_idx] = len(active_triple_idx)
 
-        if len(lq_indices) == 0:
+        if len(active_triple_idx) == 0:
             continue
 
-        lq_indices = lq_indices[rng.permutation(len(lq_indices))]
+        active_triple_idx = active_triple_idx[rng.permutation(len(active_triple_idx))]
 
-        for lq_i in lq_indices:
-            l_ids    = cur_triple_idx[lq_i]          # [anchor, l1, l2]
-            obj3     = positions[l_ids]               # (3, 3) world points for P3P
-            gate_led = cur_triple_gates[lq_i]
-            gate_obj = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
+        for triple_i in active_triple_idx:
+            led_ids            = cur_triple_idx[triple_i]    # [anchor, l1, l2]
+            p3p_world_pts      = positions[led_ids]           # (3, 3) world points for P3P
+            gate_led           = cur_triple_gates[triple_i]
+            gate_led_world_pts = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
 
             # Start blob-pair enumeration from where the previous tier left off for
             # this triple; avoids re-evaluating combinations already covered earlier.
-            min_blob_i2 = int(cur_prev_blob[lq_i])
-            had_p3p = False
+            min_blob_i2 = int(cur_prev_blob[triple_i])
+            did_p3p = False
 
             for b_anchor in range(n_blobs):
                 if strong_found:
                     break
-                nbrs   = blob_nbr[b_anchor]
-                n_nbrs = min(len(nbrs), blob_max)
-                if n_nbrs < 2:
+                blob_neighbors   = blob_nbr[b_anchor]
+                n_blob_neighbors = min(len(blob_neighbors), blob_max)
+                if n_blob_neighbors < 2:
                     continue
 
-                for i1, i2 in combinations(range(n_nbrs), 2):
+                for i1, i2 in combinations(range(n_blob_neighbors), 2):
                     if strong_found:
                         break
                     if i2 < min_blob_i2:
                         continue
-                    b1 = int(nbrs[i1])
-                    b2 = int(nbrs[i2])
+                    b1 = int(blob_neighbors[i1])
+                    b2 = int(blob_neighbors[i2])
 
-                    gate_blob_idx = [int(nbrs[j]) for j in range(n_nbrs) if j != i1 and j != i2]
-                    gate_img = blobs_undist[gate_blob_idx] if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
+                    gate_blob_idx    = [int(blob_neighbors[j]) for j in range(n_blob_neighbors) if j != i1 and j != i2]
+                    gate_blob_img_pts = blobs_undist[gate_blob_idx] if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
 
                     for b1_ord, b2_ord in ((b1, b2), (b2, b1)):
                         if strong_found:
@@ -1100,8 +1105,8 @@ def brute_match(
                         dbg = is_verbose_all() or (
                             debug_active and
                             (debug_led_set  is None or (
-                                int(l_ids[0]) == debug_led_anchor and
-                                frozenset(l_ids) == debug_led_set)) and
+                                int(led_ids[0]) == debug_led_anchor and
+                                frozenset(led_ids) == debug_led_set)) and
                             (debug_blob_set is None or (
                                 b_anchor == debug_blob_anchor and
                                 frozenset([b_anchor, b1_ord, b2_ord]) == debug_blob_set))
@@ -1109,25 +1114,25 @@ def brute_match(
                         if dbg:
                             logger.debug(
                                 f"Target triple reached — "
-                                f"LEDs {list(l_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
+                                f"LEDs {list(led_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
                                 f"tier={tier_idx} ({_tier_label(tier_spec)})"
                             )
 
-                        img3 = blobs[[b_anchor, b1_ord, b2_ord]]
+                        p3p_img_pts = blobs[[b_anchor, b1_ord, b2_ord]]
 
-                        bij = frozenset(((int(l_ids[0]), b_anchor),
-                                         (int(l_ids[1]), b1_ord),
-                                         (int(l_ids[2]), b2_ord)))
+                        bij = frozenset(((int(led_ids[0]), b_anchor),
+                                         (int(led_ids[1]), b1_ord),
+                                         (int(led_ids[2]), b2_ord)))
 
                         if bijection_counts is not None:
                             bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
 
                         # ── 1. P3P → up to 4 pose hypotheses ─────────────────
                         tier_p3p_calls[tier_idx] += 1
-                        had_p3p = True
+                        did_p3p = True
                         n_sols, rvecs, tvecs = cv2.solveP3P(
-                            obj3.reshape(3, 1, 3),
-                            img3.reshape(3, 1, 2),
+                            p3p_world_pts.reshape(3, 1, 3),
+                            p3p_img_pts.reshape(3, 1, 2),
                             K, dc,
                             flags=cv2.SOLVEPNP_P3P,
                         )
@@ -1152,7 +1157,7 @@ def brute_match(
                             R_h, _ = cv2.Rodrigues(rvec_h)
 
                             # ── 3. Gate check (any gate LED near any gate blob) ─
-                            gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_obj, gate_img, fx, fy, cx, cy, p4_thresh_sq)
+                            gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_led_world_pts, gate_blob_img_pts, fx, fy, cx, cy, p4_thresh_sq)
                             if dbg:
                                 logger.debug(f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
                             if not gate_ok:
@@ -1173,24 +1178,24 @@ def brute_match(
 
                             proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc)
                             cost     = cdist(blobs, proj_all)
-                            ri, ci   = linear_sum_assignment(cost)
+                            hungarian_blob_rows, hungarian_led_cols = linear_sum_assignment(cost)
 
-                            inlier_mask = cost[ri, ci] < hungarian_threshold_px
-                            ib = ri[inlier_mask]
-                            il = vis_ids[ci[inlier_mask]]
+                            inlier_mask    = cost[hungarian_blob_rows, hungarian_led_cols] < hungarian_threshold_px
+                            inlier_blobs   = hungarian_blob_rows[inlier_mask]
+                            inlier_leds    = vis_ids[hungarian_led_cols[inlier_mask]]
 
                             if dbg:
-                                outlier_mask = cost[ri, ci] >= hungarian_threshold_px
-                                x = ri[outlier_mask]
-                                y = vis_ids[ci[outlier_mask]]
-                                logger.debug(f"  sol {sol_i}: {len(ib)} inliers after Hungarian "
+                                outlier_mask     = cost[hungarian_blob_rows, hungarian_led_cols] >= hungarian_threshold_px
+                                outlier_blob_rows = hungarian_blob_rows[outlier_mask]
+                                outlier_led_cols  = vis_ids[hungarian_led_cols[outlier_mask]]
+                                logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after Hungarian "
                                              f"(need {min_inliers_eff})")
-                            if len(ib) < min_inliers_eff:
+                            if len(inlier_blobs) < min_inliers_eff:
                                 continue
 
                             # ── 5. RANSAC PnP refinement on inliers ───────────
                             ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
-                                positions[il], blobs[ib], K, dc,
+                                positions[inlier_leds], blobs[inlier_blobs], K, dc,
                                 rvec_h, tvec_h.reshape(3, 1),
                                 reprojection_px=reprojection_threshold,
                             )
@@ -1200,10 +1205,10 @@ def brute_match(
                             if not ok_r:
                                 continue
 
-                            il = il[ransac_inliers]
-                            ib = ib[ransac_inliers]
+                            inlier_leds  = inlier_leds[ransac_inliers]
+                            inlier_blobs = inlier_blobs[ransac_inliers]
 
-                            if len(ib) < min_inliers_eff:
+                            if len(inlier_blobs) < min_inliers_eff:
                                 continue
 
                             # ── 6. Visibility recheck with the refined pose ────
@@ -1218,12 +1223,13 @@ def brute_match(
                                 cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
                                 cam_rpmax=self.camera.rpmax,
                             )
-                            vis_sub = vis_mask_r[il]
-                            il = il[vis_sub]
-                            ib = ib[vis_sub]
+                            # Drop inliers that became occluded under the refined pose.
+                            inlier_still_visible = vis_mask_r[inlier_leds]
+                            inlier_leds  = inlier_leds[inlier_still_visible]
+                            inlier_blobs = inlier_blobs[inlier_still_visible]
                             if dbg:
-                                logger.debug(f"  sol {sol_i}: {len(ib)} inliers after vis recheck")
-                            if len(ib) < min_inliers_eff:
+                                logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after vis recheck")
+                            if len(inlier_blobs) < min_inliers_eff:
                                 continue
 
                             # ── 7. Visibility coverage check ──────────────────
@@ -1234,64 +1240,68 @@ def brute_match(
                             # contribute less to both numerator and denominator.
                             # This prevents those LEDs from unfairly failing the
                             # coverage gate when they simply aren't bright enough.
-                            vis_ids_r = np.where(vis_mask_r)[0]
-                            n_vis     = len(vis_ids_r)
-                            n_ib      = len(ib)
+                            vis_ids_r      = np.where(vis_mask_r)[0]
+                            n_visible_leds = len(vis_ids_r)
+                            n_inlier_blobs = len(inlier_blobs)
 
-                            pts_vis  = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
-                            nrm_vis  = (R_r @ normals[vis_ids_r].T).T
-                            view_vis = -pts_vis / (np.linalg.norm(pts_vis, axis=1, keepdims=True) + 1e-9)
-                            vis_w    = np.clip((nrm_vis * view_vis).sum(axis=1), 0.0, 1.0)
+                            led_cam_pts    = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
+                            led_cam_normals = (R_r @ normals[vis_ids_r].T).T
+                            led_view_dirs  = -led_cam_pts / (np.linalg.norm(led_cam_pts, axis=1, keepdims=True) + 1e-9)
+                            led_vis_weights = np.clip((led_cam_normals * led_view_dirs).sum(axis=1), 0.0, 1.0)
 
-                            # il ⊂ vis_ids_r is guaranteed by step 6
-                            il_pos    = np.searchsorted(vis_ids_r, il)
-                            n_vis_eff = float(vis_w.sum())
-                            n_ib_eff  = float(vis_w[il_pos].sum())
+                            # inlier_leds ⊂ vis_ids_r is guaranteed by step 6; searchsorted
+                            # maps each inlier LED index to its position in vis_ids_r so we
+                            # can index led_vis_weights without a full boolean mask.
+                            inlier_idx_in_vis    = np.searchsorted(vis_ids_r, inlier_leds)
+                            weighted_visible_count = float(led_vis_weights.sum())
+                            weighted_inlier_count  = float(led_vis_weights[inlier_idx_in_vis].sum())
 
-                            if n_vis_eff > 0 and n_ib_eff < min_vis_coverage * n_vis_eff:
+                            if weighted_visible_count > 0 and weighted_inlier_count < min_vis_coverage * weighted_visible_count:
                                 if dbg:
                                     logger.debug(
                                         f"  sol {sol_i}: weighted vis coverage "
-                                        f"{n_ib_eff:.2f}/{n_vis_eff:.2f}"
-                                        f"={n_ib_eff/n_vis_eff:.2f} < {min_vis_coverage:.2f}"
-                                        f"  (raw {n_ib}/{n_vis})"
+                                        f"{weighted_inlier_count:.2f}/{weighted_visible_count:.2f}"
+                                        f"={weighted_inlier_count/weighted_visible_count:.2f} < {min_vis_coverage:.2f}"
+                                        f"  (raw {n_inlier_blobs}/{n_visible_leds})"
                                     )
                                 continue
 
-                            proj_r = _project_points(rvec_r, tvec_r, positions[il], K, dc)
-                            err    = float(np.mean(np.linalg.norm(proj_r - blobs[ib], axis=1)))
+                            proj_r = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc)
+                            err    = float(np.mean(np.linalg.norm(proj_r - blobs[inlier_blobs], axis=1)))
 
                             orient_err = np.inf
                             if R_prior is not None:
-                                cos_a = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
-                                orient_err = float(np.arccos(cos_a))
+                                cos_orient_angle = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
+                                orient_err = float(np.arccos(cos_orient_angle))
 
-                            err_per  = err  / max(n_ib, 1)
-                            best_per = best_error / max(best_inliers, 1)
+                            error_per_inlier      = err  / max(n_inlier_blobs, 1)
+                            best_error_per_inlier = best_error / max(best_inliers, 1)
 
+                            # Prefer more inliers, break ties by absolute error, break
+                            # further ties by orientation distance to the prior pose.
                             is_better = (
-                                (n_ib > best_inliers and err_per < best_per) or
-                                (n_ib >= best_inliers + 2 and err_per < best_per * 1.1) or
-                                (n_ib == best_inliers and err < best_error) or
-                                (n_ib == best_inliers and
+                                (n_inlier_blobs > best_inliers and error_per_inlier < best_error_per_inlier) or
+                                (n_inlier_blobs >= best_inliers + 2 and error_per_inlier < best_error_per_inlier * 1.1) or
+                                (n_inlier_blobs == best_inliers and err < best_error) or
+                                (n_inlier_blobs == best_inliers and
                                  abs(err - best_error) < 0.5 and
                                  orient_err < best_orient_err)
                             )
 
                             if dbg:
-                                logger.debug(f"  sol {sol_i}: err={err:.3f} px  inliers={n_ib}  "
+                                logger.debug(f"  sol {sol_i}: err={err:.3f} px  inliers={n_inlier_blobs}  "
                                              f"is_better={is_better}")
 
                             if is_better:
                                 best_solution = {
                                     "rvec":       rvec_r,
                                     "tvec":       tvec_r,
-                                    "inliers":    n_ib,
+                                    "inliers":    n_inlier_blobs,
                                     "error":      err,
-                                    "assignment": list(zip(ib.tolist(), il.tolist())),
+                                    "assignment": list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
                                     "method":     "p3p_systematic",
                                 }
-                                best_inliers    = n_ib
+                                best_inliers    = n_inlier_blobs
                                 best_error      = err
                                 best_orient_err = orient_err
                                 solution_tier   = tier_idx
@@ -1299,18 +1309,18 @@ def brute_match(
                                 if log_best():
                                     logger.debug(
                                         f"  ★ new best — tier={tier_idx} "
-                                        f"LEDs{list(l_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
-                                        f"sol={sol_i}  inliers={n_ib}  err={err:.3f}px  "
-                                        f"vis={n_ib_eff:.1f}/{n_vis_eff:.1f} (raw {n_ib}/{n_vis})"
+                                        f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
+                                        f"sol={sol_i}  inliers={n_inlier_blobs}  err={err:.3f}px  "
+                                        f"vis={weighted_inlier_count:.1f}/{weighted_visible_count:.1f} (raw {n_inlier_blobs}/{n_visible_leds})"
                                     )
 
                                 if (best_inliers >= strong_inliers_eff
                                         and best_error <= strong_match_error_px
-                                        and (n_vis_eff == 0 or n_ib_eff >= min_vis_coverage * n_vis_eff)):
+                                        and (weighted_visible_count == 0 or weighted_inlier_count >= min_vis_coverage * weighted_visible_count)):
                                     strong_found = True
 
-            cur_prev_blob[lq_i] = blob_max
-            if had_p3p:
+            cur_prev_blob[triple_i] = blob_max
+            if did_p3p:
                 tier_lq_tried[tier_idx] += 1
             if strong_found:
                 break
