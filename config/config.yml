@@ -1,6 +1,6 @@
 data:
-  root: "./data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/tracking_lost/tracking_lost"
-#  root: "./data/datasets/bad_visibility/a"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data"
+#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/very_close"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -27,6 +27,8 @@ blob_detection:
   min_area: 4
   max_area: 300
   max_wh: 35              # max bounding-box width or height in pixels
+  split_merged: true
+  min_split_dist: 7.0
 
 visualization:
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
@@ -54,5 +56,5 @@ visualization:
         ry: 0.22553752
         rz: 3.15
 
-debug_mode: true
-split_to_folders: false
+debug_mode: false
+split_to_folders: true
