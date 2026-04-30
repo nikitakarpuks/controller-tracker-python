@@ -1,16 +1,10 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/deep_search_required/a"
 #  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/very_close"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
   selected_cameras: [0] # choose any sequential cameras, max list is [0, 1, 2, 3]
-
-#matching:
-#  brute_force:
-#    max_iterations: 2000
-#    reprojection_threshold: 5.0
-#    min_inliers: 5.0
 
 cameras:
   intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -30,21 +24,43 @@ blob_detection:
   split_merged: true
   min_split_dist: 7.0
 
+geometry:
+  z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
+  z_frustum_bot_padding: 0.0055   # metres subtracted below the bottommost outer LED axial position
+  wall_thickness: 0.007           # frustum wall thickness in metres (R_fc_inner = R_fc - wall_thickness)
+
+matching:
+  led_facing_angle_deg: 85.0      # LED emission half-angle; LEDs beyond this from camera axis are culled
+  depth_tiers:
+    - [2, 3]
+    - [2, 4]
+    - [2, 4, "edge"]
+    - [3, 5]
+    - [3, 5, "edge"]
+    - [4, 6]
+  p4_threshold_px: 2.0
+  hungarian_threshold_px: 5.0     # loose pre-filter on raw P3P pose; RANSAC does the real filtering
+  reprojection_threshold: 2.0     # RANSAC threshold; all reported errors will be <= this
+  min_inliers: 4
+  min_inlier_fraction: null       # e.g. 0.6 — overrides min_inliers if set
+  strong_match_inliers: 7
+  strong_match_error_px: 1.5
+  min_vis_coverage: 0.7
+  rng_seed: 42
+  proximity_snap_px: 10.0           # NN snap radius for proximity_match (px from predicted LED position)
+
+debug:
+  mode_active: true
+  split_to_folders: false
+  verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
+  log_best: true                  # log each new best solution update
+  debug_led_ids: null             # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
+  debug_blob_ids: null            # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
+
 visualization:
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
   fine_tune_alignment: false  # set to true to run alignment optimiser and print refined params
-#  initial_position_change:
-#    right:
-#      translation: # in meters
-#        x: 0.19616
-#        y: 0.015559
-#        z: -0.093833
-#
-#      rotation: # in radians
-#        rx: -0.0005
-#        ry: 0.226
-#        rz: 3.1
   initial_position_change:
     right:
       translation: # in meters
@@ -55,6 +71,3 @@ visualization:
         rx: -0.00523160
         ry: 0.22553752
         rz: 3.15
-
-debug_mode: false
-split_to_folders: true

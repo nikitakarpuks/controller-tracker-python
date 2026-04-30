@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.load_config import load_yaml_config, load_json_config
 from src.controller import create_leds_from_config, _compute_geometry
-from src.geometry import Box3D, Cylinder3D, tangent_frame
+from src.geometry import tangent_frame
 from src.visualization import build_alignment_transform, load_trimesh, make_disk_mesh
 from src._matching import _visible_mask
 
@@ -79,44 +79,9 @@ DEBUG_CAM_POS: Optional[np.ndarray] = None #np.array([0.0, 0.0, 0.0])  # np.arra
 #   • Re-run after each change — Rerun opens automatically.
 #   • LED coordinate ranges are printed to stdout on every run.
 #
-PRIMITIVES: list = [
-    Box3D(
-        name="box_vertical",
-        center=np.array([-0.009, -0.012, -0.015]),
-        half_dims=np.array([0.021, 0.0028, 0.013]),   # half x, y, z extents
-        # axes=None  →  world-aligned; example with custom orientation:
-        # axes=np.column_stack([[1,0,0],[0,0,-1],[0,1,0]]),
-        color=[220, 130, 60],
-    ),
-    Box3D(
-        name="box_horizontal",
-        center=np.array([-0.009, -0.029, -0.0048]), # normal dims
-        half_dims=np.array([0.021, 0.0032, 0.015]),  # half x, y, z extents
-        # axes=None  →  world-aligned; example with custom orientation:
-        axes=np.column_stack([[1,0,0],[0,0,-1],[0,1,0]]),
-        color=[130, 60, 220],
-    ),
-    Cylinder3D(
-        name="control_panel",
-        center=np.array([-0.008, 0.0, -0.05]),  # centre of grip, metres
-        axis=np.array([0.0, 1.0, 0.0]),
-        radius=0.031,  # extent along tangent u (~Z)
-        radius_v=0.033,  # extent along tangent v (~X) — oval cross-section
-        half_length=0.017,
-        angle=np.pi / 10,
-        color=[100, 180, 255],
-    ),
-    Cylinder3D(
-        name="handle",
-        center=np.array([0.001, 0.022, -0.098]),   # centre of grip, metres
-        axis=np.array([0.0, 1.0, -1.5]),
-        radius=0.021,    # extent along tangent u (~Z)
-        half_length=0.037,
-        color=[255, 55, 55],
-    ),
-
-]
 # ═══════════════════════════════════════════════════════════════════════════════
+# Primitives are defined in controller.py (_compute_geometry) and shared via
+# geom.boxes / geom.cylinders — edit them there, not here.
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -194,17 +159,12 @@ def build_cylinder_mesh(cy: Cylinder3D):
 
 
 def build_frustum_mesh(ring_axis: np.ndarray, ring_centroid: np.ndarray,
-                       positions: np.ndarray, is_inner: np.ndarray, z_rel: np.ndarray,
-                       R_fc: float, slope: float,
+                       R_fc: float, R_fc_inner: float, slope: float,
                        z_top: float, z_bot: float,
+                       ring_center_ax: float,
                        n_rings: int = 24, n_segments: int = 60):
     """
     Thick-walled truncated-cone mesh for the LED ring frustum.
-
-    Wall thickness is derived from the h_corpus of the inner LEDs — the radial
-    gap between each inner LED and the outer cone surface (same calculation that
-    was commented out in _compute_frustum_geometry).  The inner cone has the same
-    slope as the outer one, offset inward by the mean gap.
 
     Surfaces generated:
       • outer side wall  (faces outward)
@@ -215,23 +175,6 @@ def build_frustum_mesh(ring_axis: np.ndarray, ring_centroid: np.ndarray,
     ax = np.asarray(ring_axis, float)
     c  = np.asarray(ring_centroid, float)
     u, v = tangent_frame(ax)
-
-    # ── wall thickness from inner LED h_corpus ────────────────────────────────
-    rel      = positions - c
-    rel_proj = rel - np.outer(rel @ ax, ax)          # radial component of each LED (N, 3)
-    r_led    = np.linalg.norm(rel_proj, axis=1)      # radial distance from axis   (N,)
-
-    if is_inner.any():
-        # h_corpus[i] = gap from inner LED to outer wall at the same axial slice
-        h_corpus       = np.maximum(0.0, R_fc + slope * z_rel[is_inner] - r_led[is_inner])
-        wall_thickness = float(h_corpus.mean())
-    else:
-        wall_thickness = 0.003   # 3 mm fallback
-
-    wall_thickness = 0.007
-
-    R_fc_inner     = R_fc - wall_thickness
-    ring_center_ax = float((positions @ ax).mean())   # z_rel=0 offset in world space
 
     z_vals  = np.linspace(z_bot, z_top, n_rings)
     angles  = np.linspace(0, 2*np.pi, n_segments, endpoint=False)
@@ -288,7 +231,7 @@ def build_frustum_mesh(ring_axis: np.ndarray, ring_centroid: np.ndarray,
 
     faces  = np.array(faces, dtype=np.int32)
     colors = np.tile(np.array([130, 130, 220], dtype=np.uint8), (len(verts), 1))
-    return verts, faces, colors, wall_thickness
+    return verts, faces, colors
 
 
 def _log_mesh(path: str, verts: np.ndarray, faces: np.ndarray, colors: np.ndarray):
@@ -368,10 +311,11 @@ def main():
     ), static=True)
 
     # Frustum cone
-    fv, ff, fc, wall_mm = build_frustum_mesh(
-        ring_axis, ring_centroid, positions, is_inner, z_rel,
-        R_fc, slope, z_top, z_bot,
+    fv, ff, fc = build_frustum_mesh(
+        ring_axis, ring_centroid,
+        R_fc, geom.R_fc_inner, slope, z_top, z_bot, geom.ring_center_ax,
     )
+    wall_mm = (R_fc - geom.R_fc_inner) * 1000
     _log_mesh("world/frustum", fv, ff, fc)
 
     # LEDs: outer = red, inner = blue
@@ -410,9 +354,9 @@ def main():
             albedo_factor=[0.6, 0.6, 0.6, 0.5],
         ), static=True)
 
-    # User-defined primitives
+    # User-defined primitives (defined in controller.py, shared via geom)
     counts: dict = {}
-    for prim in PRIMITIVES:
+    for prim in geom.boxes + geom.cylinders:
         n = prim.name
         counts[n] = counts.get(n, 0) + 1
         path = f"world/primitives/{n}_{counts[n]}"
@@ -485,7 +429,7 @@ def main():
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n[handle_vis] {len(positions)} LEDs  |  "
           f"{is_inner.sum()} inner (blue), {(~is_inner).sum()} outer (red)")
-    print(f"[handle_vis] {len(PRIMITIVES)} user primitive(s)")
+    print(f"[handle_vis] {len(geom.boxes) + len(geom.cylinders)} primitive(s)")
     print(f"\nLED bounding box (controller-local, metres):")
     print(f"  X: [{positions[:,0].min():.4f},  {positions[:,0].max():.4f}]")
     print(f"  Y: [{positions[:,1].min():.4f},  {positions[:,1].max():.4f}]")
@@ -493,7 +437,7 @@ def main():
     print(f"\nFrustum params:")
     print(f"  ring_axis      = {ring_axis.round(4)}")
     print(f"  R_fc           = {R_fc*1000:.2f} mm  (outer radius at ring centroid)")
-    print(f"  wall_thickness = {wall_mm*1000:.2f} mm  (mean h_corpus of inner LEDs)")
+    print(f"  wall_thickness = {wall_mm:.2f} mm")
     print(f"  slope          = {slope:.4f}  (dR/dz_rel)")
     print(f"  z_bot..z_top   = [{z_bot*1000:.2f},  {z_top*1000:.2f}] mm")
 

@@ -271,6 +271,7 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   cam_w: int = 0,
                   cam_h: int = 0,
                   cam_rpmax: float = 0.0,
+                  facing_threshold_deg: float = 86.0,
                   debug: bool = False) -> np.ndarray:
     """
     Boolean mask: True for each LED that is camera-facing and not occluded.
@@ -302,7 +303,7 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
     normals_cam = (R @ normals.T).T
     dot         = (normals_cam * view_dir).sum(axis=1)
-    mask        = z_ok & (dot < -0.07)
+    mask        = z_ok & (dot < -np.cos(np.radians(facing_threshold_deg)))
 
     # ── Check 2b: within image frame ─────────────────────────────────────────
     # Must use distorted projection (cv2.projectPoints), not pinhole, because
@@ -772,22 +773,16 @@ def proximity_match(
     self,
     blobs: np.ndarray,
     predicted_pose: Tuple[np.ndarray, np.ndarray],
-    max_distance_px: float = 30.0,
+    max_distance_px: float = 10.0,
     prior_assignment: Optional[List] = None,
 ) -> Optional[Dict]:
     """
-    Refine a predicted pose by matching projected LEDs to detected blobs.
+    Refine a predicted pose using the assignment-locked nearest-neighbour path.
 
-    Two paths:
-
-    Path 1 — assignment-locked (used when prior_assignment is provided):
-        For each LED from the previous frame's assignment, project it with
-        the predicted pose and snap to its nearest blob within max_distance_px.
-        This is O(N_matches) instead of O(N_blobs × N_leds) and cannot
-        accidentally swap LED–blob pairs — the main source of oscillation at 30fps.
-
-    Path 2 — full Hungarian (fallback when locked path fails or no prior):
-        Project all visible LEDs, run Hungarian assignment, solvePnP.
+    For each LED from the previous frame's assignment, project it with the
+    predicted pose and snap to its nearest blob within max_distance_px.
+    RANSAC + visibility recheck then filter the locked pairs.
+    Returns None when too few pairs survive; caller falls back to brute_match.
     """
     rvec_pred, tvec_pred = predicted_pose
     rvec_pred = np.asarray(rvec_pred, dtype=np.float32).reshape(3, 1)
@@ -797,125 +792,75 @@ def proximity_match(
     dc = self.camera.dist_coeffs
 
     geom = self._geometry
+    _cfg = getattr(self, '_matching_cfg', None) or {}
+    facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',    86.0))
+    reprojection_threshold = float(_cfg.get('reprojection_threshold',   2.0))
+    min_inliers            = int(  _cfg.get('min_inliers',              4))
+    max_distance_px        = float(_cfg.get('proximity_snap_px',        max_distance_px))
 
-    # ------------------------------------------------------------------
-    # Path 1: assignment-locked nearest-neighbour
-    # ------------------------------------------------------------------
-    if prior_assignment is not None and len(prior_assignment) >= 3:
-        prior_lids = [lid for _, lid in prior_assignment]
-        prior_obj  = self.model.positions[prior_lids].astype(np.float32)
-        proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc)
-
-        # Nearest-neighbour snap: for each prior LED find which blob it moved to.
-        # Store (blob_idx, led_idx) so the same list becomes prev_assignment next frame.
-        # DO NOT run a full Hungarian expansion here — expansion with a loose threshold
-        # introduces spurious LED-blob pairs that corrupt the prior for the next frame.
-        locked_pairs, locked_obj, locked_img = [], [], []
-        for i, lid in enumerate(prior_lids):
-            dists = np.linalg.norm(blobs - proj_prior[i], axis=1)
-            j     = int(np.argmin(dists))
-            if dists[j] < max_distance_px:
-                locked_pairs.append((j, lid))
-                locked_obj.append(self.model.positions[lid])
-                locked_img.append(blobs[j])
-
-        if len(locked_pairs) >= 3:
-            lo = np.array(locked_obj, dtype=np.float32)
-            li = np.array(locked_img, dtype=np.float32)
-
-            # RANSAC PnP on locked pairs: rejects any pairs where the blob
-            # drifted to the wrong LED (outliers from sudden motion or occlusion).
-            ok, rvec, tvec, ransac_idx = _ransac_pnp(
-                lo, li, K, dc, rvec_pred, tvec_pred,
-            )
-            if ok:
-                R_new = cv2.Rodrigues(rvec)[0]
-                tvec_new = tvec.reshape(3)
-
-                # Re-check visibility with the *refined* pose, not the predicted one.
-                # This is the fix for inner-ring LEDs that were visible last frame
-                # but are now occluded by the controller body: they were in the
-                # prior assignment and pass the nearest-neighbour snap, but they
-                # must be dropped before the result is returned.
-                vis_mask_new = _visible_mask(
-                    R_new, tvec_new,
-                    self.model.positions, self.model.normals,
-                    geom,
-                    cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-                    cam_rpmax=self.camera.rpmax,
-                )
-
-                # Final pairs: must be a RANSAC inlier AND visible with new pose.
-                final_pairs = [
-                    locked_pairs[k]
-                    for k in ransac_idx
-                    if vis_mask_new[locked_pairs[k][1]]
-                ]
-
-                if len(final_pairs) >= 3:
-                    lo_f = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
-                    li_f = blobs[[b for b, _ in final_pairs]].astype(np.float32)
-                    proj  = _project_points(rvec, tvec, lo_f, K, dc)
-                    error = float(np.mean(np.linalg.norm(proj - li_f, axis=1)))
-                    if error < max_distance_px:
-                        return {
-                            "rvec":       rvec,
-                            "tvec":       tvec,
-                            "error":      error,
-                            "assignment": final_pairs,
-                            "method":     "proximity_locked",
-                        }
-
-    # ------------------------------------------------------------------
-    # Path 2: full Hungarian (no prior, or locked path failed)
-    # ------------------------------------------------------------------
-    R_pred, _ = cv2.Rodrigues(rvec_pred)
-    vis_mask  = _visible_mask(R_pred, tvec_pred,
-                              self.model.positions, self.model.normals,
-                              geom,
-                              cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-                              cam_rpmax=self.camera.rpmax)
-    vis_ids   = np.where(vis_mask)[0]
-    if len(vis_ids) < 3:
+    if prior_assignment is None or len(prior_assignment) < min_inliers:
         return None
 
-    led_proj = _project_points(rvec_pred, tvec_pred,
-                               self.model.positions[vis_ids], K, dc)
+    prior_lids = [lid for _, lid in prior_assignment]
+    prior_obj  = self.model.positions[prior_lids].astype(np.float32)
+    proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc)
 
-    cost    = cdist(blobs, led_proj)
-    ri, ci  = linear_sum_assignment(cost)
-    matches = [
-        (int(b), int(vis_ids[l]))
-        for b, l in zip(ri, ci)
-        if cost[b, l] < max_distance_px
-    ]
-    if len(matches) < 3:
+    # Nearest-neighbour snap: for each prior LED find which blob it moved to.
+    # DO NOT run a full Hungarian expansion here — expansion with a loose threshold
+    # introduces spurious LED-blob pairs that corrupt the prior for the next frame.
+    locked_pairs, locked_obj, locked_img = [], [], []
+    for i, lid in enumerate(prior_lids):
+        dists = np.linalg.norm(blobs - proj_prior[i], axis=1)
+        j     = int(np.argmin(dists))
+        if dists[j] < max_distance_px:
+            locked_pairs.append((j, lid))
+            locked_obj.append(self.model.positions[lid])
+            locked_img.append(blobs[j])
+
+    if len(locked_pairs) < min_inliers:
         return None
 
-    obj_pts = self.model.positions[[lid for _, lid in matches]].astype(np.float32)
-    img_pts = blobs[[bid for bid, _ in matches]].astype(np.float32)
+    lo = np.array(locked_obj, dtype=np.float32)
+    li = np.array(locked_img, dtype=np.float32)
 
     ok, rvec, tvec, ransac_idx = _ransac_pnp(
-        obj_pts, img_pts, K, dc, rvec_pred, tvec_pred,
+        lo, li, K, dc, rvec_pred, tvec_pred,
+        reprojection_px=reprojection_threshold,
     )
     if not ok:
         return None
 
-    # Take only the RANSAC inliers as the final assignment.
-    final_matches = [matches[k] for k in ransac_idx]
-    lo_f = self.model.positions[[l for _, l in final_matches]].astype(np.float32)
-    li_f = blobs[[b for b, _ in final_matches]].astype(np.float32)
+    R_new = cv2.Rodrigues(rvec)[0]
+    # Re-check visibility with the refined pose — drop LEDs now occluded by the body.
+    vis_mask_new = _visible_mask(
+        R_new, tvec.reshape(3),
+        self.model.positions, self.model.normals,
+        geom,
+        cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+        cam_rpmax=self.camera.rpmax,
+        facing_threshold_deg=facing_threshold_deg,
+    )
+
+    final_pairs = [
+        locked_pairs[k]
+        for k in ransac_idx
+        if vis_mask_new[locked_pairs[k][1]]
+    ]
+
+    if len(final_pairs) < min_inliers:
+        return None
+
+    lo_f  = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
+    li_f  = blobs[[b for b, _ in final_pairs]].astype(np.float32)
     proj  = _project_points(rvec, tvec, lo_f, K, dc)
     error = float(np.mean(np.linalg.norm(proj - li_f, axis=1)))
-    if error > max_distance_px:
-        return None
 
     return {
         "rvec":       rvec,
         "tvec":       tvec,
         "error":      error,
-        "assignment": final_matches,
-        "method":     "proximity",
+        "assignment": final_pairs,
+        "method":     "proximity_locked",
     }
 
 def _tier_label(t):
@@ -957,6 +902,20 @@ def brute_match(
       - Blob pairs newly eligible because i2 ≥ prev blob_max for already-eligible triples
     Exits on strong match at the end of any tier's LED triple.
     """
+    _cfg = getattr(self, '_matching_cfg', None) or {}
+    if _cfg:
+        depth_tiers            = tuple(tuple(t) for t in _cfg.get('depth_tiers', depth_tiers))
+        p4_threshold_px        = float(_cfg.get('p4_threshold_px',        p4_threshold_px))
+        hungarian_threshold_px = float(_cfg.get('hungarian_threshold_px', hungarian_threshold_px))
+        reprojection_threshold = float(_cfg.get('reprojection_threshold', reprojection_threshold))
+        min_inliers            = int(  _cfg.get('min_inliers',            min_inliers))
+        min_inlier_fraction    = _cfg.get('min_inlier_fraction', min_inlier_fraction) or None
+        strong_match_inliers   = int(  _cfg.get('strong_match_inliers',   strong_match_inliers))
+        strong_match_error_px  = float(_cfg.get('strong_match_error_px',  strong_match_error_px))
+        min_vis_coverage       = float(_cfg.get('min_vis_coverage',       min_vis_coverage))
+        rng_seed               = _cfg.get('rng_seed', rng_seed)
+    facing_threshold_deg = float(_cfg.get('led_facing_angle_deg', 86.0))
+
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
     if n_blobs < 4:
@@ -1169,6 +1128,7 @@ def brute_match(
                                 geom,
                                 cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
                                 cam_rpmax=self.camera.rpmax,
+                                facing_threshold_deg=facing_threshold_deg,
                             )
                             vis_ids = np.where(vis_mask_h)[0]
                             if dbg:
@@ -1222,6 +1182,7 @@ def brute_match(
                                 geom,
                                 cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
                                 cam_rpmax=self.camera.rpmax,
+                                facing_threshold_deg=facing_threshold_deg,
                             )
                             # Drop inliers that became occluded under the refined pose.
                             inlier_still_visible = vis_mask_r[inlier_leds]

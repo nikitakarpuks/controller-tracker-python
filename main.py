@@ -26,9 +26,20 @@ def main():
     # SEQUENTIAL: full sequential repo  → minimal logs, copy slow/lost frames
     # DEEP:       tracking_lost or deep_search_required → verbose matching logs
     data_root = Path(config["data"]["root"])
+
+    debug_cfg = config.get("debug", {})
+
     mode = (DebugMode.DEEP
-            if config["debug_mode"]
+            if config["debug"]["mode_active"]
             else DebugMode.SEQUENTIAL)
+
+    debug_config.configure(
+        mode           = mode,
+        verbose_all    = bool(debug_cfg.get("verbose_all", False)),
+        log_best       = bool(debug_cfg.get("log_best", True)),
+        debug_led_ids  = debug_cfg.get("debug_led_ids") or None,
+        debug_blob_ids = debug_cfg.get("debug_blob_ids") or None,
+    )
 
     logger.remove()
     if mode == DebugMode.SEQUENTIAL:
@@ -38,18 +49,11 @@ def main():
         logger.add(sys.stderr, level="DEBUG",
                    format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | {message}")
 
-    # Debugging options (all independent, mix as needed):
-    #   verbose_all=True  → log every P3P hypothesis (no LED/blob filter needed)
-    #   log_best=True     → log each new best solution update  (default: on)
-    #   debug_led_ids / debug_blob_ids → also log a specific triple in detail
-    debug_config.configure(mode)
-    # debug_config.configure(mode, debug_led_ids=[0, 14, 3], debug_blob_ids=[2, 5, 3])
-
     logger.info(f"mode={mode.value}  data={data_root}")
 
     # ── Output directories (sequential mode only) ──────────────────────────
     out_slow = out_tracking_lost = None
-    if config["split_to_folders"]:
+    if config["debug"]["split_to_folders"]:
         out_slow          = data_root / "deep_search_required"
         out_tracking_lost = data_root / "tracking_lost"
         out_slow.mkdir(parents=True, exist_ok=True)
@@ -65,7 +69,11 @@ def main():
     right_controller_leds = create_leds_from_config(calibration_config)
     right_controller      = ControllerModel(right_controller_leds, "right_controller")
 
-    tracking_system = TrackingSystem([right_controller], [camera_0])
+    tracking_system = TrackingSystem(
+        [right_controller], [camera_0],
+        matching_cfg=config.get("matching", {}),
+        geometry_cfg=config.get("geometry", {}),
+    )
 
     positions_model, normals_model, T_model_ctrl = prepare_model_geometry(
         right_controller_leds, config["visualization"]
