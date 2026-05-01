@@ -766,6 +766,33 @@ def _gate_fourth_point(
 
 
 # ---------------------------------------------------------------------------
+# blob LED-ID carry helper
+# ---------------------------------------------------------------------------
+
+def _carry_led_ids(
+    current_blobs: np.ndarray,   # (N, 2)
+    prev_positions: np.ndarray,  # (M, 2)
+    prev_led_ids: np.ndarray,    # (M,) int, -1 = unmatched
+    snap_px: float,
+) -> np.ndarray:                 # (N,) int, -1 = unmatched
+    """
+    Nearest-neighbour blob tracking across frames.
+    Each current blob inherits the led_id of its nearest previous blob if within snap_px.
+    No 1-to-1 enforcement: conflicts (two blobs claiming the same id) are resolved
+    downstream by proximity_match dropping to argmin when len(candidates) != 1.
+    """
+    led_ids = np.full(len(current_blobs), -1, dtype=np.int32)
+    if len(prev_positions) == 0:
+        return led_ids
+    for i, blob in enumerate(current_blobs):
+        dists = np.linalg.norm(prev_positions - blob, axis=1)
+        j = int(np.argmin(dists))
+        if dists[j] < snap_px and prev_led_ids[j] != -1:
+            led_ids[i] = int(prev_led_ids[j])
+    return led_ids
+
+
+# ---------------------------------------------------------------------------
 # proximity_match
 # ---------------------------------------------------------------------------
 
@@ -773,14 +800,16 @@ def proximity_match(
     self,
     blobs: np.ndarray,
     predicted_pose: Tuple[np.ndarray, np.ndarray],
-    max_distance_px: float = 10.0,
     prior_assignment: Optional[List] = None,
+    blob_led_ids: Optional[np.ndarray] = None,
+    blob_radii: Optional[np.ndarray] = None,
 ) -> Optional[Dict]:
     """
     Refine a predicted pose using the assignment-locked nearest-neighbour path.
 
     For each LED from the previous frame's assignment, project it with the
-    predicted pose and snap to its nearest blob within max_distance_px.
+    predicted pose and snap to its nearest blob. The snap radius is
+    depth-scaled: snap_px = focal * (led_radius_mm/1000) / depth * snap_factor.
     RANSAC + visibility recheck then filter the locked pairs.
     Returns None when too few pairs survive; caller falls back to brute_match.
     """
@@ -793,10 +822,14 @@ def proximity_match(
 
     geom = self._geometry
     _cfg = getattr(self, '_matching_cfg', None) or {}
-    facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',    86.0))
-    reprojection_threshold = float(_cfg.get('reprojection_threshold',   2.0))
-    min_inliers            = int(  _cfg.get('min_inliers',              4))
-    max_distance_px        = float(_cfg.get('proximity_snap_px',        max_distance_px))
+    facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',     86.0))
+    reprojection_threshold = float(_cfg.get('reprojection_threshold',    2.0))
+    min_inliers            = int(  _cfg.get('min_inliers',               4))
+    led_radius_mm          = float(_cfg.get('led_radius_mm',             2.5))
+    snap_factor            = float(_cfg.get('proximity_snap_factor',     4.0))
+    blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
+    blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',      0.2))
+    blob_size_score_weight = float(_cfg.get('blob_size_score_weight',    0.5))
 
     if prior_assignment is None or len(prior_assignment) < min_inliers:
         return None
@@ -805,19 +838,84 @@ def proximity_match(
     prior_obj  = self.model.positions[prior_lids].astype(np.float32)
     proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc)
 
+    # Pre-rotate all prior LED positions into camera frame to get per-LED depth.
+    R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
+    led_cam = (R_pred_arr @ prior_obj.T).T + tvec_pred  # (N, 3)
+    focal_px = float(max(K[0, 0], K[1, 1]))
+
     # Nearest-neighbour snap: for each prior LED find which blob it moved to.
     # DO NOT run a full Hungarian expansion here — expansion with a loose threshold
     # introduces spurious LED-blob pairs that corrupt the prior for the next frame.
+    # The snap radius scales with distance: closer = larger blob = more pixels of tolerance.
     locked_pairs, locked_obj, locked_img = [], [], []
+    n_id_locked = 0
     for i, lid in enumerate(prior_lids):
-        dists = np.linalg.norm(blobs - proj_prior[i], axis=1)
-        j     = int(np.argmin(dists))
-        if dists[j] < max_distance_px:
-            locked_pairs.append((j, lid))
-            locked_obj.append(self.model.positions[lid])
-            locked_img.append(blobs[j])
+        depth = float(max(led_cam[i, 2], 0.01))
+        # expected_px: physical LED radius projected at this depth (pinhole approx)
+        expected_px = focal_px * (led_radius_mm / 1000.0) / depth
+        snap_px     = expected_px * snap_factor
 
+        # Size eligibility mask: blobs whose radius falls within
+        # [min_factor, max_factor] * expected_px are candidates.
+        # Blobs outside this range are merged blobs or noise at this depth.
+        if blob_radii is not None:
+            eligible = (
+                (blob_radii >= expected_px * blob_size_min_factor) &
+                (blob_radii <= expected_px * blob_size_max_factor)
+            )
+        else:
+            eligible = None
+
+        # ID fast path: if a blob carries this LED's ID from the previous frame,
+        # verify size eligibility and reprojection distance before locking.
+        locked = False
+        if blob_led_ids is not None:
+            id_candidates = np.where(blob_led_ids == lid)[0]
+            if len(id_candidates) == 1:
+                j = int(id_candidates[0])
+                size_ok = eligible is None or bool(eligible[j])
+                if size_ok and np.linalg.norm(blobs[j] - proj_prior[i]) < reprojection_threshold:
+                    locked_pairs.append((j, lid))
+                    locked_obj.append(self.model.positions[lid])
+                    locked_img.append(blobs[j])
+                    locked = True
+                    n_id_locked += 1
+                    if is_deep():
+                        logger.debug(f"  LED {lid}: ID-path → blob {j}")
+
+        if not locked:
+            dists = np.linalg.norm(blobs - proj_prior[i], axis=1)
+
+            if eligible is not None and eligible.any():
+                # Restrict search to size-eligible blobs, score by dist + size mismatch.
+                cand_idx   = np.where(eligible)[0]
+                dists_cand = dists[cand_idx]
+                size_err   = np.abs(blob_radii[cand_idx] - expected_px)
+                scores     = dists_cand + blob_size_score_weight * size_err
+                best       = int(np.argmin(scores))
+                j          = int(cand_idx[best])
+            else:
+                # No eligible blobs (all filtered) or no size info — pure distance argmin.
+                if eligible is not None and is_deep():
+                    logger.debug(f"  LED {lid}: all blobs size-filtered, falling back to argmin")
+                j = int(np.argmin(dists))
+
+            if dists[j] < snap_px:
+                locked_pairs.append((j, lid))
+                locked_obj.append(self.model.positions[lid])
+                locked_img.append(blobs[j])
+                if is_deep():
+                    logger.debug(f"  LED {lid}: argmin → blob {j} ({dists[j]:.1f}px)")
+            elif is_deep():
+                logger.debug(f"  LED {lid}: no lock (dist {dists[j]:.1f}px ≥ snap {snap_px:.1f}px)")
+
+    logger.debug(
+        f"Proximity snap: {len(locked_pairs)}/{len(prior_lids)} locked "
+        f"({n_id_locked} ID-path, {len(locked_pairs) - n_id_locked} argmin)"
+        + ("  [size filter active]" if blob_radii is not None else "")
+    )
     if len(locked_pairs) < min_inliers:
+        logger.debug(f"Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
         return None
 
     lo = np.array(locked_obj, dtype=np.float32)
@@ -828,6 +926,7 @@ def proximity_match(
         reprojection_px=reprojection_threshold,
     )
     if not ok:
+        logger.debug("Proximity: RANSAC failed → None")
         return None
 
     R_new = cv2.Rodrigues(rvec)[0]
@@ -848,6 +947,7 @@ def proximity_match(
     ]
 
     if len(final_pairs) < min_inliers:
+        logger.debug(f"Proximity: vis-recheck dropped to {len(final_pairs)} pairs < {min_inliers} → None")
         return None
 
     lo_f  = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
@@ -855,6 +955,7 @@ def proximity_match(
     proj  = _project_points(rvec, tvec, lo_f, K, dc)
     error = float(np.mean(np.linalg.norm(proj - li_f, axis=1)))
 
+    logger.debug(f"Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px")
     return {
         "rvec":       rvec,
         "tvec":       tvec,
@@ -942,8 +1043,7 @@ def brute_match(
     led_triple_depth_edge = self._led_triple_depth_edge
     led_triple_gates_edge = self._led_triple_gates_edge
 
-    geom     = self._geometry
-    is_inner = geom.is_inner   # kept for subset indexing: is_inner[il]
+    geom = self._geometry
 
     max_blob_depth = max(t[1] for t in depth_tiers)
     blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
@@ -958,15 +1058,18 @@ def brute_match(
     fx, fy       = float(K[0, 0]), float(K[1, 1])
     cx, cy       = float(K[0, 2]), float(K[1, 2])
 
-    R_prior = None
+    R_prior    = None
+    tvec_prior = None
     if pose_prior is not None:
-        rvec_pr, _ = pose_prior
+        rvec_pr, tvec_pr = pose_prior
         R_prior, _ = cv2.Rodrigues(np.asarray(rvec_pr, dtype=np.float32).reshape(3, 1))
+        tvec_prior = np.asarray(tvec_pr, dtype=np.float32).reshape(3)
 
     best_solution   = None
     best_inliers    = 0
     best_error      = np.inf
     best_orient_err = np.inf
+    best_tvec_err   = np.inf
     strong_found    = False
     solution_tier   = None
 
@@ -1050,6 +1153,8 @@ def brute_match(
                     b2 = int(blob_neighbors[i2])
 
                     gate_blob_idx    = [int(blob_neighbors[j]) for j in range(n_blob_neighbors) if j != i1 and j != i2]
+                    # If gate_blob_idx is empty (n_blob_neighbors == 2), _gate_any_point
+                    # returns False — a 4th blob neighbour is required for gate validation.
                     gate_blob_img_pts = blobs_undist[gate_blob_idx] if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
 
                     for b1_ord, b2_ord in ((b1, b2), (b2, b1)):
@@ -1099,6 +1204,17 @@ def brute_match(
                             logger.debug(f"  P3P returned {n_sols} solutions")
                         if not n_sols or rvecs is None:
                             continue
+
+                        # Sort hypotheses by rotation distance to prior so the
+                        # closest-to-prior solution is tried first — increases the
+                        # chance of strong_found triggering early.
+                        if R_prior is not None and n_sols > 1:
+                            def _rot_score(rv):
+                                R_i, _ = cv2.Rodrigues(rv.reshape(3, 1).astype(np.float32))
+                                return float(np.trace(R_i @ R_prior.T))
+                            order  = sorted(range(n_sols), key=lambda k: -_rot_score(rvecs[k]))
+                            rvecs  = [rvecs[k] for k in order]
+                            tvecs  = [tvecs[k] for k in order]
 
                         for sol_i, (rvec_h, tvec_h) in enumerate(zip(rvecs, tvecs)):
                             if strong_found:
@@ -1273,18 +1389,26 @@ def brute_match(
                                 cos_orient_angle = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
                                 orient_err = float(np.arccos(cos_orient_angle))
 
+                            tvec_err = np.inf
+                            if tvec_prior is not None:
+                                tvec_err = float(np.linalg.norm(tvec_r.reshape(3) - tvec_prior))
+
                             error_per_inlier      = err  / max(n_inlier_blobs, 1)
                             best_error_per_inlier = best_error / max(best_inliers, 1)
 
-                            # Prefer more inliers, break ties by absolute error, break
-                            # further ties by orientation distance to the prior pose.
+                            # Prefer more inliers, break ties by absolute error, then
+                            # orientation distance to prior, then translation distance.
                             is_better = (
                                 (n_inlier_blobs > best_inliers and error_per_inlier < best_error_per_inlier) or
                                 (n_inlier_blobs >= best_inliers + 2 and error_per_inlier < best_error_per_inlier * 1.1) or
                                 (n_inlier_blobs == best_inliers and err < best_error) or
                                 (n_inlier_blobs == best_inliers and
                                  abs(err - best_error) < 0.5 and
-                                 orient_err < best_orient_err)
+                                 orient_err < best_orient_err) or
+                                (n_inlier_blobs == best_inliers and
+                                 abs(err - best_error) < 0.5 and
+                                 orient_err == best_orient_err and
+                                 tvec_err < best_tvec_err)
                             )
 
                             if dbg:
@@ -1303,6 +1427,7 @@ def brute_match(
                                 best_inliers    = n_inlier_blobs
                                 best_error      = err
                                 best_orient_err = orient_err
+                                best_tvec_err   = tvec_err
                                 solution_tier   = tier_idx
 
                                 if log_best():

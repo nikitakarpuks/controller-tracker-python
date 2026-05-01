@@ -94,7 +94,7 @@ def main():
     for batch in tqdm(get_data(config["data"])):
         img_path, image = batch[0][0], batch[0][1]
 
-        blob_centroids, blob_contours, raw_centroids, raw_contours = get_centroids(
+        blob_centroids, blob_contours, blob_radii, raw_centroids, raw_contours = get_centroids(
             image, config["blob_detection"], visualize=True, img_path=img_path
         )
         blobs.append(blob_centroids.copy())
@@ -103,7 +103,10 @@ def main():
         raw_contours_all.append(raw_contours)
 
         t0       = time()
-        solution = tracking_system.update({0: blob_centroids}).get(
+        solution = tracking_system.update(
+            {0: blob_centroids},
+            radii_per_camera={0: blob_radii},
+        ).get(
             ("right_controller", camera_0.camera_idx)
         )
         elapsed  = time() - t0
