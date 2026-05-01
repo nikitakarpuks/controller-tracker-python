@@ -5,7 +5,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from src.transformations import Transform
-from src._matching import _visible_mask
+from src._visibility import _visible_mask
 from src.controller import _compute_geometry
 
 
@@ -364,7 +364,7 @@ class ControllerAnimatorRerun:
 
     def start(self, poses, assignments, blobs_all, camera, T_model_ctrl,
               contours_all=None, raw_blobs_all=None, raw_contours_all=None,
-              save_path: str = None):
+              save_path: str = None, T_world_cam=None):
         """
         Log all frames to rerun.
         Opens the viewer automatically (spawn=True).
@@ -374,6 +374,8 @@ class ControllerAnimatorRerun:
                        When set, the session is saved to disk so it can be
                        replayed later with:  rerun <save_path>
         """
+        self._T_world_cam = T_world_cam  # None → camera frame is the world frame
+
         # When a file is being saved the viewer is not spawned — replay manually.
         spawn_viewer = save_path is None
         rr.init("controller_animator", spawn=spawn_viewer)
@@ -398,7 +400,7 @@ class ControllerAnimatorRerun:
         self._T_model_ctrl   = T_model_ctrl
         self._geom           = _compute_geometry(self._ctrl_positions, self._ctrl_normals)
 
-        self._log_static_camera(camera)
+        self._log_static_camera(camera, T_world_cam=T_world_cam)
 
         if self.vis_cfg.get("show_mesh", True):
             rr.log(
@@ -458,7 +460,7 @@ class ControllerAnimatorRerun:
     # Static geometry (logged once, no timeline)
     # ------------------------------------------------------------------
 
-    def _log_static_camera(self, cam):
+    def _log_static_camera(self, cam, T_world_cam=None):
         """Camera frustum and image-plane outline — static, logged once."""
         frustum_z = self.vis_cfg.get("frustum_z", 0.05)
 
@@ -466,9 +468,13 @@ class ControllerAnimatorRerun:
         boundary = compute_frustum_boundary(cam, z=frustum_z, edge_samples=edge_samples)
         origin   = np.zeros(3)
 
+        if T_world_cam is not None:
+            boundary = T_world_cam.apply(boundary)
+            origin   = T_world_cam.t.copy()
+
         # 4 corner points for the frustum rays (one ray per corner)
         corners = boundary[[0, edge_samples, 2 * edge_samples, 3 * edge_samples]]
-        frustum_strips = [[origin, c] for c in corners]
+        frustum_strips = [[origin.tolist(), c.tolist()] for c in corners]
 
         # Full curved boundary loop for the image plane outline
         plane_strip = np.concatenate([boundary, boundary[:1]], axis=0).tolist()
@@ -494,15 +500,27 @@ class ControllerAnimatorRerun:
             )
 
         if self.vis_cfg.get("show_camera_frame", True):
-            rr.log(
-                "world/camera/axes",
-                rr.Arrows3D(
-                    origins=[[0, 0, 0]] * 3,
-                    vectors=[[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]],
-                    colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-                ),
-                static=True,
-            )
+            if T_world_cam is not None:
+                axes_w = (T_world_cam.R @ np.eye(3) * 0.1).T
+                rr.log(
+                    "world/camera/axes",
+                    rr.Arrows3D(
+                        origins=[origin.tolist()] * 3,
+                        vectors=axes_w.tolist(),
+                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+                    ),
+                    static=True,
+                )
+            else:
+                rr.log(
+                    "world/camera/axes",
+                    rr.Arrows3D(
+                        origins=[[0, 0, 0]] * 3,
+                        vectors=[[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]],
+                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+                    ),
+                    static=True,
+                )
 
         self._frustum_z = frustum_z
 
@@ -515,8 +533,30 @@ class ControllerAnimatorRerun:
                    raw_blobs=None, raw_contours=None):
 
         offset           = self.visual_offset
-        R                = T_cam_model.R
-        t                = T_cam_model.t
+        T_world_cam      = getattr(self, '_T_world_cam', None)
+
+        # Camera-frame rotation/translation — used for projection math only.
+        R_cam = T_cam_model.R
+        t_cam = T_cam_model.t
+
+        # Display (world) frame transform — all 3D Rerun logs use this.
+        # When T_world_cam is None, camera frame is used as world (backward compat).
+        if T_world_cam is not None:
+            T_disp_model = T_world_cam.compose(T_cam_model)
+        else:
+            T_disp_model = T_cam_model
+        R_disp = T_disp_model.R
+        t_disp = T_disp_model.t
+
+        # Helper: transform a set of camera-frame 3D points to display/world frame.
+        def _w(pts):
+            if T_world_cam is None:
+                return pts
+            pts_arr = np.asarray(pts, dtype=np.float64)
+            if pts_arr.ndim == 1:
+                return T_world_cam.apply(pts_arr.reshape(1, 3))[0]
+            return T_world_cam.apply(pts_arr)
+
         ray_radius            = self.vis_cfg.get("ray_radius",            0.0002)
         led_disk_radius       = self.vis_cfg.get("led_disk_radius",       0.003)
         proj_disk_radius      = self.vis_cfg.get("proj_disk_radius",      0.0008)
@@ -525,15 +565,15 @@ class ControllerAnimatorRerun:
         error_z_offset        = self.vis_cfg.get("error_z_offset",        0.0015)
         error_radius          = self.vis_cfg.get("error_radius",          0.0001)
 
-        # Real camera-space positions (no visual offset) — used for projection
-        pts_cam_real = (R @ self.model_positions.T).T + t
-        # Offset positions for 3-D display only
-        pts_cam = pts_cam_real + offset
+        # LED positions in camera frame (for projection) and display frame (for logging).
+        pts_cam_real  = (R_cam @ self.model_positions.T).T + t_cam
+        pts_disp_real = (R_disp @ self.model_positions.T).T + t_disp
+        pts_disp      = pts_disp_real + offset
 
-        # ---- 4x4 matrix for mesh ----
+        # ---- 4x4 matrix for mesh (display frame) ----
         T4 = np.eye(4)
-        T4[:3, :3] = R
-        T4[:3,  3] = t + offset
+        T4[:3, :3] = R_disp
+        T4[:3,  3] = t_disp + offset
 
         # ---- mesh (transform only — geometry is logged once as static) ----
         if self.vis_cfg.get("show_mesh", True):
@@ -545,17 +585,18 @@ class ControllerAnimatorRerun:
                 )
             )
 
-        # normals_cam needed for both display and projection — compute unconditionally
-        normals_cam = (R @ self.model_normals.T).T   # (N_leds, 3)
+        # Normals in camera frame (for visibility mask) and display frame (for LED disks).
+        normals_cam  = (R_cam  @ self.model_normals.T).T
+        normals_disp = (R_disp @ self.model_normals.T).T
 
         # ---- LEDs (flat disks lying on the controller surface) ----
         if self.vis_cfg.get("show_leds", True):
-            colors = np.tile([255, 0, 0], (len(pts_cam), 1))
+            colors = np.tile([255, 0, 0], (len(pts_disp), 1))
             if assignment:
                 for _, lid in assignment:
                     colors[lid] = [0, 255, 0]
 
-            verts, faces, vcols = make_disk_mesh(pts_cam, normals_cam, colors,
+            verts, faces, vcols = make_disk_mesh(pts_disp, normals_disp, colors,
                                                  radius=led_disk_radius)
             rr.log(
                 "world/leds",
@@ -571,15 +612,15 @@ class ControllerAnimatorRerun:
             rr.log(
                 "world/normals",
                 rr.LineStrips3D(
-                    strips=[[s, e] for s, e in zip(pts_cam,
-                                                    pts_cam + normals_cam * 0.03)],
+                    strips=[[s, e] for s, e in zip(pts_disp,
+                                                    pts_disp + normals_disp * 0.03)],
                     colors=[255, 0, 255],
                     radii=ray_radius,
                 )
             )
 
         # ---- blobs, projections, rays (LED→proj), errors ----
-        # Z-layer ordering (front → back):
+        # Z-layer ordering (front → back), all depths in camera frame:
         #   blob contours        : frustum_z - blob_z_offset
         #   matched projections  : frustum_z - matched_proj_z_offset
         #   unmatched projections: frustum_z
@@ -597,8 +638,7 @@ class ControllerAnimatorRerun:
                 matched_lids.add(lid)
 
         # ---- per-frame visibility mask ----
-        # Primitives (boxes/cylinders) inside _geom are hardcoded in controller
-        # space, so _visible_mask must receive controller-space R, t and positions.
+        # _visible_mask takes camera-frame R, t — use R_cam / t_cam.
         T_cam_ctrl = T_cam_model.compose(self._T_model_ctrl)
         vis_mask = _visible_mask(
             T_cam_ctrl.R, T_cam_ctrl.t,
@@ -613,18 +653,17 @@ class ControllerAnimatorRerun:
         # ---- blobs as actual contour shapes ----
         if blobs is not None and len(blobs) > 0:
             # Undistort blob centroids so they live in the same space as the
-            # pinhole LED projections (proj_flat = px/pz * z).  The raw
-            # distorted pixel coordinate must not be used for 3-D display
-            # because backproject_to_plane applies a pinhole model, which only
-            # matches the LED projection when distortion has been removed first.
+            # pinhole LED projections (proj_flat = px/pz * z).
             blobs_undist_disp = cv2.undistortPoints(
                 blobs.reshape(-1, 1, 2).astype(np.float32),
                 camera.camera_matrix, camera.dist_coeffs,
                 P=camera.camera_matrix,
             ).reshape(-1, 2)
 
-            # pts_plane at error_z: both error-line endpoints live on this plane
-            pts_plane = backproject_to_plane(blobs_undist_disp, camera, z=error_z)
+            # pts_plane: blob positions on the error-z plane, camera frame.
+            # Transformed to display frame for logging.
+            pts_plane_cam  = backproject_to_plane(blobs_undist_disp, camera, z=error_z)
+            pts_plane_disp = _w(pts_plane_cam)
 
             if self.vis_cfg.get("show_blobs", True) and contours is not None:
                 blob_colors = np.array(
@@ -638,7 +677,7 @@ class ControllerAnimatorRerun:
                 )
                 if bv is not None:
                     rr.log("world/blobs", rr.Mesh3D(
-                        vertex_positions=bv,
+                        vertex_positions=_w(bv) if bv is not None else bv,
                         triangle_indices=bf,
                         vertex_colors=bc,
                     ))
@@ -652,17 +691,17 @@ class ControllerAnimatorRerun:
                 blabel_color  = self.vis_cfg.get("blob_id_label_color",  [255, 210, 0])
                 blabel_offset = self.vis_cfg.get("blob_id_label_offset", [0.0006, -0.0006])
                 bdx, bdy = blabel_offset[0], blabel_offset[1]
-                blob_label_pts = backproject_to_plane(blobs_undist_disp, camera, z=blob_z).copy()
-                blob_label_pts[:, 0] += bdx
-                blob_label_pts[:, 1] += bdy
+                blob_label_pts_cam = backproject_to_plane(blobs_undist_disp, camera, z=blob_z).copy()
+                blob_label_pts_cam[:, 0] += bdx
+                blob_label_pts_cam[:, 1] += bdy
                 rr.log("world/blob_ids", rr.Points3D(
-                    positions=blob_label_pts,
+                    positions=_w(blob_label_pts_cam),
                     labels=[str(i) for i in range(len(blobs))],
                     colors=[blabel_color] * len(blobs),
                     radii=0.0,
                 ))
         else:
-            pts_plane = None
+            pts_plane_disp = None
             rr.log("world/blobs",    rr.Clear(recursive=False))
             rr.log("world/blob_ids", rr.Clear(recursive=False))
 
@@ -676,7 +715,7 @@ class ControllerAnimatorRerun:
                 )
                 if rv is not None:
                     rr.log("world/blobs_raw", rr.Mesh3D(
-                        vertex_positions=rv,
+                        vertex_positions=_w(rv),
                         triangle_indices=rf,
                         vertex_colors=rc,
                     ))
@@ -688,18 +727,19 @@ class ControllerAnimatorRerun:
             rr.log("world/blobs_raw", rr.Clear(recursive=False))
 
         # ---- visible LED projections (matched + physically visible unmatched) ----
-        # Matched LEDs use matched_proj_z, unmatched use frustum_z.
-        # lid_to_proj_pt maps lid → 3D point for rays and error lines.
-        all_proj_pts   = []
+        # Compute projection in camera frame, then transform to display frame.
+        # lid_to_proj_pt stores display-frame points (used for rays and error lines).
+        all_proj_pts   = []   # display frame
         all_proj_lids  = []
-        lid_to_proj_pt = {}
+        lid_to_proj_pt = {}   # display frame
         for i, (px, py, pz) in enumerate(pts_cam_real):
             if pz > 1e-6 and (i in matched_lids or i in vis_set):
                 z_val = matched_proj_z if i in matched_lids else frustum_z
-                proj_pt = np.array([px / pz * z_val, py / pz * z_val, z_val])
-                all_proj_pts.append(proj_pt)
+                proj_pt_cam  = np.array([px / pz * z_val, py / pz * z_val, z_val])
+                proj_pt_disp = _w(proj_pt_cam)
+                all_proj_pts.append(proj_pt_disp)
                 all_proj_lids.append(i)
-                lid_to_proj_pt[i] = proj_pt
+                lid_to_proj_pt[i] = proj_pt_disp
 
         if self.vis_cfg.get("show_projected", True):
             if all_proj_pts:
@@ -708,7 +748,11 @@ class ControllerAnimatorRerun:
                      for lid in all_proj_lids],
                     dtype=np.uint8,
                 )
-                proj_normals = np.tile([0.0, 0.0, -1.0],
+                # Project normal [0,0,-1] (camera backward) into display frame.
+                proj_normal_cam  = np.array([0.0, 0.0, -1.0])
+                proj_normal_disp = (T_world_cam.R @ proj_normal_cam
+                                    if T_world_cam is not None else proj_normal_cam)
+                proj_normals = np.tile(proj_normal_disp,
                                        (len(all_proj_pts), 1)).astype(np.float32)
                 pv, pf, pc = make_disk_mesh(
                     np.array(all_proj_pts, dtype=np.float32),
@@ -729,11 +773,15 @@ class ControllerAnimatorRerun:
                 label_color  = self.vis_cfg.get("led_id_label_color",  [180, 0, 255])
                 label_offset = self.vis_cfg.get("led_id_label_offset", [0.0006, -0.0006])
                 dx, dy = label_offset[0], label_offset[1]
-                label_pts = np.array(all_proj_pts, dtype=np.float32).copy()
-                label_pts[:, 0] += dx
-                label_pts[:, 1] += dy
+                # Apply offset in camera frame before transforming to display frame.
+                label_pts_cam = np.array([
+                    [pts_cam_real[lid, 0] / pts_cam_real[lid, 2] * frustum_z + dx,
+                     pts_cam_real[lid, 1] / pts_cam_real[lid, 2] * frustum_z + dy,
+                     frustum_z]
+                    for lid in all_proj_lids
+                ], dtype=np.float32)
                 rr.log("world/led_ids", rr.Points3D(
-                    positions=label_pts,
+                    positions=_w(label_pts_cam),
                     labels=[str(lid) for lid in all_proj_lids],
                     colors=[label_color] * len(all_proj_lids),
                     radii=0.0,
@@ -742,8 +790,6 @@ class ControllerAnimatorRerun:
                 rr.log("world/led_ids", rr.Clear(recursive=False))
 
         # ---- rays: matched (blue) and unmatched-but-visible (orange-red) ----
-        # Both sets are merged into one path so there is never a stale second
-        # path persisting from a previous frame with a leftover color.
         ray_strips = []
         ray_colors = []
         error_strips    = []
@@ -752,40 +798,41 @@ class ControllerAnimatorRerun:
 
         # Pre-project all matched LEDs at once using the real K + distortion,
         # matching exactly how _matching.py computes its reported error.
-        rvec_model, _ = cv2.Rodrigues(R)
-        if assignment and pts_plane is not None:
+        rvec_model, _ = cv2.Rodrigues(R_cam)
+        if assignment and pts_plane_disp is not None:
             matched_lids_ord = [lid for _, lid in assignment]
             proj_matched, _ = cv2.projectPoints(
                 self.model_positions[matched_lids_ord].astype(np.float32),
                 rvec_model,
-                t.astype(np.float32).reshape(3, 1),
+                t_cam.astype(np.float32).reshape(3, 1),
                 camera.camera_matrix,
                 camera.dist_coeffs,
             )
             proj_matched = proj_matched.reshape(-1, 2)
 
             for pair_i, (bid, lid) in enumerate(assignment):
-                if bid >= len(pts_plane) or lid not in lid_to_proj_pt:
+                if bid >= len(pts_plane_disp) or lid not in lid_to_proj_pt:
                     continue
                 if self.vis_cfg.get("show_rays", True):
-                    ray_strips.append([pts_cam_real[lid], lid_to_proj_pt[lid]])
+                    ray_strips.append([pts_disp_real[lid].tolist(), lid_to_proj_pt[lid].tolist()])
                     ray_colors.append([70, 130, 255])
                 px, py, pz = pts_cam_real[lid]
                 if pz > 1e-6:
-                    proj_flat = np.array([px / pz * error_z, py / pz * error_z, error_z])
+                    proj_flat_cam  = np.array([px / pz * error_z, py / pz * error_z, error_z])
+                    proj_flat_disp = _w(proj_flat_cam)
                     if self.vis_cfg.get("show_errors", True):
-                        error_strips.append([proj_flat, pts_plane[bid]])
+                        error_strips.append([proj_flat_disp.tolist(), pts_plane_disp[bid].tolist()])
                     u, v = blobs[bid]
                     pu, pv = proj_matched[pair_i]
                     err_px = np.sqrt((u - pu) ** 2 + (v - pv) ** 2)
                     error_values.append(err_px)
-                    error_label_pts.append((proj_flat + pts_plane[bid]) / 2)
+                    error_label_pts.append((proj_flat_disp + pts_plane_disp[bid]) / 2)
 
         # Unmatched rays: visible LEDs not in the assignment
         if self.vis_cfg.get("show_rays", True):
             for lid, proj_pt in lid_to_proj_pt.items():
                 if lid not in matched_lids:
-                    ray_strips.append([pts_cam_real[lid], proj_pt])
+                    ray_strips.append([pts_disp_real[lid].tolist(), proj_pt.tolist()])
                     ray_colors.append([230, 80, 50])
 
         # Always log every frame — empty strips clears the path, preventing

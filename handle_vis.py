@@ -46,7 +46,7 @@ from src.load_config import load_yaml_config, load_json_config
 from src.controller import create_leds_from_config, _compute_geometry
 from src.geometry import tangent_frame
 from src.visualization import build_alignment_transform, load_trimesh, make_disk_mesh
-from src._matching import _visible_mask
+from src._visibility import _visible_mask
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -376,7 +376,7 @@ def main():
     # Also draws rays and marks the virtual camera so you can verify the shapes
     # transferred from PRIMITIVES to _compute_geometry match.
     # if DEBUG_CAM_POS is not None:
-    from src._matching import _rays_blocked_by_box, _rays_blocked_by_cylinder
+    from src._visibility import _rays_blocked_by_box, _rays_blocked_by_cylinder
 
     # R_dbg = cv2.Rodrigues(np.array([[0.26485262], [1.42825671], [-2.72708413]]))[0]
     # t_dbg = np.array([0.05591549, -0.08879955, 0.29305191])

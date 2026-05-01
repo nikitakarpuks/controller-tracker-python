@@ -143,6 +143,7 @@ def main():
         raw_blobs_all=raw_blobs,
         raw_contours_all=raw_contours_all,
         save_path=config["visualization"].get("save_recording"),
+        T_world_cam=camera_0.T_world_cam,
     )
 
 

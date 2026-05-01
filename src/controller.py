@@ -156,8 +156,8 @@ class SingleViewTracker:
         self.camera = camera
         self.model = model
 
-        # Cached transform (Camera -> VRH IMU)
-        self.T_imu_cam: Transform = camera.T_imu_cam
+        # T_world_cam: camera frame → world/IMU frame (used to express solutions in world frame)
+        self.T_world_cam: Transform = camera.T_world_cam
 
         # Tracking state — current frame
         self.prev_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
@@ -184,7 +184,7 @@ class SingleViewTracker:
         self.kd_tree_cache = None
 
         # Pre-compute body geometry and LED quad cache once from the fixed model.
-        from src._matching import (
+        from src._led_graph import (
             _build_led_neighbor_lists,
             _build_led_neighbor_lists_edge,
             _precompute_led_quads,
@@ -206,14 +206,14 @@ class SingleViewTracker:
         )
 
         # Bind strategies
-        from src._matching import proximity_match, brute_match, _carry_led_ids
-        from src._pnp_solver import p2p_solver, p1p_solver
+        from src._matching import (
+            proximity_match, brute_match, prior_constrained_match, _carry_led_ids,
+        )
 
-        self.proximity_match = proximity_match.__get__(self)
-        self.brute_match = brute_match.__get__(self)
-        self.p2p_solver = p2p_solver.__get__(self)
-        self.p1p_solver = p1p_solver.__get__(self)
-        self._carry_led_ids = _carry_led_ids
+        self.proximity_match          = proximity_match.__get__(self)
+        self.brute_match              = brute_match.__get__(self)
+        self.prior_constrained_match  = prior_constrained_match.__get__(self)
+        self._carry_led_ids           = _carry_led_ids
 
     # # -----------------------------------------------------
     # # Custom projection
@@ -465,6 +465,23 @@ class SingleViewTracker:
                         solution = None
 
         # ------------------------------------------------------------------
+        # Low-blob-count fallback: prior-constrained translation solve
+        # P2P (3 blobs): fix R, solve t from 2 pairs, validate with 3rd.
+        # P1P (2 blobs): fix R + depth, solve (tx,ty) from 1 pair, validate with 2nd.
+        # Only reachable when prev_pose exists (prior quality requirement).
+        # ------------------------------------------------------------------
+        if (solution is None
+                and self.prev_pose is not None
+                and self.prev_assignment is not None
+                and 2 <= n_blobs <= 3):
+            logger.debug(f"[track] n_blobs={n_blobs} + prior → prior_constrained_match")
+            solution = self.prior_constrained_match(
+                blobs, predicted_pose,
+                prior_assignment=self.prev_assignment,
+                blob_radii=blob_radii,
+            )
+
+        # ------------------------------------------------------------------
         # Pose-jump guard against prev_pose (tight, per-frame)
         # ------------------------------------------------------------------
         if solution is not None and self.prev_pose is not None:
@@ -501,6 +518,11 @@ class SingleViewTracker:
             self.last_good_pose       = self.prev_pose
             self.last_good_assignment = self.prev_assignment
             self.consecutive_failures = 0
+
+            # World-frame controller pose: T_world_ctrl = T_world_cam ∘ T_cam_ctrl
+            R_ctrl, _ = cv2.Rodrigues(solution["rvec"])
+            T_cam_ctrl = Transform(R_ctrl, solution["tvec"].reshape(3))
+            solution["T_world_ctrl"] = self.T_world_cam.compose(T_cam_ctrl)
 
             # Update blob ID state for next frame.
             blob_led_ids_out = np.full(n_blobs, -1, dtype=np.int32)
