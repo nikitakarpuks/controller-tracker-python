@@ -249,6 +249,14 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     rejected_centroids  = centroids_arr[rejected_indices]
     rejected_contours   = [blob_contours[i] for i in rejected_indices]
 
+    # Equivalent-circle radius (px) for each kept blob: radius = sqrt(area / π).
+    # Used downstream for depth-scaled size filtering in matching.
+    filtered_radii = np.array(
+        [np.sqrt(max(cv2.contourArea(cnt.reshape(-1, 1, 2)), 1.0) / np.pi)
+         for cnt in filtered_contours],
+        dtype=np.float32,
+    ) if len(filtered_contours) > 0 else np.empty(0, dtype=np.float32)
+
     # ── 4. Visualization ──────────────────────────────────────────────────────
     if visualize:
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -291,4 +299,4 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             img_out_path = out_dir / f"{Path(img_path).stem}_blobs.png"
             cv2.imwrite(str(img_out_path), vis)
 
-    return filtered_centroids, filtered_contours, rejected_centroids, rejected_contours
+    return filtered_centroids, filtered_contours, filtered_radii, rejected_centroids, rejected_contours

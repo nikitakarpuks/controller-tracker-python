@@ -161,6 +161,7 @@ class SingleViewTracker:
 
         # Tracking state — current frame
         self.prev_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.prev_prev_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None  # for velocity extrapolation
         self.prev_assignment = None
 
         # Last frame where tracking was confirmed good.
@@ -168,6 +169,11 @@ class SingleViewTracker:
         # validated for plausibility (pose-jump guard).
         self.last_good_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.last_good_assignment = None
+
+        # Blob ID persistence: each blob carries the LED ID it was matched to
+        # last frame, carried forward via spatial nearest-neighbour matching.
+        self.prev_blob_positions: Optional[np.ndarray] = None  # (N, 2)
+        self.prev_blob_led_ids:   Optional[np.ndarray] = None  # (N,) int, -1 = unknown
 
         # Consecutive frames without a valid solution.
         self.consecutive_failures: int = 0
@@ -200,13 +206,14 @@ class SingleViewTracker:
         )
 
         # Bind strategies
-        from src._matching import proximity_match, brute_match
+        from src._matching import proximity_match, brute_match, _carry_led_ids
         from src._pnp_solver import p2p_solver, p1p_solver
 
         self.proximity_match = proximity_match.__get__(self)
         self.brute_match = brute_match.__get__(self)
         self.p2p_solver = p2p_solver.__get__(self)
         self.p1p_solver = p1p_solver.__get__(self)
+        self._carry_led_ids = _carry_led_ids
 
     # # -----------------------------------------------------
     # # Custom projection
@@ -273,28 +280,71 @@ class SingleViewTracker:
         rvec_ref, tvec_ref,
         max_dist_m: float = 0.15,
         max_angle_deg: float = 25.0,
+        pos_thresh_xyz_m: tuple = None,
+        rot_thresh_xyz_deg: tuple = None,
     ) -> bool:
         """
         Return True if the new pose is implausibly far from the reference.
 
-        Position:  Euclidean distance between translation vectors.
-        Rotation:  angle of the relative rotation R_new @ R_ref^T,
-                   computed as arccos((trace - 1) / 2).
+        Scalar mode (default): Euclidean translation distance and total rotation angle.
+        Per-axis mode: if pos_thresh_xyz_m or rot_thresh_xyz_deg are given, each
+          axis is checked independently (any axis over threshold → reject).
+          For rotation the axis errors come from the Rodrigues log of the relative
+          rotation, i.e. the rotation-vector components in radians.
+          Per-axis mode overrides the corresponding scalar check when provided.
         """
         tvec_new = np.asarray(tvec_new, dtype=np.float64).reshape(3)
         tvec_ref = np.asarray(tvec_ref, dtype=np.float64).reshape(3)
-        if np.linalg.norm(tvec_new - tvec_ref) > max_dist_m:
+        pos_diff = tvec_new - tvec_ref
+
+        if pos_thresh_xyz_m is not None:
+            tx, ty, tz = pos_thresh_xyz_m
+            if abs(pos_diff[0]) > tx or abs(pos_diff[1]) > ty or abs(pos_diff[2]) > tz:
+                return True
+        elif np.linalg.norm(pos_diff) > max_dist_m:
             return True
 
         R_new, _ = cv2.Rodrigues(np.asarray(rvec_new, dtype=np.float32).reshape(3, 1))
         R_ref, _ = cv2.Rodrigues(np.asarray(rvec_ref, dtype=np.float32).reshape(3, 1))
-        cos_a = np.clip((np.trace(R_new @ R_ref.T) - 1.0) / 2.0, -1.0, 1.0)
-        return float(np.degrees(np.arccos(cos_a))) > max_angle_deg
+
+        if rot_thresh_xyz_deg is not None:
+            # Rodrigues log of relative rotation gives axis-angle as a 3-vector (radians).
+            R_rel = R_new @ R_ref.T
+            rvec_rel, _ = cv2.Rodrigues(R_rel.astype(np.float32))
+            rot_deg = np.degrees(np.abs(rvec_rel.reshape(3)))
+            rx, ry, rz = rot_thresh_xyz_deg
+            if rot_deg[0] > rx or rot_deg[1] > ry or rot_deg[2] > rz:
+                return True
+        else:
+            cos_a = np.clip((np.trace(R_new @ R_ref.T) - 1.0) / 2.0, -1.0, 1.0)
+            if float(np.degrees(np.arccos(cos_a))) > max_angle_deg:
+                return True
+
+        return False
+
+    @staticmethod
+    def _extrapolate_pose(rvec_n, tvec_n, rvec_nm1, tvec_nm1):
+        """
+        Constant-velocity extrapolation: predict pose at frame n+1.
+
+        Translation: linear — tvec_{n+1} = 2*tvec_n - tvec_{n-1}
+        Rotation: apply the same delta rotation again in camera frame —
+            R_delta = R_n @ R_{n-1}.T  (rotation change from n-1 to n)
+            R_{n+1} = R_delta @ R_n
+        """
+        tvec_pred = 2.0 * np.asarray(tvec_n, np.float64) - np.asarray(tvec_nm1, np.float64)
+
+        R_n,   _ = cv2.Rodrigues(np.asarray(rvec_n,   np.float32).reshape(3, 1))
+        R_nm1, _ = cv2.Rodrigues(np.asarray(rvec_nm1, np.float32).reshape(3, 1))
+        R_pred    = (R_n @ R_nm1.T) @ R_n
+        rvec_pred, _ = cv2.Rodrigues(R_pred.astype(np.float32))
+
+        return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3).astype(np.float32)
 
     # -----------------------------------------------------
     # Tracking
     # -----------------------------------------------------
-    def track(self, blobs: np.ndarray) -> Optional[Dict]:
+    def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None) -> Optional[Dict]:
         """
         State machine:
 
@@ -315,12 +365,46 @@ class SingleViewTracker:
         blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
 
+        # Per-axis jump thresholds from config (fall back to scalar defaults if absent).
+        _cfg = self._matching_cfg
+        _use_proximity = bool(_cfg.get('use_proximity_match', True))
+        _blob_snap_px  = float(_cfg.get('blob_tracking_snap_px', 25.0))
+        _pos_ax = _cfg.get('pose_jump_pos_thresh_m')
+        _rot_ax = _cfg.get('pose_jump_rot_thresh_deg')
+        _jump_kw = {}
+        if _pos_ax is not None:
+            _jump_kw['pos_thresh_xyz_m']   = tuple(_pos_ax)
+        if _rot_ax is not None:
+            _jump_kw['rot_thresh_xyz_deg'] = tuple(_rot_ax)
+
         # Normalise prev_pose shapes
         if self.prev_pose is not None:
             rvec, tvec = self.prev_pose
             self.prev_pose = (
                 np.asarray(rvec, dtype=np.float32).reshape(3, 1),
                 np.asarray(tvec, dtype=np.float32).reshape(3),
+            )
+
+        # Constant-velocity pose prediction: extrapolate from the last two frames.
+        # Falls back to prev_pose (constant-position) when only one prior exists.
+        if self.prev_pose is not None and self.prev_prev_pose is not None:
+            predicted_pose = self._extrapolate_pose(
+                self.prev_pose[0],     self.prev_pose[1],
+                self.prev_prev_pose[0], self.prev_prev_pose[1],
+            )
+        else:
+            predicted_pose = self.prev_pose
+
+        # ------------------------------------------------------------------
+        # Blob LED-ID carry: inherit LED IDs from previous frame's blobs
+        # ------------------------------------------------------------------
+        blob_led_ids = None
+        if self.prev_blob_positions is not None and self.prev_blob_led_ids is not None:
+            blob_led_ids = self._carry_led_ids(
+                blobs,
+                self.prev_blob_positions,
+                self.prev_blob_led_ids,
+                snap_px=_blob_snap_px,
             )
 
         # ------------------------------------------------------------------
@@ -330,10 +414,12 @@ class SingleViewTracker:
 
         if self.prev_pose is not None:
             # --- Primary: proximity (fast, assignment-locked) ---
-            if n_blobs >= 3:
+            if _use_proximity and n_blobs >= 3:
                 solution = self.proximity_match(
-                    blobs, self.prev_pose,
+                    blobs, predicted_pose,
                     prior_assignment=self.prev_assignment,
+                    blob_led_ids=blob_led_ids,
+                    blob_radii=blob_radii,
                 )
 
             # --- Fallback: brute when proximity is absent or degraded ---
@@ -341,18 +427,27 @@ class SingleViewTracker:
             # above this indicate drifting or a wrong assignment lock.
             proximity_poor = solution is None or solution["error"] > 2.5
             if proximity_poor and n_blobs >= 4:
-                brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+                if solution is None:
+                    logger.debug("[track] proximity → None, running brute fallback")
+                else:
+                    logger.debug(f"[track] proximity degraded (err={solution['error']:.2f}px > 2.5px), running brute fallback")
+                brute = self.brute_match(blobs, pose_prior=predicted_pose)
                 if brute is not None:
                     prox_n  = len(solution["assignment"]) if solution else 0
                     brute_n = brute.get("inliers", len(brute["assignment"]))
                     if (solution is None or
                             brute_n > prox_n or
                             (brute_n == prox_n and brute["error"] < solution["error"])):
+                        logger.debug(
+                            f"[track] brute selected (inliers={brute_n} err={brute['error']:.2f}px"
+                            f" vs prox inliers={prox_n})"
+                        )
                         solution = brute
 
         else:
             # --- No prior pose: brute-force re-acquisition ---
             if n_blobs >= 4:
+                logger.debug("[track] no prev_pose → cold-start brute")
                 solution = self.brute_match(blobs)
 
                 # In deep-debug mode frames are non-consecutive, so the last_good_pose
@@ -364,6 +459,7 @@ class SingleViewTracker:
                         rvec_lg, tvec_lg,
                         max_dist_m=0.5,
                         max_angle_deg=60.0,
+                        **_jump_kw,
                     ):
                         logger.debug("Brute re-acquisition rejected: too far from last known good pose.")
                         solution = None
@@ -376,6 +472,7 @@ class SingleViewTracker:
             if self._pose_jump_too_large(
                 solution["rvec"], solution["tvec"],
                 rvec_p, tvec_p,
+                **_jump_kw,
             ):
                 print(f"[tracking] Pose jump detected "
                       f"(method={solution.get('method','?')}, "
@@ -386,6 +483,7 @@ class SingleViewTracker:
                     brute = self.brute_match(blobs, pose_prior=self.prev_pose)
                     if brute is not None and not self._pose_jump_too_large(
                         brute["rvec"], brute["tvec"], rvec_p, tvec_p,
+                        **_jump_kw,
                     ):
                         solution = brute
 
@@ -393,17 +491,37 @@ class SingleViewTracker:
         # Accept / reject
         # ------------------------------------------------------------------
         if solution is not None and solution["error"] < 5.0:
+            logger.debug(
+                f"[track] accepted — method={solution.get('method','?')}  "
+                f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
+            )
+            self.prev_prev_pose  = self.prev_pose  # shift window for next-frame extrapolation
             self.prev_pose       = (solution["rvec"], solution["tvec"])
             self.prev_assignment = solution["assignment"]
             self.last_good_pose       = self.prev_pose
             self.last_good_assignment = self.prev_assignment
             self.consecutive_failures = 0
+
+            # Update blob ID state for next frame.
+            blob_led_ids_out = np.full(n_blobs, -1, dtype=np.int32)
+            for b_idx, l_id in solution["assignment"]:
+                blob_led_ids_out[b_idx] = l_id
+            self.prev_blob_positions = blobs.copy()
+            self.prev_blob_led_ids   = blob_led_ids_out
+
             return solution
 
-        # Tracking lost — keep last_good_pose for re-acquisition plausibility
+        # Tracking lost — clear velocity history and blob ID state so re-acquisition starts fresh
+        if solution is not None:
+            logger.debug(f"[track] rejected — err={solution['error']:.2f}px exceeds 5.0px threshold")
+        else:
+            logger.debug("[track] rejected — no solution found")
         self.consecutive_failures += 1
-        self.prev_pose       = None
-        self.prev_assignment = None
+        self.prev_pose           = None
+        self.prev_prev_pose      = None
+        self.prev_assignment     = None
+        self.prev_blob_positions = None
+        self.prev_blob_led_ids   = None
         return None
 
 
@@ -422,8 +540,11 @@ class TrackingSystem:
                 key = (ctrl.name, cam.camera_idx)
                 self.trackers[key] = SingleViewTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geometry_cfg)
 
-    def update(self, observations_per_camera: Dict[int, np.ndarray]):
-
+    def update(
+        self,
+        observations_per_camera: Dict[int, np.ndarray],
+        radii_per_camera: Optional[Dict[int, np.ndarray]] = None,
+    ):
         results = {}
 
         for (ctrl_name, cam_id), tracker in self.trackers.items():
@@ -434,7 +555,8 @@ class TrackingSystem:
                 results[(ctrl_name, cam_id)] = None
                 continue
 
-            results[(ctrl_name, cam_id)] = tracker.track(blobs)
+            blob_radii = radii_per_camera.get(cam_id) if radii_per_camera else None
+            results[(ctrl_name, cam_id)] = tracker.track(blobs, blob_radii=blob_radii)
 
         return results
 
