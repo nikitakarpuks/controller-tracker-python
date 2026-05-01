@@ -47,7 +47,7 @@ matching:
   strong_match_error_px: 1.5
   min_vis_coverage: 0.7
   rng_seed: 42
-  use_proximity_match: true          # set to false to skip proximity match and always use brute force
+  use_proximity_match: false          # set to false to skip proximity match and always use brute force
   blob_tracking_snap_px: 25.0       # max pixel distance to carry a led_id from prev blob to current blob
   led_radius_mm: 3.0                # physical LED emitter radius; used to compute depth-scaled snap threshold
   proximity_snap_factor: 4.0        # snap_px = focal * (led_radius_mm/1000) / depth_m * this factor
