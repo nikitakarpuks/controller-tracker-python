@@ -5,6 +5,7 @@ import numpy as np
 from loguru import logger
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
+from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
 from src.debug_config import is_deep, get_debug_triple, is_verbose_all, log_best
@@ -228,6 +229,70 @@ def proximity_match(
         logger.debug(f"Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
         return None
 
+    # Hungarian expansion: if proximity locked fewer than expansion_threshold of
+    # model-visible LEDs, try to assign unmatched blobs to untracked visible LEDs.
+    # Runs with the predicted pose; RANSAC downstream filters bad pairs.
+    expansion_threshold = float(_cfg.get('proximity_expansion_threshold', 0.6))
+    expansion_px        = float(_cfg.get('proximity_expansion_px',        5.0))
+
+    vis_mask_pred = _visible_mask(
+        R_pred_arr, tvec_pred,
+        self.model.positions, self.model.normals,
+        geom,
+        cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+        cam_rpmax=self.camera.rpmax,
+        facing_threshold_deg=facing_threshold_deg,
+    )
+    n_model_visible = int(vis_mask_pred.sum())
+    did_expand = False
+
+    if n_model_visible > 0 and len(locked_pairs) / n_model_visible < expansion_threshold:
+        locked_blob_set = {b for b, _ in locked_pairs}
+        locked_led_set  = {l for _, l in locked_pairs}
+
+        free_blob_idx = [i for i in range(len(blobs)) if i not in locked_blob_set]
+        free_led_idx  = [int(lid) for lid in np.where(vis_mask_pred)[0]
+                         if int(lid) not in locked_led_set]
+
+        if free_blob_idx and free_led_idx:
+            free_led_obj = self.model.positions[free_led_idx].astype(np.float32)
+            proj_free    = _project_points(rvec_pred, tvec_pred, free_led_obj, K, dc)
+            free_blobs   = blobs[free_blob_idx]
+
+            cost = cdist(proj_free, free_blobs)  # (n_free_leds, n_free_blobs)
+
+            if blob_radii is not None:
+                free_blob_radii = blob_radii[free_blob_idx]
+                free_led_cam    = (R_pred_arr @ free_led_obj.T).T + tvec_pred
+                for k in range(len(free_led_idx)):
+                    depth       = float(max(free_led_cam[k, 2], 0.01))
+                    expected_px = focal_px * (led_radius_mm / 1000.0) / depth
+                    ineligible  = (
+                        (free_blob_radii < expected_px * blob_size_min_factor) |
+                        (free_blob_radii > expected_px * blob_size_max_factor)
+                    )
+                    cost[k, ineligible] = 1e9
+
+            row_ind, col_ind = linear_sum_assignment(cost)
+
+            n_expanded = 0
+            for r, c in zip(row_ind, col_ind):
+                if cost[r, c] < expansion_px:
+                    blob_j = free_blob_idx[c]
+                    led_id = free_led_idx[r]
+                    locked_pairs.append((blob_j, led_id))
+                    locked_obj.append(self.model.positions[led_id])
+                    locked_img.append(blobs[blob_j])
+                    n_expanded += 1
+
+            if n_expanded:
+                did_expand = True
+                logger.debug(
+                    f"Proximity expansion: +{n_expanded} via Hungarian "
+                    f"(coverage {len(locked_pairs) - n_expanded}/{n_model_visible} "
+                    f"→ {len(locked_pairs)}/{n_model_visible})"
+                )
+
     lo = np.array(locked_obj, dtype=np.float32)
     li = np.array(locked_img, dtype=np.float32)
 
@@ -271,7 +336,7 @@ def proximity_match(
         "tvec":       tvec,
         "error":      error,
         "assignment": final_pairs,
-        "method":     "proximity_locked",
+        "method":     "proximity_expanded" if did_expand else "proximity_locked",
     }
 
 
