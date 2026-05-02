@@ -1,6 +1,6 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/deep_search_required/a"
-#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/very_close"
+#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/initial_proximity_fails"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -47,18 +47,20 @@ matching:
   strong_match_error_px: 1.5
   min_vis_coverage: 0.7
   rng_seed: 42
-  use_proximity_match: false          # set to false to skip proximity match and always use brute force
+  use_proximity_match: true          # set to false to skip proximity match and always use brute force
   blob_tracking_snap_px: 25.0       # max pixel distance to carry a led_id from prev blob to current blob
   led_radius_mm: 3.0                # physical LED emitter radius; used to compute depth-scaled snap threshold
   proximity_snap_factor: 4.0        # snap_px = focal * (led_radius_mm/1000) / depth_m * this factor
   blob_size_max_factor: 4.0         # blob radius > expected * this → excluded (merged blob / noise)
   blob_size_min_factor: 0.2         # blob radius < expected * this → excluded (sub-pixel noise)
   blob_size_score_weight: 0.5       # px penalty per px of size mismatch added to argmin score
+  proximity_expansion_threshold: 0.7  # if locked/model_visible < this after snap, run Hungarian to lock more
+  proximity_expansion_px: 5.0         # max reprojection distance to accept a Hungarian-expanded pair
   pose_jump_pos_thresh_m: [0.25, 0.25, 0.30]   # per-axis translation jump limit [x, y, z] in metres
   pose_jump_rot_thresh_deg: [30.0, 30.0, 30.0] # per-axis rotation jump limit [rx, ry, rz] in degrees
 
 debug:
-  mode_active: true
+  mode_active: false
   split_to_folders: false
   verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
   log_best: true                  # log each new best solution update
