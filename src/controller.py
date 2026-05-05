@@ -350,7 +350,8 @@ class SingleViewTracker:
 
         Have prev_pose?
           Yes → proximity_match (fast locked path)
-                  if error > 2.5 px or no result → brute_match fallback
+                  if max_pair_error > proximity_max_pair_error_px or no result → brute_match fallback
+          Prediction via constant-velocity extrapolation (prev_pose + prev_prev_pose).
           No  → brute_match (cold start or re-acquisition)
 
         After any candidate solution:
@@ -385,8 +386,7 @@ class SingleViewTracker:
                 np.asarray(tvec, dtype=np.float32).reshape(3),
             )
 
-        # Constant-velocity pose prediction: extrapolate from the last two frames.
-        # Falls back to prev_pose (constant-position) when only one prior exists.
+        # Pose prediction: constant-velocity extrapolation from the last two frames.
         if self.prev_pose is not None and self.prev_prev_pose is not None:
             predicted_pose = self._extrapolate_pose(
                 self.prev_pose[0],     self.prev_pose[1],
@@ -423,14 +423,24 @@ class SingleViewTracker:
                 )
 
             # --- Fallback: brute when proximity is absent or degraded ---
-            # Threshold 2.5 px: correct tracking gives < 0.5–1 px; values
-            # above this indicate drifting or a wrong assignment lock.
-            proximity_poor = solution is None or solution["error"] > 2.5
+            # Any single pair exceeding proximity_max_pair_error_px indicates a
+            # bad argmin lock or drifting pose; trigger brute immediately rather
+            # than accumulating error across frames.
+            _prox_max_err = float(_cfg.get('proximity_max_pair_error_px', 1.5))
+            if solution is not None:
+                _prox_max_observed = solution.get("max_error", solution["error"])
+                proximity_poor = _prox_max_observed > _prox_max_err
+            else:
+                proximity_poor = True
             if proximity_poor and n_blobs >= 4:
                 if solution is None:
                     logger.debug("[track] proximity → None, running brute fallback")
                 else:
-                    logger.debug(f"[track] proximity degraded (err={solution['error']:.2f}px > 2.5px), running brute fallback")
+                    logger.debug(
+                        f"[track] proximity degraded "
+                        f"(max_err={solution.get('max_error', solution['error']):.2f}px"
+                        f" > {_prox_max_err:.1f}px), running brute fallback"
+                    )
                 brute = self.brute_match(blobs, pose_prior=predicted_pose)
                 if brute is not None:
                     prox_n  = len(solution["assignment"]) if solution else 0

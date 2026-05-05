@@ -136,6 +136,7 @@ def main():
         config["visualization"]["3d_model_path"],
         positions_model,
         normals_model,
+        matching_cfg=config.get("matching", {}),
     )
     animator.start(
         poses, assignments, blobs, camera_0, T_model_ctrl,
