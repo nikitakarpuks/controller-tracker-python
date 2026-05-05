@@ -53,6 +53,18 @@ def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     return kept
 
 
+def _saddle_min(image, seed_a, seed_b):
+    """Return the minimum pixel value along the straight line between two seed points."""
+    y0, x0 = seed_a
+    y1, x1 = seed_b
+    n = max(abs(y1 - y0), abs(x1 - x0)) + 1
+    ys = np.round(np.linspace(y0, y1, n)).astype(int)
+    xs = np.round(np.linspace(x0, x1, n)).astype(int)
+    ys = np.clip(ys, 0, image.shape[0] - 1)
+    xs = np.clip(xs, 0, image.shape[1] - 1)
+    return int(image[ys, xs].min())
+
+
 def _split_blob_at_seeds(image, intensities, ys, xs, seed_a, seed_b):
     """
     Split blob pixels by Voronoi partition around seed_a and seed_b (y, x tuples).
@@ -147,6 +159,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
     split_merged       = bool(cfg.get("split_merged", False))
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
+    split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
 
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
     _, mask = cv2.threshold(image, pixel_threshold, 255, cv2.THRESH_BINARY)
@@ -216,6 +229,15 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             maxima = _find_split_maxima(image, ys_b, xs_b, required_threshold, min_split_dist)
 
             if len(maxima) == 2:
+                peak_lower = min(int(image[maxima[0][0], maxima[0][1]]),
+                                 int(image[maxima[1][0], maxima[1][1]]))
+                saddle = _saddle_min(image, maxima[0], maxima[1])
+                valley_ok = peak_lower > 0 and saddle / peak_lower < split_valley_ratio
+                if not valley_ok:
+                    new_centroids.append(centroids[i])
+                    new_blob_contours.append(blob_contours[i])
+                    new_blob_is_split.append(False)
+                    continue
                 split_result = _split_blob_at_seeds(image, intensities, ys_b, xs_b, maxima[0], maxima[1])
                 if split_result is not None:
                     for (pcx, pcy), part_cnt in split_result:

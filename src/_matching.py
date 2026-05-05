@@ -154,86 +154,11 @@ def proximity_match(
     led_cam = (R_pred_arr @ prior_obj.T).T + tvec_pred  # (N, 3)
     focal_px = float(max(K[0, 0], K[1, 1]))
 
-    # Nearest-neighbour snap: for each prior LED find which blob it moved to.
-    # DO NOT run a full Hungarian expansion here — expansion with a loose threshold
-    # introduces spurious LED-blob pairs that corrupt the prior for the next frame.
-    # The snap radius scales with distance: closer = larger blob = more pixels of tolerance.
-    locked_pairs, locked_obj, locked_img = [], [], []
-    n_id_locked = 0
-    for i, lid in enumerate(prior_lids):
-        depth = float(max(led_cam[i, 2], 0.01))
-        # expected_px: physical LED radius projected at this depth (pinhole approx)
-        expected_px = focal_px * (led_radius_mm / 1000.0) / depth
-        snap_px     = expected_px * snap_factor
-
-        # Size eligibility mask: blobs whose radius falls within
-        # [min_factor, max_factor] * expected_px are candidates.
-        # Blobs outside this range are merged blobs or noise at this depth.
-        if blob_radii is not None:
-            eligible = (
-                (blob_radii >= expected_px * blob_size_min_factor) &
-                (blob_radii <= expected_px * blob_size_max_factor)
-            )
-        else:
-            eligible = None
-
-        # ID fast path: if a blob carries this LED's ID from the previous frame,
-        # verify size eligibility and reprojection distance before locking.
-        locked = False
-        if blob_led_ids is not None:
-            id_candidates = np.where(blob_led_ids == lid)[0]
-            if len(id_candidates) == 1:
-                j = int(id_candidates[0])
-                size_ok = eligible is None or bool(eligible[j])
-                if size_ok and np.linalg.norm(blobs[j] - proj_prior[i]) < reprojection_threshold:
-                    locked_pairs.append((j, lid))
-                    locked_obj.append(self.model.positions[lid])
-                    locked_img.append(blobs[j])
-                    locked = True
-                    n_id_locked += 1
-                    if is_deep():
-                        logger.debug(f"  LED {lid}: ID-path → blob {j}")
-
-        if not locked:
-            dists = np.linalg.norm(blobs - proj_prior[i], axis=1)
-
-            if eligible is not None and eligible.any():
-                # Restrict search to size-eligible blobs, score by dist + size mismatch.
-                cand_idx   = np.where(eligible)[0]
-                dists_cand = dists[cand_idx]
-                size_err   = np.abs(blob_radii[cand_idx] - expected_px)
-                scores     = dists_cand + blob_size_score_weight * size_err
-                best       = int(np.argmin(scores))
-                j          = int(cand_idx[best])
-            else:
-                # No eligible blobs (all filtered) or no size info — pure distance argmin.
-                if eligible is not None and is_deep():
-                    logger.debug(f"  LED {lid}: all blobs size-filtered, falling back to argmin")
-                j = int(np.argmin(dists))
-
-            if dists[j] < snap_px:
-                locked_pairs.append((j, lid))
-                locked_obj.append(self.model.positions[lid])
-                locked_img.append(blobs[j])
-                if is_deep():
-                    logger.debug(f"  LED {lid}: argmin → blob {j} ({dists[j]:.1f}px)")
-            elif is_deep():
-                logger.debug(f"  LED {lid}: no lock (dist {dists[j]:.1f}px ≥ snap {snap_px:.1f}px)")
-
-    logger.debug(
-        f"Proximity snap: {len(locked_pairs)}/{len(prior_lids)} locked "
-        f"({n_id_locked} ID-path, {len(locked_pairs) - n_id_locked} argmin)"
-        + ("  [size filter active]" if blob_radii is not None else "")
-    )
-    if len(locked_pairs) < min_inliers:
-        logger.debug(f"Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
-        return None
-
-    # Hungarian expansion: if proximity locked fewer than expansion_threshold of
-    # model-visible LEDs, try to assign unmatched blobs to untracked visible LEDs.
-    # Runs with the predicted pose; RANSAC downstream filters bad pairs.
-    expansion_threshold = float(_cfg.get('proximity_expansion_threshold', 0.6))
-    expansion_px        = float(_cfg.get('proximity_expansion_px',        5.0))
+    # Compute model visibility with the predicted pose up front — needed both for
+    # the vis-drop expansion trigger and for the post-snap expansion block.
+    expansion_threshold   = float(_cfg.get('proximity_expansion_threshold', 0.6))
+    expansion_px          = float(_cfg.get('proximity_expansion_px',        5.0))
+    vis_drop_threshold    = int(  _cfg.get('proximity_vis_drop_threshold',  1))
 
     vis_mask_pred = _visible_mask(
         R_pred_arr, tvec_pred,
@@ -244,16 +169,127 @@ def proximity_match(
         facing_threshold_deg=facing_threshold_deg,
     )
     n_model_visible = int(vis_mask_pred.sum())
-    did_expand = False
 
-    if n_model_visible > 0 and len(locked_pairs) / n_model_visible < expansion_threshold:
-        locked_blob_set = {b for b, _ in locked_pairs}
-        locked_led_set  = {l for _, l in locked_pairs}
+    # Snap: assign blobs to prior LEDs in two passes.
+    # Direction is blob→LED: each blob claims its nearest unclaimed prior LED.
+    # This prevents an occluded LED's projection from stealing a blob that belongs
+    # to a still-visible neighbour — occluded LEDs simply receive no blob and are
+    # absent from locked_pairs (natural occlusion inference, no vis_mask needed).
+    #
+    # Pass 1 (ID fast path): blobs that carry a LED ID from the previous frame are
+    #   matched to that LED directly, subject to size + distance checks.
+    # Pass 2 (blob→LED greedy): each remaining blob finds its nearest unclaimed
+    #   prior LED within the LED's depth-scaled snap radius and argmin_max_px cap.
+    #   Score = dist + blob_size_score_weight * size_err to prefer size-correct matches.
+    argmin_max_px = float(_cfg.get('proximity_argmin_max_dist_px',
+                                    float(_cfg.get('proximity_expansion_px', 8.0))))
 
-        free_blob_idx = [i for i in range(len(blobs)) if i not in locked_blob_set]
-        free_led_idx  = [int(lid) for lid in np.where(vis_mask_pred)[0]
-                         if int(lid) not in locked_led_set]
+    # Precompute per-LED depth-scaled snap parameters.
+    expected_pxs = np.zeros(len(prior_lids))
+    snap_pxs     = np.zeros(len(prior_lids))
+    for i in range(len(prior_lids)):
+        depth            = float(max(led_cam[i, 2], 0.01))
+        expected_pxs[i]  = focal_px * (led_radius_mm / 1000.0) / depth
+        snap_pxs[i]      = expected_pxs[i] * snap_factor
 
+    # Index for O(1) LED-ID → prior index lookup used in the ID fast path.
+    prior_lid_to_idx = {lid: i for i, lid in enumerate(prior_lids)}
+
+    locked_pairs, locked_obj, locked_img = [], [], []
+    used_blobs: set = set()
+    used_led_idxs: set = set()
+    n_id_locked = 0
+
+    # Pass 1: ID fast path.
+    if blob_led_ids is not None:
+        for j in range(len(blobs)):
+            lid = int(blob_led_ids[j])
+            if lid == -1:
+                continue
+            i = prior_lid_to_idx.get(lid, -1)
+            if i == -1 or i in used_led_idxs:
+                continue
+            dist = float(np.linalg.norm(blobs[j] - proj_prior[i]))
+            if dist >= snap_pxs[i]:
+                continue
+            if blob_radii is not None:
+                if not (expected_pxs[i] * blob_size_min_factor
+                        <= blob_radii[j]
+                        <= expected_pxs[i] * blob_size_max_factor):
+                    continue
+            locked_pairs.append((j, lid))
+            locked_obj.append(self.model.positions[lid])
+            locked_img.append(blobs[j])
+            used_blobs.add(j)
+            used_led_idxs.add(i)
+            n_id_locked += 1
+            if is_deep():
+                logger.debug(f"  LED {lid}: ID-path → blob {j}")
+
+    # Pass 2: blob→LED greedy for unmatched blobs.
+    for j in range(len(blobs)):
+        if j in used_blobs:
+            continue
+        blob_r     = blob_radii[j] if blob_radii is not None else None
+        best_i     = -1
+        best_score = float('inf')
+        best_dist  = float('inf')
+        for i, lid in enumerate(prior_lids):
+            if i in used_led_idxs:
+                continue
+            dist = float(np.linalg.norm(blobs[j] - proj_prior[i]))
+            if dist >= snap_pxs[i] or dist >= argmin_max_px:
+                continue
+            if blob_r is not None:
+                if not (expected_pxs[i] * blob_size_min_factor
+                        <= blob_r
+                        <= expected_pxs[i] * blob_size_max_factor):
+                    continue
+            size_err = float(abs(blob_r - expected_pxs[i])) if blob_r is not None else 0.0
+            score    = dist + blob_size_score_weight * size_err
+            if score < best_score:
+                best_score = score
+                best_i     = i
+                best_dist  = dist
+        if best_i >= 0:
+            lid = prior_lids[best_i]
+            locked_pairs.append((j, lid))
+            locked_obj.append(self.model.positions[lid])
+            locked_img.append(blobs[j])
+            used_blobs.add(j)
+            used_led_idxs.add(best_i)
+            if is_deep():
+                logger.debug(f"  LED {lid}: blob {j} → nearest ({best_dist:.1f}px)")
+
+    logger.debug(
+        f"Proximity snap: {len(locked_pairs)}/{len(blobs)} blobs locked "
+        f"({n_id_locked} ID-path, {len(locked_pairs) - n_id_locked} nearest) "
+        f"of {len(prior_lids)} prior LEDs"
+        + ("  [size filter active]" if blob_radii is not None else "")
+    )
+    if len(locked_pairs) < min_inliers:
+        logger.debug(f"Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
+        return None
+
+    # Hungarian expansion: triggered when proximity locked fewer than expansion_threshold
+    # of model-visible LEDs, OR when visible LED count dropped significantly from the
+    # prior (vis_drop_threshold) and there are still unassigned blobs to place.
+    # Runs with the predicted pose; RANSAC downstream filters bad pairs.
+    locked_blob_set = {b for b, _ in locked_pairs}
+    locked_led_set  = {l for _, l in locked_pairs}
+
+    free_blob_idx = [i for i in range(len(blobs)) if i not in locked_blob_set]
+    free_led_idx  = [int(lid) for lid in np.where(vis_mask_pred)[0]
+                     if int(lid) not in locked_led_set]
+
+    n_prior_gone = sum(1 for lid in prior_lids if not vis_mask_pred[lid])
+    vis_dropped  = n_prior_gone > vis_drop_threshold
+    did_expand  = False
+
+    if n_model_visible > 0 and (
+        len(locked_pairs) / n_model_visible < expansion_threshold
+        or (vis_dropped and len(free_blob_idx) > 0)
+    ):
         if free_blob_idx and free_led_idx:
             free_led_obj = self.model.positions[free_led_idx].astype(np.float32)
             proj_free    = _project_points(rvec_pred, tvec_pred, free_led_obj, K, dc)
@@ -304,37 +340,27 @@ def proximity_match(
         logger.debug("Proximity: RANSAC failed → None")
         return None
 
-    R_new = cv2.Rodrigues(rvec)[0]
-    # Re-check visibility with the refined pose — drop LEDs now occluded by the body.
-    vis_mask_new = _visible_mask(
-        R_new, tvec.reshape(3),
-        self.model.positions, self.model.normals,
-        geom,
-        cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-        cam_rpmax=self.camera.rpmax,
-        facing_threshold_deg=facing_threshold_deg,
-    )
-
-    final_pairs = [
-        locked_pairs[k]
-        for k in ransac_idx
-        if vis_mask_new[locked_pairs[k][1]]
-    ]
+    # Keep all RANSAC inliers — the visibility check is an approximation and
+    # the blob's physical presence is stronger evidence than the model geometry.
+    final_pairs = [locked_pairs[k] for k in ransac_idx]
 
     if len(final_pairs) < min_inliers:
-        logger.debug(f"Proximity: vis-recheck dropped to {len(final_pairs)} pairs < {min_inliers} → None")
+        logger.debug(f"Proximity: too few inliers ({len(final_pairs)} < {min_inliers}) → None")
         return None
 
     lo_f  = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
     li_f  = blobs[[b for b, _ in final_pairs]].astype(np.float32)
     proj  = _project_points(rvec, tvec, lo_f, K, dc)
-    error = float(np.mean(np.linalg.norm(proj - li_f, axis=1)))
+    pair_errors = np.linalg.norm(proj - li_f, axis=1)
+    error     = float(pair_errors.mean())
+    max_error = float(pair_errors.max())
 
-    logger.debug(f"Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px")
+    logger.debug(f"Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px")
     return {
         "rvec":       rvec,
         "tvec":       tvec,
         "error":      error,
+        "max_error":  max_error,
         "assignment": final_pairs,
         "method":     "proximity_expanded" if did_expand else "proximity_locked",
     }

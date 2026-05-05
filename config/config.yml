@@ -1,6 +1,6 @@
 data:
-#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data"
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/initial_proximity_fails"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data"
+#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/very_close"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -17,12 +17,13 @@ controllers:
 
 blob_detection:
   min_threshold: 5       # pixels >= this are included in a blob
-  required_threshold: 15  # blob must contain at least one pixel >= this (filters dim noise)
+  required_threshold: 12  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 4
   max_area: 300
   max_wh: 35              # max bounding-box width or height in pixels
   split_merged: true
-  min_split_dist: 7.0
+  min_split_dist: 5.0
+  split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
 
 geometry:
   z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
@@ -40,9 +41,9 @@ matching:
     - [4, 6]
   p4_threshold_px: 2.0
   hungarian_threshold_px: 5.0     # loose pre-filter on raw P3P pose; RANSAC does the real filtering
-  reprojection_threshold: 2.0     # RANSAC threshold; all reported errors will be <= this
+  reprojection_threshold: 2.5     # RANSAC threshold; all reported errors will be <= this
   min_inliers: 4
-  min_inlier_fraction: null       # e.g. 0.6 — overrides min_inliers if set
+  min_inlier_fraction: null       # e.g. 0.6 — overrides min_inliers if set, number of min BLOBS
   strong_match_inliers: 7
   strong_match_error_px: 1.5
   min_vis_coverage: 0.7
@@ -55,12 +56,15 @@ matching:
   blob_size_min_factor: 0.2         # blob radius < expected * this → excluded (sub-pixel noise)
   blob_size_score_weight: 0.5       # px penalty per px of size mismatch added to argmin score
   proximity_expansion_threshold: 0.7  # if locked/model_visible < this after snap, run Hungarian to lock more
-  proximity_expansion_px: 5.0         # max reprojection distance to accept a Hungarian-expanded pair
+  proximity_expansion_px: 8.0         # max reprojection distance to accept a Hungarian-expanded pair
+  proximity_vis_drop_threshold: 2     # also run Hungarian expansion if prior LED count dropped by more than this
+  proximity_argmin_max_dist_px: 5.0   # hard cap on argmin (non-ID-path) snap distance; ID-path uses full depth-scaled snap_px
+  proximity_max_pair_error_px: 1.5    # if any inlier pair's reprojection error exceeds this, fall back to brute match
   pose_jump_pos_thresh_m: [0.25, 0.25, 0.30]   # per-axis translation jump limit [x, y, z] in metres
   pose_jump_rot_thresh_deg: [30.0, 30.0, 30.0] # per-axis rotation jump limit [rx, ry, rz] in degrees
 
 debug:
-  mode_active: false
+  mode_active: true
   split_to_folders: false
   verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
   log_best: true                  # log each new best solution update

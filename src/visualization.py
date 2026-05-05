@@ -346,12 +346,14 @@ class ControllerAnimatorRerun:
     def __init__(self, mesh_path: str,
                  model_positions: np.ndarray,
                  model_normals: np.ndarray,
-                 vis_cfg: dict = None):
+                 vis_cfg: dict = None,
+                 matching_cfg: dict = None):
 
         self.mesh_path       = mesh_path
         self.model_positions = model_positions.astype(np.float32)
         self.model_normals   = model_normals.astype(np.float32)
         self.vis_cfg         = vis_cfg if vis_cfg is not None else dict(VIS_CONFIG)
+        self._matching_cfg   = matching_cfg or {}
 
         self._trimesh        = load_trimesh(mesh_path)
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
@@ -589,12 +591,33 @@ class ControllerAnimatorRerun:
         normals_cam  = (R_cam  @ self.model_normals.T).T
         normals_disp = (R_disp @ self.model_normals.T).T
 
+        # ---- per-frame visibility mask ----
+        # _visible_mask takes camera-frame R, t — use R_cam / t_cam.
+        T_cam_ctrl = T_cam_model.compose(self._T_model_ctrl)
+        facing_threshold_deg = float(self._matching_cfg.get('led_facing_angle_deg', 86.0))
+        vis_mask = _visible_mask(
+            T_cam_ctrl.R, T_cam_ctrl.t,
+            self._ctrl_positions, self._ctrl_normals,
+            self._geom,
+            cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
+            cam_w=camera.width, cam_h=camera.height,
+            cam_rpmax=camera.rpmax,
+            facing_threshold_deg=facing_threshold_deg,
+        )
+        vis_set = set(np.where(vis_mask)[0].tolist())
+
         # ---- LEDs (flat disks lying on the controller surface) ----
+        # green  : matched and model-visible
+        # pink   : matched but not model-visible (vis_mask approximation overridden by blob evidence)
+        # red    : unmatched
         if self.vis_cfg.get("show_leds", True):
             colors = np.tile([255, 0, 0], (len(pts_disp), 1))
             if assignment:
                 for _, lid in assignment:
-                    colors[lid] = [0, 255, 0]
+                    if lid in vis_set:
+                        colors[lid] = [0, 255, 0]
+                    else:
+                        colors[lid] = [255, 105, 180]
 
             verts, faces, vcols = make_disk_mesh(pts_disp, normals_disp, colors,
                                                  radius=led_disk_radius)
@@ -636,19 +659,6 @@ class ControllerAnimatorRerun:
             for bid, lid in assignment:
                 matched_bids.add(bid)
                 matched_lids.add(lid)
-
-        # ---- per-frame visibility mask ----
-        # _visible_mask takes camera-frame R, t — use R_cam / t_cam.
-        T_cam_ctrl = T_cam_model.compose(self._T_model_ctrl)
-        vis_mask = _visible_mask(
-            T_cam_ctrl.R, T_cam_ctrl.t,
-            self._ctrl_positions, self._ctrl_normals,
-            self._geom,
-            cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
-            cam_w=camera.width, cam_h=camera.height,
-            cam_rpmax=camera.rpmax,
-        )
-        vis_set = set(np.where(vis_mask)[0].tolist())
 
         # ---- blobs as actual contour shapes ----
         if blobs is not None and len(blobs) > 0:
