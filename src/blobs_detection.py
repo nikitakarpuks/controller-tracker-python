@@ -157,7 +157,6 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     max_wh             = int(cfg.get("max_wh", 35))
     neighbor_k         = int(cfg.get("neighbor_k", 3))
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
-    split_merged       = bool(cfg.get("split_merged", False))
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
     split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
 
@@ -217,42 +216,38 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         blob_pixels_list.append((ys, xs))
 
     # ── 2b. Merged-blob splitting ─────────────────────────────────────────────
-    blob_is_split = [False] * len(centroids)
+    new_centroids     = []
+    new_blob_contours = []
+    blob_is_split = []
 
-    if split_merged:
-        new_centroids     = []
-        new_blob_contours = []
-        new_blob_is_split = []
+    for i in range(len(centroids)):
+        ys_b, xs_b = blob_pixels_list[i]
+        maxima = _find_split_maxima(image, ys_b, xs_b, required_threshold, min_split_dist)
 
-        for i in range(len(centroids)):
-            ys_b, xs_b = blob_pixels_list[i]
-            maxima = _find_split_maxima(image, ys_b, xs_b, required_threshold, min_split_dist)
+        if len(maxima) == 2:
+            peak_lower = min(int(image[maxima[0][0], maxima[0][1]]),
+                             int(image[maxima[1][0], maxima[1][1]]))
+            saddle = _saddle_min(image, maxima[0], maxima[1])
+            valley_ok = peak_lower > 0 and saddle / peak_lower < split_valley_ratio
+            if not valley_ok:
+                new_centroids.append(centroids[i])
+                new_blob_contours.append(blob_contours[i])
+                blob_is_split.append(False)
+                continue
+            split_result = _split_blob_at_seeds(image, intensities, ys_b, xs_b, maxima[0], maxima[1])
+            if split_result is not None:
+                for (pcx, pcy), part_cnt in split_result:
+                    new_centroids.append((pcx, pcy))
+                    new_blob_contours.append(part_cnt)
+                    blob_is_split.append(True)
+                continue
 
-            if len(maxima) == 2:
-                peak_lower = min(int(image[maxima[0][0], maxima[0][1]]),
-                                 int(image[maxima[1][0], maxima[1][1]]))
-                saddle = _saddle_min(image, maxima[0], maxima[1])
-                valley_ok = peak_lower > 0 and saddle / peak_lower < split_valley_ratio
-                if not valley_ok:
-                    new_centroids.append(centroids[i])
-                    new_blob_contours.append(blob_contours[i])
-                    new_blob_is_split.append(False)
-                    continue
-                split_result = _split_blob_at_seeds(image, intensities, ys_b, xs_b, maxima[0], maxima[1])
-                if split_result is not None:
-                    for (pcx, pcy), part_cnt in split_result:
-                        new_centroids.append((pcx, pcy))
-                        new_blob_contours.append(part_cnt)
-                        new_blob_is_split.append(True)
-                    continue
+        new_centroids.append(centroids[i])
+        new_blob_contours.append(blob_contours[i])
+        blob_is_split.append(False)
 
-            new_centroids.append(centroids[i])
-            new_blob_contours.append(blob_contours[i])
-            new_blob_is_split.append(False)
-
-        centroids     = new_centroids
-        blob_contours = new_blob_contours
-        blob_is_split = new_blob_is_split
+    centroids     = new_centroids
+    blob_contours = new_blob_contours
 
     centroids_arr     = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
     blob_is_split_arr = np.array(blob_is_split, dtype=bool)

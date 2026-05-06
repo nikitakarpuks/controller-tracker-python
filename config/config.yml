@@ -21,7 +21,6 @@ blob_detection:
   min_area: 4
   max_area: 300
   max_wh: 35              # max bounding-box width or height in pixels
-  split_merged: true
   min_split_dist: 5.0
   split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
 
