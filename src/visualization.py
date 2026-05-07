@@ -21,7 +21,6 @@ VIS_CONFIG = {
     "show_blobs":       True,
     "show_projected":   True,
     "show_errors":      True,
-    "show_frustum":     True,
     "show_image_plane": True,
     "show_camera_frame": False, # unit vector lines
     "show_led_ids":       True,   # LED index labels next to projected disks
@@ -50,7 +49,23 @@ VIS_CONFIG = {
     "blob_id_label_size":    12,            # point marker size that anchors the label (Rerun units)
     "blob_id_label_color":   [255, 210, 0], # RGB — yellow, matching blob colour
     "blob_id_label_offset":  [-0.0013, 0.0008],  # [dx, dy] shift in blob-plane metres
+    # Camera centre / world origin markers
+    "camera_center_radius":  0.004,   # metres
+    "world_origin_radius":   0.006,   # metres
+    "world_origin_color":    [255, 255, 255],
 }
+
+# One distinct colour per camera index (cyan / orange / purple / green).
+# Used for frustum outlines, filled image planes, centre balls, and blob contours.
+CAMERA_COLORS = [
+    [  0, 220, 255],   # cam 0 — cyan
+    [255, 120,   0],   # cam 1 — orange
+    [180,   0, 255],   # cam 2 — purple
+    [ 50, 255,  50],   # cam 3 — green
+]
+
+def _camera_color(cam_idx: int) -> list:
+    return CAMERA_COLORS[cam_idx % len(CAMERA_COLORS)]
 
 
 # =========================================================
@@ -364,19 +379,21 @@ class ControllerAnimatorRerun:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def start(self, poses, assignments, blobs_all, camera, T_model_ctrl,
+    def start(self, poses, assignments, blobs_all, cameras: dict, T_model_ctrl,
               contours_all=None, raw_blobs_all=None, raw_contours_all=None,
-              save_path: str = None, T_world_cam=None):
+              save_path: str = None):
         """
         Log all frames to rerun.
         Opens the viewer automatically (spawn=True).
 
         Args:
-            save_path: Optional path for an .rrd recording file.
-                       When set, the session is saved to disk so it can be
-                       replayed later with:  rerun <save_path>
+            cameras   : {cam_idx: Camera} for all selected cameras.
+            save_path : Optional path for an .rrd recording file.
+                        When set, the session is saved to disk so it can be
+                        replayed later with:  rerun <save_path>
         """
-        self._T_world_cam = T_world_cam  # None → camera frame is the world frame
+        self._cameras     = cameras
+        self._T_world_cam = cameras[0].T_world_cam  # cam-0 only — used for tracked geometry
 
         # When a file is being saved the viewer is not spawned — replay manually.
         spawn_viewer = save_path is None
@@ -402,7 +419,7 @@ class ControllerAnimatorRerun:
         self._T_model_ctrl   = T_model_ctrl
         self._geom           = _compute_geometry(self._ctrl_positions, self._ctrl_normals)
 
-        self._log_static_camera(camera, T_world_cam=T_world_cam)
+        self._log_static_cameras(cameras)
 
         if self.vis_cfg.get("show_mesh", True):
             rr.log(
@@ -449,8 +466,9 @@ class ControllerAnimatorRerun:
                             if raw_contours_all is not None and idx < len(raw_contours_all)
                             else None)
 
-            self._log_frame(idx, T_cam_model, assignment, blobs, camera, contours,
-                            raw_blobs=raw_blobs, raw_contours=raw_contours)
+            self._log_frame(idx, T_cam_model, assignment, blobs, contours,
+                            raw_blobs_per_cam=raw_blobs,
+                            raw_contours_per_cam=raw_contours)
 
         msg = f"[rerun] Logged {n_frames} frames."
         if save_path:
@@ -462,80 +480,135 @@ class ControllerAnimatorRerun:
     # Static geometry (logged once, no timeline)
     # ------------------------------------------------------------------
 
-    def _log_static_camera(self, cam, T_world_cam=None):
-        """Camera frustum and image-plane outline — static, logged once."""
-        frustum_z = self.vis_cfg.get("frustum_z", 0.05)
-
+    def _log_static_cameras(self, cameras: dict):
+        """Frustum image planes and camera markers — logged once."""
+        frustum_z    = self.vis_cfg.get("frustum_z", 0.05)
         edge_samples = 20
-        boundary = compute_frustum_boundary(cam, z=frustum_z, edge_samples=edge_samples)
-        origin   = np.zeros(3)
+        cam_r        = self.vis_cfg.get("camera_center_radius", 0.004)
 
-        if T_world_cam is not None:
-            boundary = T_world_cam.apply(boundary)
-            origin   = T_world_cam.t.copy()
+        for cam_idx, cam in cameras.items():
+            color       = _camera_color(cam_idx)
+            color_dim   = [int(c * 0.25) for c in color]  # dim fill for the plane mesh
+            T_world_cam = cam.T_world_cam
+            boundary    = compute_frustum_boundary(cam, z=frustum_z, edge_samples=edge_samples)
+            origin      = np.zeros(3)
 
-        # 4 corner points for the frustum rays (one ray per corner)
-        corners = boundary[[0, edge_samples, 2 * edge_samples, 3 * edge_samples]]
-        frustum_strips = [[origin.tolist(), c.tolist()] for c in corners]
-
-        # Full curved boundary loop for the image plane outline
-        plane_strip = np.concatenate([boundary, boundary[:1]], axis=0).tolist()
-
-        if self.vis_cfg.get("show_frustum", True):
-            rr.log(
-                "world/camera/frustum",
-                rr.LineStrips3D(
-                    strips=frustum_strips,
-                    colors=[0, 255, 0],
-                ),
-                static=True,
-            )
-
-        if self.vis_cfg.get("show_image_plane", True):
-            rr.log(
-                "world/camera/image_plane",
-                rr.LineStrips3D(
-                    strips=[plane_strip],
-                    colors=[255, 255, 255],
-                ),
-                static=True,
-            )
-
-        if self.vis_cfg.get("show_camera_frame", True):
             if T_world_cam is not None:
-                axes_w = (T_world_cam.R @ np.eye(3) * 0.1).T
-                rr.log(
-                    "world/camera/axes",
-                    rr.Arrows3D(
-                        origins=[origin.tolist()] * 3,
-                        vectors=axes_w.tolist(),
-                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-                    ),
-                    static=True,
-                )
-            else:
-                rr.log(
-                    "world/camera/axes",
-                    rr.Arrows3D(
-                        origins=[[0, 0, 0]] * 3,
-                        vectors=[[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]],
-                        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-                    ),
-                    static=True,
-                )
+                boundary = T_world_cam.apply(boundary)
+                origin   = T_world_cam.t.copy()
+
+            path = f"world/camera_{cam_idx}"
+
+            # ---- image-plane boundary outline (camera colour) ----
+            if self.vis_cfg.get("show_image_plane", True):
+                plane_strip = np.concatenate([boundary, boundary[:1]], axis=0).tolist()
+                rr.log(f"{path}/image_plane",
+                       rr.LineStrips3D(strips=[plane_strip], colors=[color]),
+                       static=True)
+
+            # ---- camera-centre ball + ID label ----
+            rr.log(f"{path}/center",
+                   rr.Points3D(positions=[origin.tolist()], colors=[color], radii=cam_r),
+                   static=True)
+            rr.log(f"{path}/id_label",
+                   rr.Points3D(positions=[origin.tolist()],
+                               labels=[f"cam {cam_idx}"],
+                               colors=[color],
+                               radii=0.0),
+                   static=True)
+
+            # ---- optional camera-frame axes ----
+            if self.vis_cfg.get("show_camera_frame", True):
+                axes_w = (T_world_cam.R @ np.eye(3) * 0.1).T if T_world_cam is not None else np.eye(3) * 0.1
+                rr.log(f"{path}/axes",
+                       rr.Arrows3D(origins=[origin.tolist()] * 3, vectors=axes_w.tolist(),
+                                   colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]]),
+                       static=True)
+
+        # ---- world-origin ball ----
+        wo_color  = self.vis_cfg.get("world_origin_color",  [255, 255, 255])
+        wo_radius = self.vis_cfg.get("world_origin_radius", 0.006)
+        rr.log("world/origin",
+               rr.Points3D(positions=[[0, 0, 0]], colors=[wo_color], radii=wo_radius),
+               static=True)
 
         self._frustum_z = frustum_z
+
+    # ------------------------------------------------------------------
+    # Per-camera blob logging (used for cameras other than cam-0)
+    # ------------------------------------------------------------------
+
+    def _log_camera_blobs(self, cam_idx: int, cam,
+                          blobs, contours, raw_blobs, raw_contours,
+                          blob_z: float, raw_blob_z: float):
+        """Log blob contours, IDs, and raw blobs for a single camera."""
+        T_world_cam = cam.T_world_cam
+        color       = _camera_color(cam_idx)
+        color_dim   = [int(c * 0.5) for c in color]
+
+        def _wc(pts):
+            if T_world_cam is None:
+                return pts
+            return T_world_cam.apply(np.asarray(pts, dtype=np.float64))
+
+        path = f"world/camera_{cam_idx}"
+
+        if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blobs", True) and contours is not None:
+            blob_colors = np.array([color] * len(contours), dtype=np.uint8)
+            bv, bf, bc = make_contour_mesh_3d(contours, cam, blob_z, blob_colors, undistort=True)
+            if bv is not None:
+                rr.log(f"{path}/blobs", rr.Mesh3D(vertex_positions=_wc(bv),
+                                                   triangle_indices=bf, vertex_colors=bc))
+            else:
+                rr.log(f"{path}/blobs", rr.Clear(recursive=False))
+        else:
+            rr.log(f"{path}/blobs", rr.Clear(recursive=False))
+
+        if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blob_ids", True):
+            blobs_ud = cv2.undistortPoints(
+                blobs.reshape(-1, 1, 2).astype(np.float32),
+                cam.camera_matrix, cam.dist_coeffs, P=cam.camera_matrix,
+            ).reshape(-1, 2)
+            bdx, bdy = self.vis_cfg.get("blob_id_label_offset", [-0.0013, 0.0008])
+            label_pts = backproject_to_plane(blobs_ud, cam, z=blob_z).copy()
+            label_pts[:, 0] += bdx
+            label_pts[:, 1] += bdy
+            rr.log(f"{path}/blob_ids", rr.Points3D(
+                positions=_wc(label_pts),
+                labels=[str(i) for i in range(len(blobs))],
+                colors=[color] * len(blobs),
+                radii=0.0,
+            ))
+        else:
+            rr.log(f"{path}/blob_ids", rr.Clear(recursive=False))
+
+        if self.vis_cfg.get("show_raw_blobs", True) and raw_blobs is not None and len(raw_blobs) > 0 and raw_contours is not None:
+            raw_colors = np.array([[255, 192, 203]] * len(raw_contours), dtype=np.uint8)
+            rv, rf, rc = make_contour_mesh_3d(raw_contours, cam, raw_blob_z, raw_colors, undistort=True)
+            if rv is not None:
+                rr.log(f"{path}/blobs_raw", rr.Mesh3D(vertex_positions=_wc(rv),
+                                                       triangle_indices=rf, vertex_colors=rc))
+            else:
+                rr.log(f"{path}/blobs_raw", rr.Clear(recursive=False))
+        else:
+            rr.log(f"{path}/blobs_raw", rr.Clear(recursive=False))
 
     # ------------------------------------------------------------------
     # Per-frame logging
     # ------------------------------------------------------------------
 
     def _log_frame(self, idx: int, T_cam_model: Transform,
-                   assignment, blobs, camera, contours=None,
-                   raw_blobs=None, raw_contours=None):
+                   assignment, blobs_per_cam: dict, contours_per_cam: dict = None,
+                   raw_blobs_per_cam: dict = None, raw_contours_per_cam: dict = None):
 
-        offset           = self.visual_offset
-        T_world_cam      = getattr(self, '_T_world_cam', None)
+        camera       = self._cameras[0]
+        T_world_cam  = camera.T_world_cam
+        blobs        = blobs_per_cam.get(0) if blobs_per_cam else None
+        contours     = contours_per_cam.get(0) if contours_per_cam else None
+        raw_blobs    = raw_blobs_per_cam.get(0) if raw_blobs_per_cam else None
+        raw_contours = raw_contours_per_cam.get(0) if raw_contours_per_cam else None
+
+        offset       = self.visual_offset
 
         # Camera-frame rotation/translation — used for projection math only.
         R_cam = T_cam_model.R
@@ -611,14 +684,7 @@ class ControllerAnimatorRerun:
         # pink   : matched but not model-visible (vis_mask approximation overridden by blob evidence)
         # red    : unmatched
         if self.vis_cfg.get("show_leds", True):
-            colors = np.tile([255, 0, 0], (len(pts_disp), 1))
-            if assignment:
-                for _, lid in assignment:
-                    if lid in vis_set:
-                        colors[lid] = [0, 255, 0]
-                    else:
-                        colors[lid] = [255, 105, 180]
-
+            colors = np.tile([255, 192, 203], (len(pts_disp), 1))
             verts, faces, vcols = make_disk_mesh(pts_disp, normals_disp, colors,
                                                  radius=led_disk_radius)
             rr.log(
@@ -676,8 +742,10 @@ class ControllerAnimatorRerun:
             pts_plane_disp = _w(pts_plane_cam)
 
             if self.vis_cfg.get("show_blobs", True) and contours is not None:
+                cam0_color     = _camera_color(0)
+                cam0_color_dim = [int(c * 0.5) for c in cam0_color]
                 blob_colors = np.array(
-                    [[255, 210, 0] if i in matched_bids else [130, 100, 0]
+                    [cam0_color if i in matched_bids else cam0_color_dim
                      for i in range(len(contours))],
                     dtype=np.uint8,
                 )
@@ -686,15 +754,15 @@ class ControllerAnimatorRerun:
                     undistort=True,
                 )
                 if bv is not None:
-                    rr.log("world/blobs", rr.Mesh3D(
+                    rr.log("world/camera_0/blobs", rr.Mesh3D(
                         vertex_positions=_w(bv) if bv is not None else bv,
                         triangle_indices=bf,
                         vertex_colors=bc,
                     ))
                 else:
-                    rr.log("world/blobs", rr.Clear(recursive=False))
+                    rr.log("world/camera_0/blobs", rr.Clear(recursive=False))
             elif self.vis_cfg.get("show_blobs", True):
-                rr.log("world/blobs", rr.Clear(recursive=False))
+                rr.log("world/camera_0/blobs", rr.Clear(recursive=False))
 
             # ---- blob ID labels on the blob plane ----
             if self.vis_cfg.get("show_blob_ids", True):
@@ -704,7 +772,7 @@ class ControllerAnimatorRerun:
                 blob_label_pts_cam = backproject_to_plane(blobs_undist_disp, camera, z=blob_z).copy()
                 blob_label_pts_cam[:, 0] += bdx
                 blob_label_pts_cam[:, 1] += bdy
-                rr.log("world/blob_ids", rr.Points3D(
+                rr.log("world/camera_0/blob_ids", rr.Points3D(
                     positions=_w(blob_label_pts_cam),
                     labels=[str(i) for i in range(len(blobs))],
                     colors=[blabel_color] * len(blobs),
@@ -712,8 +780,8 @@ class ControllerAnimatorRerun:
                 ))
         else:
             pts_plane_disp = None
-            rr.log("world/blobs",    rr.Clear(recursive=False))
-            rr.log("world/blob_ids", rr.Clear(recursive=False))
+            rr.log("world/camera_0/blobs",    rr.Clear(recursive=False))
+            rr.log("world/camera_0/blob_ids", rr.Clear(recursive=False))
 
         # ---- raw (pre-filter) blobs ----
         if self.vis_cfg.get("show_raw_blobs", True) and raw_blobs is not None and len(raw_blobs) > 0:
@@ -724,17 +792,17 @@ class ControllerAnimatorRerun:
                     undistort=True,
                 )
                 if rv is not None:
-                    rr.log("world/blobs_raw", rr.Mesh3D(
+                    rr.log("world/camera_0/blobs_raw", rr.Mesh3D(
                         vertex_positions=_w(rv),
                         triangle_indices=rf,
                         vertex_colors=rc,
                     ))
                 else:
-                    rr.log("world/blobs_raw", rr.Clear(recursive=False))
+                    rr.log("world/camera_0/blobs_raw", rr.Clear(recursive=False))
             else:
-                rr.log("world/blobs_raw", rr.Clear(recursive=False))
+                rr.log("world/camera_0/blobs_raw", rr.Clear(recursive=False))
         else:
-            rr.log("world/blobs_raw", rr.Clear(recursive=False))
+            rr.log("world/camera_0/blobs_raw", rr.Clear(recursive=False))
 
         # ---- visible LED projections (matched + physically visible unmatched) ----
         # Compute projection in camera frame, then transform to display frame.
@@ -874,6 +942,19 @@ class ControllerAnimatorRerun:
                 ))
             else:
                 rr.log("world/error_values", rr.Clear(recursive=False))
+
+        # ---- blobs for all cameras except cam-0 (cam-0 handled above) ----
+        for cam_idx, cam in self._cameras.items():
+            if cam_idx == 0:
+                continue
+            self._log_camera_blobs(
+                cam_idx, cam,
+                blobs_per_cam.get(cam_idx) if blobs_per_cam else None,
+                contours_per_cam.get(cam_idx) if contours_per_cam else None,
+                raw_blobs_per_cam.get(cam_idx) if raw_blobs_per_cam else None,
+                raw_contours_per_cam.get(cam_idx) if raw_contours_per_cam else None,
+                blob_z, blob_z - 0.001,
+            )
 
 
 # =========================================================

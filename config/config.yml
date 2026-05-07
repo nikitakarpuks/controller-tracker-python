@@ -1,10 +1,10 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_one_camera_zooming_rotating_right_ctrl/mav0/cam0/data/a"
 #  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/very_close"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
-  selected_cameras: [0] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
   intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"

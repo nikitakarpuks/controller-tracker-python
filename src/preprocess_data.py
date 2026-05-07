@@ -1,5 +1,4 @@
 from pathlib import Path
-from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import numpy as np
@@ -8,25 +7,16 @@ import numpy as np
 class ImageDataset(Dataset):
     """Load images from a flat directory without labels"""
 
-    def __init__(self, root_dir, transform=None):
+    def __init__(self, root_dir, crops_per_cam: dict):
         """
         Args:
             root_dir: Path to directory containing images
-            transform: Optional transform to apply
+            crops_per_cam: {cam_idx: (left, top, right, bottom)}
         """
         self.root_dir = Path(root_dir)
-        self.transform = transform
+        self.crops_per_cam = crops_per_cam
 
-        # Get all image files
-        self.image_paths = []
-        extensions = ["*.png"]
-
-        for ext in extensions:
-            self.image_paths.extend(self.root_dir.glob(ext))
-
-        # Sort for consistent ordering
-        self.image_paths = sorted(self.image_paths)
-
+        self.image_paths = sorted(self.root_dir.glob("*.png"))
         print(f"Found {len(self.image_paths)} images in {root_dir}")
 
     def __len__(self):
@@ -35,72 +25,31 @@ class ImageDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('L')
-
-        if self.transform:
-            image = self.transform(image)
-
-        return img_path, image
-
-class StaticCrop:
-    """Static crop to specific coordinates"""
-
-    def __init__(self, left, top, right, bottom):
-        self.left = left
-        self.top = top
-        self.right = right
-        self.bottom = bottom
-
-    def __call__(self, img):
-        return img.crop((self.left, self.top, self.right, self.bottom))
-
-
-class ToNumpy:
-    """Convert PIL Image or Tensor to numpy array"""
-
-    def __call__(self, pic):
-        if isinstance(pic, np.ndarray):
-            return pic
-        # Convert PIL Image to numpy
-        return np.array(pic)
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}()"
+        cam_images = {
+            cam_idx: np.array(image.crop(crop))
+            for cam_idx, crop in self.crops_per_cam.items()
+        }
+        return img_path, cam_images
 
 
 def get_data(cfg):
-    data_transform = get_transform(cfg)
-
-    dataset = ImageDataset(
-        root_dir=cfg["root"],
-        transform=data_transform
-    )
-
+    crops = get_crop_coordinates(cfg)
+    dataset = ImageDataset(root_dir=cfg["root"], crops_per_cam=crops)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
-        collate_fn=lambda batch: batch)
-
+        collate_fn=lambda batch: batch,
+    )
     return dataloader
 
-def get_transform(cfg):
-    crop_bbox = get_crop_coordinates(cfg)
-    data_transform = transforms.Compose([
-        StaticCrop(*crop_bbox),
-        # transforms.ToTensor()
-        ToNumpy()
-    ])
-    return data_transform
 
-def get_crop_coordinates(cfg):
-    """Get crop coordinates based on cameras we want to use.
-    The image is horizontally split into equal parts, each part corresponds to a camera."""
-
+def get_crop_coordinates(cfg) -> dict:
+    """Returns {cam_idx: (left, top, right, bottom)} for each selected camera."""
     part_width = cfg["img_width"] // cfg["total_cameras_number"]
-    selected_cameras = cfg["selected_cameras"]
-    left = selected_cameras[0] * part_width
-    right = (selected_cameras[-1] + 1) * part_width
-    top = 1  # top pixel row  has some exposure and gain values encoded, ignoring it
+    top = 1  # top pixel row has exposure/gain values encoded, skip it
     bottom = cfg["img_height"]
-
-    return left, top, right, bottom
+    return {
+        cam_idx: (cam_idx * part_width, top, (cam_idx + 1) * part_width, bottom)
+        for cam_idx in cfg["selected_cameras"]
+    }
