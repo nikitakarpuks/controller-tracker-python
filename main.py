@@ -60,10 +60,10 @@ def main():
         out_tracking_lost.mkdir(parents=True, exist_ok=True)
 
     # ── Camera & controller setup ──────────────────────────────────────────
-    camera_0 = Camera(
-        load_json_config(config["cameras"]["intrinsics_path"]),
-        camera_idx=0,
-    )
+    calib_cfg = load_json_config(config["cameras"]["intrinsics_path"])
+    cameras   = {idx: Camera(calib_cfg, camera_idx=idx)
+                 for idx in config["data"]["selected_cameras"]}
+    camera_0  = cameras[0]
 
     calibration_config    = load_json_config(config["controllers"]["right_controller"]["config_path"])
     right_controller_leds = create_leds_from_config(calibration_config)
@@ -92,20 +92,35 @@ def main():
     raw_contours_all  = []
 
     for batch in tqdm(get_data(config["data"])):
-        img_path, image = batch[0][0], batch[0][1]
+        img_path, cam_images = batch[0][0], batch[0][1]
+        # cam_images: {cam_idx: numpy array}
 
-        blob_centroids, blob_contours, blob_radii, raw_centroids, raw_contours = get_centroids(
-            image, config["blob_detection"], visualize=True, img_path=img_path
-        )
-        blobs.append(blob_centroids.copy())
-        contours_all.append(blob_contours)
-        raw_blobs.append(raw_centroids.copy())
-        raw_contours_all.append(raw_contours)
+        cam_blobs        = {}
+        cam_contours     = {}
+        cam_radii        = {}
+        cam_raw_blobs    = {}
+        cam_raw_contours = {}
 
+        for cam_idx, image in cam_images.items():
+            blob_centroids, blob_contours, blob_radii, raw_centroids, raw_contours = get_centroids(
+                image, config["blob_detection"], visualize=True, img_path=img_path
+            )
+            cam_blobs[cam_idx]        = blob_centroids.copy()
+            cam_contours[cam_idx]     = blob_contours
+            cam_radii[cam_idx]        = blob_radii
+            cam_raw_blobs[cam_idx]    = raw_centroids.copy()
+            cam_raw_contours[cam_idx] = raw_contours
+
+        blobs.append(cam_blobs)
+        contours_all.append(cam_contours)
+        raw_blobs.append(cam_raw_blobs)
+        raw_contours_all.append(cam_raw_contours)
+
+        # Tracking: camera 0 only for now
         t0       = time()
         solution = tracking_system.update(
-            {0: blob_centroids},
-            radii_per_camera={0: blob_radii},
+            {0: cam_blobs[0]},
+            radii_per_camera={0: cam_radii[0]},
         ).get(
             ("right_controller", camera_0.camera_idx)
         )
@@ -139,12 +154,11 @@ def main():
         matching_cfg=config.get("matching", {}),
     )
     animator.start(
-        poses, assignments, blobs, camera_0, T_model_ctrl,
+        poses, assignments, blobs, cameras, T_model_ctrl,
         contours_all=contours_all,
         raw_blobs_all=raw_blobs,
         raw_contours_all=raw_contours_all,
         save_path=config["visualization"].get("save_recording"),
-        T_world_cam=camera_0.T_world_cam,
     )
 
 
