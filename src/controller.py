@@ -344,13 +344,13 @@ class SingleViewTracker:
     # -----------------------------------------------------
     # Tracking
     # -----------------------------------------------------
-    def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None) -> Optional[Dict]:
+    def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+              other_cameras_blobs: Optional[List] = None) -> Optional[Dict]:
         """
         State machine:
 
         Have prev_pose?
-          Yes → proximity_match (fast locked path)
-                  if max_pair_error > proximity_max_pair_error_px or no result → brute_match fallback
+          Yes → proximity_match (fast locked path); brute fallback only if proximity returns None
           Prediction via constant-velocity extrapolation (prev_pose + prev_prev_pose).
           No  → brute_match (cold start or re-acquisition)
 
@@ -365,6 +365,7 @@ class SingleViewTracker:
         """
         blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
+        cam_idx = self.camera.camera_idx
 
         # Per-axis jump thresholds from config (fall back to scalar defaults if absent).
         _cfg = self._matching_cfg
@@ -420,45 +421,24 @@ class SingleViewTracker:
                     prior_assignment=self.prev_assignment,
                     blob_led_ids=blob_led_ids,
                     blob_radii=blob_radii,
+                    other_cameras_blobs=other_cameras_blobs,
                 )
 
-            # --- Fallback: brute when proximity is absent or degraded ---
-            # Any single pair exceeding proximity_max_pair_error_px indicates a
-            # bad argmin lock or drifting pose; trigger brute immediately rather
-            # than accumulating error across frames.
-            _prox_max_err = float(_cfg.get('proximity_max_pair_error_px', 1.5))
-            if solution is not None:
-                _prox_max_observed = solution.get("max_error", solution["error"])
-                proximity_poor = _prox_max_observed > _prox_max_err
-            else:
-                proximity_poor = True
-            if proximity_poor and n_blobs >= 4:
-                if solution is None:
-                    logger.debug("[track] proximity → None, running brute fallback")
-                else:
-                    logger.debug(
-                        f"[track] proximity degraded "
-                        f"(max_err={solution.get('max_error', solution['error']):.2f}px"
-                        f" > {_prox_max_err:.1f}px), running brute fallback"
-                    )
-                brute = self.brute_match(blobs, pose_prior=predicted_pose)
+            # --- Fallback: brute only when proximity found no solution ---
+            if solution is None and n_blobs >= 4:
+                logger.debug(f"[cam {cam_idx} | track] proximity → None, running brute fallback")
+                brute = self.brute_match(blobs, pose_prior=predicted_pose,
+                                         other_cameras_blobs=other_cameras_blobs,
+                                         blob_radii=blob_radii)
                 if brute is not None:
-                    prox_n  = len(solution["assignment"]) if solution else 0
-                    brute_n = brute.get("inliers", len(brute["assignment"]))
-                    if (solution is None or
-                            brute_n > prox_n or
-                            (brute_n == prox_n and brute["error"] < solution["error"])):
-                        logger.debug(
-                            f"[track] brute selected (inliers={brute_n} err={brute['error']:.2f}px"
-                            f" vs prox inliers={prox_n})"
-                        )
-                        solution = brute
+                    solution = brute
 
         else:
             # --- No prior pose: brute-force re-acquisition ---
             if n_blobs >= 4:
-                logger.debug("[track] no prev_pose → cold-start brute")
-                solution = self.brute_match(blobs)
+                logger.debug(f"[cam {cam_idx} | track] no prev_pose → cold-start brute")
+                solution = self.brute_match(blobs, other_cameras_blobs=other_cameras_blobs,
+                                            blob_radii=blob_radii)
 
                 # In deep-debug mode frames are non-consecutive, so the last_good_pose
                 # plausibility check is skipped — the controller can be anywhere.
@@ -471,7 +451,7 @@ class SingleViewTracker:
                         max_angle_deg=60.0,
                         **_jump_kw,
                     ):
-                        logger.debug("Brute re-acquisition rejected: too far from last known good pose.")
+                        logger.debug(f"[cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
                         solution = None
 
         # ------------------------------------------------------------------
@@ -484,11 +464,12 @@ class SingleViewTracker:
                 and self.prev_pose is not None
                 and self.prev_assignment is not None
                 and 2 <= n_blobs <= 3):
-            logger.debug(f"[track] n_blobs={n_blobs} + prior → prior_constrained_match")
+            logger.debug(f"[cam {cam_idx} | track] n_blobs={n_blobs} + prior → prior_constrained_match")
             solution = self.prior_constrained_match(
                 blobs, predicted_pose,
                 prior_assignment=self.prev_assignment,
                 blob_radii=blob_radii,
+                other_cameras_blobs=other_cameras_blobs,
             )
 
         # ------------------------------------------------------------------
@@ -501,13 +482,15 @@ class SingleViewTracker:
                 rvec_p, tvec_p,
                 **_jump_kw,
             ):
-                print(f"[tracking] Pose jump detected "
+                print(f"[cam {cam_idx} | tracking] Pose jump detected "
                       f"(method={solution.get('method','?')}, "
                       f"err={solution['error']:.2f} px) — "
                       f"attempting brute recovery.")
                 solution = None
                 if n_blobs >= 4:
-                    brute = self.brute_match(blobs, pose_prior=self.prev_pose)
+                    brute = self.brute_match(blobs, pose_prior=self.prev_pose,
+                                             other_cameras_blobs=other_cameras_blobs,
+                                             blob_radii=blob_radii)
                     if brute is not None and not self._pose_jump_too_large(
                         brute["rvec"], brute["tvec"], rvec_p, tvec_p,
                         **_jump_kw,
@@ -519,7 +502,7 @@ class SingleViewTracker:
         # ------------------------------------------------------------------
         if solution is not None and solution["error"] < 5.0:
             logger.debug(
-                f"[track] accepted — method={solution.get('method','?')}  "
+                f"[cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
             )
             self.prev_prev_pose  = self.prev_pose  # shift window for next-frame extrapolation
@@ -545,9 +528,9 @@ class SingleViewTracker:
 
         # Tracking lost — clear velocity history and blob ID state so re-acquisition starts fresh
         if solution is not None:
-            logger.debug(f"[track] rejected — err={solution['error']:.2f}px exceeds 5.0px threshold")
+            logger.debug(f"[cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds 5.0px threshold")
         else:
-            logger.debug("[track] rejected — no solution found")
+            logger.debug(f"[cam {cam_idx} | track] rejected — no solution found")
         self.consecutive_failures += 1
         self.prev_pose           = None
         self.prev_prev_pose      = None
@@ -565,6 +548,7 @@ class TrackingSystem:
     def __init__(self, controllers: List[ControllerModel], cameras: List[Camera],
                  matching_cfg: dict = None, geometry_cfg: dict = None):
 
+        self.cameras: Dict[int, Camera] = {cam.camera_idx: cam for cam in cameras}
         self.trackers: Dict[Tuple[str, int], SingleViewTracker] = {}
 
         for ctrl in controllers:
@@ -572,23 +556,139 @@ class TrackingSystem:
                 key = (ctrl.name, cam.camera_idx)
                 self.trackers[key] = SingleViewTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geometry_cfg)
 
+        self._matching_cfg:       dict                       = matching_cfg or {}
+        self._designated_primary: Dict[str, Optional[int]]  = {}
+        self._handoff_counter:    Dict[str, Dict[int, int]] = {}
+
     def update(
         self,
         observations_per_camera: Dict[int, np.ndarray],
         radii_per_camera: Optional[Dict[int, np.ndarray]] = None,
-    ):
-        results = {}
+    ) -> Dict[str, Optional[Dict]]:
+        """
+        Run tracking for every controller using a single primary camera.
 
-        for (ctrl_name, cam_id), tracker in self.trackers.items():
+        For each controller:
+          - Tracking mode  (a tracker already has prev_pose):
+              use that tracker's camera — it runs proximity or brute on its own blobs.
+          - Cold start / re-acquisition:
+              pick the camera with the most blobs as the primary camera,
+              run brute_match once, and pass every other camera's blobs as
+              other_cameras_blobs so the existing aux validation scores them.
 
-            blobs = observations_per_camera.get(cam_id)
+        Returns {ctrl_name: solution_or_None}.  The solution dict gains a
+        "primary_cam" key with the index of the camera that produced the pose.
+        """
+        results: Dict[str, Optional[Dict]] = {}
 
-            if blobs is None:
-                results[(ctrl_name, cam_id)] = None
+        ctrl_names: set = {ctrl for ctrl, _ in self.trackers}
+
+        for ctrl_name in ctrl_names:
+            ctrl_pairs: List[Tuple[int, "SingleViewTracker"]] = [
+                (cam_id, tracker)
+                for (cname, cam_id), tracker in self.trackers.items()
+                if cname == ctrl_name
+            ]
+
+            # Cameras that delivered blob observations this frame
+            available: Dict[int, np.ndarray] = {
+                cam_id: observations_per_camera[cam_id]
+                for cam_id, _ in ctrl_pairs
+                if cam_id in observations_per_camera
+                   and observations_per_camera[cam_id] is not None
+            }
+
+            if not available:
+                results[ctrl_name] = None
                 continue
 
-            blob_radii = radii_per_camera.get(cam_id) if radii_per_camera else None
-            results[(ctrl_name, cam_id)] = tracker.track(blobs, blob_radii=blob_radii)
+            tracker_map = {cam_id: t for cam_id, t in ctrl_pairs}
+            _cfg = self._matching_cfg
+
+            # --- Select primary camera ---
+            # Prefer the designated primary (handoff winner) if it has a prior pose.
+            _designated = self._designated_primary.get(ctrl_name)
+            if (_designated is not None
+                    and _designated in available
+                    and tracker_map[_designated].prev_pose is not None):
+                primary_cam_id = _designated
+            else:
+                tracking_cam = next(
+                    (cam_id for cam_id, tracker in ctrl_pairs
+                     if tracker.prev_pose is not None and cam_id in available),
+                    None,
+                )
+                primary_cam_id = tracking_cam if tracking_cam is not None else max(
+                    available, key=lambda cid: len(available[cid])
+                )
+
+            primary_tracker = tracker_map[primary_cam_id]
+            primary_blobs   = available[primary_cam_id]
+            primary_radii   = radii_per_camera.get(primary_cam_id) if radii_per_camera else None
+
+            other_cameras_blobs = [
+                (self.cameras[cid], available[cid],
+                 radii_per_camera.get(cid) if radii_per_camera else None)
+                for cid in available
+                if cid != primary_cam_id
+            ]
+
+            solution = primary_tracker.track(
+                primary_blobs,
+                blob_radii=primary_radii,
+                other_cameras_blobs=other_cameras_blobs,
+            )
+
+            if solution is not None:
+                solution["primary_cam"] = primary_cam_id
+
+                # State propagation: push T_world_ctrl into every non-primary tracker
+                # so any camera can be promoted to primary without cold-start brute search.
+                T_world_ctrl = solution["T_world_ctrl"]
+                aux_asgns = solution.get("aux_assignments") or {}
+                for _cid, _tracker in tracker_map.items():
+                    if _cid == primary_cam_id:
+                        continue
+                    _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
+                    _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
+                    _tv_np = _T_cam_ctrl.t.astype(np.float32)
+                    _tracker.prev_prev_pose = _tracker.prev_pose
+                    _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
+                    _tracker.last_good_pose = _tracker.prev_pose
+                    _aux_asgn = aux_asgns.get(_cid)
+                    if _aux_asgn is not None:
+                        _tracker.prev_assignment      = _aux_asgn
+                        _tracker.last_good_assignment = _aux_asgn
+                    elif _tracker.prev_assignment is None:
+                        _tracker.last_good_assignment = None
+                    _tracker.consecutive_failures = 0
+
+                # Handoff check: promote an aux camera that consistently dominates.
+                # Uses full aux_assignments (snap + expansion) rather than aux_cameras
+                # (which only counts LEDs in the primary's RANSAC inlier set).
+                if bool(_cfg.get('camera_handoff', True)):
+                    _ratio_thr  = float(_cfg.get('handoff_coverage_ratio',   1.5))
+                    _min_adv    = int(  _cfg.get('handoff_min_advantage',     3))
+                    _hysteresis = int(  _cfg.get('handoff_hysteresis_frames', 3))
+                    _n_primary  = len(solution["assignment"])
+                    _hctr = self._handoff_counter.setdefault(ctrl_name, {})
+                    for _aux_cid, _aux_pairs in (aux_asgns.items()):
+                        _aux_n = len(_aux_pairs)
+                        if (_aux_n >= _ratio_thr * _n_primary
+                                and _aux_n - _n_primary >= _min_adv):
+                            _hctr[_aux_cid] = _hctr.get(_aux_cid, 0) + 1
+                            if _hctr[_aux_cid] >= _hysteresis:
+                                logger.info(
+                                    f"[{ctrl_name}] Camera handoff: "
+                                    f"cam{primary_cam_id}({_n_primary} LEDs)"
+                                    f" → cam{_aux_cid}({_aux_n} LEDs)"
+                                )
+                                self._designated_primary[ctrl_name] = _aux_cid
+                                _hctr.clear()
+                        else:
+                            _hctr[_aux_cid] = 0
+
+            results[ctrl_name] = solution
 
         return results
 

@@ -3,7 +3,7 @@ import math
 import cv2
 import numpy as np
 from loguru import logger
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment, least_squares
 from scipy.spatial.distance import cdist
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
@@ -12,6 +12,7 @@ from src.debug_config import is_deep, get_debug_triple, is_verbose_all, log_best
 from src._pnp import _ransac_pnp, _project_points, _check_z_range
 from src._visibility import _visible_mask
 from src._led_graph import _build_blob_neighbor_lists
+from src.transformations import Transform
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,138 @@ def _carry_led_ids(
 
 
 # ---------------------------------------------------------------------------
+# Joint multi-camera LM refinement
+# ---------------------------------------------------------------------------
+
+def _filter_aux_by_reprojection(
+    T_world_ctrl,
+    aux_joint_data: List,   # [(Camera, blobs_np, [(blob_idx, led_id)])]
+    positions: np.ndarray,
+    threshold_px: float,
+) -> List:
+    """Return aux_joint_data with each camera's pairs pre-filtered to reprojection < threshold_px."""
+    result = []
+    for _ocam, _oblobs, _pairs in aux_joint_data:
+        if not _pairs:
+            continue
+        _T_ci = _ocam.T_world_cam.inverse().compose(T_world_ctrl)
+        _rv_ci, _ = cv2.Rodrigues(_T_ci.R.astype(np.float32))
+        _tv_ci = _T_ci.t.astype(np.float32)
+        _led_ids   = [led_id for _, led_id in _pairs]
+        _blob_idxs = [b_idx  for b_idx, _  in _pairs]
+        _pts3d = positions[_led_ids].astype(np.float32)
+        _proj  = _project_points(_rv_ci, _tv_ci, _pts3d, _ocam.camera_matrix, _ocam.dist_coeffs)
+        _errs  = np.linalg.norm(_proj - _oblobs[_blob_idxs], axis=1)
+        _kept  = [_pairs[i] for i in range(len(_pairs)) if _errs[i] < threshold_px]
+        if _kept:
+            result.append((_ocam, _oblobs, _kept))
+    return result
+
+
+def _joint_refine_pose(
+    T_world_ctrl_init: Transform,
+    primary_cam,
+    primary_pairs: List[Tuple[int, int]],   # [(blob_idx, led_id)]
+    primary_blobs: np.ndarray,
+    aux_cam_data: List,                      # [(Camera, blobs_np, [(blob_j, led_id)])]
+    model_positions: np.ndarray,
+    max_nfev: int = 200,
+    primary_weight: float = 2.0,
+    huber_scale: float = 1.5,
+) -> Tuple[Optional[Transform], float]:
+    """
+    Refine T_world_ctrl jointly over all cameras via Trust-Region with Huber loss.
+
+    Parameterisation: 6-vector [rvec(3) | tvec(3)] for T_world_ctrl.
+    Residuals: (proj_x - blob_x, proj_y - blob_y) per correspondence per camera,
+    scaled by a per-camera weight so cameras contribute equally regardless of
+    correspondence count. Primary camera gets an additional `primary_weight`
+    multiplier to keep the RANSAC-validated fit dominant.
+
+    Huber loss (f_scale=huber_scale) down-weights aux outliers without
+    discarding them entirely — mismatched aux pairs influence the solution
+    much less than valid ones.
+
+    Returns (refined_T_world_ctrl, unweighted_mean_reproj_err_px) or (None, inf).
+    """
+    # Pre-assemble immutable per-camera arrays once — avoids object creation in the hot loop.
+    cam_data = []
+    for cam, blobs_c, pairs_c in (
+        [(primary_cam, primary_blobs, primary_pairs)] +
+        [(ac, ab, ap) for ac, ab, ap in aux_cam_data if ap]
+    ):
+        if not pairs_c:
+            continue
+        T_cw = cam.T_world_cam.inverse()
+        b_idx = np.array([b for b, _ in pairs_c], dtype=np.int32)
+        l_idx = np.array([l for _, l in pairs_c], dtype=np.int32)
+        cam_data.append((
+            T_cw.R.astype(np.float64),          # R_cam_world
+            T_cw.t.astype(np.float64),          # t_cam_world
+            cam.camera_matrix,
+            cam.dist_coeffs,
+            model_positions[l_idx].astype(np.float32),
+            blobs_c[b_idx].astype(np.float32),
+        ))
+
+    if sum(len(e[4]) for e in cam_data) < 4:
+        return None, np.inf
+
+    # Per-camera residual weight: normalise by 1/sqrt(n_pairs) so each camera
+    # contributes equally to the total objective regardless of correspondence count.
+    # Primary gets an additional `primary_weight` multiplier.
+    cam_weights = np.array([
+        (primary_weight if i == 0 else 1.0) / float(np.sqrt(max(len(e[4]), 1)))
+        for i, e in enumerate(cam_data)
+    ], dtype=np.float64)
+
+    # Flat weight vector aligned with the residual vector — used to recover
+    # unweighted errors for reporting after optimisation.
+    flat_weights = np.concatenate([
+        np.full(2 * len(e[4]), w) for e, w in zip(cam_data, cam_weights)
+    ])
+
+    rvec0, _ = cv2.Rodrigues(T_world_ctrl_init.R.astype(np.float32))
+    x0 = np.concatenate([rvec0.ravel(), T_world_ctrl_init.t]).astype(np.float64)
+
+    def _residuals(x):
+        rv = x[:3].astype(np.float32).reshape(3, 1)
+        tv = x[3:].astype(np.float64)
+        R_wc = cv2.Rodrigues(rv)[0].astype(np.float64)
+        parts = []
+        for (R_cw, t_cw, K_c, dc_c, leds, blobs_ref), w in zip(cam_data, cam_weights):
+            R_ci = (R_cw @ R_wc).astype(np.float32)
+            t_ci = (R_cw @ tv + t_cw).astype(np.float32)
+            rv_ci = cv2.Rodrigues(R_ci)[0]
+            proj, _ = cv2.projectPoints(
+                leds.reshape(-1, 1, 3), rv_ci, t_ci.reshape(3, 1), K_c, dc_c,
+            )
+            parts.append(((proj.reshape(-1, 2) - blobs_ref) * w).ravel())
+        return np.concatenate(parts).astype(np.float64)
+
+    try:
+        result = least_squares(
+            _residuals, x0, method='trf',
+            loss='huber', f_scale=huber_scale,
+            ftol=1e-7, xtol=1e-7, gtol=1e-7, max_nfev=max_nfev,
+        )
+    except Exception:
+        return None, np.inf
+
+    tv_opt = result.x[3:].astype(np.float64)
+    if np.linalg.norm(tv_opt) > 10.0:     # sanity: reject absurd translations
+        return None, np.inf
+
+    R_opt = cv2.Rodrigues(result.x[:3].astype(np.float32).reshape(3, 1))[0].astype(np.float64)
+    T_opt = Transform(R_opt, tv_opt)
+    # Divide weighted residuals by flat_weights to recover unweighted pixel errors.
+    mean_err = float(np.mean(np.linalg.norm(
+        (result.fun / flat_weights).reshape(-1, 2), axis=1
+    )))
+    return T_opt, mean_err
+
+
+# ---------------------------------------------------------------------------
 # proximity_match
 # ---------------------------------------------------------------------------
 
@@ -114,6 +247,7 @@ def proximity_match(
     prior_assignment: Optional[List] = None,
     blob_led_ids: Optional[np.ndarray] = None,
     blob_radii: Optional[np.ndarray] = None,
+    other_cameras_blobs: Optional[List] = None,
 ) -> Optional[Dict]:
     """
     Refine a predicted pose using the assignment-locked nearest-neighbour path.
@@ -133,8 +267,9 @@ def proximity_match(
 
     geom = self._geometry
     _cfg = getattr(self, '_matching_cfg', None) or {}
+    _cam = self.camera.camera_idx
     facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',     86.0))
-    reprojection_threshold = float(_cfg.get('reprojection_threshold',    2.0))
+    reprojection_threshold = float(_cfg.get('proximity_reprojection_threshold', 2.0))
     min_inliers            = int(  _cfg.get('min_inliers',               4))
     led_radius_mm          = float(_cfg.get('led_radius_mm',             2.5))
     snap_factor            = float(_cfg.get('proximity_snap_factor',     4.0))
@@ -262,14 +397,16 @@ def proximity_match(
                 logger.debug(f"  LED {lid}: blob {j} → nearest ({best_dist:.1f}px)")
 
     logger.debug(
-        f"Proximity snap: {len(locked_pairs)}/{len(blobs)} blobs locked "
+        f"[cam {_cam}] Proximity snap: {len(locked_pairs)}/{len(blobs)} blobs locked "
         f"({n_id_locked} ID-path, {len(locked_pairs) - n_id_locked} nearest) "
         f"of {len(prior_lids)} prior LEDs"
         + ("  [size filter active]" if blob_radii is not None else "")
     )
     if len(locked_pairs) < min_inliers:
-        logger.debug(f"Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
+        logger.debug(f"[cam {_cam}] Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
         return None
+
+    aux_snapped_per_cam: Dict[int, List] = {}
 
     # Hungarian expansion: triggered when proximity locked fewer than expansion_threshold
     # of model-visible LEDs, OR when visible LED count dropped significantly from the
@@ -324,7 +461,7 @@ def proximity_match(
             if n_expanded:
                 did_expand = True
                 logger.debug(
-                    f"Proximity expansion: +{n_expanded} via Hungarian "
+                    f"[cam {_cam}] Proximity expansion: +{n_expanded} via Hungarian "
                     f"(coverage {len(locked_pairs) - n_expanded}/{n_model_visible} "
                     f"→ {len(locked_pairs)}/{n_model_visible})"
                 )
@@ -337,7 +474,7 @@ def proximity_match(
         reprojection_px=reprojection_threshold,
     )
     if not ok:
-        logger.debug("Proximity: RANSAC failed → None")
+        logger.debug(f"[cam {_cam}] Proximity: RANSAC failed → None")
         return None
 
     # Keep all RANSAC inliers — the visibility check is an approximation and
@@ -345,7 +482,7 @@ def proximity_match(
     final_pairs = [locked_pairs[k] for k in ransac_idx]
 
     if len(final_pairs) < min_inliers:
-        logger.debug(f"Proximity: too few inliers ({len(final_pairs)} < {min_inliers}) → None")
+        logger.debug(f"[cam {_cam}] Proximity: too few inliers ({len(final_pairs)} < {min_inliers}) → None")
         return None
 
     lo_f  = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
@@ -355,14 +492,163 @@ def proximity_match(
     error     = float(pair_errors.mean())
     max_error = float(pair_errors.max())
 
-    logger.debug(f"Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px")
+    # Post-RANSAC aux snap: re-project prior LEDs into each aux camera using the refined
+    # pose, then greedy-snap with radii filter. Expanded pairs (new LEDs found during
+    # gen-cam expansion) are merged in, deduplicating by LED and blob index.
+    if other_cameras_blobs:
+        _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
+        _T_world_ref = self.T_world_cam.compose(Transform(_R_ref, np.asarray(tvec, dtype=np.float32).reshape(3)))
+        for _ocam, _oblobs, _oradii in other_cameras_blobs:
+            _oblobs = np.asarray(_oblobs, dtype=np.float32)
+            _pairs_i: List = []
+            if len(_oblobs) > 0:
+                _T_ci_r   = _ocam.T_world_cam.inverse().compose(_T_world_ref)
+                _R_i_r    = _T_ci_r.R.astype(np.float32)
+                _t_i_r    = _T_ci_r.t.astype(np.float32)
+                _rv_i_r, _ = cv2.Rodrigues(_R_i_r)
+                _proj_i_r  = _project_points(_rv_i_r, _t_i_r, prior_obj,
+                                              _ocam.camera_matrix, _ocam.dist_coeffs)
+                _led_ci_r  = (_R_i_r @ prior_obj.T).T + _t_i_r
+                _focal_i_r = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
+                _depth_i_r = np.maximum(_led_ci_r[:, 2], 0.01)
+                _snap_i_r  = _focal_i_r * (led_radius_mm / 1000.0) / _depth_i_r * snap_factor
+                _exp_px_i_r = _focal_i_r * (led_radius_mm / 1000.0) / _depth_i_r
+
+                _used_l_r: set = set()
+                for _j in range(len(_oblobs)):
+                    _blob_r_j = float(_oradii[_j]) if _oradii is not None else None
+                    _best_ii  = -1
+                    _best_sc  = float('inf')
+                    for _ii, _lid in enumerate(prior_lids):
+                        if _ii in _used_l_r:
+                            continue
+                        _dist = float(np.linalg.norm(_oblobs[_j] - _proj_i_r[_ii]))
+                        if _dist >= _snap_i_r[_ii] or _dist >= argmin_max_px:
+                            continue
+                        if _blob_r_j is not None:
+                            _ep = float(_exp_px_i_r[_ii])
+                            if not (_ep * blob_size_min_factor <= _blob_r_j <= _ep * blob_size_max_factor):
+                                continue
+                        _size_err = abs(_blob_r_j - float(_exp_px_i_r[_ii])) if _blob_r_j is not None else 0.0
+                        _score    = _dist + blob_size_score_weight * _size_err
+                        if _score < _best_sc:
+                            _best_sc = _score
+                            _best_ii = _ii
+                    if _best_ii >= 0:
+                        _pairs_i.append((_j, prior_lids[_best_ii]))
+                        _used_l_r.add(_best_ii)
+
+                # Independent aux expansion: re-evaluate coverage with the refined pose
+                # and run Hungarian for visible-but-unmatched LEDs if coverage is low.
+                _vis_i_r = _visible_mask(
+                    _R_i_r, _t_i_r, self.model.positions, self.model.normals, geom,
+                    cam_K=_ocam.camera_matrix, cam_dc=_ocam.dist_coeffs,
+                    cam_w=_ocam.width, cam_h=_ocam.height, cam_rpmax=_ocam.rpmax,
+                    facing_threshold_deg=facing_threshold_deg,
+                )
+                _n_vis_i_r  = int(np.sum(_vis_i_r))
+                _snap_lids  = {lid for _, lid in _pairs_i}
+                _snap_blobs = {b   for b, _   in _pairs_i}
+                if _n_vis_i_r > 0 and len(_pairs_i) / _n_vis_i_r < expansion_threshold:
+                    _free_lid_i_r  = [int(lid) for lid in np.where(_vis_i_r)[0]
+                                      if int(lid) not in _snap_lids]
+                    _free_blob_i_r = [_jj for _jj in range(len(_oblobs))
+                                      if _jj not in _snap_blobs]
+                    if _free_lid_i_r and _free_blob_i_r:
+                        _free_obj_i_r  = self.model.positions[_free_lid_i_r].astype(np.float32)
+                        _proj_free_i_r = _project_points(_rv_i_r, _t_i_r, _free_obj_i_r,
+                                                         _ocam.camera_matrix, _ocam.dist_coeffs)
+                        _cost_i_r = cdist(_proj_free_i_r, _oblobs[_free_blob_i_r])
+                        if _oradii is not None:
+                            _led_ci_r2 = (_R_i_r @ _free_obj_i_r.T).T + _t_i_r
+                            for _k in range(len(_free_lid_i_r)):
+                                _depth_k  = float(max(_led_ci_r2[_k, 2], 0.01))
+                                _exp_px_k = _focal_i_r * (led_radius_mm / 1000.0) / _depth_k
+                                _cost_i_r[_k, ((_oradii[_free_blob_i_r] < _exp_px_k * blob_size_min_factor) |
+                                               (_oradii[_free_blob_i_r] > _exp_px_k * blob_size_max_factor))] = 1e9
+                        _row_r, _col_r = linear_sum_assignment(_cost_i_r)
+                        _n_exp_i = 0
+                        for _rr, _cc in zip(_row_r, _col_r):
+                            if _cost_i_r[_rr, _cc] < expansion_px:
+                                _pairs_i.append((_free_blob_i_r[_cc], _free_lid_i_r[_rr]))
+                                _snap_lids.add(_free_lid_i_r[_rr])
+                                _snap_blobs.add(_free_blob_i_r[_cc])
+                                _n_exp_i += 1
+                        if is_deep() and _n_exp_i:
+                            logger.debug(
+                                f"[cam {_cam}] Proximity aux expansion cam{_ocam.camera_idx}: "
+                                f"+{_n_exp_i} via Hungarian (refined pose, "
+                                f"coverage {len(_pairs_i) - _n_exp_i}/{_n_vis_i_r}"
+                                f"→{len(_pairs_i)}/{_n_vis_i_r})"
+                            )
+
+            aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
+            if is_deep() and _pairs_i:
+                logger.debug(
+                    f"[cam {_cam}] Proximity aux snap cam{_ocam.camera_idx}: "
+                    f"{len(_pairs_i)} pairs (refined pose)"
+                    + ("  [size filter active]" if _oradii is not None else "")
+                )
+
+    aux_inlier_count = 0
+    aux_cameras_result: List = []
+    for _aux_cam_idx, _aux_pairs_i in aux_snapped_per_cam.items():
+        _n_aux = len(_aux_pairs_i)
+        aux_inlier_count += _n_aux
+        aux_cameras_result.append((_aux_cam_idx, _n_aux))
+
+    # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
+    _method_suffix = "_expanded" if did_expand else "_locked"
+    if bool(_cfg.get('joint_optimization', True)) and aux_snapped_per_cam:
+        _aux_joint = [
+            (_ocam, np.asarray(_oblobs, dtype=np.float32),
+             aux_snapped_per_cam.get(_ocam.camera_idx, []))
+            for _ocam, _oblobs, _ in (other_cameras_blobs or [])
+            if aux_snapped_per_cam.get(_ocam.camera_idx)
+        ]
+        if _aux_joint:
+            _R_pr, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
+            _T_wc_pr = self.T_world_cam.compose(
+                Transform(_R_pr.astype(np.float64),
+                          np.asarray(tvec, dtype=np.float64).reshape(3))
+            )
+            _prox_thresh = float(_cfg.get('proximity_reprojection_threshold', 2.0))
+            _aux_joint = _filter_aux_by_reprojection(
+                _T_wc_pr, _aux_joint, self.model.positions, _prox_thresh
+            )
+            _T_joint = _joint_err = None
+            if _aux_joint:
+                _T_joint, _joint_err = _joint_refine_pose(
+                    _T_wc_pr, self.camera, final_pairs, blobs, _aux_joint, self.model.positions,
+                    primary_weight=float(_cfg.get('joint_primary_weight', 2.0)),
+                    huber_scale=float(_cfg.get('joint_huber_scale', 1.5)),
+                )
+            if _T_joint is not None:
+                _T_prim = self.T_world_cam.inverse().compose(_T_joint)
+                _rv_j = cv2.Rodrigues(_T_prim.R.astype(np.float32))[0]
+                _tv_j = _T_prim.t.astype(np.float32)
+                _proj_j = _project_points(_rv_j, _tv_j, lo_f, K, dc)
+                _err_j = float(np.mean(np.linalg.norm(_proj_j - li_f, axis=1)))
+                logger.debug(
+                    f"[cam {_cam}] Proximity joint LM: "
+                    f"primary err {error:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
+                )
+                rvec, tvec, error = _rv_j, _tv_j, _err_j
+                _method_suffix += "_mc"
+
+    _aux_log = ""
+    if aux_cameras_result:
+        _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result if n > 0) + "]"
+    logger.debug(f"[cam {_cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}")
     return {
         "rvec":       rvec,
         "tvec":       tvec,
         "error":      error,
-        "max_error":  max_error,
         "assignment": final_pairs,
-        "method":     "proximity_expanded" if did_expand else "proximity_locked",
+        "method":          "proximity" + _method_suffix,
+        "aux_inliers":     aux_inlier_count,
+        "aux_cameras":     aux_cameras_result or None,
+        "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,
     }
 
 
@@ -376,6 +662,7 @@ def prior_constrained_match(
     predicted_pose: Tuple[np.ndarray, np.ndarray],
     prior_assignment: Optional[List] = None,
     blob_radii: Optional[np.ndarray] = None,
+    other_cameras_blobs: Optional[List] = None,
 ) -> Optional[Dict]:
     """
     Prior-constrained translation solver for 2–3 blob frames.
@@ -386,23 +673,31 @@ def prior_constrained_match(
 
     P2P mode  (n_blobs == 3):
         Project prior LEDs → snap 3 pairs.
-        Build a 4×3 overdetermined system from 2 pairs (undistorted normalised
-        coordinates) and solve for (tx, ty, tz) via least-squares.
+        Build a 4×3 overdetermined system from 2 pairs plus any aux-camera
+        pairs and solve for (tx, ty, tz) via least-squares.
         Validate with the 3rd pair.
 
     P1P mode  (n_blobs == 2):
         Project prior LEDs → snap 2 pairs.
-        Additionally fix tz = tvec_prior[2] (single-camera depth cannot be
-        recovered from one correspondence alone; the prior depth is the best
-        available estimate).
-        Solve (tx, ty) analytically from 1 pair, validate with the 2nd.
+        If aux cameras supply ≥1 additional pair the system is overdetermined
+        and all three translation components are solved freely.
+        Otherwise fix tz = tvec_prior[2] (depth cannot be recovered from one
+        primary correspondence alone) and solve (tx, ty) analytically.
+        Validate with the 2nd primary pair.
 
-    All pairs must reproject within reprojection_threshold after solving —
-    there are too few matches to average away a wrong correspondence.
+    All primary pairs must reproject within reprojection_threshold after
+    solving — there are too few primary matches to average away a bad one.
 
-    Note: P1P depth-fixation approximates the stereo triangulation used in
-    the original multi-camera implementation (Meta blog, 2021).  It works
-    well for slow radial motion but drifts when depth changes quickly.
+    Multi-camera notes:
+        Aux pairs are pre-snapped with the predicted pose, contribute linear
+        rows to the same translation solve, then re-snapped with the solved
+        pose for the output aux_assignments dict.
+        The linear equation for a pair in aux camera i with relative transform
+        (A, c) = T_{aux←primary} is:
+            q = A @ R_prior @ P_ctrl + c   (known)
+            (A[0] − xn·A[2]) @ u = xn·q[2] − q[0]
+            (A[1] − yn·A[2]) @ u = yn·q[2] − q[1]
+        Primary rows are the A=I, c=0 special case.
     """
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
@@ -431,7 +726,7 @@ def prior_constrained_match(
     mode       = 'p2p' if n_blobs >= 3 else 'p1p'
     n_required = 3     if mode == 'p2p' else 2
 
-    # ── Snap assignment: project prior LEDs, snap to nearest unique blobs ────
+    # ── Primary snap ──────────────────────────────────────────────────────────
     prior_lids = [lid for _, lid in prior_assignment]
     prior_obj  = self.model.positions[prior_lids].astype(np.float32)
     proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc)
@@ -481,21 +776,67 @@ def prior_constrained_match(
     pairs_hyp = locked_pairs[:n_required - 1]   # hypothesis pairs (2 for P2P, 1 for P1P)
     pair_val  = locked_pairs[n_required - 1]     # validating pair
 
-    # ── Undistort hypothesis blob positions → normalised image coordinates ───
+    # ── Aux pre-snap with predicted pose (augments the linear system) ─────────
+    # Maps cam_idx → (Camera, blobs_array_f32, [(blob_idx, led_id)])
+    _aux_pre: Dict = {}
+    if other_cameras_blobs:
+        _T_world_pred = self.T_world_cam.compose(
+            Transform(R_prior.astype(np.float32), tvec_pred)
+        )
+        for _ocam, _oblobs, _oradii in other_cameras_blobs:
+            _obl = np.asarray(_oblobs, dtype=np.float32)
+            if len(_obl) == 0:
+                _aux_pre[_ocam.camera_idx] = (_ocam, _obl, [])
+                continue
+            _T_ci_p     = _ocam.T_world_cam.inverse().compose(_T_world_pred)
+            _R_ci_p     = _T_ci_p.R.astype(np.float32)
+            _t_ci_p     = _T_ci_p.t.astype(np.float32)
+            _rv_ci_p, _ = cv2.Rodrigues(_R_ci_p)
+            _proj_ci_p  = _project_points(_rv_ci_p, _t_ci_p, prior_obj,
+                                           _ocam.camera_matrix, _ocam.dist_coeffs)
+            _led_ci_p   = (_R_ci_p @ prior_obj.T).T + _t_ci_p
+            _focal_ci   = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
+            _pairs_ci: List = []
+            _used_ci: set   = set()
+            for _ii, _lid in enumerate(prior_lids):
+                _depth_ci = float(max(_led_ci_p[_ii, 2], 0.01))
+                _exp_ci   = _focal_ci * (led_radius_mm / 1000.0) / _depth_ci
+                _snap_ci  = _exp_ci * snap_factor
+                if _oradii is not None:
+                    _elig_ci = ((_oradii >= _exp_ci * blob_size_min_factor) &
+                                (_oradii <= _exp_ci * blob_size_max_factor))
+                else:
+                    _elig_ci = None
+                _dists_ci = np.linalg.norm(_obl - _proj_ci_p[_ii], axis=1)
+                if _elig_ci is not None and _elig_ci.any():
+                    _cand_ci   = np.where(_elig_ci)[0]
+                    _scores_ci = (_dists_ci[_cand_ci]
+                                  + blob_size_score_weight * np.abs(_oradii[_cand_ci] - _exp_ci))
+                    _jj        = int(_cand_ci[np.argmin(_scores_ci)])
+                else:
+                    _jj = int(np.argmin(_dists_ci))
+                if _dists_ci[_jj] < _snap_ci and _jj not in _used_ci:
+                    _pairs_ci.append((_jj, _lid))
+                    _used_ci.add(_jj)
+            _aux_pre[_ocam.camera_idx] = (_ocam, _obl, _pairs_ci)
+
+    n_aux_pre = sum(len(v[2]) for v in _aux_pre.values())
+
+    # ── Undistort primary hypothesis blob positions ───────────────────────────
     hyp_blobs  = np.array([blobs[b] for b, _ in pairs_hyp], dtype=np.float32)
     pts_undist = cv2.undistortPoints(
         hyp_blobs.reshape(-1, 1, 2), K, dc,
-    ).reshape(-1, 2)    # K-removed, distortion-removed
+    ).reshape(-1, 2)
 
     # ── Translation solve ─────────────────────────────────────────────────────
-    # Pinhole projection with fixed R:
-    #   x_n = (R[0]@P + tx) / (R[2]@P + tz)
-    #   x_n*(r2 + tz) = r0 + tx
-    #   tx - x_n*tz  = x_n*r2 - r0
-    #   → [1, 0, -x_n] @ [tx, ty, tz] = x_n*R[2]@P - R[0]@P
-    # P2P: 2 pairs → 4×3 overdetermined → least-squares
-    # P1P: 1 pair + fixed tz → solve (tx, ty) directly
-    if mode == 'p2p':
+    # General linear equation per pair in a camera with relative transform
+    # (A, c) = T_{cam←primary} applied to the primary-frame pose unknowns u:
+    #   P_cam = A @ R_prior @ P_ctrl + A @ u + c  =  q + A @ u
+    #   (A[0] − xn·A[2]) @ u = xn·q[2] − q[0]
+    #   (A[1] − yn·A[2]) @ u = yn·q[2] − q[1]
+    # Primary camera: A = I, c = 0  →  [1,0,−xn] / [0,1,−yn] rows.
+    if mode == 'p2p' or n_aux_pre > 0:
+        # Enough constraints for unconstrained 3-DOF least-squares
         A_rows: List = []
         b_rows: List = []
         for k, (_, lk) in enumerate(pairs_hyp):
@@ -507,14 +848,32 @@ def prior_constrained_match(
             r2  = float(R_prior[2] @ Pi)
             A_rows += [[1.0, 0.0, -xn], [0.0, 1.0, -yn]]
             b_rows += [xn * r2 - r0,    yn * r2 - r1]
+        for _, (_ocam, _obl, _pairs_ci) in _aux_pre.items():
+            if not _pairs_ci:
+                continue
+            _T_ap  = _ocam.T_world_cam.inverse().compose(self.T_world_cam)
+            _A     = _T_ap.R.astype(np.float64)
+            _c     = _T_ap.t.astype(np.float64)
+            _aux_hyp = np.array([_obl[b_idx] for b_idx, _ in _pairs_ci], dtype=np.float32)
+            _und_aux = cv2.undistortPoints(
+                _aux_hyp.reshape(-1, 1, 2), _ocam.camera_matrix, _ocam.dist_coeffs,
+            ).reshape(-1, 2)
+            for _k, (_, _lid) in enumerate(_pairs_ci):
+                _Pi = self.model.positions[_lid].astype(np.float64)
+                _q  = _A @ (R_prior.astype(np.float64) @ _Pi) + _c
+                _xn = float(_und_aux[_k, 0])
+                _yn = float(_und_aux[_k, 1])
+                A_rows.append((_A[0] - _xn * _A[2]).tolist())
+                b_rows.append(float(_xn * _q[2] - _q[0]))
+                A_rows.append((_A[1] - _yn * _A[2]).tolist())
+                b_rows.append(float(_yn * _q[2] - _q[1]))
         t_solved, _, _, _ = np.linalg.lstsq(
             np.array(A_rows, dtype=np.float64),
             np.array(b_rows, dtype=np.float64),
             rcond=None,
         )
-
-    else:   # p1p: additionally fix depth from prior
-        # tx = x_n*(r2 + tz) - r0,  ty = y_n*(r2 + tz) - r1
+    else:
+        # P1P with no aux: fix depth from prior
         tz  = float(tvec_pred[2])
         Pi  = self.model.positions[pairs_hyp[0][1]].astype(np.float64)
         xn  = float(pts_undist[0, 0])
@@ -535,12 +894,12 @@ def prior_constrained_match(
         )
         return None
 
-    # ── Validate all pairs (no averaging — too few to hide a bad match) ───────
-    all_pairs = pairs_hyp + [pair_val]
-    all_obj   = self.model.positions[[l for _, l in all_pairs]].astype(np.float32)
-    all_img   = blobs[[b for b, _ in all_pairs]].astype(np.float32)
-    proj_all  = _project_points(rvec_pred, t_solved.astype(np.float32), all_obj, K, dc)
-    errors    = np.linalg.norm(proj_all - all_img, axis=1)
+    # ── Validate primary pairs ────────────────────────────────────────────────
+    all_primary = pairs_hyp + [pair_val]
+    all_obj     = self.model.positions[[l for _, l in all_primary]].astype(np.float32)
+    all_img     = blobs[[b for b, _ in all_primary]].astype(np.float32)
+    proj_all    = _project_points(rvec_pred, t_solved.astype(np.float32), all_obj, K, dc)
+    errors      = np.linalg.norm(proj_all - all_img, axis=1)
 
     if np.any(errors > reprojection_threshold):
         logger.debug(
@@ -550,14 +909,72 @@ def prior_constrained_match(
         return None
 
     error = float(np.mean(errors))
-    logger.debug(f"prior_constrained ({mode}): OK  pairs={len(all_pairs)}  err={error:.2f}px")
+
+    # ── Post-solve aux snap with solved pose → aux_assignments ────────────────
+    aux_snapped_per_cam: Dict = {}
+    if other_cameras_blobs:
+        _T_world_solved = self.T_world_cam.compose(
+            Transform(R_prior.astype(np.float32), t_solved.astype(np.float32))
+        )
+        for _ocam, _oblobs, _oradii in other_cameras_blobs:
+            _obl = np.asarray(_oblobs, dtype=np.float32)
+            if len(_obl) == 0:
+                aux_snapped_per_cam[_ocam.camera_idx] = []
+                continue
+            _T_ci_s     = _ocam.T_world_cam.inverse().compose(_T_world_solved)
+            _R_ci_s     = _T_ci_s.R.astype(np.float32)
+            _t_ci_s     = _T_ci_s.t.astype(np.float32)
+            _rv_ci_s, _ = cv2.Rodrigues(_R_ci_s)
+            _proj_ci_s  = _project_points(_rv_ci_s, _t_ci_s, prior_obj,
+                                           _ocam.camera_matrix, _ocam.dist_coeffs)
+            _led_ci_s   = (_R_ci_s @ prior_obj.T).T + _t_ci_s
+            _focal_ci   = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
+            _pairs_s: List = []
+            _used_s: set   = set()
+            for _ii, _lid in enumerate(prior_lids):
+                _depth_s = float(max(_led_ci_s[_ii, 2], 0.01))
+                _exp_s   = _focal_ci * (led_radius_mm / 1000.0) / _depth_s
+                _snap_s  = _exp_s * snap_factor
+                if _oradii is not None:
+                    _elig_s = ((_oradii >= _exp_s * blob_size_min_factor) &
+                               (_oradii <= _exp_s * blob_size_max_factor))
+                else:
+                    _elig_s = None
+                _dists_s = np.linalg.norm(_obl - _proj_ci_s[_ii], axis=1)
+                if _elig_s is not None and _elig_s.any():
+                    _cand_s   = np.where(_elig_s)[0]
+                    _scores_s = (_dists_s[_cand_s]
+                                 + blob_size_score_weight * np.abs(_oradii[_cand_s] - _exp_s))
+                    _jj_s     = int(_cand_s[np.argmin(_scores_s)])
+                else:
+                    _jj_s = int(np.argmin(_dists_s))
+                if _dists_s[_jj_s] < _snap_s and _jj_s not in _used_s:
+                    _pairs_s.append((_jj_s, _lid))
+                    _used_s.add(_jj_s)
+            aux_snapped_per_cam[_ocam.camera_idx] = _pairs_s
+
+    aux_inlier_count   = sum(len(v) for v in aux_snapped_per_cam.values())
+    aux_cameras_result = [(idx, len(pairs))
+                          for idx, pairs in aux_snapped_per_cam.items() if pairs]
+
+    _aux_log = ""
+    if aux_cameras_result:
+        _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result) + "]"
+    logger.debug(
+        f"prior_constrained ({mode}): OK  pairs={len(all_primary)}  err={error:.2f}px"
+        + (f"  n_aux_solve={n_aux_pre}" if n_aux_pre > 0 else "")
+        + _aux_log
+    )
 
     return {
-        "rvec":       rvec_pred.astype(np.float64).reshape(3, 1),
-        "tvec":       t_solved.reshape(3, 1),
-        "error":      error,
-        "assignment": all_pairs,
-        "method":     f"prior_constrained_{mode}",
+        "rvec":          rvec_pred.astype(np.float64).reshape(3, 1),
+        "tvec":          t_solved.reshape(3, 1),
+        "error":         error,
+        "assignment":    all_primary,
+        "method":        f"prior_constrained_{mode}",
+        "aux_inliers":   aux_inlier_count,
+        "aux_cameras":   aux_cameras_result or None,
+        "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,
     }
 
 
@@ -579,6 +996,8 @@ def brute_match(
     min_vis_coverage: float = 0.75,
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     rng_seed: Optional[int] = 42,
+    other_cameras_blobs: Optional[List] = None,
+    blob_radii: Optional[np.ndarray] = None,
 ) -> Optional[Dict]:
     """
     Exhaustive pose search via P3P over LED/blob triple correspondences.
@@ -597,6 +1016,7 @@ def brute_match(
     Exits on strong match at the end of any tier's LED triple.
     """
     _cfg = getattr(self, '_matching_cfg', None) or {}
+    _cam = self.camera.camera_idx
     if _cfg:
         depth_tiers            = tuple(tuple(t) for t in _cfg.get('depth_tiers', depth_tiers))
         p4_threshold_px        = float(_cfg.get('p4_threshold_px',        p4_threshold_px))
@@ -609,6 +1029,9 @@ def brute_match(
         min_vis_coverage       = float(_cfg.get('min_vis_coverage',       min_vis_coverage))
         rng_seed               = _cfg.get('rng_seed', rng_seed)
     facing_threshold_deg = float(_cfg.get('led_facing_angle_deg', 86.0))
+    blob_size_min_factor = float(_cfg.get('blob_size_min_factor', 0.2))
+    blob_size_max_factor = float(_cfg.get('blob_size_max_factor', 4.0))
+    led_radius_mm        = float(_cfg.get('led_radius_mm',        2.5))
 
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
@@ -627,6 +1050,7 @@ def brute_match(
     normals   = self.model.normals.astype(np.float32)
     K         = self.camera.camera_matrix
     dc        = self.camera.dist_coeffs
+    focal_px  = float(max(K[0, 0], K[1, 1]))
 
     led_triple_idx   = self._led_triple_idx    # (N_LT, 3) int32
     led_triple_depth = self._led_triple_depth  # (N_LT,) int32
@@ -658,13 +1082,14 @@ def brute_match(
         R_prior, _ = cv2.Rodrigues(np.asarray(rvec_pr, dtype=np.float32).reshape(3, 1))
         tvec_prior = np.asarray(tvec_pr, dtype=np.float32).reshape(3)
 
-    best_solution   = None
-    best_inliers    = 0
-    best_error      = np.inf
-    best_orient_err = np.inf
-    best_tvec_err   = np.inf
-    strong_found    = False
-    solution_tier   = None
+    best_solution      = None
+    best_inliers       = 0
+    best_inliers_total = 0
+    best_error         = np.inf
+    best_orient_err    = np.inf
+    best_tvec_err      = np.inf
+    strong_found       = False
+    solution_tier      = None
 
     # Per-triple: how far blob depth has been explored (the blob_max of the last tier
     # that processed this triple). Enables delta coverage across tiers.
@@ -918,6 +1343,8 @@ def brute_match(
                                 proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc)
                                 cost_r     = cdist(blobs, proj_vis_r)
                                 sub_min    = cost_r[np.ix_(unmatched_blobs, unmatched_col_idx)].min(axis=0)
+                                _led_cam_r = ((R_r @ positions[vis_ids_r].T).T + tvec_r_flat
+                                              if blob_radii is not None else None)
                                 extra_blobs: List[int] = []
                                 extra_leds:  List[int] = []
                                 for order_j in np.argsort(sub_min):
@@ -925,12 +1352,20 @@ def brute_match(
                                         break
                                     col    = int(unmatched_col_idx[order_j])
                                     led_id = int(vis_ids_r[col])
+                                    _exp_px_rc = (focal_px * (led_radius_mm / 1000.0) /
+                                                  float(max(_led_cam_r[col, 2], 0.01))
+                                                  if _led_cam_r is not None else None)
                                     for row_i in np.argsort(cost_r[unmatched_blobs, col]):
                                         b = int(unmatched_blobs[row_i])
                                         if b in matched_blob_set:
                                             continue
                                         if cost_r[b, col] >= reprojection_threshold:
                                             break
+                                        if (_exp_px_rc is not None and not (
+                                                _exp_px_rc * blob_size_min_factor
+                                                <= float(blob_radii[b])
+                                                <= _exp_px_rc * blob_size_max_factor)):
+                                            continue
                                         matched_blob_set.add(b)
                                         extra_blobs.append(b)
                                         extra_leds.append(led_id)
@@ -941,6 +1376,77 @@ def brute_match(
                                     if dbg:
                                         logger.debug(f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
 
+                            # ── 6.7. Aux-camera validation ────────────────────
+                            # Lift refined pose to world frame and score against
+                            # each aux camera's blobs. These correspondences
+                            # are not added to the primary-cam assignment but do
+                            # increase the pooled coverage and inlier count used
+                            # for hypothesis ranking.
+                            extra_vis_weight      = 0.0
+                            extra_inlier_weight   = 0.0
+                            extra_inlier_count    = 0
+                            aux_cameras_current   = []
+                            aux_assignments_current: Dict[int, List] = {}
+                            if other_cameras_blobs:
+                                T_world_ctrl = self.T_world_cam.compose(
+                                    Transform(R_r, tvec_r_flat)
+                                )
+                                for _ocam, _oblobs, _oradii in other_cameras_blobs:
+                                    _oblobs = np.asarray(_oblobs, dtype=np.float32)
+                                    if len(_oblobs) == 0:
+                                        continue
+                                    _T_ci_ctrl = _ocam.T_world_cam.inverse().compose(T_world_ctrl)
+                                    _R_i  = _T_ci_ctrl.R.astype(np.float32)
+                                    _t_i  = _T_ci_ctrl.t.astype(np.float32)
+                                    _rv_i = cv2.Rodrigues(_R_i)[0]
+
+                                    _vis_i = _visible_mask(
+                                        _R_i, _t_i, positions, normals, geom,
+                                        cam_K=_ocam.camera_matrix,
+                                        cam_dc=_ocam.dist_coeffs,
+                                        cam_w=_ocam.width,
+                                        cam_h=_ocam.height,
+                                        cam_rpmax=_ocam.rpmax,
+                                        facing_threshold_deg=facing_threshold_deg,
+                                    )
+                                    _vis_ids_i = np.where(_vis_i)[0]
+                                    if len(_vis_ids_i) == 0:
+                                        continue
+
+                                    _proj_i = _project_points(
+                                        _rv_i, _t_i, positions[_vis_ids_i],
+                                        _ocam.camera_matrix, _ocam.dist_coeffs,
+                                    )
+                                    _cost_i = cdist(_oblobs, _proj_i)
+                                    _rows_i, _cols_i = linear_sum_assignment(_cost_i)
+                                    _inlier_i = _cost_i[_rows_i, _cols_i] < reprojection_threshold
+                                    _led_cam_i = (_R_i @ positions[_vis_ids_i].T).T + _t_i
+                                    if _oradii is not None:
+                                        _focal_i = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
+                                        for _k in range(len(_rows_i)):
+                                            if not _inlier_i[_k]:
+                                                continue
+                                            _depth_k = float(max(_led_cam_i[_cols_i[_k], 2], 0.01))
+                                            _exp_px_k = _focal_i * (led_radius_mm / 1000.0) / _depth_k
+                                            if not (_exp_px_k * blob_size_min_factor
+                                                    <= float(_oradii[_rows_i[_k]])
+                                                    <= _exp_px_k * blob_size_max_factor):
+                                                _inlier_i[_k] = False
+                                    _n_aux = int(_inlier_i.sum())
+                                    extra_inlier_count += _n_aux
+                                    aux_cameras_current.append((_ocam.camera_idx, _n_aux))
+                                    aux_assignments_current[_ocam.camera_idx] = [
+                                        (int(_rows_i[_k]), int(_vis_ids_i[_cols_i[_k]]))
+                                        for _k in range(len(_rows_i)) if _inlier_i[_k]
+                                    ]
+
+                                    _led_nrm_i = (_R_i @ normals[_vis_ids_i].T).T
+                                    _vdirs_i   = -_led_cam_i / (np.linalg.norm(_led_cam_i, axis=1, keepdims=True) + 1e-9)
+                                    _w_i       = np.clip((_led_nrm_i * _vdirs_i).sum(axis=1), 0.0, 1.0)
+
+                                    extra_vis_weight    += float(_w_i.sum())
+                                    extra_inlier_weight += float(_w_i[_cols_i[_inlier_i]].sum())
+
                             # ── 7. Visibility coverage check ──────────────────
                             # Weight each visible LED by cos(θ) — the dot product
                             # of its normal with the view direction.  LEDs at
@@ -949,8 +1455,12 @@ def brute_match(
                             # contribute less to both numerator and denominator.
                             # This prevents those LEDs from unfairly failing the
                             # coverage gate when they simply aren't bright enough.
+                            # Counts from other cameras (extra_*) are pooled in so
+                            # that combined multi-camera evidence can satisfy the
+                            # threshold even when one camera sees few LEDs.
                             n_visible_leds = len(vis_ids_r)
                             n_inlier_blobs = len(inlier_blobs)
+                            n_inlier_total = n_inlier_blobs + extra_inlier_count
 
                             led_cam_pts    = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
                             led_cam_normals = (R_r @ normals[vis_ids_r].T).T
@@ -961,16 +1471,17 @@ def brute_match(
                             # maps each inlier LED index to its position in vis_ids_r so we
                             # can index led_vis_weights without a full boolean mask.
                             inlier_idx_in_vis    = np.searchsorted(vis_ids_r, inlier_leds)
-                            weighted_visible_count = float(led_vis_weights.sum())
-                            weighted_inlier_count  = float(led_vis_weights[inlier_idx_in_vis].sum())
+                            weighted_visible_count = float(led_vis_weights.sum()) + extra_vis_weight
+                            weighted_inlier_count  = float(led_vis_weights[inlier_idx_in_vis].sum()) + extra_inlier_weight
 
                             if weighted_visible_count > 0 and weighted_inlier_count < min_vis_coverage * weighted_visible_count:
                                 if dbg:
                                     logger.debug(
-                                        f"  sol {sol_i}: weighted vis coverage "
+                                        f"  sol {sol_i}: pooled weighted vis coverage "
                                         f"{weighted_inlier_count:.2f}/{weighted_visible_count:.2f}"
                                         f"={weighted_inlier_count/weighted_visible_count:.2f} < {min_vis_coverage:.2f}"
-                                        f"  (raw {n_inlier_blobs}/{n_visible_leds})"
+                                        f"  (primary raw {n_inlier_blobs}/{n_visible_leds},"
+                                        f" +{extra_inlier_count} from aux cams)"
                                     )
                                 continue
 
@@ -986,52 +1497,62 @@ def brute_match(
                             if tvec_prior is not None:
                                 tvec_err = float(np.linalg.norm(tvec_r.reshape(3) - tvec_prior))
 
-                            error_per_inlier      = err  / max(n_inlier_blobs, 1)
-                            best_error_per_inlier = best_error / max(best_inliers, 1)
-
-                            # Prefer more inliers, break ties by absolute error, then
-                            # orientation distance to prior, then translation distance.
+                            # Prefer more inliers (pooled across all cameras); break
+                            # ties by primary error, then prior distances.
+                            # The error cap prevents a high-inlier solution at poor
+                            # accuracy from displacing a tight low-inlier one.
                             is_better = (
-                                (n_inlier_blobs > best_inliers and error_per_inlier < best_error_per_inlier) or
-                                (n_inlier_blobs >= best_inliers + 2 and error_per_inlier < best_error_per_inlier * 1.1) or
-                                (n_inlier_blobs == best_inliers and err < best_error) or
-                                (n_inlier_blobs == best_inliers and
+                                (n_inlier_total > best_inliers_total and err < best_error + 1.0) or
+                                (n_inlier_total >= best_inliers_total + 2 and err < best_error + 1.5) or
+                                (n_inlier_total == best_inliers_total and err < best_error) or
+                                (n_inlier_total == best_inliers_total and
                                  abs(err - best_error) < 0.5 and
                                  orient_err < best_orient_err) or
-                                (n_inlier_blobs == best_inliers and
+                                (n_inlier_total == best_inliers_total and
                                  abs(err - best_error) < 0.5 and
                                  orient_err == best_orient_err and
                                  tvec_err < best_tvec_err)
                             )
 
                             if dbg:
-                                logger.debug(f"  sol {sol_i}: err={err:.3f} px  inliers={n_inlier_blobs}  "
+                                logger.debug(f"  sol {sol_i}: err={err:.3f} px  "
+                                             f"inliers={n_inlier_blobs}+{extra_inlier_count}aux={n_inlier_total}  "
                                              f"is_better={is_better}")
 
                             if is_better:
                                 best_solution = {
-                                    "rvec":       rvec_r,
-                                    "tvec":       tvec_r,
-                                    "inliers":    n_inlier_blobs,
-                                    "error":      err,
-                                    "assignment": list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
-                                    "method":     "p3p_systematic",
+                                    "rvec":             rvec_r,
+                                    "tvec":             tvec_r,
+                                    "inliers":          n_inlier_blobs,
+                                    "aux_inliers":      extra_inlier_count,
+                                    "aux_cameras":      aux_cameras_current or None,
+                                    "aux_assignments":  dict(aux_assignments_current) or None,
+                                    "error":            err,
+                                    "assignment":       list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
+                                    "method":           "p3p_systematic",
                                 }
-                                best_inliers    = n_inlier_blobs
-                                best_error      = err
-                                best_orient_err = orient_err
-                                best_tvec_err   = tvec_err
-                                solution_tier   = tier_idx
+                                best_inliers       = n_inlier_blobs
+                                best_inliers_total = n_inlier_total
+                                best_error         = err
+                                best_orient_err    = orient_err
+                                best_tvec_err      = tvec_err
+                                solution_tier      = tier_idx
 
                                 if log_best():
+                                    _aux_dbg = ""
+                                    if aux_cameras_current:
+                                        _aux_dbg = "  aux=[" + ",".join(
+                                            f"cam{c}:{n}" for c, n in aux_cameras_current
+                                        ) + "]"
                                     logger.debug(
-                                        f"  ★ new best — tier={tier_idx} "
+                                        f"  ★ [cam {_cam}] new best — tier={tier_idx} "
                                         f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
-                                        f"sol={sol_i}  inliers={n_inlier_blobs}  err={err:.3f}px  "
-                                        f"vis={weighted_inlier_count:.1f}/{weighted_visible_count:.1f} (raw {n_inlier_blobs}/{n_visible_leds})"
+                                        f"sol={sol_i}  inliers={n_inlier_blobs}+{extra_inlier_count}aux  err={err:.3f}px  "
+                                        f"vis={weighted_inlier_count:.1f}/{weighted_visible_count:.1f} (pooled)"
+                                        + _aux_dbg
                                     )
 
-                                if (best_inliers >= strong_inliers_eff
+                                if (best_inliers_total >= strong_inliers_eff
                                         and best_error <= strong_match_error_px
                                         and (weighted_visible_count == 0 or weighted_inlier_count >= min_vis_coverage * weighted_visible_count)):
                                     strong_found = True
@@ -1041,6 +1562,55 @@ def brute_match(
                 tier_lq_tried[tier_idx] += 1
             if strong_found:
                 break
+
+    # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
+    if (best_solution is not None
+            and other_cameras_blobs
+            and bool(_cfg.get('joint_optimization', True))
+            and best_solution.get('aux_assignments')):
+        _aux_joint = [
+            (_ocam, np.asarray(_oblobs, dtype=np.float32),
+             best_solution['aux_assignments'].get(_ocam.camera_idx, []))
+            for _ocam, _oblobs, _ in other_cameras_blobs
+            if best_solution['aux_assignments'].get(_ocam.camera_idx)
+        ]
+        if _aux_joint:
+            _R_b, _ = cv2.Rodrigues(best_solution['rvec'].reshape(3, 1).astype(np.float32))
+            _T_wc_b = self.T_world_cam.compose(
+                Transform(_R_b.astype(np.float64),
+                          best_solution['tvec'].reshape(3).astype(np.float64))
+            )
+            _prox_thresh = float(_cfg.get('proximity_reprojection_threshold', 2.0))
+            _aux_joint = _filter_aux_by_reprojection(
+                _T_wc_b, _aux_joint, positions, _prox_thresh
+            )
+            _T_joint, _joint_err = _joint_refine_pose(
+                _T_wc_b,
+                self.camera,
+                best_solution['assignment'],
+                blobs,
+                _aux_joint,
+                positions,
+                primary_weight=float(_cfg.get('joint_primary_weight', 2.0)),
+                huber_scale=float(_cfg.get('joint_huber_scale', 1.5)),
+            ) if _aux_joint else (None, None)
+            if _T_joint is not None:
+                _T_prim = self.T_world_cam.inverse().compose(_T_joint)
+                _rv_j = cv2.Rodrigues(_T_prim.R.astype(np.float32))[0]
+                _tv_j = _T_prim.t.astype(np.float32)
+                _lo_b = positions[np.array([l for _, l in best_solution['assignment']], dtype=np.int32)]
+                _li_b = blobs[np.array([b for b, _ in best_solution['assignment']], dtype=np.int32)]
+                _err_j = float(np.mean(np.linalg.norm(
+                    _project_points(_rv_j, _tv_j, _lo_b, K, dc) - _li_b, axis=1,
+                )))
+                logger.debug(
+                    f"[cam {_cam}] Brute joint LM: "
+                    f"primary err {best_solution['error']:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
+                )
+                best_solution['rvec']   = _rv_j
+                best_solution['tvec']   = _tv_j.reshape(3, 1)
+                best_solution['error']  = _err_j
+                best_solution['method'] = best_solution['method'] + '_mc'
 
     total_p3p_tried = sum(tier_p3p_calls)
 
@@ -1065,7 +1635,7 @@ def brute_match(
         for i in range(len(depth_tiers))
     )
     logger.debug(
-        f"Brute-force: {result_str}\n"
+        f"[cam {_cam}] Brute-force: {result_str}\n"
         f"{tier_lines}\n"
         f"  total — {total_p3p_tried:>7} P3P calls"
         f"{dup_line}"
