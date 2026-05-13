@@ -44,17 +44,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.load_config import load_yaml_config, load_json_config
 from src.controller import create_leds_from_config, _compute_geometry
-from src.geometry import tangent_frame
+from src.geometry import tangent_frame, Box3D, Cylinder3D
 from src.visualization import build_alignment_transform, load_trimesh, make_disk_mesh
 from src._visibility import _visible_mask
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Box3D / Cylinder3D are defined in src/geometry.py (imported above).
+#  ↓↓↓  EDIT HERE  ↓↓↓
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ↓↓↓  EDIT HERE: define your handle primitives  ↓↓↓
-# ═══════════════════════════════════════════════════════════════════════════════
-#
+
+# Which controller to inspect: "right" or "left"
+CONTROLLER: str = "left"
+
 # Shift the precise 3-D mesh along X so it sits beside the primitives.
 # Set to 0.0 to overlap both objects for a direct comparison.
 MESH_X_OFFSET: float = 0.0  # metres
@@ -68,7 +69,7 @@ LED_LABEL_RADIUS:        float = 0.0005             # anchor dot radius (0 = inv
 # Debug visibility overlay: set to a camera position (controller-local, metres)
 # to see green=visible / red=occluded rays from that viewpoint.
 # Set to None to disable.
-DEBUG_CAM_POS: Optional[np.ndarray] = None #np.array([0.0, 0.0, 0.0])  # np.array([0.2, -0.2, -0.20])
+DEBUG_CAM_POS: Optional[np.ndarray] = np.array([0.0, 0.0, 0.0])  # np.array([0.2, -0.2, -0.20])
 # Try also: np.array([0.2, 0.2, -0.2]) for diagonal, or None to disable.
 #
 # Tips:
@@ -250,13 +251,17 @@ def main():
     config = load_yaml_config('./config/config.yml')
 
     # ── Load LEDs (controller-local space) ────────────────────────────────────
-    cal       = load_json_config(config["controllers"]["right_controller"]["config_path"])
+    ctrl_cfg  = config["controllers"][f"{CONTROLLER}_controller"]
+    cal       = load_json_config(ctrl_cfg["config_path"])
     leds      = create_leds_from_config(cal)
     positions = np.array([l.position for l in leds], dtype=np.float64)
     normals   = np.array([l.normal   for l in leds], dtype=np.float64)
 
     # ── Full controller geometry (frustum + handle primitives) ───────────────
-    geom        = _compute_geometry(positions, normals)
+    geo_cfg = dict(config.get("geometry", {}))
+    if "handle_primitives" in ctrl_cfg:
+        geo_cfg["handle_primitives"] = ctrl_cfg["handle_primitives"]
+    geom        = _compute_geometry(positions, normals, geo_cfg)
     ring_axis   = geom.ring_axis
     is_inner    = geom.is_inner
     ring_centroid = geom.ring_centroid
@@ -267,6 +272,9 @@ def main():
     z_rel       = geom.z_rel
 
     # ── Load 3-D mesh → transform to controller-local space ──────────────────
+    # The mesh file is the right-controller model.  For the left controller we
+    # derive mesh_verts by negating X after applying the right alignment, because
+    # T_ctrl_left = Rx · T_ctrl_right  (left_ctrl = Rx · right_ctrl pointwise).
     mesh_verts = None
     mesh_faces = None
     mesh_path  = config["visualization"].get("3d_model_path")
@@ -274,10 +282,12 @@ def main():
         try:
             raw_mesh     = load_trimesh(mesh_path)
             T_model_ctrl = build_alignment_transform(
-                config["visualization"]["initial_position_change"]["right"]
+                config["controllers"]["right_controller"]["mesh_alignment"]
             )
             T_ctrl_model = T_model_ctrl.inverse()   # model-space → controller-space
             mesh_verts   = T_ctrl_model.apply(raw_mesh.vertices.astype(np.float64))
+            if CONTROLLER == "left":
+                mesh_verts[:, 0] *= -1
             mesh_faces   = raw_mesh.faces
             print(f"[handle_vis] mesh loaded: {len(mesh_verts)} verts, {len(mesh_faces)} faces")
         except Exception as e:
@@ -286,7 +296,7 @@ def main():
     # ── Rerun init ────────────────────────────────────────────────────────────
     rr.init("handle_model_vis", spawn=True)
     rr.send_blueprint(rrb.Blueprint(
-        rrb.Spatial3DView(name="Controller handle model", origin="/world"),
+        rrb.Spatial3DView(name=f"Controller handle model — {CONTROLLER}", origin="/world"),
         collapse_panels=False,
     ))
 
@@ -318,11 +328,18 @@ def main():
     wall_mm = (R_fc - geom.R_fc_inner) * 1000
     _log_mesh("world/frustum", fv, ff, fc)
 
-    # LEDs: outer = red, inner = blue
+    # ── Visibility from debug camera ──────────────────────────────────────────
+    from src._visibility import _rays_blocked_by_box, _rays_blocked_by_cylinder
+    R_dbg = cv2.Rodrigues(np.array([[np.pi], [0.0], [0.0]]))[0]  # look in -Z (down at ring)
+    t_dbg = np.array([0.0, 0.0, 0.1])   # cam at [0,0,0.1] in controller space
+    cam_world = -(R_dbg.T @ t_dbg)
+    vis = _visible_mask(R_dbg, t_dbg, positions, normals, geom)
+
+    # LEDs: blue = visible, pink = occluded
     led_colors = np.where(
-        is_inner[:, None],
-        np.array([[80, 80, 255]], dtype=np.uint8),
-        np.array([[255, 80, 80]], dtype=np.uint8),
+        vis[:, None],
+        np.array([[80, 80, 255]],  dtype=np.uint8),
+        np.array([[255, 80, 160]], dtype=np.uint8),
     )
     lv, lf, lc = make_disk_mesh(positions, normals, led_colors.astype(np.uint8),
                                  radius=0.0015, surface_offset=0.0)
@@ -372,33 +389,6 @@ def main():
         print(f"[handle_vis] logged {path}")
 
     # ── Debug visibility overlay ──────────────────────────────────────────────
-    # Colors each LED green (visible) or red (occluded) from DEBUG_CAM_POS.
-    # Also draws rays and marks the virtual camera so you can verify the shapes
-    # transferred from PRIMITIVES to _compute_geometry match.
-    # if DEBUG_CAM_POS is not None:
-    from src._visibility import _rays_blocked_by_box, _rays_blocked_by_cylinder
-
-    # R_dbg = cv2.Rodrigues(np.array([[0.26485262], [1.42825671], [-2.72708413]]))[0]
-    # t_dbg = np.array([0.05591549, -0.08879955, 0.29305191])
-
-    R_dbg = cv2.Rodrigues(np.array([[0.0], [0.0], [0.0]]))[0]
-    t_dbg = np.array([0.0, 0.0, -0.1])
-
-    # R_dbg    = np.eye(3, dtype=np.float64)
-    # t_dbg    = -DEBUG_CAM_POS.astype(np.float64)   # cam_world = -R^T t = cam_pos
-    cam_world = -(R_dbg.T @ t_dbg)
-
-    vis = _visible_mask(R_dbg, t_dbg, positions, normals, geom)
-
-    dbg_colors = np.where(
-        vis[:, None],
-        np.array([[0, 220, 80]],  dtype=np.uint8),   # green  = visible
-        np.array([[220, 40, 40]], dtype=np.uint8),   # red    = occluded
-    )
-    dv, df, dc = make_disk_mesh(positions, normals, dbg_colors.astype(np.uint8),
-                                radius=0.003, surface_offset=0.0015)
-    _log_mesh("world/debug/led_visibility", dv, df, dc)
-
     rr.log("world/debug/camera", rr.Points3D(
         positions=[cam_world.tolist()],#[DEBUG_CAM_POS.tolist()],
         colors=[[255, 255, 0]],
@@ -407,8 +397,8 @@ def main():
     ), static=True)
 
     rr.log("world/debug/rays", rr.LineStrips3D(
-        strips=[[cam_world.tolist(), p.tolist()] for p in positions], # [[DEBUG_CAM_POS.tolist(), p.tolist()] for p in positions],
-        colors=[[0, 200, 80] if v else [200, 40, 40] for v in vis],
+        strips=[[cam_world.tolist(), p.tolist()] for p in positions],
+        colors=[[80, 80, 255] if v else [255, 80, 160] for v in vis],
         radii=0.00018,
     ), static=True)
 
