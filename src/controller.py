@@ -45,6 +45,33 @@ def create_leds_from_config(cfg) -> List[ControllerLED]:
 # 2. GEOMETRY — fit frustum + bake handle primitives
 # =========================================================
 
+def _primitives_from_cfg(prim_cfg: dict):
+    """Parse Box3D / Cylinder3D lists from a handle_primitives config dict."""
+    boxes = []
+    for b in prim_cfg.get("boxes", []):
+        axes = np.asarray(b["axes"], float) if "axes" in b else None
+        boxes.append(Box3D(
+            name=b["name"],
+            center=np.array(b["center"], float),
+            half_dims=np.array(b["half_dims"], float),
+            axes=axes,
+            color=b.get("color", [220, 180, 80]),
+        ))
+    cylinders = []
+    for cy in prim_cfg.get("cylinders", []):
+        cylinders.append(Cylinder3D(
+            name=cy["name"],
+            center=np.array(cy["center"], float),
+            axis=np.array(cy["axis"], float),
+            radius=float(cy["radius"]),
+            radius_v=float(cy["radius_v"]) if cy.get("radius_v") is not None else None,
+            half_length=float(cy["half_length"]),
+            angle=float(cy.get("angle", 0.0)),
+            color=cy.get("color", [100, 180, 255]),
+        ))
+    return boxes, cylinders
+
+
 def _compute_geometry(positions: np.ndarray, normals: np.ndarray, geometry_cfg: dict = None) -> ControllerGeometry:
     """
     Fit the LED-ring frustum and bundle it with the hardcoded handle body
@@ -93,42 +120,48 @@ def _compute_geometry(positions: np.ndarray, normals: np.ndarray, geometry_cfg: 
     wall_thickness = float(cfg.get("wall_thickness", 0.007))
     R_fc_inner = R_fc - wall_thickness
 
-    # ── Handle body primitives (values finalized via handle_vis.py) ───────────
-    boxes = [
-        Box3D(
-            name="box_vertical",
-            center=np.array([-0.009, -0.012, -0.015]),
-            half_dims=np.array([0.021, 0.0028, 0.013]),
-            color=[220, 130, 60],
-        ),
-        Box3D(
-            name="box_horizontal",
-            center=np.array([-0.009, -0.029, -0.0048]),
-            half_dims=np.array([0.021, 0.0032, 0.015]),
-            axes=np.column_stack([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).astype(float),
-            color=[130, 60, 220],
-        ),
-    ]
-    cylinders = [
-        Cylinder3D(
-            name="control_panel",
-            center=np.array([-0.008, 0.0, -0.05]),
-            axis=np.array([0.0, 1.0, 0.0]),
-            radius=0.031,
-            radius_v=0.033,
-            half_length=0.017,
-            angle=np.pi / 10,
-            color=[100, 180, 255],
-        ),
-        Cylinder3D(
-            name="handle",
-            center=np.array([0.001, 0.022, -0.098]),
-            axis=np.array([0.0, 1.0, -1.5]),
-            radius=0.021,
-            half_length=0.037,
-            color=[255, 55, 55],
-        ),
-    ]
+    # ── Handle body primitives ────────────────────────────────────────────────
+    # Use config values if provided (right/left selectable), else fall back to
+    # hardcoded right-controller defaults (keeps existing callers working).
+    prim_cfg = cfg.get("handle_primitives")
+    if prim_cfg is not None:
+        boxes, cylinders = _primitives_from_cfg(prim_cfg)
+    else:
+        boxes = [
+            Box3D(
+                name="box_vertical",
+                center=np.array([-0.009, -0.012, -0.015]),
+                half_dims=np.array([0.021, 0.0028, 0.013]),
+                color=[220, 130, 60],
+            ),
+            Box3D(
+                name="box_horizontal",
+                center=np.array([-0.009, -0.029, -0.0048]),
+                half_dims=np.array([0.021, 0.0032, 0.015]),
+                axes=np.column_stack([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).astype(float),
+                color=[130, 60, 220],
+            ),
+        ]
+        cylinders = [
+            Cylinder3D(
+                name="control_panel",
+                center=np.array([-0.008, 0.0, -0.05]),
+                axis=np.array([0.0, 1.0, 0.0]),
+                radius=0.031,
+                radius_v=0.033,
+                half_length=0.017,
+                angle=np.pi / 10,
+                color=[100, 180, 255],
+            ),
+            Cylinder3D(
+                name="handle",
+                center=np.array([0.001, 0.022, -0.098]),
+                axis=np.array([0.0, 1.0, -1.5]),
+                radius=0.021,
+                half_length=0.037,
+                color=[255, 55, 55],
+            ),
+        ]
 
     return ControllerGeometry(
         ring_axis=big_ring_axis,
@@ -546,7 +579,8 @@ class SingleViewTracker:
 
 class TrackingSystem:
     def __init__(self, controllers: List[ControllerModel], cameras: List[Camera],
-                 matching_cfg: dict = None, geometry_cfg: dict = None):
+                 matching_cfg: dict = None, geometry_cfg: dict = None,
+                 geometry_cfg_per_ctrl: dict = None):
 
         self.cameras: Dict[int, Camera] = {cam.camera_idx: cam for cam in cameras}
         self.trackers: Dict[Tuple[str, int], SingleViewTracker] = {}
@@ -554,11 +588,32 @@ class TrackingSystem:
         for ctrl in controllers:
             for cam in cameras:
                 key = (ctrl.name, cam.camera_idx)
-                self.trackers[key] = SingleViewTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geometry_cfg)
+                geo = (geometry_cfg_per_ctrl or {}).get(ctrl.name) or geometry_cfg
+                self.trackers[key] = SingleViewTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geo)
 
         self._matching_cfg:       dict                       = matching_cfg or {}
         self._designated_primary: Dict[str, Optional[int]]  = {}
         self._handoff_counter:    Dict[str, Dict[int, int]] = {}
+
+    @staticmethod
+    def _strip_matched(
+        cam_pool: Dict[int, np.ndarray],
+        radii_pool: Dict[int, Optional[np.ndarray]],
+        solution: Dict,
+        primary_cam_id: int,
+    ) -> None:
+        """Remove blobs consumed by this controller's solution from the shared pools."""
+        def _remove(cam_id: int, indices: set) -> None:
+            if not indices or cam_id not in cam_pool or cam_pool[cam_id] is None:
+                return
+            keep = [i for i in range(len(cam_pool[cam_id])) if i not in indices]
+            cam_pool[cam_id] = cam_pool[cam_id][keep]
+            if radii_pool.get(cam_id) is not None:
+                radii_pool[cam_id] = radii_pool[cam_id][keep]
+
+        _remove(primary_cam_id, {b for b, _ in solution.get("assignment", [])})
+        for cam_id, pairs in (solution.get("aux_assignments") or {}).items():
+            _remove(cam_id, {b for b, _ in pairs})
 
     def update(
         self,
@@ -576,6 +631,10 @@ class TrackingSystem:
               run brute_match once, and pass every other camera's blobs as
               other_cameras_blobs so the existing aux validation scores them.
 
+        Controllers that are already tracking run first; their matched blobs are
+        removed from the shared pool before cold-starting controllers search,
+        reducing false-positive P3P candidates during re-acquisition.
+
         Returns {ctrl_name: solution_or_None}.  The solution dict gains a
         "primary_cam" key with the index of the camera that produced the pose.
         """
@@ -583,19 +642,38 @@ class TrackingSystem:
 
         ctrl_names: set = {ctrl for ctrl, _ in self.trackers}
 
-        for ctrl_name in ctrl_names:
+        # Tracking controllers first → their blobs are stripped before cold-start search
+        def _has_prior(name: str) -> bool:
+            return any(
+                t.prev_pose is not None
+                for (cname, _), t in self.trackers.items()
+                if cname == name
+            )
+        ordered = sorted(ctrl_names, key=lambda n: 0 if _has_prior(n) else 1)
+
+        # Mutable per-camera pools; tracking controllers consume their blobs first
+        cam_pool: Dict[int, np.ndarray] = {
+            cid: blobs.copy() if blobs is not None else None
+            for cid, blobs in observations_per_camera.items()
+        }
+        radii_pool: Dict[int, Optional[np.ndarray]] = {
+            cid: (r.copy() if r is not None else None)
+            for cid, r in (radii_per_camera or {}).items()
+        }
+
+        for ctrl_name in ordered:
             ctrl_pairs: List[Tuple[int, "SingleViewTracker"]] = [
                 (cam_id, tracker)
                 for (cname, cam_id), tracker in self.trackers.items()
                 if cname == ctrl_name
             ]
 
-            # Cameras that delivered blob observations this frame
+            # Cameras that delivered blob observations this frame (draw from mutable pool)
             available: Dict[int, np.ndarray] = {
-                cam_id: observations_per_camera[cam_id]
+                cam_id: cam_pool[cam_id]
                 for cam_id, _ in ctrl_pairs
-                if cam_id in observations_per_camera
-                   and observations_per_camera[cam_id] is not None
+                if cam_id in cam_pool
+                   and cam_pool[cam_id] is not None
             }
 
             if not available:
@@ -624,11 +702,10 @@ class TrackingSystem:
 
             primary_tracker = tracker_map[primary_cam_id]
             primary_blobs   = available[primary_cam_id]
-            primary_radii   = radii_per_camera.get(primary_cam_id) if radii_per_camera else None
+            primary_radii   = radii_pool.get(primary_cam_id)
 
             other_cameras_blobs = [
-                (self.cameras[cid], available[cid],
-                 radii_per_camera.get(cid) if radii_per_camera else None)
+                (self.cameras[cid], available[cid], radii_pool.get(cid))
                 for cid in available
                 if cid != primary_cam_id
             ]
@@ -641,6 +718,7 @@ class TrackingSystem:
 
             if solution is not None:
                 solution["primary_cam"] = primary_cam_id
+                self._strip_matched(cam_pool, radii_pool, solution, primary_cam_id)
 
                 # State propagation: push T_world_ctrl into every non-primary tracker
                 # so any camera can be promoted to primary without cold-start brute search.

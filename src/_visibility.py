@@ -367,12 +367,10 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
             # the trailing 1-EPS sentinel so only intervals bounded by real crossings
             # on both sides can trigger blocking.
             t_cands_sorted = sorted(t_cands)
-            # if led_in_wall[i]:
-            #     intervals = [EPS] + t_cands_sorted
-            # else:
-            #     intervals = [EPS] + t_cands_sorted + [1.0 - EPS]
-
-            intervals = [EPS] + t_cands_sorted + [1.0 - EPS]
+            if led_in_wall[i]:
+                intervals = [EPS] + t_cands_sorted
+            else:
+                intervals = [EPS] + t_cands_sorted + [1.0 - EPS]
 
             for j in range(len(intervals) - 1):
                 t_mid     = 0.5 * (intervals[j] + intervals[j + 1])
