@@ -268,6 +268,7 @@ def proximity_match(
     geom = self._geometry
     _cfg = getattr(self, '_matching_cfg', None) or {}
     _cam = self.camera.camera_idx
+    _ctrl = self.model.name.replace("_controller", "")
     facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',     86.0))
     reprojection_threshold = float(_cfg.get('proximity_reprojection_threshold', 2.0))
     min_inliers            = int(  _cfg.get('min_inliers',               4))
@@ -397,13 +398,13 @@ def proximity_match(
                 logger.debug(f"  LED {lid}: blob {j} → nearest ({best_dist:.1f}px)")
 
     logger.debug(
-        f"[cam {_cam}] Proximity snap: {len(locked_pairs)}/{len(blobs)} blobs locked "
+        f"[{_ctrl} | cam {_cam}] Proximity snap: {len(locked_pairs)}/{len(blobs)} blobs locked "
         f"({n_id_locked} ID-path, {len(locked_pairs) - n_id_locked} nearest) "
         f"of {len(prior_lids)} prior LEDs"
         + ("  [size filter active]" if blob_radii is not None else "")
     )
     if len(locked_pairs) < min_inliers:
-        logger.debug(f"[cam {_cam}] Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
         return None
 
     aux_snapped_per_cam: Dict[int, List] = {}
@@ -461,7 +462,7 @@ def proximity_match(
             if n_expanded:
                 did_expand = True
                 logger.debug(
-                    f"[cam {_cam}] Proximity expansion: +{n_expanded} via Hungarian "
+                    f"[{_ctrl} | cam {_cam}] Proximity expansion: +{n_expanded} via Hungarian "
                     f"(coverage {len(locked_pairs) - n_expanded}/{n_model_visible} "
                     f"→ {len(locked_pairs)}/{n_model_visible})"
                 )
@@ -474,7 +475,7 @@ def proximity_match(
         reprojection_px=reprojection_threshold,
     )
     if not ok:
-        logger.debug(f"[cam {_cam}] Proximity: RANSAC failed → None")
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC failed → None")
         return None
 
     # Keep all RANSAC inliers — the visibility check is an approximation and
@@ -482,7 +483,7 @@ def proximity_match(
     final_pairs = [locked_pairs[k] for k in ransac_idx]
 
     if len(final_pairs) < min_inliers:
-        logger.debug(f"[cam {_cam}] Proximity: too few inliers ({len(final_pairs)} < {min_inliers}) → None")
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few inliers ({len(final_pairs)} < {min_inliers}) → None")
         return None
 
     lo_f  = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
@@ -576,7 +577,7 @@ def proximity_match(
                                 _n_exp_i += 1
                         if is_deep() and _n_exp_i:
                             logger.debug(
-                                f"[cam {_cam}] Proximity aux expansion cam{_ocam.camera_idx}: "
+                                f"[{_ctrl} | cam {_cam}] Proximity aux expansion cam{_ocam.camera_idx}: "
                                 f"+{_n_exp_i} via Hungarian (refined pose, "
                                 f"coverage {len(_pairs_i) - _n_exp_i}/{_n_vis_i_r}"
                                 f"→{len(_pairs_i)}/{_n_vis_i_r})"
@@ -585,7 +586,7 @@ def proximity_match(
             aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
             if is_deep() and _pairs_i:
                 logger.debug(
-                    f"[cam {_cam}] Proximity aux snap cam{_ocam.camera_idx}: "
+                    f"[{_ctrl} | cam {_cam}] Proximity aux snap cam{_ocam.camera_idx}: "
                     f"{len(_pairs_i)} pairs (refined pose)"
                     + ("  [size filter active]" if _oradii is not None else "")
                 )
@@ -630,7 +631,7 @@ def proximity_match(
                 _proj_j = _project_points(_rv_j, _tv_j, lo_f, K, dc)
                 _err_j = float(np.mean(np.linalg.norm(_proj_j - li_f, axis=1)))
                 logger.debug(
-                    f"[cam {_cam}] Proximity joint LM: "
+                    f"[{_ctrl} | cam {_cam}] Proximity joint LM: "
                     f"primary err {error:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
                 )
                 rvec, tvec, error = _rv_j, _tv_j, _err_j
@@ -639,7 +640,7 @@ def proximity_match(
     _aux_log = ""
     if aux_cameras_result:
         _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result if n > 0) + "]"
-    logger.debug(f"[cam {_cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}")
+    logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}")
     return {
         "rvec":       rvec,
         "tvec":       tvec,
@@ -714,6 +715,8 @@ def prior_constrained_match(
 
     K  = self.camera.camera_matrix
     dc = self.camera.dist_coeffs
+    _cam = self.camera.camera_idx
+    _ctrl = self.model.name.replace("_controller", "")
 
     _cfg = getattr(self, '_matching_cfg', None) or {}
     reprojection_threshold = float(_cfg.get('reprojection_threshold', 2.0))
@@ -961,7 +964,7 @@ def prior_constrained_match(
     if aux_cameras_result:
         _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result) + "]"
     logger.debug(
-        f"prior_constrained ({mode}): OK  pairs={len(all_primary)}  err={error:.2f}px"
+        f"[{_ctrl} | cam {_cam}] prior_constrained ({mode}): OK  pairs={len(all_primary)}  err={error:.2f}px"
         + (f"  n_aux_solve={n_aux_pre}" if n_aux_pre > 0 else "")
         + _aux_log
     )
@@ -1017,6 +1020,7 @@ def brute_match(
     """
     _cfg = getattr(self, '_matching_cfg', None) or {}
     _cam = self.camera.camera_idx
+    _ctrl = self.model.name.replace("_controller", "")
     if _cfg:
         depth_tiers            = tuple(tuple(t) for t in _cfg.get('depth_tiers', depth_tiers))
         p4_threshold_px        = float(_cfg.get('p4_threshold_px',        p4_threshold_px))
@@ -1545,10 +1549,11 @@ def brute_match(
                                             f"cam{c}:{n}" for c, n in aux_cameras_current
                                         ) + "]"
                                     logger.debug(
-                                        f"  ★ [cam {_cam}] new best — tier={tier_idx} "
+                                        f"  ★ [{_ctrl} | cam {_cam}] new best — tier={tier_idx} "
                                         f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
                                         f"sol={sol_i}  inliers={n_inlier_blobs}+{extra_inlier_count}aux  err={err:.3f}px  "
                                         f"vis={weighted_inlier_count:.1f}/{weighted_visible_count:.1f} (pooled)"
+                                        f"  matched={n_inlier_blobs}/{n_visible_leds}"
                                         + _aux_dbg
                                     )
 
@@ -1604,7 +1609,7 @@ def brute_match(
                     _project_points(_rv_j, _tv_j, _lo_b, K, dc) - _li_b, axis=1,
                 )))
                 logger.debug(
-                    f"[cam {_cam}] Brute joint LM: "
+                    f"[{_ctrl} | cam {_cam}] Brute joint LM: "
                     f"primary err {best_solution['error']:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
                 )
                 best_solution['rvec']   = _rv_j
@@ -1635,7 +1640,7 @@ def brute_match(
         for i in range(len(depth_tiers))
     )
     logger.debug(
-        f"[cam {_cam}] Brute-force: {result_str}\n"
+        f"[{_ctrl} | cam {_cam}] Brute-force: {result_str}\n"
         f"{tier_lines}\n"
         f"  total — {total_p3p_tried:>7} P3P calls"
         f"{dup_line}"

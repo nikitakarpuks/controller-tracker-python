@@ -43,7 +43,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.load_config import load_yaml_config, load_json_config
-from src.controller import create_leds_from_config, _compute_geometry
+from src.controller import create_leds_from_config, _compute_geometry, mirror_primitives
 from src.geometry import tangent_frame, Box3D, Cylinder3D
 from src.visualization import build_alignment_transform, load_trimesh, make_disk_mesh
 from src._visibility import _visible_mask
@@ -54,7 +54,7 @@ from src._visibility import _visible_mask
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Which controller to inspect: "right" or "left"
-CONTROLLER: str = "left"
+CONTROLLER: str = "right"
 
 # Shift the precise 3-D mesh along X so it sits beside the primitives.
 # Set to 0.0 to overlap both objects for a direct comparison.
@@ -259,8 +259,11 @@ def main():
 
     # ── Full controller geometry (frustum + handle primitives) ───────────────
     geo_cfg = dict(config.get("geometry", {}))
+    right_prim = config["controllers"]["right_controller"].get("handle_primitives")
     if "handle_primitives" in ctrl_cfg:
         geo_cfg["handle_primitives"] = ctrl_cfg["handle_primitives"]
+    elif CONTROLLER == "left" and right_prim is not None:
+        geo_cfg["handle_primitives"] = mirror_primitives(right_prim)
     geom        = _compute_geometry(positions, normals, geo_cfg)
     ring_axis   = geom.ring_axis
     is_inner    = geom.is_inner

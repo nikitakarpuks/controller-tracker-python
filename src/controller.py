@@ -1,3 +1,4 @@
+import copy
 import cv2
 import numpy as np
 from loguru import logger
@@ -44,6 +45,20 @@ def create_leds_from_config(cfg) -> List[ControllerLED]:
 # =========================================================
 # 2. GEOMETRY — fit frustum + bake handle primitives
 # =========================================================
+
+def mirror_primitives(prim_cfg: dict) -> dict:
+    """Return a YZ-plane (X-reflected) copy of a handle_primitives config block."""
+    p = copy.deepcopy(prim_cfg)
+    for b in p.get("boxes", []):
+        b["center"][0] = -b["center"][0]
+        if "axes" in b:
+            for row in b["axes"]:
+                row[0] = -row[0]
+    for cy in p.get("cylinders", []):
+        cy["center"][0] = -cy["center"][0]
+        cy["angle"] = -cy.get("angle", 0.0)
+    return p
+
 
 def _primitives_from_cfg(prim_cfg: dict):
     """Parse Box3D / Cylinder3D lists from a handle_primitives config dict."""
@@ -399,6 +414,7 @@ class SingleViewTracker:
         blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
         cam_idx = self.camera.camera_idx
+        ctrl_name = self.model.name.replace("_controller", "")
 
         # Per-axis jump thresholds from config (fall back to scalar defaults if absent).
         _cfg = self._matching_cfg
@@ -459,7 +475,7 @@ class SingleViewTracker:
 
             # --- Fallback: brute only when proximity found no solution ---
             if solution is None and n_blobs >= 4:
-                logger.debug(f"[cam {cam_idx} | track] proximity → None, running brute fallback")
+                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity → None, running brute fallback")
                 brute = self.brute_match(blobs, pose_prior=predicted_pose,
                                          other_cameras_blobs=other_cameras_blobs,
                                          blob_radii=blob_radii)
@@ -469,7 +485,7 @@ class SingleViewTracker:
         else:
             # --- No prior pose: brute-force re-acquisition ---
             if n_blobs >= 4:
-                logger.debug(f"[cam {cam_idx} | track] no prev_pose → cold-start brute")
+                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] no prev_pose → cold-start brute")
                 solution = self.brute_match(blobs, other_cameras_blobs=other_cameras_blobs,
                                             blob_radii=blob_radii)
 
@@ -484,7 +500,7 @@ class SingleViewTracker:
                         max_angle_deg=60.0,
                         **_jump_kw,
                     ):
-                        logger.debug(f"[cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
+                        logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
                         solution = None
 
         # ------------------------------------------------------------------
@@ -497,7 +513,7 @@ class SingleViewTracker:
                 and self.prev_pose is not None
                 and self.prev_assignment is not None
                 and 2 <= n_blobs <= 3):
-            logger.debug(f"[cam {cam_idx} | track] n_blobs={n_blobs} + prior → prior_constrained_match")
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] n_blobs={n_blobs} + prior → prior_constrained_match")
             solution = self.prior_constrained_match(
                 blobs, predicted_pose,
                 prior_assignment=self.prev_assignment,
@@ -515,7 +531,7 @@ class SingleViewTracker:
                 rvec_p, tvec_p,
                 **_jump_kw,
             ):
-                print(f"[cam {cam_idx} | tracking] Pose jump detected "
+                print(f"[{ctrl_name} | cam {cam_idx} | tracking] Pose jump detected "
                       f"(method={solution.get('method','?')}, "
                       f"err={solution['error']:.2f} px) — "
                       f"attempting brute recovery.")
@@ -535,7 +551,7 @@ class SingleViewTracker:
         # ------------------------------------------------------------------
         if solution is not None and solution["error"] < 5.0:
             logger.debug(
-                f"[cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
+                f"[{ctrl_name} | cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
             )
             self.prev_prev_pose  = self.prev_pose  # shift window for next-frame extrapolation
@@ -561,9 +577,9 @@ class SingleViewTracker:
 
         # Tracking lost — clear velocity history and blob ID state so re-acquisition starts fresh
         if solution is not None:
-            logger.debug(f"[cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds 5.0px threshold")
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds 5.0px threshold")
         else:
-            logger.debug(f"[cam {cam_idx} | track] rejected — no solution found")
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
         self.consecutive_failures += 1
         self.prev_pose           = None
         self.prev_prev_pose      = None
@@ -599,10 +615,13 @@ class TrackingSystem:
     def _strip_matched(
         cam_pool: Dict[int, np.ndarray],
         radii_pool: Dict[int, Optional[np.ndarray]],
+        pool_orig_idx: Dict[int, List[int]],
         solution: Dict,
         primary_cam_id: int,
     ) -> None:
-        """Remove blobs consumed by this controller's solution from the shared pools."""
+        """Remove blobs consumed by this controller from the shared pools.
+        Also updates pool_orig_idx so subsequent controllers can remap their
+        pool-relative blob IDs back to the original observation indices."""
         def _remove(cam_id: int, indices: set) -> None:
             if not indices or cam_id not in cam_pool or cam_pool[cam_id] is None:
                 return
@@ -610,6 +629,8 @@ class TrackingSystem:
             cam_pool[cam_id] = cam_pool[cam_id][keep]
             if radii_pool.get(cam_id) is not None:
                 radii_pool[cam_id] = radii_pool[cam_id][keep]
+            if cam_id in pool_orig_idx:
+                pool_orig_idx[cam_id] = [pool_orig_idx[cam_id][k] for k in keep]
 
         _remove(primary_cam_id, {b for b, _ in solution.get("assignment", [])})
         for cam_id, pairs in (solution.get("aux_assignments") or {}).items():
@@ -659,6 +680,14 @@ class TrackingSystem:
         radii_pool: Dict[int, Optional[np.ndarray]] = {
             cid: (r.copy() if r is not None else None)
             for cid, r in (radii_per_camera or {}).items()
+        }
+        # Maps current pool index → original observation index per camera.
+        # Stays in sync with cam_pool so later controllers can remap their
+        # pool-relative blob IDs to original indices for visualization.
+        pool_orig_idx: Dict[int, List[int]] = {
+            cid: list(range(len(blobs)))
+            for cid, blobs in observations_per_camera.items()
+            if blobs is not None
         }
 
         for ctrl_name in ordered:
@@ -718,7 +747,30 @@ class TrackingSystem:
 
             if solution is not None:
                 solution["primary_cam"] = primary_cam_id
-                self._strip_matched(cam_pool, radii_pool, solution, primary_cam_id)
+
+                # Save pool-relative blob IDs for stripping (must stay pool-relative).
+                _pool_rel = {
+                    "assignment":      list(solution["assignment"]),
+                    "aux_assignments": dict(solution.get("aux_assignments") or {}),
+                }
+
+                # Remap pool-relative blob IDs → original observation indices so
+                # visualization can index directly into the unstripped blob arrays.
+                _orig_p = pool_orig_idx.get(primary_cam_id, [])
+                if _orig_p:
+                    solution["assignment"] = [
+                        (_orig_p[b], lid) for b, lid in solution["assignment"]
+                    ]
+                _aux_asgns_raw = solution.get("aux_assignments") or {}
+                if _aux_asgns_raw:
+                    solution["aux_assignments"] = {
+                        cam_id: [(_orig_a[b], lid) for b, lid in pairs]
+                        for cam_id, pairs in _aux_asgns_raw.items()
+                        if (_orig_a := pool_orig_idx.get(cam_id, []))
+                    }
+
+                # Strip using pool-relative IDs, then update pool_orig_idx.
+                self._strip_matched(cam_pool, radii_pool, pool_orig_idx, _pool_rel, primary_cam_id)
 
                 # State propagation: push T_world_ctrl into every non-primary tracker
                 # so any camera can be promoted to primary without cold-start brute search.

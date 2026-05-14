@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from pathlib import Path
+from loguru import logger
 
 
 def _mean_knn_distances(centroids, k):
@@ -160,6 +161,14 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
     split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
 
+    _dbbox = cfg.get("debug_bbox")  # [x1, y1, x2, y2] or null
+
+    def _in_bbox(cx, cy):
+        if _dbbox is None:
+            return False
+        x1, y1, x2, y2 = _dbbox
+        return x1 <= cx <= x2 and y1 <= cy <= y2
+
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
     _, mask = cv2.threshold(image, pixel_threshold, 255, cv2.THRESH_BINARY)
 
@@ -173,18 +182,29 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
+        x_b, y_b, w_b, h_b = cv2.boundingRect(cnt)
+        bx, by = x_b + w_b / 2.0, y_b + h_b / 2.0  # position proxy before centroid is known
 
         # ── Reject by area ────────────────────────────────────────────────────
-        if area < min_area or area > max_area:
+        if area < min_area:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} < min_area {min_area}")
+            continue
+        if area > max_area:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} > max_area {max_area}")
             continue
 
         # ── Reject 1×1 blobs (pure noise) ────────────────────────────────────
-        x_b, y_b, w_b, h_b = cv2.boundingRect(cnt)
         if w_b == 1 and h_b == 1:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: 1×1 blob")
             continue
 
         # ── Reject blobs that are too large to be LEDs ───────────────────────
         if w_b > max_wh or h_b > max_wh:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: size {w_b}×{h_b} > max_wh {max_wh}")
             continue
 
         # ── Build pixel mask for this blob ───────────────────────────────────
@@ -196,12 +216,17 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         # collects faint blobs but discards purely-dim background regions.
         roi_pixels = image[blob_mask > 0]
         if roi_pixels.size == 0 or int(roi_pixels.max()) < required_threshold:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: max pixel "
+                             f"{int(roi_pixels.max()) if roi_pixels.size else 0} < required_threshold {required_threshold}")
             continue
 
         # ── Intensity-weighted centroid (greysum, 1-based coords) ─────────────
         weights = intensities * (blob_mask > 0)
         total_weight = np.sum(weights)
         if total_weight == 0:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: zero total weight")
             continue
 
         ys, xs = np.nonzero(blob_mask)
@@ -254,12 +279,27 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
 
     # ── 3. Distance-based outlier filter ─────────────────────────────────────
     keep_mask = None
+    mean_nn   = None
     if len(centroids_arr) > neighbor_k:
-        mean_nn = _mean_knn_distances(centroids_arr, neighbor_k)
+        mean_nn   = _mean_knn_distances(centroids_arr, neighbor_k)
         keep_mask = mean_nn <= outlier_factor * np.median(mean_nn)
 
     kept_indices     = np.where(keep_mask)[0] if keep_mask is not None else np.arange(len(centroids_arr))
     rejected_indices = np.where(~keep_mask)[0] if keep_mask is not None else np.array([], dtype=int)
+
+    if _dbbox is not None:
+        if mean_nn is not None:
+            med_nn = float(np.median(mean_nn))
+            for i in rejected_indices:
+                cx_r, cy_r = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
+                if _in_bbox(cx_r, cy_r):
+                    logger.debug(f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: outlier filter  "
+                                 f"mean_nn={float(mean_nn[i]):.1f} > {outlier_factor}×median({med_nn:.1f})")
+        for i in kept_indices:
+            cx_k, cy_k = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
+            if _in_bbox(cx_k, cy_k):
+                logger.debug(f"[blob_debug] ({cx_k:.1f},{cy_k:.1f}) survived all stages → kept")
+
     filtered_centroids  = centroids_arr[kept_indices]
     filtered_contours   = [blob_contours[i] for i in kept_indices]
     filtered_is_split   = blob_is_split_arr[kept_indices] if len(blob_is_split_arr) else np.zeros(0, dtype=bool)
