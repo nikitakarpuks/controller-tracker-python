@@ -366,7 +366,7 @@ class ControllerAnimatorRerun:
         controllers_vis: {ctrl_name: {"positions": np.ndarray,   # model-frame LED positions
                                       "normals":   np.ndarray,   # model-frame LED normals
                                       "T_model_ctrl": Transform, # controller→model transform
-                                      "side": "right"|"left"}}   # for mesh X-flip
+                                      "side": "right"|"left"}}   # informational only
         """
         self.vis_cfg         = vis_cfg if vis_cfg is not None else dict(VIS_CONFIG)
         self._matching_cfg   = matching_cfg or {}
@@ -377,13 +377,11 @@ class ControllerAnimatorRerun:
         self._mesh_faces = raw_mesh.faces
         self._mesh_vertex_normals = (raw_mesh.vertex_normals
                                      if hasattr(raw_mesh, "vertex_normals") else None)
-        # Pre-compute per-controller mesh vertices (X-flipped for left).
+        # T_model_ctrl_left already embeds the X-reflection (Rx factor),
+        # so model-space vertices are the same STP verts for both controllers.
         self._mesh_verts: dict = {}
-        for ctrl_name, cv in controllers_vis.items():
-            verts = raw_mesh.vertices.astype(np.float32).copy()
-            if cv.get("side") == "left":
-                verts[:, 0] *= -1
-            self._mesh_verts[ctrl_name] = verts
+        for ctrl_name in controllers_vis:
+            self._mesh_verts[ctrl_name] = raw_mesh.vertices.astype(np.float32).copy()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -496,7 +494,7 @@ class ControllerAnimatorRerun:
                 "ctrl_positions":  ctrl_pos,
                 "ctrl_normals":    ctrl_nrm,
                 "T_model_ctrl":    T_model_ctrl,
-                "geom":            _compute_geometry(ctrl_pos, ctrl_nrm),
+                "geom":            _compute_geometry(ctrl_pos, ctrl_nrm, cv.get("geometry_cfg")),
             }
 
         self._log_static_cameras(cameras)
@@ -772,7 +770,7 @@ class ControllerAnimatorRerun:
             normals_disp = (R_disp @ model_normals.T).T
 
             # ── Visibility mask ─────────────────────────────────────────────
-            T_cam_ctrl = T_cam_model.compose(cs["T_model_ctrl"].inverse())
+            T_cam_ctrl = T_cam_model.compose(cs["T_model_ctrl"])
             vis_mask = _visible_mask(
                 T_cam_ctrl.R, T_cam_ctrl.t,
                 cs["ctrl_positions"], cs["ctrl_normals"],
@@ -927,13 +925,18 @@ class ControllerAnimatorRerun:
             error_values    = []
             error_label_pts = []
 
-            rvec_model, _ = cv2.Rodrigues(R_cam)
+            # T_cam_ctrl has det=+1 (proper rotation); T_cam_model.R may have det=-1
+            # for the left controller (T_model_ctrl embeds an Rx reflection), so
+            # cv2.Rodrigues(R_cam) would give garbage.  Use ctrl_positions + T_cam_ctrl.
+            rvec_ctrl, _ = cv2.Rodrigues(T_cam_ctrl.R.astype(np.float32))
+            tvec_ctrl    = T_cam_ctrl.t.astype(np.float32)
+            ctrl_positions = cs["ctrl_positions"]
             if assignment and pts_plane_disp is not None:
                 matched_lids_ord = [lid for _, lid in assignment]
                 proj_matched, _ = cv2.projectPoints(
-                    model_positions[matched_lids_ord].astype(np.float32),
-                    rvec_model,
-                    t_cam.astype(np.float32).reshape(3, 1),
+                    ctrl_positions[matched_lids_ord].astype(np.float32),
+                    rvec_ctrl,
+                    tvec_ctrl.reshape(3, 1),
                     camera.camera_matrix, camera.dist_coeffs,
                 )
                 proj_matched = proj_matched.reshape(-1, 2)
@@ -1062,11 +1065,14 @@ class ControllerAnimatorRerun:
                 _aux_error_z     = frustum_z - error_z_offset
 
                 if _aux_blobs_arr is not None:
-                    _rv_aux, _ = cv2.Rodrigues(_T_aux_model.R.astype(np.float32))
-                    _tv_aux    = _T_aux_model.t.astype(np.float32).reshape(3, 1)
+                    # _T_aux_model.R may have det=-1 (improper rotation for left controller).
+                    # Recover proper-rotation T_aux_ctrl by composing with T_model_ctrl.
+                    _T_aux_ctrl   = _T_aux_model.compose(cs["T_model_ctrl"])
+                    _rv_aux, _    = cv2.Rodrigues(_T_aux_ctrl.R.astype(np.float32))
+                    _tv_aux       = _T_aux_ctrl.t.astype(np.float32).reshape(3, 1)
                     _aux_lids_ord = [_lid for _, _lid in _aux_pairs]
                     _proj_px_aux, _ = cv2.projectPoints(
-                        model_positions[_aux_lids_ord].astype(np.float32),
+                        ctrl_positions[_aux_lids_ord].astype(np.float32),
                         _rv_aux, _tv_aux,
                         _aux_cam.camera_matrix, _aux_cam.dist_coeffs,
                     )

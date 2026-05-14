@@ -1,6 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/1_r_ctrl_all_basic_moves/data/a"
-#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/interesting_cases/very_close"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/4_MAIN_complex_moves_hand_ctrl_occlusions_occluded_spin/simple"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -26,7 +25,7 @@ controllers:
       boxes:
         - name: box_vertical
           center: [-0.009, -0.012, -0.015]
-          half_dims: [0.021, 0.0028, 0.013]
+          half_dims: [0.022, 0.0028, 0.013]
           color: [220, 130, 60]
         - name: box_horizontal
           center: [-0.009, -0.029, -0.0048]
@@ -49,45 +48,20 @@ controllers:
           half_length: 0.037
           color: [255, 55, 55]
   left_controller:
-    enabled: true
+    enabled: false
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
-    # (code negates mesh_verts[:,0] after applying right_controller.mesh_alignment)
-    handle_primitives:       # X-reflected copy of right; refine with handle_vis.py
-      boxes:
-        - name: box_vertical
-          center: [0.009, -0.012, -0.015]
-          half_dims: [0.021, 0.0028, 0.013]
-          color: [220, 130, 60]
-        - name: box_horizontal
-          center: [0.009, -0.029, -0.0048]
-          half_dims: [0.021, 0.0032, 0.015]
-          axes: [[-1, 0, 0], [0, 0, 1], [0, -1, 0]]  # X column negated
-          color: [130, 60, 220]
-      cylinders:
-        - name: control_panel
-          center: [0.008, 0.0, -0.05]
-          axis: [0.0, 1.0, 0.0]
-          radius: 0.031
-          radius_v: 0.033
-          half_length: 0.017
-          angle: -0.31416   # negated
-          color: [100, 180, 255]
-        - name: handle
-          center: [-0.001, 0.022, -0.098]
-          axis: [0.0, 1.0, -1.5]
-          radius: 0.021
-          half_length: 0.037
-          color: [255, 55, 55]
+    # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
 blob_detection:
-  min_threshold: 5       # pixels >= this are included in a blob
+  min_threshold: 6       # pixels >= this are included in a blob
   required_threshold: 12  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 4
-  max_area: 300
+  max_area: 250
   max_wh: 35              # max bounding-box width or height in pixels
   min_split_dist: 4.0
   split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
+  debug_bbox: null        # [x1, y1, x2, y2] — log why any centroid inside this pixel bbox was dropped
 
 geometry:
   z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
@@ -113,7 +87,7 @@ matching:
   strong_match_error_px: 1.5
   min_vis_coverage: 0.7
   rng_seed: 42
-  use_proximity_match: true          # set to false to skip proximity match and always use brute force
+  use_proximity_match: false          # set to false to skip proximity match and always use brute force
   blob_tracking_snap_px: 25.0       # max pixel distance to carry a led_id from prev blob to current blob
   led_radius_mm: 3.0                # physical LED emitter radius; used to compute depth-scaled snap threshold
   proximity_snap_factor: 4.0        # snap_px = focal * (led_radius_mm/1000) / depth_m * this factor

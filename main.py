@@ -12,7 +12,7 @@ from tqdm import tqdm
 from src import debug_config
 from src.blobs_detection import get_centroids
 from src.camera import Camera
-from src.controller import ControllerModel, TrackingSystem, create_leds_from_config
+from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.debug_config import DebugMode
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data
@@ -88,6 +88,10 @@ def main():
         geo = dict(config.get("geometry", {}))
         if "handle_primitives" in ctrl_cfg:
             geo["handle_primitives"] = ctrl_cfg["handle_primitives"]
+        elif ctrl_key == "left_controller":
+            right_prim = right_ctrl_cfg.get("handle_primitives")
+            if right_prim is not None:
+                geo["handle_primitives"] = mirror_primitives(right_prim)
         geo_cfg_per_ctrl[ctrl_key] = geo
 
     tracking_system = TrackingSystem(
@@ -194,6 +198,7 @@ def main():
                 "normals":      nrm,
                 "T_model_ctrl": T,
                 "side":         side,
+                "geometry_cfg": geo_cfg_per_ctrl[ctrl_name],
             }
         animator = ControllerAnimatorRerun(
             config["visualization"]["3d_model_path"],
