@@ -61,6 +61,7 @@ blob_detection:
   max_wh: 35              # max bounding-box width or height in pixels
   min_split_dist: 4.0
   split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
+  min_circularity: 0.5      # 4π·area/perimeter² must exceed this after splitting; rejects elongated non-circular shapes
   area_outlier_k: 6.0      # blob area > median(area) + this * MAD(area) is rejected before matching
   outlier_factor: 3.0      # blob with 1-NN distance > this * median(1-NN) is rejected as spatially isolated noise
   debug_bbox: null        # [x1, y1, x2, y2] — log why any centroid inside this pixel bbox was dropped
