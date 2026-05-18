@@ -4,19 +4,6 @@ from pathlib import Path
 from loguru import logger
 
 
-def _mean_knn_distances(centroids, k):
-    """For each point return mean Euclidean distance to its k nearest neighbors."""
-    n = len(centroids)
-    diff = centroids[:, None, :] - centroids[None, :, :]   # (n, n, 2)
-    dists = np.sqrt((diff ** 2).sum(axis=-1))               # (n, n)
-    mean_nn = np.empty(n, dtype=np.float32)
-    for i in range(n):
-        row = dists[i].copy()
-        row[i] = np.inf                     # exclude self
-        mean_nn[i] = np.sort(row)[:k].mean()
-    return mean_nn
-
-
 def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     """
     Find local maxima within a blob (pixel coords given by ys, xs).
@@ -133,12 +120,21 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     prevent the first row/column from never contributing — the result is then
     shifted back to 0-based.
 
-    Distance-based outlier filter
-    ─────────────────────────────
-    After detection, each blob's mean distance to its neighbor_k nearest
-    neighbors is computed.  Blobs whose mean exceeds outlier_factor × median
-    of all such means are dropped as spatially isolated noise.
-    Skipped when fewer than neighbor_k + 1 blobs are detected.
+    Outlier filters (applied after splitting)
+    ─────────────────────────────────────────
+    Two sequential stages, both depth-invariant:
+
+    1. Area filter — rejects blobs whose area exceeds
+       median(area) + area_outlier_k × MAD(area).  Catches large reflections
+       or unsplit merged groups without needing a pose estimate.  Skipped when
+       fewer than 3 blobs survive (MAD undefined / uninformative).
+
+    2. DBSCAN 1-NN spatial filter — for each blob (from the area-kept set),
+       finds its nearest neighbour distance.  Any blob whose 1-NN distance
+       exceeds outlier_factor × median(1-NN distances) is rejected as
+       spatially isolated noise.  Epsilon is derived from the surviving blob
+       distances, so it scales naturally with depth.  Skipped when fewer than
+       2 blobs survive.
 
     Merged-blob splitting (optional)
     ────────────────────────────────
@@ -156,8 +152,8 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     min_area           = float(cfg["min_area"])
     max_area           = float(cfg["max_area"])
     max_wh             = int(cfg.get("max_wh", 35))
-    neighbor_k         = int(cfg.get("neighbor_k", 3))
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
+    area_outlier_k     = float(cfg.get("area_outlier_k", 6.0))
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
     split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
 
@@ -178,6 +174,11 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     centroids = []
     blob_contours = []
     blob_pixels_list = []
+    # Per-reason rejection lists — populated only when visualize=True
+    det_rej_area_small = []   # area < min_area (or 1×1)
+    det_rej_area_large = []   # area > max_area (hard limit)
+    det_rej_wh         = []   # bounding-box dimension > max_wh
+    det_rej_threshold  = []   # max pixel < required_threshold (or zero weight)
     intensities = image.astype(np.float32)
 
     for cnt in contours:
@@ -189,22 +190,26 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         if area < min_area:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} < min_area {min_area}")
+            if visualize: det_rej_area_small.append(cnt)
             continue
         if area > max_area:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} > max_area {max_area}")
+            if visualize: det_rej_area_large.append(cnt)
             continue
 
         # ── Reject 1×1 blobs (pure noise) ────────────────────────────────────
         if w_b == 1 and h_b == 1:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: 1×1 blob")
+            if visualize: det_rej_area_small.append(cnt)
             continue
 
         # ── Reject blobs that are too large to be LEDs ───────────────────────
         if w_b > max_wh or h_b > max_wh:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: size {w_b}×{h_b} > max_wh {max_wh}")
+            if visualize: det_rej_wh.append(cnt)
             continue
 
         # ── Build pixel mask for this blob ───────────────────────────────────
@@ -219,6 +224,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: max pixel "
                              f"{int(roi_pixels.max()) if roi_pixels.size else 0} < required_threshold {required_threshold}")
+            if visualize: det_rej_threshold.append(cnt)
             continue
 
         # ── Intensity-weighted centroid (greysum, 1-based coords) ─────────────
@@ -227,6 +233,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         if total_weight == 0:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: zero total weight")
+            if visualize: det_rej_threshold.append(cnt)
             continue
 
         ys, xs = np.nonzero(blob_mask)
@@ -277,24 +284,58 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     centroids_arr     = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
     blob_is_split_arr = np.array(blob_is_split, dtype=bool)
 
-    # ── 3. Distance-based outlier filter ─────────────────────────────────────
-    keep_mask = None
-    mean_nn   = None
-    if len(centroids_arr) > neighbor_k:
-        mean_nn   = _mean_knn_distances(centroids_arr, neighbor_k)
-        keep_mask = mean_nn <= outlier_factor * np.median(mean_nn)
+    # ── 3. Area outlier filter + DBSCAN 1-NN spatial outlier filter ──────────
+    areas_arr = np.array(
+        [cv2.contourArea(cnt.reshape(-1, 1, 2)) for cnt in blob_contours],
+        dtype=np.float32,
+    ) if blob_contours else np.empty(0, dtype=np.float32)
 
-    kept_indices     = np.where(keep_mask)[0] if keep_mask is not None else np.arange(len(centroids_arr))
-    rejected_indices = np.where(~keep_mask)[0] if keep_mask is not None else np.array([], dtype=int)
+    keep_mask      = np.ones(len(centroids_arr), dtype=bool)
+    area_keep_mask = np.ones(len(centroids_arr), dtype=bool)
+    upper_limit    = np.inf
+    median_area    = mad = 0.0
+    epsilon        = np.inf
+
+    # ── 3a. Area filter: reject blobs with area > median + area_outlier_k * MAD
+    if len(areas_arr) >= 3:
+        median_area = float(np.median(areas_arr))
+        mad         = float(np.median(np.abs(areas_arr - median_area)))
+        if mad > 0:
+            upper_limit    = median_area + area_outlier_k * mad
+            area_keep_mask = areas_arr <= upper_limit
+            keep_mask     &= area_keep_mask
+
+    # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
+    #   Epsilon is set from the surviving blob distances so it is depth-invariant.
+    candidates   = centroids_arr[keep_mask]
+    min_nn_full  = np.full(len(centroids_arr), np.inf)
+    if len(candidates) > 1:
+        diffs    = candidates[:, None, :] - candidates[None, :, :]
+        sq_dists = (diffs ** 2).sum(axis=-1)
+        np.fill_diagonal(sq_dists, np.inf)
+        min_nn      = np.sqrt(sq_dists.min(axis=1))
+        epsilon     = outlier_factor * float(np.median(min_nn))
+        cand_idx    = np.where(keep_mask)[0]
+        min_nn_full[cand_idx] = min_nn
+        keep_mask[cand_idx[min_nn > epsilon]] = False
+
+    kept_indices     = np.where(keep_mask)[0]
+    rejected_indices = np.where(~keep_mask)[0]
 
     if _dbbox is not None:
-        if mean_nn is not None:
-            med_nn = float(np.median(mean_nn))
-            for i in rejected_indices:
-                cx_r, cy_r = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
-                if _in_bbox(cx_r, cy_r):
-                    logger.debug(f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: outlier filter  "
-                                 f"mean_nn={float(mean_nn[i]):.1f} > {outlier_factor}×median({med_nn:.1f})")
+        for i in rejected_indices:
+            cx_r, cy_r = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
+            if _in_bbox(cx_r, cy_r):
+                if not area_keep_mask[i]:
+                    logger.debug(
+                        f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: area outlier "
+                        f"area={areas_arr[i]:.1f} > {median_area:.1f}+{area_outlier_k}×{mad:.1f}"
+                    )
+                else:
+                    logger.debug(
+                        f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: spatial outlier "
+                        f"1-NN={min_nn_full[i]:.1f}px > epsilon={epsilon:.1f}px"
+                    )
         for i in kept_indices:
             cx_k, cy_k = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
             if _in_bbox(cx_k, cy_k):
@@ -318,42 +359,61 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     if visualize:
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-        # Rejected blobs in red
-        if keep_mask is not None:
-            for i in np.where(~keep_mask)[0]:
-                pt = (int(round(centroids_arr[i, 0])), int(round(centroids_arr[i, 1])))
-                cv2.circle(vis, pt, 4, (0, 0, 255), 1)
+        # BGR colours per category
+        C_AREA_SM  = (130, 130, 130)  # grey        — area < min_area or 1×1
+        C_AREA_LG  = (0,   80,  200)  # dark orange — area > max_area (hard limit)
+        C_WH       = (200,  80,    0)  # dark blue   — bounding-box too wide/tall
+        C_THRESH   = (200,   0,  200)  # magenta     — below required brightness
+        C_AREA_OUT = (0,  140,  255)  # orange      — area outlier filter
+        C_SPAT     = (0,    0,  210)  # red         — spatial (DBSCAN) outlier
+        C_KEPT     = (0,  200,    0)  # green       — kept
+        C_SPLT     = (255, 200,    0)  # cyan        — kept (split)
 
-        # Kept blobs
-        for idx, pt_f in enumerate(filtered_centroids):
+        def _draw_cnt(cnt, color):
+            cv2.drawContours(vis, [cnt.reshape(-1, 1, 2).astype(np.int32)], -1, color, 1)
+
+        for cnt in det_rej_area_small: _draw_cnt(cnt, C_AREA_SM)
+        for cnt in det_rej_area_large: _draw_cnt(cnt, C_AREA_LG)
+        for cnt in det_rej_wh:         _draw_cnt(cnt, C_WH)
+        for cnt in det_rej_threshold:  _draw_cnt(cnt, C_THRESH)
+
+        for i in rejected_indices:
+            _draw_cnt(blob_contours[i], C_AREA_OUT if not area_keep_mask[i] else C_SPAT)
+
+        for i, (pt_f, cnt) in enumerate(zip(filtered_centroids, filtered_contours)):
+            is_split = bool(filtered_is_split[i]) if i < len(filtered_is_split) else False
+            color = C_SPLT if is_split else C_KEPT
+            _draw_cnt(cnt, color)
             pt = (int(round(pt_f[0])), int(round(pt_f[1])))
-            is_split = bool(filtered_is_split[idx]) if idx < len(filtered_is_split) else False
+            cv2.circle(vis, pt, 2, color, -1)
+            cv2.putText(vis, str(i), (pt[0] + 5, pt[1] + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
-            if is_split:
-                # Cyan: draw the partition contour so the split boundary is visible
-                cnt_draw = filtered_contours[idx].astype(np.int32).reshape(-1, 1, 2)
-                cv2.drawContours(vis, [cnt_draw], -1, (255, 255, 0), 1)
-                cv2.circle(vis, pt, 2, (255, 255, 0), -1)
-                cv2.circle(vis, pt, 3, (255, 255, 0), 1)
-            else:
-                cv2.circle(vis, pt, 2, (255, 0, 0), -1)
-                cv2.circle(vis, pt, 3, (255, 255, 255), 1)
-
-            cv2.putText(
-                vis,
-                str(idx),
-                (pt[0] + 10, pt[1] + 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
+        # Legend — horizontal strip below image
+        strip_entries = [
+            (C_KEPT,     "kept"),
+            (C_SPLT,     "split"),
+            (C_AREA_OUT, "area outlier"),
+            (C_SPAT,     "spatial outlier"),
+            (C_THRESH,   "too dim"),
+            (C_WH,       f"wh > {max_wh}px"),
+            (C_AREA_LG,  f"area > {int(max_area)}px"),
+            (C_AREA_SM,  f"area < {int(min_area)}px"),
+        ]
+        strip_h = 22
+        strip = np.zeros((strip_h, vis.shape[1], 3), dtype=np.uint8)
+        x = 6
+        for color, label in strip_entries:
+            cv2.rectangle(strip, (x, 5), (x + 10, 15), color, -1)
+            x += 13
+            cv2.putText(strip, label, (x, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+            (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+            x += tw + 10
+        vis = np.vstack([vis, strip])
 
         if img_path is not None:
             out_dir = Path("./visualization/blobs")
             out_dir.mkdir(parents=True, exist_ok=True)
-            img_out_path = out_dir / f"{Path(img_path).stem}_blobs.png"
-            cv2.imwrite(str(img_out_path), vis)
+            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_blobs.png"), vis)
 
     return filtered_centroids, filtered_contours, filtered_radii, rejected_centroids, rejected_contours
