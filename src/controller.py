@@ -420,6 +420,7 @@ class SingleViewTracker:
         _cfg = self._matching_cfg
         _use_proximity = bool(_cfg.get('use_proximity_match', True))
         _blob_snap_px  = float(_cfg.get('blob_tracking_snap_px', 25.0))
+        _accept_err_px = float(_cfg.get('accept_error_px', 3.0))
         _pos_ax = _cfg.get('pose_jump_pos_thresh_m')
         _rot_ax = _cfg.get('pose_jump_rot_thresh_deg')
         _jump_kw = {}
@@ -549,7 +550,18 @@ class SingleViewTracker:
         # ------------------------------------------------------------------
         # Accept / reject
         # ------------------------------------------------------------------
-        if solution is not None and solution["error"] < 5.0:
+
+        # Proximity found a solution but error is too high — try brute before giving up
+        if solution is not None and solution["error"] >= _accept_err_px and n_blobs >= 4:
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity err={solution['error']:.2f}px exceeds threshold, attempting brute recovery")
+            brute = self.brute_match(blobs, pose_prior=self.prev_pose,
+                                     other_cameras_blobs=other_cameras_blobs,
+                                     blob_radii=blob_radii)
+            if brute is not None:
+                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] brute recovery err={brute['error']:.2f}px")
+                solution = brute
+
+        if solution is not None and solution["error"] < _accept_err_px:
             logger.debug(
                 f"[{ctrl_name} | cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
@@ -577,7 +589,7 @@ class SingleViewTracker:
 
         # Tracking lost — clear velocity history and blob ID state so re-acquisition starts fresh
         if solution is not None:
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds 5.0px threshold")
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds {_accept_err_px:.1f}px threshold")
         else:
             logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
         self.consecutive_failures += 1

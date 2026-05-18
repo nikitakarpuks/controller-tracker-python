@@ -407,12 +407,30 @@ def proximity_match(
         logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
         return None
 
+    # First-pass RANSAC on snap-only pairs to get a refined pose before Hungarian
+    # expansion. Using the predicted pose for expansion projects LEDs from a stale
+    # estimate; the refined pose is typically much closer, giving Hungarian better
+    # projections and lower error on the final inlier set.
+    # Falls back to predicted pose if first-pass RANSAC fails (degenerate geometry).
+    rvec_exp, tvec_exp, R_exp = rvec_pred, tvec_pred, R_pred_arr
+    _ok_snap, _rvec_snap, _tvec_snap, _ = _ransac_pnp(
+        np.array(locked_obj, dtype=np.float32),
+        np.array(locked_img, dtype=np.float32),
+        K, dc, rvec_pred, tvec_pred,
+        reprojection_px=reprojection_threshold,
+    )
+    if _ok_snap:
+        rvec_exp = _rvec_snap
+        tvec_exp = np.asarray(_tvec_snap, dtype=np.float32).reshape(3)
+        R_exp, _ = cv2.Rodrigues(np.asarray(_rvec_snap, dtype=np.float32).reshape(3, 1))
+
     aux_snapped_per_cam: Dict[int, List] = {}
 
     # Hungarian expansion: triggered when proximity locked fewer than expansion_threshold
     # of model-visible LEDs, OR when visible LED count dropped significantly from the
     # prior (vis_drop_threshold) and there are still unassigned blobs to place.
-    # Runs with the predicted pose; RANSAC downstream filters bad pairs.
+    # Projects free LEDs from the first-pass refined pose (rvec_exp) so Hungarian
+    # correspondences are grounded in a better estimate than the raw prediction.
     locked_blob_set = {b for b, _ in locked_pairs}
     locked_led_set  = {l for _, l in locked_pairs}
 
@@ -430,14 +448,14 @@ def proximity_match(
     ):
         if free_blob_idx and free_led_idx:
             free_led_obj = self.model.positions[free_led_idx].astype(np.float32)
-            proj_free    = _project_points(rvec_pred, tvec_pred, free_led_obj, K, dc)
+            proj_free    = _project_points(rvec_exp, tvec_exp, free_led_obj, K, dc)
             free_blobs   = blobs[free_blob_idx]
 
             cost = cdist(proj_free, free_blobs)  # (n_free_leds, n_free_blobs)
 
             if blob_radii is not None:
                 free_blob_radii = blob_radii[free_blob_idx]
-                free_led_cam    = (R_pred_arr @ free_led_obj.T).T + tvec_pred
+                free_led_cam    = (R_exp @ free_led_obj.T).T + tvec_exp
                 for k in range(len(free_led_idx)):
                     depth       = float(max(free_led_cam[k, 2], 0.01))
                     expected_px = focal_px * (led_radius_mm / 1000.0) / depth
@@ -471,7 +489,7 @@ def proximity_match(
     li = np.array(locked_img, dtype=np.float32)
 
     ok, rvec, tvec, ransac_idx = _ransac_pnp(
-        lo, li, K, dc, rvec_pred, tvec_pred,
+        lo, li, K, dc, rvec_exp, tvec_exp,
         reprojection_px=reprojection_threshold,
     )
     if not ok:
