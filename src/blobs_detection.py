@@ -156,6 +156,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     area_outlier_k     = float(cfg.get("area_outlier_k", 6.0))
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
     split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
+    min_circularity    = float(cfg.get("min_circularity", 0.5))
 
     _dbbox = cfg.get("debug_bbox")  # [x1, y1, x2, y2] or null
 
@@ -284,7 +285,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     centroids_arr     = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
     blob_is_split_arr = np.array(blob_is_split, dtype=bool)
 
-    # ── 3. Area outlier filter + DBSCAN 1-NN spatial outlier filter ──────────
+    # ── 3. Post-split outlier filters ────────────────────────────────────────
     areas_arr = np.array(
         [cv2.contourArea(cnt.reshape(-1, 1, 2)) for cnt in blob_contours],
         dtype=np.float32,
@@ -292,11 +293,23 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
 
     keep_mask      = np.ones(len(centroids_arr), dtype=bool)
     area_keep_mask = np.ones(len(centroids_arr), dtype=bool)
+    circ_keep_mask = np.ones(len(centroids_arr), dtype=bool)
     upper_limit    = np.inf
     median_area    = mad = 0.0
     epsilon        = np.inf
 
-    # ── 3a. Area filter: reject blobs with area > median + area_outlier_k * MAD
+    # ── 3a. Circularity filter: reject non-circular blobs (4π·area/perimeter²)
+    for i, cnt in enumerate(blob_contours):
+        perimeter = cv2.arcLength(cnt.reshape(-1, 1, 2), closed=True)
+        if perimeter > 0:
+            circularity = 4 * np.pi * areas_arr[i] / (perimeter ** 2)
+            if circularity < min_circularity:
+                circ_keep_mask[i] = False
+        else:
+            circ_keep_mask[i] = False
+    keep_mask &= circ_keep_mask
+
+    # ── 3b. Area filter: reject blobs with area > median + area_outlier_k * MAD
     if len(areas_arr) >= 3:
         median_area = float(np.median(areas_arr))
         mad         = float(np.median(np.abs(areas_arr - median_area)))
@@ -305,7 +318,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             area_keep_mask = areas_arr <= upper_limit
             keep_mask     &= area_keep_mask
 
-    # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
+    # ── 3c. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
     #   Epsilon is set from the surviving blob distances so it is depth-invariant.
     candidates   = centroids_arr[keep_mask]
     min_nn_full  = np.full(len(centroids_arr), np.inf)
@@ -364,6 +377,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         C_AREA_LG  = (0,   80,  200)  # dark orange — area > max_area (hard limit)
         C_WH       = (200,  80,    0)  # dark blue   — bounding-box too wide/tall
         C_THRESH   = (200,   0,  200)  # magenta     — below required brightness
+        C_CIRC     = (0,  200,  200)  # yellow      — circularity filter
         C_AREA_OUT = (0,  140,  255)  # orange      — area outlier filter
         C_SPAT     = (0,    0,  210)  # red         — spatial (DBSCAN) outlier
         C_KEPT     = (0,  200,    0)  # green       — kept
@@ -378,7 +392,12 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         for cnt in det_rej_threshold:  _draw_cnt(cnt, C_THRESH)
 
         for i in rejected_indices:
-            _draw_cnt(blob_contours[i], C_AREA_OUT if not area_keep_mask[i] else C_SPAT)
+            if not circ_keep_mask[i]:
+                _draw_cnt(blob_contours[i], C_CIRC)
+            elif not area_keep_mask[i]:
+                _draw_cnt(blob_contours[i], C_AREA_OUT)
+            else:
+                _draw_cnt(blob_contours[i], C_SPAT)
 
         for i, (pt_f, cnt) in enumerate(zip(filtered_centroids, filtered_contours)):
             is_split = bool(filtered_is_split[i]) if i < len(filtered_is_split) else False
@@ -394,21 +413,28 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             (C_KEPT,     "kept"),
             (C_SPLT,     "split"),
             (C_AREA_OUT, "area outlier"),
+            (C_CIRC,     f"not circular (< {min_circularity})"),
             (C_SPAT,     "spatial outlier"),
             (C_THRESH,   "too dim"),
             (C_WH,       f"wh > {max_wh}px"),
             (C_AREA_LG,  f"area > {int(max_area)}px"),
             (C_AREA_SM,  f"area < {int(min_area)}px"),
         ]
-        strip_h = 22
-        strip = np.zeros((strip_h, vis.shape[1], 3), dtype=np.uint8)
-        x = 6
-        for color, label in strip_entries:
-            cv2.rectangle(strip, (x, 5), (x + 10, 15), color, -1)
-            x += 13
-            cv2.putText(strip, label, (x, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
-            (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-            x += tw + 10
+        row_h = 20
+        half = len(strip_entries) // 2 + len(strip_entries) % 2
+        rows = [strip_entries[:half], strip_entries[half:]]
+        strip = np.zeros((row_h * 2, vis.shape[1], 3), dtype=np.uint8)
+        for row_idx, row in enumerate(rows):
+            x = 6
+            y_sq_top = row_idx * row_h + 5
+            y_sq_bot = y_sq_top + 10
+            y_text   = y_sq_bot - 1
+            for color, label in row:
+                cv2.rectangle(strip, (x, y_sq_top), (x + 10, y_sq_bot), color, -1)
+                x += 13
+                cv2.putText(strip, label, (x, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+                (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+                x += tw + 10
         vis = np.vstack([vis, strip])
 
         if img_path is not None:
