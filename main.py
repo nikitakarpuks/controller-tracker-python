@@ -110,35 +110,27 @@ def main():
     assignments_all     = {n: [] for n in enabled_ctrls}
     primary_cams_all    = {n: [] for n in enabled_ctrls}
     aux_assignments_all = {n: [] for n in enabled_ctrls}
-    blobs               = []
-    contours_all        = []
-    raw_blobs           = []
-    raw_contours_all    = []
+    blobs        = []
+    contours_all = []
 
     for batch in tqdm(get_data(config["data"])):
         img_path, cam_images = batch[0][0], batch[0][1]
         # cam_images: {cam_idx: numpy array}
 
-        cam_blobs        = {}
-        cam_contours     = {}
-        cam_radii        = {}
-        cam_raw_blobs    = {}
-        cam_raw_contours = {}
+        cam_blobs    = {}
+        cam_contours = {}
+        cam_radii    = {}
 
         for cam_idx, image in cam_images.items():
-            blob_centroids, blob_contours, blob_radii, raw_centroids, raw_contours = get_centroids(
+            blob_centroids, blob_contours, blob_radii, _, _ = get_centroids(
                 image, config["blob_detection"], visualize=True, img_path=img_path
             )
-            cam_blobs[cam_idx]        = blob_centroids.copy()
-            cam_contours[cam_idx]     = blob_contours
-            cam_radii[cam_idx]        = blob_radii
-            cam_raw_blobs[cam_idx]    = raw_centroids.copy()
-            cam_raw_contours[cam_idx] = raw_contours
+            cam_blobs[cam_idx]    = blob_centroids.copy()
+            cam_contours[cam_idx] = blob_contours
+            cam_radii[cam_idx]    = blob_radii
 
         blobs.append(cam_blobs)
         contours_all.append(cam_contours)
-        raw_blobs.append(cam_raw_blobs)
-        raw_contours_all.append(cam_raw_contours)
 
         t0      = time()
         results = tracking_system.update(cam_blobs, radii_per_camera=cam_radii)
@@ -210,8 +202,6 @@ def main():
             assignments_all,
             blobs, cameras,
             contours_all=contours_all,
-            raw_blobs_all=raw_blobs,
-            raw_contours_all=raw_contours_all,
             save_path=config["visualization"].get("save_recording"),
             primary_cams_all=primary_cams_all,
             aux_assignments_all=aux_assignments_all,

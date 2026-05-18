@@ -448,7 +448,7 @@ class ControllerAnimatorRerun:
 
     def start(self, poses_per_ctrl: dict, assignments_per_ctrl: dict,
               blobs_all, cameras: dict,
-              contours_all=None, raw_blobs_all=None, raw_contours_all=None,
+              contours_all=None,
               save_path: str = None,
               primary_cams_all: dict = None,
               aux_assignments_all: dict = None):
@@ -530,10 +530,8 @@ class ControllerAnimatorRerun:
                 T_ctrl_model = self._ctrl_state[ctrl_name]["T_model_ctrl"].inverse()
                 T_cam_model_per_ctrl[ctrl_name] = T_cam_ctrl.compose(T_ctrl_model)
 
-            blobs        = blobs_all[idx]        if blobs_all        is not None and idx < len(blobs_all)        else None
-            contours     = contours_all[idx]     if contours_all     is not None and idx < len(contours_all)     else None
-            raw_blobs    = raw_blobs_all[idx]    if raw_blobs_all    is not None and idx < len(raw_blobs_all)    else None
-            raw_contours = raw_contours_all[idx] if raw_contours_all is not None and idx < len(raw_contours_all) else None
+            blobs    = blobs_all[idx]    if blobs_all    is not None and idx < len(blobs_all)    else None
+            contours = contours_all[idx] if contours_all is not None and idx < len(contours_all) else None
 
             # Slice per-controller lists for this frame.
             assignments_frame = {
@@ -557,8 +555,6 @@ class ControllerAnimatorRerun:
             }
 
             self._log_frame(idx, T_cam_model_per_ctrl, assignments_frame, blobs, contours,
-                            raw_blobs_per_cam=raw_blobs,
-                            raw_contours_per_cam=raw_contours,
                             primary_cam_per_ctrl=primary_cams_frame,
                             aux_assignments_per_ctrl=aux_assignments_frame)
 
@@ -631,9 +627,10 @@ class ControllerAnimatorRerun:
     # ------------------------------------------------------------------
 
     def _log_camera_blobs(self, cam_idx: int, cam,
-                          blobs, contours, raw_blobs, raw_contours,
-                          blob_z: float, raw_blob_z: float):
-        """Log blob contours, IDs, and raw blobs for a single camera."""
+                          blobs, contours,
+                          blob_z: float,
+                          matched_bids: set = None):
+        """Log blob contours and IDs; matched blobs are bright, unmatched are dim."""
         T_world_cam = cam.T_world_cam
         color       = _camera_color(cam_idx)
         color_dim   = [int(c * 0.5) for c in color]
@@ -646,7 +643,14 @@ class ControllerAnimatorRerun:
         path = f"world/camera_{cam_idx}"
 
         if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blobs", True) and contours is not None:
-            blob_colors = np.array([color] * len(contours), dtype=np.uint8)
+            if matched_bids is not None:
+                blob_colors = np.array(
+                    [color if i in matched_bids else color_dim
+                     for i in range(len(contours))],
+                    dtype=np.uint8,
+                )
+            else:
+                blob_colors = np.array([color] * len(contours), dtype=np.uint8)
             bv, bf, bc = make_contour_mesh_3d(contours, cam, blob_z, blob_colors, undistort=True)
             if bv is not None:
                 rr.log(f"{path}/blobs", rr.Mesh3D(vertex_positions=_wc(bv),
@@ -674,17 +678,6 @@ class ControllerAnimatorRerun:
         else:
             rr.log(f"{path}/blob_ids", rr.Clear(recursive=False))
 
-        if self.vis_cfg.get("show_raw_blobs", True) and raw_blobs is not None and len(raw_blobs) > 0 and raw_contours is not None:
-            raw_colors = np.array([[255, 192, 203]] * len(raw_contours), dtype=np.uint8)
-            rv, rf, rc = make_contour_mesh_3d(raw_contours, cam, raw_blob_z, raw_colors, undistort=True)
-            if rv is not None:
-                rr.log(f"{path}/blobs_raw", rr.Mesh3D(vertex_positions=_wc(rv),
-                                                       triangle_indices=rf, vertex_colors=rc))
-            else:
-                rr.log(f"{path}/blobs_raw", rr.Clear(recursive=False))
-        else:
-            rr.log(f"{path}/blobs_raw", rr.Clear(recursive=False))
-
     # ------------------------------------------------------------------
     # Per-frame logging
     # ------------------------------------------------------------------
@@ -692,7 +685,6 @@ class ControllerAnimatorRerun:
     def _log_frame(self, idx: int, T_cam_model_per_ctrl: dict,
                    assignments_per_ctrl: dict, blobs_per_cam: dict,
                    contours_per_cam: dict = None,
-                   raw_blobs_per_cam: dict = None, raw_contours_per_cam: dict = None,
                    primary_cam_per_ctrl: dict = None,
                    aux_assignments_per_ctrl: dict = None):
 
@@ -709,15 +701,26 @@ class ControllerAnimatorRerun:
         error_z               = frustum_z - error_z_offset
         offset                = self.visual_offset
 
+        # ── matched_bids per camera, aggregated across all controllers ───────
+        matched_bids_per_cam: dict = {ci: set() for ci in self._cameras}
+        for ctrl_name in self._controllers_vis:
+            pri = (primary_cam_per_ctrl or {}).get(ctrl_name, next(iter(self._cameras)))
+            if pri not in self._cameras:
+                pri = next(iter(self._cameras))
+            for bid, _ in ((assignments_per_ctrl or {}).get(ctrl_name) or []):
+                matched_bids_per_cam[pri].add(bid)
+            for aux_ci, pairs in ((aux_assignments_per_ctrl or {}).get(ctrl_name) or {}).items():
+                for bid, _ in pairs:
+                    matched_bids_per_cam.setdefault(aux_ci, set()).add(bid)
+
         # ── Blobs for all cameras (shared, controller-independent) ──────────
         for cam_idx, cam in self._cameras.items():
             self._log_camera_blobs(
                 cam_idx, cam,
                 blobs_per_cam.get(cam_idx) if blobs_per_cam else None,
                 contours_per_cam.get(cam_idx) if contours_per_cam else None,
-                raw_blobs_per_cam.get(cam_idx) if raw_blobs_per_cam else None,
-                raw_contours_per_cam.get(cam_idx) if raw_contours_per_cam else None,
-                blob_z, blob_z - 0.001,
+                blob_z,
+                matched_bids=matched_bids_per_cam.get(cam_idx),
             )
 
         # ── Per-controller loop ─────────────────────────────────────────────
@@ -807,9 +810,8 @@ class ControllerAnimatorRerun:
                     matched_bids.add(bid)
                     matched_lids.add(lid)
 
-            # ── Blobs for primary camera: highlight matched vs unmatched ───
-            blobs    = blobs_per_cam.get(primary_cam_idx) if blobs_per_cam else None
-            contours = contours_per_cam.get(primary_cam_idx) if contours_per_cam else None
+            # ── blob positions on the error plane (used by error lines below) ─
+            blobs = blobs_per_cam.get(primary_cam_idx) if blobs_per_cam else None
             if blobs is not None and len(blobs) > 0:
                 blobs_undist_disp = cv2.undistortPoints(
                     blobs.reshape(-1, 1, 2).astype(np.float32),
@@ -818,58 +820,13 @@ class ControllerAnimatorRerun:
                 ).reshape(-1, 2)
                 pts_plane_cam  = backproject_to_plane(blobs_undist_disp, camera, z=error_z)
                 pts_plane_disp = _w(pts_plane_cam)
-
-                if self.vis_cfg.get("show_blobs", True) and contours is not None:
-                    primary_color     = _camera_color(primary_cam_idx)
-                    primary_color_dim = [int(c * 0.5) for c in primary_color]
-                    blob_colors = np.array(
-                        [primary_color if i in matched_bids else primary_color_dim
-                         for i in range(len(contours))],
-                        dtype=np.uint8,
-                    )
-                    bv, bf, bc = make_contour_mesh_3d(contours, camera, blob_z, blob_colors, undistort=True)
-                    if bv is not None:
-                        rr.log(f"{cam_path}/blobs",
-                               rr.Mesh3D(vertex_positions=_w(bv), triangle_indices=bf, vertex_colors=bc))
-                    else:
-                        rr.log(f"{cam_path}/blobs", rr.Clear(recursive=False))
-                elif self.vis_cfg.get("show_blobs", True):
-                    rr.log(f"{cam_path}/blobs", rr.Clear(recursive=False))
-
-                if self.vis_cfg.get("show_blob_ids", True):
-                    blabel_color  = self.vis_cfg.get("blob_id_label_color",  [255, 210, 0])
-                    bdx, bdy      = self.vis_cfg.get("blob_id_label_offset", [0.0006, -0.0006])
-                    blob_lbl_cam  = backproject_to_plane(blobs_undist_disp, camera, z=blob_z).copy()
-                    blob_lbl_cam[:, 0] += bdx
-                    blob_lbl_cam[:, 1] += bdy
-                    rr.log(f"{cam_path}/blob_ids", rr.Points3D(
-                        positions=_w(blob_lbl_cam),
-                        labels=[str(i) for i in range(len(blobs))],
-                        colors=[blabel_color] * len(blobs), radii=0.0))
             else:
                 pts_plane_disp = None
-                rr.log(f"{cam_path}/blobs",    rr.Clear(recursive=False))
-                rr.log(f"{cam_path}/blob_ids", rr.Clear(recursive=False))
-
-            # ── Raw blobs (primary camera) ──────────────────────────────────
-            raw_blobs    = raw_blobs_per_cam.get(primary_cam_idx) if raw_blobs_per_cam else None
-            raw_contours = raw_contours_per_cam.get(primary_cam_idx) if raw_contours_per_cam else None
-            if self.vis_cfg.get("show_raw_blobs", True) and raw_blobs is not None and len(raw_blobs) > 0 and raw_contours is not None:
-                raw_colors = np.array([[255, 192, 203]] * len(raw_contours), dtype=np.uint8)
-                rv, rf, rc = make_contour_mesh_3d(raw_contours, camera, blob_z - 0.001, raw_colors, undistort=True)
-                if rv is not None:
-                    rr.log(f"{cam_path}/blobs_raw",
-                           rr.Mesh3D(vertex_positions=_w(rv), triangle_indices=rf, vertex_colors=rc))
-                else:
-                    rr.log(f"{cam_path}/blobs_raw", rr.Clear(recursive=False))
-            else:
-                rr.log(f"{cam_path}/blobs_raw", rr.Clear(recursive=False))
 
             # ── Clear stale per-camera assets for non-primary cameras ───────
             for _ci in self._cameras:
                 if _ci != primary_cam_idx:
-                    for _sub in ("rays", "projected_leds", "led_ids", "errors", "error_values",
-                                 "blobs", "blob_ids", "blobs_raw"):
+                    for _sub in ("rays", "projected_leds", "led_ids", "errors", "error_values"):
                         rr.log(f"{ctrl_path}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))
 
             # ── Projected LEDs (matched + visible unmatched) ────────────────

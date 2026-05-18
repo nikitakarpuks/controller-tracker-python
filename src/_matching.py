@@ -613,9 +613,9 @@ def proximity_match(
                 Transform(_R_pr.astype(np.float64),
                           np.asarray(tvec, dtype=np.float64).reshape(3))
             )
-            _prox_thresh = float(_cfg.get('proximity_reprojection_threshold', 2.0))
+            _aux_prefilter_px = float(_cfg.get('joint_aux_prefilter_px', 8.0))
             _aux_joint = _filter_aux_by_reprojection(
-                _T_wc_pr, _aux_joint, self.model.positions, _prox_thresh
+                _T_wc_pr, _aux_joint, self.model.positions, _aux_prefilter_px
             )
             _T_joint = _joint_err = None
             if _aux_joint:
@@ -634,6 +634,21 @@ def proximity_match(
                     f"[{_ctrl} | cam {_cam}] Proximity joint LM: "
                     f"primary err {error:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
                 )
+                for _aux_cam_j, _aux_blobs_j, _aux_pr_j in _aux_joint:
+                    if not _aux_pr_j:
+                        continue
+                    _T_aux_j = _aux_cam_j.T_world_cam.inverse().compose(_T_joint)
+                    _rv_aux_j = cv2.Rodrigues(_T_aux_j.R.astype(np.float32))[0]
+                    _tv_aux_j = _T_aux_j.t.astype(np.float32)
+                    _leds_aux_j  = self.model.positions[[l for _, l in _aux_pr_j]].astype(np.float32)
+                    _blobs_aux_j = _aux_blobs_j[[b for b, _ in _aux_pr_j]].astype(np.float32)
+                    _proj_aux_j  = _project_points(_rv_aux_j, _tv_aux_j, _leds_aux_j,
+                                                   _aux_cam_j.camera_matrix, _aux_cam_j.dist_coeffs)
+                    _err_aux_j   = float(np.mean(np.linalg.norm(_proj_aux_j - _blobs_aux_j, axis=1)))
+                    logger.debug(
+                        f"[{_ctrl} | cam {_cam}] Proximity joint LM cam{_aux_cam_j.camera_idx}: "
+                        f"err={_err_aux_j:.2f}px  ({len(_aux_pr_j)} pairs)"
+                    )
                 rvec, tvec, error = _rv_j, _tv_j, _err_j
                 _method_suffix += "_mc"
 
@@ -1585,9 +1600,9 @@ def brute_match(
                 Transform(_R_b.astype(np.float64),
                           best_solution['tvec'].reshape(3).astype(np.float64))
             )
-            _prox_thresh = float(_cfg.get('proximity_reprojection_threshold', 2.0))
+            _aux_prefilter_px = float(_cfg.get('joint_aux_prefilter_px', 8.0))
             _aux_joint = _filter_aux_by_reprojection(
-                _T_wc_b, _aux_joint, positions, _prox_thresh
+                _T_wc_b, _aux_joint, positions, _aux_prefilter_px
             )
             _T_joint, _joint_err = _joint_refine_pose(
                 _T_wc_b,
@@ -1612,6 +1627,21 @@ def brute_match(
                     f"[{_ctrl} | cam {_cam}] Brute joint LM: "
                     f"primary err {best_solution['error']:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
                 )
+                for _aux_cam_j, _aux_blobs_j, _aux_pr_j in _aux_joint:
+                    if not _aux_pr_j:
+                        continue
+                    _T_aux_j = _aux_cam_j.T_world_cam.inverse().compose(_T_joint)
+                    _rv_aux_j = cv2.Rodrigues(_T_aux_j.R.astype(np.float32))[0]
+                    _tv_aux_j = _T_aux_j.t.astype(np.float32)
+                    _leds_aux_j  = positions[[l for _, l in _aux_pr_j]].astype(np.float32)
+                    _blobs_aux_j_ref = _aux_blobs_j[[b for b, _ in _aux_pr_j]].astype(np.float32)
+                    _proj_aux_j  = _project_points(_rv_aux_j, _tv_aux_j, _leds_aux_j,
+                                                   _aux_cam_j.camera_matrix, _aux_cam_j.dist_coeffs)
+                    _err_aux_j   = float(np.mean(np.linalg.norm(_proj_aux_j - _blobs_aux_j_ref, axis=1)))
+                    logger.debug(
+                        f"[{_ctrl} | cam {_cam}] Brute joint LM cam{_aux_cam_j.camera_idx}: "
+                        f"err={_err_aux_j:.2f}px  ({len(_aux_pr_j)} pairs)"
+                    )
                 best_solution['rvec']   = _rv_j
                 best_solution['tvec']   = _tv_j.reshape(3, 1)
                 best_solution['error']  = _err_j
