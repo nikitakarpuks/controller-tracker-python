@@ -1,16 +1,17 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/4_MAIN_complex_moves_hand_ctrl_occlusions_occluded_spin/simple"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/a"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
-  selected_cameras: [0] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
   intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
+#  intrinsics_path: "./data/cameras/cam-calib.json"
 
 controllers:
   right_controller:
-    enabled: true
+    enabled: false
     config_path: "./data/controllers/right_controller_A85K6081930636R.json"
     mesh_alignment:
       translation: # in meters
@@ -48,22 +49,24 @@ controllers:
           half_length: 0.037
           color: [255, 55, 55]
   left_controller:
-    enabled: false
+    enabled: true
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
 blob_detection:
   min_threshold: 6       # pixels >= this are included in a blob
-  required_threshold: 12  # blob must contain at least one pixel >= this (filters dim noise)
+  required_threshold: 13  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 3
   max_area: 250
   max_wh: 35              # max bounding-box width or height in pixels
   min_split_dist: 4.0
   split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
-  min_circularity: 0.5      # 4π·area/perimeter² must exceed this after splitting; rejects elongated non-circular shapes
-  area_outlier_k: 6.0      # blob area > median(area) + this * MAD(area) is rejected before matching
+  min_circularity: 0.6      # 4π·area/perimeter² must exceed this after splitting; rejects elongated non-circular shapes
+  area_outlier_k: 10.0      # blob area > median(area) + this * MAD(area) is rejected before matching
   outlier_factor: 3.0      # blob with 1-NN distance > this * median(1-NN) is rejected as spatially isolated noise
+  pass2_threshold_factor: 0.5  # 0 = disabled; e.g. 0.35 — raises pixel_threshold in a 2nd pass to min(peak_per_blob) * factor, cutting dim bridges to IR sources (windows, reflections)
+  pass2_min_area: 1         # null = use min_area; override minimum blob area for pass 2 (blobs shrink under higher threshold, so this can be smaller)
   debug_bbox: null        # [x1, y1, x2, y2] — log why any centroid inside this pixel bbox was dropped
 
 geometry:
@@ -82,8 +85,8 @@ matching:
   # --------------------------------------------------------------------------
   # Blob size filtering  (shared pre-filter for both brute and proximity)
   # --------------------------------------------------------------------------
-  blob_size_max_factor: 4.0       # blob radius > expected * this → rejected (merged blob / noise)
-  blob_size_min_factor: 0.2       # blob radius < expected * this → rejected (sub-pixel noise)
+  blob_size_max_factor: 3.0       # blob radius > expected * this → rejected (merged blob / noise)
+  blob_size_min_factor: 0.3       # blob radius < expected * this → rejected (sub-pixel noise)
   blob_size_score_weight: 0.5     # px penalty per px of size mismatch added to argmin score
 
   # --------------------------------------------------------------------------
@@ -101,8 +104,7 @@ matching:
   reprojection_threshold: 2.5    # RANSAC inlier threshold
   min_inliers: 4
   min_inlier_fraction: null      # e.g. 0.6 — overrides min_inliers if set (fraction of visible LEDs)
-  strong_match_inliers: 7
-  strong_match_error_px: 1.5
+  strong_match_error_px: 1.0
   min_vis_coverage: 0.7
   rng_seed: 42
 
@@ -112,11 +114,12 @@ matching:
   use_proximity_match: true              # set to false to always use brute force
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
   blob_tracking_snap_px: 25.0           # max pixel distance to carry a led_id from prev frame to current
-  proximity_snap_factor: 4.0            # depth-scaled snap: focal * (led_radius_mm/1000) / depth * factor
+  proximity_snap_factor: 3.0            # depth-scaled snap: focal * (led_radius_mm/1000) / depth * factor
   proximity_argmin_max_dist_px: 5.0     # hard cap on argmin (non-ID-path) snap; ID-path uses full depth-scaled snap_px
   proximity_expansion_threshold: 0.7    # run Hungarian expansion if locked/model_visible < this after snap
   proximity_expansion_px: 4.0           # max reprojection distance to accept a Hungarian-expanded pair
   proximity_vis_drop_threshold: 2       # also expand if prior LED count dropped by more than this
+  projection_snap_px: 25.0              # projection fallback: max Hungarian cost to accept a blob-LED pair
 
   # --------------------------------------------------------------------------
   # Pose validation

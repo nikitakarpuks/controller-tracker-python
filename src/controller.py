@@ -375,10 +375,8 @@ class SingleViewTracker:
         """
         Constant-velocity extrapolation: predict pose at frame n+1.
 
-        Translation: linear — tvec_{n+1} = 2*tvec_n - tvec_{n-1}
-        Rotation: apply the same delta rotation again in camera frame —
-            R_delta = R_n @ R_{n-1}.T  (rotation change from n-1 to n)
-            R_{n+1} = R_delta @ R_n
+        Translation: tvec_{n+1} = 2*tvec_n - tvec_{n-1}
+        Rotation: R_delta = R_n @ R_{n-1}.T; R_{n+1} = R_delta @ R_n
         """
         tvec_pred = 2.0 * np.asarray(tvec_n, np.float64) - np.asarray(tvec_nm1, np.float64)
 
@@ -440,7 +438,7 @@ class SingleViewTracker:
         # Pose prediction: constant-velocity extrapolation from the last two frames.
         if self.prev_pose is not None and self.prev_prev_pose is not None:
             predicted_pose = self._extrapolate_pose(
-                self.prev_pose[0],     self.prev_pose[1],
+                self.prev_pose[0],      self.prev_pose[1],
                 self.prev_prev_pose[0], self.prev_prev_pose[1],
             )
         else:
