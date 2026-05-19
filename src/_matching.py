@@ -277,6 +277,9 @@ def proximity_match(
     blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
     blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',      0.2))
     blob_size_score_weight = float(_cfg.get('blob_size_score_weight',    0.5))
+    _accept_err_px         = float(_cfg.get('accept_error_px',           3.0))
+    _proj_snap_px          = float(_cfg.get('projection_snap_px',
+                                   _cfg.get('proximity_expansion_px',    8.0)))
 
     if prior_assignment is None or len(prior_assignment) < min_inliers:
         return None
@@ -404,8 +407,7 @@ def proximity_match(
         + ("  [size filter active]" if blob_radii is not None else "")
     )
     if len(locked_pairs) < min_inliers:
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few pairs ({len(locked_pairs)} < {min_inliers}) → None")
-        return None
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: few snap pairs ({len(locked_pairs)} < {min_inliers}), will attempt projection fallback")
 
     # First-pass RANSAC on snap-only pairs to get a refined pose before Hungarian
     # expansion. Using the predicted pose for expansion projects LEDs from a stale
@@ -492,24 +494,95 @@ def proximity_match(
         lo, li, K, dc, rvec_exp, tvec_exp,
         reprojection_px=reprojection_threshold,
     )
-    if not ok:
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC failed → None")
-        return None
 
-    # Keep all RANSAC inliers — the visibility check is an approximation and
+    # Evaluate snap-path result without early-returning — projection fallback below may recover.
+    # Keep all RANSAC inliers: the visibility check is an approximation and
     # the blob's physical presence is stronger evidence than the model geometry.
-    final_pairs = [locked_pairs[k] for k in ransac_idx]
+    final_pairs = lo_f = li_f = None
+    error = max_error = float('inf')
+    if ok:
+        _fp = [locked_pairs[k] for k in ransac_idx]
+        if len(_fp) >= min_inliers:
+            _lo_f = self.model.positions[[l for _, l in _fp]].astype(np.float32)
+            _li_f = blobs[[b for b, _ in _fp]].astype(np.float32)
+            _pe   = np.linalg.norm(_project_points(rvec, tvec, _lo_f, K, dc) - _li_f, axis=1)
+            final_pairs = _fp
+            lo_f, li_f  = _lo_f, _li_f
+            error       = float(_pe.mean())
+            max_error   = float(_pe.max())
+        else:
+            logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC gave too few inliers ({len(_fp)})")
+    else:
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC failed")
 
-    if len(final_pairs) < min_inliers:
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few inliers ({len(final_pairs)} < {min_inliers}) → None")
+    # Projection fallback: if the snap path failed or returned a high-error solution,
+    # discard all blob-tracking locked pairs and run a fresh full Hungarian over ALL
+    # blobs vs ALL model-visible LEDs projected from the refined predicted pose.
+    # Unlike the expansion above (which only handles "free" blobs/LEDs left after snapping),
+    # this completely ignores locked pairs and is therefore immune to ID swap errors from Pass 1.
+    _did_proj_fallback = False
+    if final_pairs is None or error >= _accept_err_px:
+        _vis_ids = np.where(vis_mask_pred)[0]
+        if len(_vis_ids) >= min_inliers:
+            _vis_pos = self.model.positions[_vis_ids].astype(np.float32)
+            _proj_p  = _project_points(rvec_exp, tvec_exp, _vis_pos, K, dc)
+            _lc_p    = (R_exp @ _vis_pos.T).T + tvec_exp.reshape(3)
+            _cost_p  = cdist(_proj_p, blobs)
+            if blob_radii is not None:
+                for _k in range(len(_vis_ids)):
+                    _d  = float(max(_lc_p[_k, 2], 0.01))
+                    _ep = focal_px * (led_radius_mm / 1000.0) / _d
+                    _cost_p[_k, (blob_radii < _ep * blob_size_min_factor) |
+                                 (blob_radii > _ep * blob_size_max_factor)] = 1e9
+            _row_p, _col_p = linear_sum_assignment(_cost_p)
+            _pp, _lo_pp, _li_pp = [], [], []
+            for _r, _c in zip(_row_p, _col_p):
+                if _cost_p[_r, _c] < _proj_snap_px:
+                    _lid = int(_vis_ids[_r])
+                    _pp.append((int(_c), _lid))
+                    _lo_pp.append(self.model.positions[_lid])
+                    _li_pp.append(blobs[_c])
+            logger.debug(
+                f"[{_ctrl} | cam {_cam}] Proximity projection fallback attempt: "
+                f"{len(_pp)}/{len(_vis_ids)} visible LEDs matched (snap_px={_proj_snap_px:.1f})"
+            )
+            if len(_pp) >= min_inliers:
+                _ok_p, _rv_p, _tv_p, _ri_p = _ransac_pnp(
+                    np.array(_lo_pp, np.float32), np.array(_li_pp, np.float32),
+                    K, dc, rvec_exp, tvec_exp,
+                    reprojection_px=reprojection_threshold,
+                )
+                if _ok_p and _ri_p is not None:
+                    _fp_p = [_pp[_k] for _k in _ri_p]
+                    if len(_fp_p) >= min_inliers:
+                        _lo_p = self.model.positions[[_l for _, _l in _fp_p]].astype(np.float32)
+                        _li_p = blobs[[_b for _b, _ in _fp_p]].astype(np.float32)
+                        _pe_p = np.linalg.norm(_project_points(_rv_p, _tv_p, _lo_p, K, dc) - _li_p, axis=1)
+                        _err_p = float(_pe_p.mean())
+                        if _err_p < error:
+                            rvec, tvec = _rv_p, _tv_p
+                            final_pairs = _fp_p
+                            lo_f, li_f  = _lo_p, _li_p
+                            error       = _err_p
+                            max_error   = float(_pe_p.max())
+                            _did_proj_fallback = True
+                            logger.debug(
+                                f"[{_ctrl} | cam {_cam}] Proximity projection fallback: "
+                                f"inliers={len(_fp_p)}  err={_err_p:.2f}px"
+                            )
+                        else:
+                            logger.debug(
+                                f"[{_ctrl} | cam {_cam}] Proximity projection fallback: "
+                                f"err={_err_p:.2f}px not better than snap err={error:.2f}px → snap kept"
+                            )
+                else:
+                    logger.debug(f"[{_ctrl} | cam {_cam}] Proximity projection fallback: RANSAC failed or too few inliers")
+            else:
+                logger.debug(f"[{_ctrl} | cam {_cam}] Proximity projection fallback: too few Hungarian pairs ({len(_pp)} < {min_inliers})")
+
+    if final_pairs is None:
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: no valid solution → None")
         return None
-
-    lo_f  = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
-    li_f  = blobs[[b for b, _ in final_pairs]].astype(np.float32)
-    proj  = _project_points(rvec, tvec, lo_f, K, dc)
-    pair_errors = np.linalg.norm(proj - li_f, axis=1)
-    error     = float(pair_errors.mean())
-    max_error = float(pair_errors.max())
 
     # Post-RANSAC aux snap: re-project prior LEDs into each aux camera using the refined
     # pose, then greedy-snap with radii filter. Expanded pairs (new LEDs found during
@@ -617,7 +690,9 @@ def proximity_match(
         aux_cameras_result.append((_aux_cam_idx, _n_aux))
 
     # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
-    _method_suffix = "_expanded" if did_expand else "_locked"
+    _method_suffix = ("_proj_fallback" if _did_proj_fallback
+                      else "_expanded" if did_expand
+                      else "_locked")
     if bool(_cfg.get('joint_optimization', True)) and aux_snapped_per_cam:
         _aux_joint = [
             (_ocam, np.asarray(_oblobs, dtype=np.float32),
@@ -1590,8 +1665,7 @@ def brute_match(
                                         + _aux_dbg
                                     )
 
-                                if (best_inliers_total >= strong_inliers_eff
-                                        and best_error <= strong_match_error_px
+                                if (best_error <= strong_match_error_px
                                         and (weighted_visible_count == 0 or weighted_inlier_count >= min_vis_coverage * weighted_visible_count)):
                                     strong_found = True
 

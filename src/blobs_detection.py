@@ -3,6 +3,8 @@ import numpy as np
 from pathlib import Path
 from loguru import logger
 
+_pass2_memory: dict = {}  # persists pixel_threshold and max_area from last successful pass 2
+
 
 def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     """
@@ -91,7 +93,9 @@ def _split_blob_at_seeds(image, intensities, ys, xs, seed_a, seed_b):
     return results
 
 
-def get_centroids(image, cfg, visualize=False, img_path=None):
+def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
+                   visualize=False, img_path=None, vis_suffix="",
+                   max_area_override=None, min_area_override=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -147,10 +151,8 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     also kept as-is (treated as noise rather than 3 merged LEDs).
     Split blobs are drawn in cyan with their partition contours visible.
     """
-    pixel_threshold    = int(cfg["min_threshold"])
-    required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
-    min_area           = float(cfg["min_area"])
-    max_area           = float(cfg["max_area"])
+    min_area           = float(min_area_override if min_area_override is not None else cfg["min_area"])
+    max_area           = float(max_area_override if max_area_override is not None else cfg["max_area"])
     max_wh             = int(cfg.get("max_wh", 35))
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
     area_outlier_k     = float(cfg.get("area_outlier_k", 6.0))
@@ -373,7 +375,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
         # BGR colours per category
-        C_AREA_SM  = (130, 130, 130)  # grey        — area < min_area or 1×1
+        C_AREA_SM  = (255, 0, 127)  # grey        — area < min_area or 1×1
         C_AREA_LG  = (0,   80,  200)  # dark orange — area > max_area (hard limit)
         C_WH       = (200,  80,    0)  # dark blue   — bounding-box too wide/tall
         C_THRESH   = (200,   0,  200)  # magenta     — below required brightness
@@ -440,6 +442,57 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         if img_path is not None:
             out_dir = Path("./visualization/blobs")
             out_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_blobs.png"), vis)
+            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_blobs{vis_suffix}.png"), vis)
 
     return filtered_centroids, filtered_contours, filtered_radii, rejected_centroids, rejected_contours
+
+
+def get_centroids(image, cfg, visualize=False, img_path=None):
+    pixel_threshold    = int(cfg["min_threshold"])
+    required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
+    pass2_factor       = float(cfg.get("pass2_threshold_factor", 0.0))
+
+    vis_suffix_1 = "_pass1" if pass2_factor > 0 else ""
+    result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
+                            visualize, img_path, vis_suffix_1)
+
+    min_area_pass2 = cfg.get("pass2_min_area")
+    min_area_pass2 = float(min_area_pass2) if min_area_pass2 is not None else None
+
+    if pass2_factor > 0 and len(result[0]) >= 2:
+        # Normal path: derive pass-2 params from pass-1 blob stats.
+        peak_vals = []
+        area_vals = []
+        for cnt in result[1]:
+            bm = np.zeros(image.shape[:2], dtype=np.uint8)
+            cv2.drawContours(bm, [cnt.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
+            px = image[bm > 0]
+            if px.size > 0:
+                peak_vals.append(int(px.max()))
+            area_vals.append(float(cv2.contourArea(cnt.reshape(-1, 1, 2))))
+        if peak_vals:
+            ref_brightness    = int(np.min(peak_vals))
+            pixel_threshold_2 = int(ref_brightness * pass2_factor)
+            if pixel_threshold_2 > pixel_threshold:
+                max_area_pass2 = float(max(area_vals)) if area_vals else None
+                result2 = _detect_blobs(image, pixel_threshold_2, required_threshold, cfg,
+                                         visualize, img_path, "_pass2",
+                                         max_area_override=max_area_pass2,
+                                         min_area_override=min_area_pass2)
+                if len(result2[0]) >= 1:
+                    _pass2_memory["pixel_threshold"] = pixel_threshold_2
+                    _pass2_memory["max_area"]        = max_area_pass2
+                    return result2
+
+    elif pass2_factor > 0 and _pass2_memory:
+        # Fallback: pass 1 didn't yield enough blobs to compute stats — reuse
+        # params from the last successful pass 2.  Clear memory if this also fails.
+        result2 = _detect_blobs(image, _pass2_memory["pixel_threshold"], required_threshold, cfg,
+                                 visualize, img_path, "_pass2",
+                                 max_area_override=_pass2_memory["max_area"],
+                                 min_area_override=min_area_pass2)
+        if len(result2[0]) >= 1:
+            return result2
+        _pass2_memory.clear()
+
+    return result
