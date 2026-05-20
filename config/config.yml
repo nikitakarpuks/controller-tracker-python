@@ -3,7 +3,7 @@ data:
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
-  selected_cameras: [0, 1] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
   intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -62,11 +62,30 @@ blob_detection:
   max_wh: 35              # max bounding-box width or height in pixels
   min_split_dist: 4.0
   split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
-  min_circularity: 0.6      # 4π·area/perimeter² must exceed this after splitting; rejects elongated non-circular shapes
+  min_circularity: 0.5      # 4π·area/perimeter² must exceed this after splitting; rejects elongated non-circular shapes
   area_outlier_k: 10.0      # blob area > median(area) + this * MAD(area) is rejected before matching
   outlier_factor: 3.0      # blob with 1-NN distance > this * median(1-NN) is rejected as spatially isolated noise
-  pass2_threshold_factor: 0.5  # 0 = disabled; e.g. 0.35 — raises pixel_threshold in a 2nd pass to min(peak_per_blob) * factor, cutting dim bridges to IR sources (windows, reflections)
-  pass2_min_area: 1         # null = use min_area; override minimum blob area for pass 2 (blobs shrink under higher threshold, so this can be smaller)
+  pass2_threshold_factor: 0.7       # 0 = disabled; pixel_threshold_2 = percentile(mean_per_blob) * factor
+  pass2_required_factor: 1.2        # required_threshold_2 = percentile(mean_per_blob) * factor; must be > pass2_threshold_factor
+  pass2_brightness_percentile: 25   # percentile of per-blob mean intensities used as brightness reference (low = anchor to dimmer cluster)
+  pass2_min_area: 1             # null = use min_area; override minimum blob area for pass 2 (blobs shrink under higher threshold, so this can be smaller)
+
+  # H1: interior-of-large-blob exclusion (pass-2 only)
+  # Pass-2 candidates whose centroid is deep inside a pass-1 large rejected blob are dropped.
+  # "Deep" = distance-to-nearest-edge > factor * large_blob_radius.
+  interior_edge_margin_px: 10.0    # static px distance from contour edge; centroid farther inside than this is rejected
+
+  # H2: smooth-gradient filter (all passes, very last step)
+  # Casts rays outward from the NMS peak (same logic as split detection).
+  # Rays must be monotonically non-increasing in the original image within the
+  # tolerance, stopping early at a valley (same convention as split_valley_ratio).
+  gradient_radius_factor: 2.5       # neighbourhood radius = factor * blob_radius
+  gradient_num_rays: 16             # rays cast (22.5° apart)
+  gradient_valley_ratio: 0.6        # aligned with split_valley_ratio; stop ray at this fraction of peak
+  gradient_step_tolerance: 0.15     # allow up to 15% per-step intensity increase (noise)
+  gradient_max_bad_ray_fraction: 0.4  # reject blob if ≥ this fraction of rays are non-monotonic
+  gradient_min_radius: 5.0          # minimum neighbourhood radius in px (handles very small blobs)
+
   debug_bbox: null        # [x1, y1, x2, y2] — log why any centroid inside this pixel bbox was dropped
 
 geometry:
