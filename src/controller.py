@@ -391,6 +391,7 @@ class SingleViewTracker:
     # Tracking
     # -----------------------------------------------------
     def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+              blob_brightnesses: Optional[np.ndarray] = None,
               other_cameras_blobs: Optional[List] = None) -> Optional[Dict]:
         """
         State machine:
@@ -469,6 +470,7 @@ class SingleViewTracker:
                     prior_assignment=self.prev_assignment,
                     blob_led_ids=blob_led_ids,
                     blob_radii=blob_radii,
+                    blob_brightnesses=blob_brightnesses,
                     other_cameras_blobs=other_cameras_blobs,
                 )
 
@@ -650,6 +652,7 @@ class TrackingSystem:
         self,
         observations_per_camera: Dict[int, np.ndarray],
         radii_per_camera: Optional[Dict[int, np.ndarray]] = None,
+        brightnesses_per_camera: Optional[Dict[int, np.ndarray]] = None,
     ) -> Dict[str, Optional[Dict]]:
         """
         Run tracking for every controller using a single primary camera.
@@ -690,6 +693,10 @@ class TrackingSystem:
         radii_pool: Dict[int, Optional[np.ndarray]] = {
             cid: (r.copy() if r is not None else None)
             for cid, r in (radii_per_camera or {}).items()
+        }
+        brightnesses_pool: Dict[int, Optional[np.ndarray]] = {
+            cid: (b.copy() if b is not None else None)
+            for cid, b in (brightnesses_per_camera or {}).items()
         }
         # Maps current pool index → original observation index per camera.
         # Stays in sync with cam_pool so later controllers can remap their
@@ -739,9 +746,10 @@ class TrackingSystem:
                     available, key=lambda cid: len(available[cid])
                 )
 
-            primary_tracker = tracker_map[primary_cam_id]
-            primary_blobs   = available[primary_cam_id]
-            primary_radii   = radii_pool.get(primary_cam_id)
+            primary_tracker      = tracker_map[primary_cam_id]
+            primary_blobs        = available[primary_cam_id]
+            primary_radii        = radii_pool.get(primary_cam_id)
+            primary_brightnesses = brightnesses_pool.get(primary_cam_id)
 
             other_cameras_blobs = [
                 (self.cameras[cid], available[cid], radii_pool.get(cid))
@@ -752,6 +760,7 @@ class TrackingSystem:
             solution = primary_tracker.track(
                 primary_blobs,
                 blob_radii=primary_radii,
+                blob_brightnesses=primary_brightnesses,
                 other_cameras_blobs=other_cameras_blobs,
             )
 

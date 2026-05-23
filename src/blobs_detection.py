@@ -6,6 +6,10 @@ from loguru import logger
 _pass2_memory: dict = {}  # persists pixel_threshold, max_area, large_blobs from last successful pass 2
 
 
+_NEIGHBOR_DY = np.array([-1, -1, -1,  0,  0,  1,  1,  1], dtype=np.int32)
+_NEIGHBOR_DX = np.array([-1,  0,  1, -1,  1, -1,  0,  1], dtype=np.int32)
+
+
 def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     """
     Find local maxima within a blob (pixel coords given by ys, xs).
@@ -16,23 +20,22 @@ def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     """
     vals = image[ys, xs].astype(np.int32)
     is_max = vals >= peak_threshold
+    if not is_max.any():
+        return []
 
-    for dy in range(-1, 2):
-        for dx in range(-1, 2):
-            if dy == 0 and dx == 0:
-                continue
-            ny = np.clip(ys + dy, 0, image.shape[0] - 1)
-            nx = np.clip(xs + dx, 0, image.shape[1] - 1)
-            is_max &= vals >= image[ny, nx].astype(np.int32)
+    h, w = image.shape[:2]
+    # Batch all 8 directions: 2 clips instead of 16.
+    ny = np.clip(ys[None, :] + _NEIGHBOR_DY[:, None], 0, h - 1)  # (8, N)
+    nx = np.clip(xs[None, :] + _NEIGHBOR_DX[:, None], 0, w - 1)  # (8, N)
+    is_max &= (vals >= image[ny, nx].astype(np.int32)).all(axis=0)
 
-    if not np.any(is_max):
+    if not is_max.any():
         return []
 
     max_ys   = ys[is_max]
     max_xs   = xs[is_max]
     max_vals = vals[is_max]
 
-    # NMS: process strongest first, suppress within min_split_dist
     order = np.argsort(max_vals)[::-1]
     kept = []
     for i in order:
@@ -208,6 +211,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     centroids        = []
     blob_contours    = []
     blob_pixels_list = []
+    blob_max_pixels  = []
     # Large blobs rejected by area/wh — always tracked; passed to pass-2 as H1 exclusion zones.
     large_rejected_contours = []
     # Per-reason rejection lists — populated only when visualize=True.
@@ -251,34 +255,41 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             if visualize: det_rej_wh.append(cnt)
             continue
 
-        # ── Build pixel mask for this blob ───────────────────────────────────
-        blob_mask = np.zeros_like(image, dtype=np.uint8)
-        cv2.drawContours(blob_mask, [cnt], -1, 255, -1)
+        # ── Build pixel mask for this blob (ROI-sized, not full-image) ──────
+        roi_mask = np.zeros((h_b, w_b), dtype=np.uint8)
+        cnt_roi = cnt.reshape(-1, 2).copy()
+        cnt_roi[:, 0] -= x_b
+        cnt_roi[:, 1] -= y_b
+        cv2.drawContours(roi_mask, [cnt_roi.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
+        ys_roi, xs_roi = np.nonzero(roi_mask)
+        ys = ys_roi + y_b
+        xs = xs_roi + x_b
 
         # ── Required-threshold gate: need at least one bright pixel ───────────
-        roi_pixels = image[blob_mask > 0]
-        if roi_pixels.size == 0 or int(roi_pixels.max()) < required_threshold:
+        if ys.size == 0:
+            if visualize: det_rej_threshold.append(cnt)
+            continue
+        w_pix = intensities[ys, xs]
+        max_pix = int(w_pix.max())
+        if max_pix < required_threshold:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: max pixel "
-                             f"{int(roi_pixels.max()) if roi_pixels.size else 0} < required_threshold {required_threshold}")
+                             f"{max_pix} < required_threshold {required_threshold}")
             if visualize: det_rej_threshold.append(cnt)
             continue
 
         # ── Intensity-weighted centroid (greysum, 1-based coords) ─────────────
-        weights = intensities * (blob_mask > 0)
-        total_weight = np.sum(weights)
+        total_weight = float(w_pix.sum())
         if total_weight == 0:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: zero total weight")
             if visualize: det_rej_threshold.append(cnt)
             continue
 
-        ys, xs = np.nonzero(blob_mask)
-
         # 1-based coordinates prevent the first row/column from never
         # contributing to the weighted sum (matches blobwatch.c greysum logic).
-        cx = np.sum((xs + 1) * weights[ys, xs]) / total_weight - 1.0
-        cy = np.sum((ys + 1) * weights[ys, xs]) / total_weight - 1.0
+        cx = float(np.sum((xs + 1) * w_pix)) / total_weight - 1.0
+        cy = float(np.sum((ys + 1) * w_pix)) / total_weight - 1.0
 
         # ── H1: reject if centroid is deep inside a large pass-1 blob ────────
         if interior_exclude_blobs:
@@ -300,15 +311,19 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         centroids.append((cx, cy))
         blob_contours.append(cnt.reshape(-1, 2).astype(np.float32))
         blob_pixels_list.append((ys, xs))
+        blob_max_pixels.append(max_pix)
 
     # ── 2b. Merged-blob splitting ─────────────────────────────────────────────
     new_centroids     = []
     new_blob_contours = []
+    new_blob_max_pixels = []
+    new_blob_peaks    = []  # cached (peak_y, peak_x) per post-split blob for H2 reuse
     blob_is_split     = []
 
     for i in range(len(centroids)):
         ys_b, xs_b = blob_pixels_list[i]
         maxima = _find_split_maxima(image, ys_b, xs_b, required_threshold, min_split_dist)
+        peak = maxima[0] if maxima else None
 
         if len(maxima) == 2:
             peak_lower = min(int(image[maxima[0][0], maxima[0][1]]),
@@ -318,25 +333,38 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             if not valley_ok:
                 new_centroids.append(centroids[i])
                 new_blob_contours.append(blob_contours[i])
+                new_blob_max_pixels.append(blob_max_pixels[i])
+                new_blob_peaks.append(peak)
                 blob_is_split.append(False)
                 continue
             split_result = _split_blob_at_seeds(image, intensities, ys_b, xs_b, maxima[0], maxima[1])
             if split_result is not None:
-                for (pcx, pcy), part_cnt in split_result:
+                dist_a  = (ys_b - maxima[0][0]) ** 2 + (xs_b - maxima[0][1]) ** 2
+                dist_b_ = (ys_b - maxima[1][0]) ** 2 + (xs_b - maxima[1][1]) ** 2
+                for part_idx, ((pcx, pcy), part_cnt) in enumerate(split_result):
                     new_centroids.append((pcx, pcy))
                     new_blob_contours.append(part_cnt)
                     blob_is_split.append(True)
+                    part_mask = (dist_a <= dist_b_) if part_idx == 0 else (dist_a > dist_b_)
+                    part_pix  = image[ys_b[part_mask], xs_b[part_mask]] if part_mask.any() else np.array([0])
+                    new_blob_max_pixels.append(int(part_pix.max()))
+                    new_blob_peaks.append(maxima[part_idx])
                 continue
 
         new_centroids.append(centroids[i])
         new_blob_contours.append(blob_contours[i])
+        new_blob_max_pixels.append(blob_max_pixels[i])
+        new_blob_peaks.append(peak)
         blob_is_split.append(False)
 
-    centroids     = new_centroids
-    blob_contours = new_blob_contours
+    centroids       = new_centroids
+    blob_contours   = new_blob_contours
+    blob_max_pixels = new_blob_max_pixels
+    blob_peaks      = new_blob_peaks
 
-    centroids_arr     = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
-    blob_is_split_arr = np.array(blob_is_split, dtype=bool)
+    centroids_arr       = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
+    blob_max_pixels_arr = np.array(blob_max_pixels, dtype=np.float32) if blob_max_pixels else np.empty(0, dtype=np.float32)
+    blob_is_split_arr   = np.array(blob_is_split, dtype=bool)
 
     # ── 3. Post-split outlier filters ────────────────────────────────────────
     areas_arr = np.array(
@@ -385,61 +413,69 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         min_nn_full[cand_idx] = min_nn
         keep_mask[cand_idx[min_nn > epsilon]] = False
 
-    # ── 3d. Gradient smoothness filter (very last; reads original unthresholded image)
-    #
-    # For each surviving blob: find the NMS peak (same logic as split detection,
-    # already validated on large blobs), then cast gradient_num_rays rays outward.
-    # Each ray must be monotonically non-increasing within gradient_step_tolerance.
-    # A ray is stopped early when intensity drops below gradient_valley_ratio * peak
-    # (valley = boundary with a neighbouring blob — same convention as split valley).
-    # Blobs with too many non-monotonic rays are rejected as pseudo-LEDs.
+    # ── 3d. Gradient smoothness filter (vectorized ray casting)
     h_img, w_img = image.shape[:2]
+    _ray_angles = (2.0 * np.pi / gradient_num_rays) * np.arange(gradient_num_rays)
+    _ray_dy = np.sin(_ray_angles)   # (R,) — precomputed, same for every blob
+    _ray_dx = np.cos(_ray_angles)   # (R,)
     for i in np.where(keep_mask)[0]:
         cnt_i       = blob_contours[i]
         blob_radius = np.sqrt(max(float(areas_arr[i]), 1.0) / np.pi)
-        nr          = max(gradient_radius_factor * blob_radius, gradient_min_radius)
+        nr_int      = max(int(gradient_radius_factor * blob_radius), int(gradient_min_radius))
 
-        # Recompute blob pixel coords from contour (required for split-blob partitions).
-        bm = np.zeros((h_img, w_img), dtype=np.uint8)
-        cv2.drawContours(bm, [cnt_i.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
-        ys_b, xs_b = np.nonzero(bm)
-        if ys_b.size == 0:
+        # ROI-sized mask — avoids allocating / scanning a full (H×W) image.
+        x_b, y_b, w_b, h_b = cv2.boundingRect(cnt_i.reshape(-1, 1, 2).astype(np.int32))
+        roi_mask = np.zeros((h_b, w_b), dtype=np.uint8)
+        cnt_roi  = cnt_i.reshape(-1, 2).copy()
+        cnt_roi[:, 0] -= x_b
+        cnt_roi[:, 1] -= y_b
+        cv2.drawContours(roi_mask, [cnt_roi.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
+        ys_roi, xs_roi = np.nonzero(roi_mask)
+        if ys_roi.size == 0:
             continue
+        ys_b = ys_roi + y_b
+        xs_b = xs_roi + x_b
 
-        # NMS peak — reuses _find_split_maxima which is already tested on large blobs.
-        maxima = _find_split_maxima(image, ys_b, xs_b, required_threshold, min_split_dist)
-        if not maxima:
+        cached_peak = blob_peaks[i]
+        if cached_peak is None:
             continue
-        peak_y, peak_x = maxima[0]   # strongest maximum first (NMS sorted by value)
+        peak_y, peak_x = cached_peak
         peak_val = int(image[peak_y, peak_x])
         if peak_val == 0:
             continue
 
         valley_floor = gradient_valley_ratio * peak_val
-        bad_rays = 0
 
-        for ray_idx in range(gradient_num_rays):
-            angle   = 2.0 * np.pi * ray_idx / gradient_num_rays
-            dy_ray  = np.sin(angle)
-            dx_ray  = np.cos(angle)
-            prev_val = float(peak_val)
-            ray_bad  = False
+        # Vectorized: compute all (R × S) pixel coords at once and read image in one shot.
+        steps  = np.arange(1, nr_int + 1, dtype=np.float32)             # (S,)
+        py_all = np.round(peak_y + _ray_dy[:, None] * steps).astype(np.int32)  # (R, S)
+        px_all = np.round(peak_x + _ray_dx[:, None] * steps).astype(np.int32)  # (R, S)
 
-            for step in range(1, int(nr) + 1):
-                py = int(round(peak_y + dy_ray * step))
-                px = int(round(peak_x + dx_ray * step))
-                if py < 0 or py >= h_img or px < 0 or px >= w_img:
-                    break
-                val = float(image[py, px])
-                if val < valley_floor:
-                    break  # valley reached — neighbouring blob territory, stop ray
-                if val > prev_val * (1.0 + gradient_step_tolerance):
-                    ray_bad = True
-                    break
-                prev_val = val
+        in_bounds = ((py_all >= 0) & (py_all < h_img) &
+                     (px_all >= 0) & (px_all < w_img))                   # (R, S)
+        py_clip = np.clip(py_all, 0, h_img - 1)
+        px_clip = np.clip(px_all, 0, w_img - 1)
 
-            if ray_bad:
-                bad_rays += 1
+        vals = image[py_clip, px_clip].astype(np.float32)                # (R, S)
+
+        # Active range: each ray stops at the first valley or first out-of-bounds step.
+        valley_hit  = in_bounds & (vals < valley_floor)
+        oob_hit     = ~in_bounds
+        first_valley = np.where(valley_hit.any(1), np.argmax(valley_hit, axis=1), nr_int)
+        first_oob    = np.where(oob_hit.any(1),    np.argmax(oob_hit,    axis=1), nr_int)
+        active_end   = np.minimum(first_valley, first_oob)               # (R,)
+
+        # Monotonicity: detect any step where intensity rises beyond tolerance.
+        prev_vals = np.empty_like(vals)
+        prev_vals[:, 0] = float(peak_val)
+        if nr_int > 1:
+            prev_vals[:, 1:] = vals[:, :-1]
+        step_idx  = np.arange(nr_int)[None, :]                           # (1, S)
+        in_active = step_idx < active_end[:, None]                       # (R, S)
+        bad_rays  = int(
+            (in_active & in_bounds & (vals > prev_vals * (1.0 + gradient_step_tolerance)))
+            .any(axis=1).sum()
+        )
 
         if bad_rays / gradient_num_rays > gradient_max_bad_ray_frac:
             gradient_keep_mask[i] = False
@@ -477,11 +513,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             if _in_bbox(cx_k, cy_k):
                 logger.debug(f"[blob_debug] ({cx_k:.1f},{cy_k:.1f}) survived all stages → kept")
 
-    filtered_centroids  = centroids_arr[kept_indices]
-    filtered_contours   = [blob_contours[i] for i in kept_indices]
-    filtered_is_split   = blob_is_split_arr[kept_indices] if len(blob_is_split_arr) else np.zeros(0, dtype=bool)
-    rejected_centroids  = centroids_arr[rejected_indices]
-    rejected_contours   = [blob_contours[i] for i in rejected_indices]
+    filtered_centroids   = centroids_arr[kept_indices]
+    filtered_contours    = [blob_contours[i] for i in kept_indices]
+    filtered_is_split    = blob_is_split_arr[kept_indices] if len(blob_is_split_arr) else np.zeros(0, dtype=bool)
+    filtered_brightnesses = blob_max_pixels_arr[kept_indices] if len(kept_indices) else np.empty(0, dtype=np.float32)
+    rejected_centroids   = centroids_arr[rejected_indices]
+    rejected_contours    = [blob_contours[i] for i in rejected_indices]
 
     filtered_radii = np.array(
         [np.sqrt(max(cv2.contourArea(cnt.reshape(-1, 1, 2)), 1.0) / np.pi)
@@ -502,7 +539,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         C_THRESH = (180, 0, 0)  # magenta      — below required brightness
         C_CIRC = (0, 255, 255)  # yellow       — circularity filter
         C_AREA_OUT = (0, 0, 255)  # orange       — area outlier filter
-        C_SPAT = (255, 0, 0)  # red          — spatial (DBSCAN) outlier
+        C_SPAT = (128, 128, 128)  # red          — spatial (DBSCAN) outlier
         C_INTERIOR = (128, 0, 255)  # purple       — H1: deep inside large blob
         C_GRAD = (0, 255, 0)  # teal         — H2: no smooth gradient
         C_KEPT = (255, 255, 255)  # green        — kept
@@ -576,20 +613,23 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_blobs{vis_suffix}.png"), vis)
 
     return (filtered_centroids, filtered_contours, filtered_radii,
+            filtered_brightnesses,
             rejected_centroids, rejected_contours, large_rejected_contours)
 
 
 def get_centroids(image, cfg, visualize=False, img_path=None):
-    pixel_threshold      = int(cfg["min_threshold"])
-    required_threshold   = int(cfg.get("required_threshold", pixel_threshold * 2))
-    pass2_factor               = float(cfg.get("pass2_threshold_factor", 0.0))
-    pass2_required_factor      = float(cfg.get("pass2_required_factor", 0.7))
+    pixel_threshold             = int(cfg["min_threshold"])
+    required_threshold          = int(cfg.get("required_threshold", pixel_threshold * 2))
+    pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
+    pass2_required_factor       = float(cfg.get("pass2_required_factor", 0.7))
     pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
+    ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
+    count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
 
     vis_suffix_1 = "_pass1" if pass2_factor > 0 else ""
     result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                             visualize, img_path, vis_suffix_1)
-    large_blobs_pass1 = result[5]
+    large_blobs_pass1 = result[6]
 
     min_area_pass2 = cfg.get("pass2_min_area")
     min_area_pass2 = float(min_area_pass2) if min_area_pass2 is not None else None
@@ -599,17 +639,43 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
         mean_vals = []
         area_vals = []
         for cnt in result[1]:
-            bm = np.zeros(image.shape[:2], dtype=np.uint8)
-            cv2.drawContours(bm, [cnt.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
-            px = image[bm > 0]
+            cnt_int = cnt.reshape(-1, 1, 2).astype(np.int32)
+            xb, yb, wb, hb = cv2.boundingRect(cnt_int)
+            roi_m = np.zeros((hb, wb), dtype=np.uint8)
+            cnt_r = cnt.reshape(-1, 2).copy()
+            cnt_r[:, 0] -= xb
+            cnt_r[:, 1] -= yb
+            cv2.drawContours(roi_m, [cnt_r.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
+            px = image[yb:yb+hb, xb:xb+wb][roi_m > 0]
             if px.size > 0:
                 mean_vals.append(float(np.mean(px)))
-            area_vals.append(float(cv2.contourArea(cnt.reshape(-1, 1, 2))))
+            area_vals.append(float(cv2.contourArea(cnt_int)))
         if mean_vals:
-            ref_brightness        = float(np.percentile(mean_vals, pass2_brightness_percentile))
-            pixel_threshold_2     = int(ref_brightness * pass2_factor)
-            required_threshold_2  = int(ref_brightness * pass2_required_factor)
-            if pixel_threshold_2 > pixel_threshold:
+            ref_brightness   = float(np.percentile(mean_vals, pass2_brightness_percentile))
+            raw_pixel_thr    = int(ref_brightness * pass2_factor)
+            raw_required_thr = int(ref_brightness * pass2_required_factor)
+            if raw_pixel_thr > pixel_threshold:
+                cur_count  = len(mean_vals)
+                prev_count = _pass2_memory.get("blob_count", cur_count)
+                count_stable = (max(cur_count, prev_count) / max(min(cur_count, prev_count), 1)
+                                <= count_gate_max_factor)
+
+                if count_stable or not _pass2_memory:
+                    if _pass2_memory:
+                        pixel_threshold_2    = int(ema_alpha * raw_pixel_thr
+                                                   + (1 - ema_alpha) * _pass2_memory.get("pixel_threshold", raw_pixel_thr))
+                        required_threshold_2 = int(ema_alpha * raw_required_thr
+                                                   + (1 - ema_alpha) * _pass2_memory.get("required_threshold", raw_required_thr))
+                    else:
+                        pixel_threshold_2    = raw_pixel_thr
+                        required_threshold_2 = raw_required_thr
+                    update_memory = True
+                else:
+                    # Blob count jumped — hold previous stable thresholds, don't update memory.
+                    pixel_threshold_2    = _pass2_memory["pixel_threshold"]
+                    required_threshold_2 = _pass2_memory.get("required_threshold", required_threshold)
+                    update_memory = False
+
                 max_area_pass2 = float(max(area_vals)) if area_vals else None
                 result2 = _detect_blobs(image, pixel_threshold_2, required_threshold_2, cfg,
                                          visualize, img_path, "_pass2",
@@ -617,10 +683,12 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
                                          min_area_override=min_area_pass2,
                                          interior_exclude_blobs=large_blobs_pass1)
                 if len(result2[0]) >= 1:
-                    _pass2_memory["pixel_threshold"]    = pixel_threshold_2
-                    _pass2_memory["required_threshold"] = required_threshold_2
-                    _pass2_memory["max_area"]           = max_area_pass2
-                    _pass2_memory["large_blobs"]        = large_blobs_pass1
+                    if update_memory:
+                        _pass2_memory["pixel_threshold"]    = pixel_threshold_2
+                        _pass2_memory["required_threshold"] = required_threshold_2
+                        _pass2_memory["max_area"]           = max_area_pass2
+                        _pass2_memory["large_blobs"]        = large_blobs_pass1
+                        _pass2_memory["blob_count"]         = cur_count
                     return result2
 
     elif pass2_factor > 0 and _pass2_memory:
