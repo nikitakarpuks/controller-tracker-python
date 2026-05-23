@@ -117,95 +117,101 @@ def main():
         img_path, cam_images = batch[0][0], batch[0][1]
         # cam_images: {cam_idx: numpy array}
 
-        cam_blobs    = {}
-        cam_contours = {}
-        cam_radii    = {}
+        cam_blobs        = {}
+        cam_contours     = {}
+        cam_radii        = {}
+        cam_brightnesses = {}
 
         for cam_idx, image in cam_images.items():
-            blob_centroids, blob_contours, blob_radii, _, _, _ = get_centroids(
+            t0 = time()
+            blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
                 image, config["blob_detection"], visualize=True, img_path=img_path
             )
-            cam_blobs[cam_idx]    = blob_centroids.copy()
-            cam_contours[cam_idx] = blob_contours
-            cam_radii[cam_idx]    = blob_radii
+            t1 = time()
+            logger.info(f"blob detection took {t1 - t0} seconds")
+
+            cam_blobs[cam_idx]        = blob_centroids.copy()
+            cam_contours[cam_idx]     = blob_contours
+            cam_radii[cam_idx]        = blob_radii
+            cam_brightnesses[cam_idx] = blob_brightnesses
 
         blobs.append(cam_blobs)
         contours_all.append(cam_contours)
 
-    #     t0      = time()
-    #     results = tracking_system.update(cam_blobs, radii_per_camera=cam_radii)
-    #     elapsed = time() - t0
-    #
-    #     for ctrl_name in enabled_ctrls:
-    #         sol = results.get(ctrl_name)
-    #         if sol:
-    #             T_world_ctrl    = sol["T_world_ctrl"]
-    #             primary_cam_idx = sol.get("primary_cam", 0)
-    #             primary_camera  = cameras[primary_cam_idx]
-    #             T_primary_ctrl  = primary_camera.T_world_cam.inverse().compose(T_world_ctrl)
-    #             rvec_primary, _ = cv2.Rodrigues(T_primary_ctrl.R.astype(np.float32))
-    #             poses_all[ctrl_name].append((rvec_primary.reshape(3), T_primary_ctrl.t.astype(np.float32)))
-    #             assignments_all[ctrl_name].append(sol["assignment"].copy())
-    #             primary_cams_all[ctrl_name].append(primary_cam_idx)
-    #             aux_assignments_all[ctrl_name].append(sol.get("aux_assignments"))
-    #             primary_cam = sol.get("primary_cam", "?")
-    #             aux_cameras = sol.get("aux_cameras")
-    #             if aux_cameras:
-    #                 _aux_parts = [f"cam{c}:{n}" for c, n in aux_cameras if n > 0]
-    #                 aux_str = ("  aux=[" + ",".join(_aux_parts) + "]") if _aux_parts else ""
-    #             elif sol.get("aux_inliers", 0):
-    #                 aux_str = f"  +{sol['aux_inliers']}aux"
-    #             else:
-    #                 aux_str = ""
-    #             logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  "
-    #                         f"cam={primary_cam}  err={sol['error']:.2f}px  "
-    #                         f"matches={len(sol['assignment'])}{aux_str}  "
-    #                         f"method={sol.get('method', '?')}")
-    #         else:
-    #             poses_all[ctrl_name].append(None)
-    #             assignments_all[ctrl_name].append(None)
-    #             primary_cams_all[ctrl_name].append(None)
-    #             aux_assignments_all[ctrl_name].append(None)
-    #             logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  TRACKING LOST")
-    #
-    #     if out_slow is not None and elapsed > SLOW_MATCH_THRESHOLD_S:
-    #         copy(img_path, out_slow / img_path.name)
-    #         logger.info(f"  → saved to deep_search_required (slow: {elapsed:.1f}s)")
-    #     if out_tracking_lost is not None and any(poses_all[n][-1] is None for n in enabled_ctrls):
-    #         copy(img_path, out_tracking_lost / img_path.name)
-    #
-    # # ── Sanity check ───────────────────────────────────────────────────────
-    # for ctrl_name in enabled_ctrls:
-    #     if all(p is None for p in poses_all[ctrl_name]):
-    #         logger.warning(f"[{ctrl_name}] No valid poses found in the entire sequence.")
-    #
-    # # ── Visualisation ──────────────────────────────────────────────────────
-    # if enabled_ctrls:
-    #     controllers_vis = {}
-    #     for ctrl_name in enabled_ctrls:
-    #         pos, nrm, T = ctrl_geom[ctrl_name]
-    #         side = "right" if ctrl_name == "right_controller" else "left"
-    #         controllers_vis[ctrl_name] = {
-    #             "positions":    pos,
-    #             "normals":      nrm,
-    #             "T_model_ctrl": T,
-    #             "side":         side,
-    #             "geometry_cfg": geo_cfg_per_ctrl[ctrl_name],
-    #         }
-    #     animator = ControllerAnimatorRerun(
-    #         config["visualization"]["3d_model_path"],
-    #         controllers_vis,
-    #         matching_cfg=config.get("matching", {}),
-    #     )
-    #     animator.start(
-    #         poses_all,
-    #         assignments_all,
-    #         blobs, cameras,
-    #         contours_all=contours_all,
-    #         save_path=config["visualization"].get("save_recording"),
-    #         primary_cams_all=primary_cams_all,
-    #         aux_assignments_all=aux_assignments_all,
-    #     )
+        t0      = time()
+        results = tracking_system.update(cam_blobs, radii_per_camera=cam_radii)
+        elapsed = time() - t0
+
+        for ctrl_name in enabled_ctrls:
+            sol = results.get(ctrl_name)
+            if sol:
+                T_world_ctrl    = sol["T_world_ctrl"]
+                primary_cam_idx = sol.get("primary_cam", 0)
+                primary_camera  = cameras[primary_cam_idx]
+                T_primary_ctrl  = primary_camera.T_world_cam.inverse().compose(T_world_ctrl)
+                rvec_primary, _ = cv2.Rodrigues(T_primary_ctrl.R.astype(np.float32))
+                poses_all[ctrl_name].append((rvec_primary.reshape(3), T_primary_ctrl.t.astype(np.float32)))
+                assignments_all[ctrl_name].append(sol["assignment"].copy())
+                primary_cams_all[ctrl_name].append(primary_cam_idx)
+                aux_assignments_all[ctrl_name].append(sol.get("aux_assignments"))
+                primary_cam = sol.get("primary_cam", "?")
+                aux_cameras = sol.get("aux_cameras")
+                if aux_cameras:
+                    _aux_parts = [f"cam{c}:{n}" for c, n in aux_cameras if n > 0]
+                    aux_str = ("  aux=[" + ",".join(_aux_parts) + "]") if _aux_parts else ""
+                elif sol.get("aux_inliers", 0):
+                    aux_str = f"  +{sol['aux_inliers']}aux"
+                else:
+                    aux_str = ""
+                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  "
+                            f"cam={primary_cam}  err={sol['error']:.2f}px  "
+                            f"matches={len(sol['assignment'])}{aux_str}  "
+                            f"method={sol.get('method', '?')}")
+            else:
+                poses_all[ctrl_name].append(None)
+                assignments_all[ctrl_name].append(None)
+                primary_cams_all[ctrl_name].append(None)
+                aux_assignments_all[ctrl_name].append(None)
+                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  TRACKING LOST")
+
+        if out_slow is not None and elapsed > SLOW_MATCH_THRESHOLD_S:
+            copy(img_path, out_slow / img_path.name)
+            logger.info(f"  → saved to deep_search_required (slow: {elapsed:.1f}s)")
+        if out_tracking_lost is not None and any(poses_all[n][-1] is None for n in enabled_ctrls):
+            copy(img_path, out_tracking_lost / img_path.name)
+
+    # ── Sanity check ───────────────────────────────────────────────────────
+    for ctrl_name in enabled_ctrls:
+        if all(p is None for p in poses_all[ctrl_name]):
+            logger.warning(f"[{ctrl_name}] No valid poses found in the entire sequence.")
+
+    # ── Visualisation ──────────────────────────────────────────────────────
+    if enabled_ctrls:
+        controllers_vis = {}
+        for ctrl_name in enabled_ctrls:
+            pos, nrm, T = ctrl_geom[ctrl_name]
+            side = "right" if ctrl_name == "right_controller" else "left"
+            controllers_vis[ctrl_name] = {
+                "positions":    pos,
+                "normals":      nrm,
+                "T_model_ctrl": T,
+                "side":         side,
+                "geometry_cfg": geo_cfg_per_ctrl[ctrl_name],
+            }
+        animator = ControllerAnimatorRerun(
+            config["visualization"]["3d_model_path"],
+            controllers_vis,
+            matching_cfg=config.get("matching", {}),
+        )
+        animator.start(
+            poses_all,
+            assignments_all,
+            blobs, cameras,
+            contours_all=contours_all,
+            save_path=config["visualization"].get("save_recording"),
+            primary_cams_all=primary_cams_all,
+            aux_assignments_all=aux_assignments_all,
+        )
 
 
 if __name__ == "__main__":

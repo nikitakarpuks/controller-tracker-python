@@ -247,6 +247,7 @@ def proximity_match(
     prior_assignment: Optional[List] = None,
     blob_led_ids: Optional[np.ndarray] = None,
     blob_radii: Optional[np.ndarray] = None,
+    blob_brightnesses: Optional[np.ndarray] = None,
     other_cameras_blobs: Optional[List] = None,
 ) -> Optional[Dict]:
     """
@@ -276,8 +277,9 @@ def proximity_match(
     snap_factor            = float(_cfg.get('proximity_snap_factor',     4.0))
     blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
     blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',      0.2))
-    blob_size_score_weight = float(_cfg.get('blob_size_score_weight',    0.5))
-    _accept_err_px         = float(_cfg.get('accept_error_px',           3.0))
+    blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',       0.5))
+    blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight', 0.3))
+    _accept_err_px               = float(_cfg.get('accept_error_px',               3.0))
     _proj_snap_px          = float(_cfg.get('projection_snap_px',
                                    _cfg.get('proximity_expansion_px',    8.0)))
 
@@ -330,6 +332,17 @@ def proximity_match(
         depth            = float(max(led_cam[i, 2], 0.01))
         expected_pxs[i]  = focal_px * (led_radius_mm / 1000.0) / depth
         snap_pxs[i]      = expected_pxs[i] * snap_factor
+
+    # Per-prior-LED facing factor: dot product of rotated normal with camera +Z axis.
+    prior_normals_cam = (R_pred_arr @ self.model.normals[prior_lids].T).T  # (N, 3)
+    prior_facing      = np.maximum(0.0, prior_normals_cam[:, 2])           # (N,)
+
+    # Normalise blob brightnesses to [0, 1] relative to the brightest blob this frame.
+    _brightness_norm = None
+    if blob_brightnesses is not None and len(blob_brightnesses) > 0:
+        _bmax = float(blob_brightnesses.max())
+        if _bmax > 0:
+            _brightness_norm = blob_brightnesses / _bmax
 
     # Index for O(1) LED-ID → prior index lookup used in the ID fast path.
     prior_lid_to_idx = {lid: i for i, lid in enumerate(prior_lids)}
@@ -384,8 +397,10 @@ def proximity_match(
                         <= blob_r
                         <= expected_pxs[i] * blob_size_max_factor):
                     continue
-            size_err = float(abs(blob_r - expected_pxs[i])) if blob_r is not None else 0.0
-            score    = dist + blob_size_score_weight * size_err
+            size_err       = float(abs(blob_r - expected_pxs[i])) if blob_r is not None else 0.0
+            brightness_err = (abs(float(_brightness_norm[j]) - prior_facing[i])
+                              if _brightness_norm is not None else 0.0)
+            score = dist + blob_size_score_weight * size_err + blob_brightness_score_weight * brightness_err
             if score < best_score:
                 best_score = score
                 best_i     = i
@@ -466,6 +481,14 @@ def proximity_match(
                         (free_blob_radii > expected_px * blob_size_max_factor)
                     )
                     cost[k, ineligible] = 1e9
+
+            if _brightness_norm is not None:
+                free_normals_cam   = (R_exp @ self.model.normals[free_led_idx].T).T
+                free_facing        = np.maximum(0.0, free_normals_cam[:, 2])          # (n_free_leds,)
+                free_b_norm        = _brightness_norm[free_blob_idx]                  # (n_free_blobs,)
+                cost += blob_brightness_score_weight * np.abs(
+                    free_facing[:, None] - free_b_norm[None, :]
+                )
 
             row_ind, col_ind = linear_sum_assignment(cost)
 
