@@ -140,7 +140,8 @@ def main():
         contours_all.append(cam_contours)
 
         t0      = time()
-        results = tracking_system.update(cam_blobs, radii_per_camera=cam_radii)
+        results = tracking_system.update(cam_blobs, radii_per_camera=cam_radii,
+                                         brightnesses_per_camera=cam_brightnesses)
         elapsed = time() - t0
 
         for ctrl_name in enabled_ctrls:
