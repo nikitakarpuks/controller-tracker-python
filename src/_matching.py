@@ -324,6 +324,8 @@ def proximity_match(
     #   Score = dist + blob_size_score_weight * size_err to prefer size-correct matches.
     argmin_max_px = float(_cfg.get('proximity_argmin_max_dist_px',
                                     float(_cfg.get('proximity_expansion_px', 8.0))))
+    # Aux cameras may have larger calibration offsets; use a looser cap there.
+    _aux_snap_px  = float(_cfg.get('aux_snap_px', argmin_max_px * 3))
 
     # Precompute per-LED depth-scaled snap parameters.
     expected_pxs = np.zeros(len(prior_lids))
@@ -638,7 +640,7 @@ def proximity_match(
                         if _ii in _used_l_r:
                             continue
                         _dist = float(np.linalg.norm(_oblobs[_j] - _proj_i_r[_ii]))
-                        if _dist >= _snap_i_r[_ii] or _dist >= argmin_max_px:
+                        if _dist >= _snap_i_r[_ii] or _dist >= _aux_snap_px:
                             continue
                         if _blob_r_j is not None:
                             _ep = float(_exp_px_i_r[_ii])
@@ -684,7 +686,7 @@ def proximity_match(
                         _row_r, _col_r = linear_sum_assignment(_cost_i_r)
                         _n_exp_i = 0
                         for _rr, _cc in zip(_row_r, _col_r):
-                            if _cost_i_r[_rr, _cc] < expansion_px:
+                            if _cost_i_r[_rr, _cc] < _aux_snap_px:
                                 _pairs_i.append((_free_blob_i_r[_cc], _free_lid_i_r[_rr]))
                                 _snap_lids.add(_free_lid_i_r[_rr])
                                 _snap_blobs.add(_free_blob_i_r[_cc])

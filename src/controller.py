@@ -8,6 +8,7 @@ from src.camera import Camera
 from src.debug_config import is_deep
 from src.geometry import Box3D, Cylinder3D, ControllerGeometry
 from src.transformations import Transform
+from src._self_calibration import SelfCalibrator
 
 
 # =========================================================
@@ -608,9 +609,34 @@ class SingleViewTracker:
 class TrackingSystem:
     def __init__(self, controllers: List[ControllerModel], cameras: List[Camera],
                  matching_cfg: dict = None, geometry_cfg: dict = None,
-                 geometry_cfg_per_ctrl: dict = None):
+                 geometry_cfg_per_ctrl: dict = None,
+                 self_calibration_cfg: dict = None):
 
         self.cameras: Dict[int, Camera] = {cam.camera_idx: cam for cam in cameras}
+
+        # Self-calibration: optionally apply saved extrinsics before tracker creation
+        # so every tracker's T_world_cam starts with the correct (calibrated) value.
+        self._self_cal: Optional[SelfCalibrator] = None
+        sc_cfg = self_calibration_cfg or {}
+        _sc_primary_idx: Optional[int] = None
+
+        if sc_cfg.get("enabled", False):
+            _sc_primary_idx = int(sc_cfg.get("primary_camera", 0))
+            _aux_cam_idxs = sc_cfg.get("aux_cameras") or [
+                cid for cid in self.cameras if cid != _sc_primary_idx
+            ]
+            _primary_cam = self.cameras.get(_sc_primary_idx)
+            _aux_cams = [self.cameras[cid] for cid in _aux_cam_idxs if cid in self.cameras]
+
+            if _primary_cam and _aux_cams:
+                if sc_cfg.get("apply_on_load", True):
+                    from pathlib import Path
+                    _out = Path(sc_cfg.get("output_path",
+                                           "./data/cameras/self_calibrated_extrinsics.json"))
+                    SelfCalibrator.load_and_apply(_out, self.cameras, _sc_primary_idx)
+
+                self._self_cal = SelfCalibrator(_primary_cam, _aux_cams, sc_cfg)
+
         self.trackers: Dict[Tuple[str, int], SingleViewTracker] = {}
 
         for ctrl in controllers:
@@ -622,6 +648,16 @@ class TrackingSystem:
         self._matching_cfg:       dict                       = matching_cfg or {}
         self._designated_primary: Dict[str, Optional[int]]  = {}
         self._handoff_counter:    Dict[str, Dict[int, int]] = {}
+
+        # Resolve fixed primary camera: matching cfg wins, then self-cal lock_primary.
+        _fpc = self._matching_cfg.get("fixed_primary_camera")
+        if _fpc is None and _sc_primary_idx is not None and sc_cfg.get("lock_primary", True):
+            _fpc = _sc_primary_idx
+        self._fixed_primary_cam: Optional[int] = int(_fpc) if _fpc is not None else None
+
+        if self._fixed_primary_cam is not None:
+            for ctrl in controllers:
+                self._designated_primary[ctrl.name] = self._fixed_primary_cam
 
     @staticmethod
     def _strip_matched(
@@ -730,21 +766,26 @@ class TrackingSystem:
             _cfg = self._matching_cfg
 
             # --- Select primary camera ---
-            # Prefer the designated primary (handoff winner) if it has a prior pose.
-            _designated = self._designated_primary.get(ctrl_name)
-            if (_designated is not None
-                    and _designated in available
-                    and tracker_map[_designated].prev_pose is not None):
-                primary_cam_id = _designated
+            # Fixed primary always wins if it has blobs; fall back to most-blob cam only if absent.
+            if (self._fixed_primary_cam is not None
+                    and self._fixed_primary_cam in available):
+                primary_cam_id = self._fixed_primary_cam
             else:
-                tracking_cam = next(
-                    (cam_id for cam_id, tracker in ctrl_pairs
-                     if tracker.prev_pose is not None and cam_id in available),
-                    None,
-                )
-                primary_cam_id = tracking_cam if tracking_cam is not None else max(
-                    available, key=lambda cid: len(available[cid])
-                )
+                # Prefer the designated primary (handoff winner) if it has a prior pose.
+                _designated = self._designated_primary.get(ctrl_name)
+                if (_designated is not None
+                        and _designated in available
+                        and tracker_map[_designated].prev_pose is not None):
+                    primary_cam_id = _designated
+                else:
+                    tracking_cam = next(
+                        (cam_id for cam_id, tracker in ctrl_pairs
+                         if tracker.prev_pose is not None and cam_id in available),
+                        None,
+                    )
+                    primary_cam_id = tracking_cam if tracking_cam is not None else max(
+                        available, key=lambda cid: len(available[cid])
+                    )
 
             primary_tracker      = tracker_map[primary_cam_id]
             primary_blobs        = available[primary_cam_id]
@@ -764,8 +805,43 @@ class TrackingSystem:
                 other_cameras_blobs=other_cameras_blobs,
             )
 
+            # Primary failed — try other cameras before giving up.
+            # Sort by: prev_pose first (can do proximity), then most blobs (brute odds).
+            if solution is None and len(available) > 1:
+                _fallback_order = sorted(
+                    [cid for cid in available if cid != primary_cam_id],
+                    key=lambda cid: (
+                        0 if tracker_map[cid].prev_pose is not None else 1,
+                        -len(available[cid]),
+                    ),
+                )
+                for _fb_cid in _fallback_order:
+                    _fb_blobs = available[_fb_cid]
+                    if len(_fb_blobs) < 3:
+                        continue
+                    _fb_tracker = tracker_map[_fb_cid]
+                    _fb_other = [
+                        (self.cameras[cid], available[cid], radii_pool.get(cid))
+                        for cid in available if cid != _fb_cid
+                    ]
+                    solution = _fb_tracker.track(
+                        _fb_blobs,
+                        blob_radii=radii_pool.get(_fb_cid),
+                        blob_brightnesses=brightnesses_pool.get(_fb_cid),
+                        other_cameras_blobs=_fb_other,
+                    )
+                    if solution is not None:
+                        primary_cam_id  = _fb_cid
+                        primary_tracker = _fb_tracker
+                        break
+
             if solution is not None:
                 solution["primary_cam"] = primary_cam_id
+
+                # Persist winning camera so next frame's selection prefers it over
+                # other trackers that gained prev_pose via state propagation.
+                if self._fixed_primary_cam is None:
+                    self._designated_primary[ctrl_name] = primary_cam_id
 
                 # Save pool-relative blob IDs for stripping (must stay pool-relative).
                 _pool_rel = {
@@ -787,6 +863,34 @@ class TrackingSystem:
                         for cam_id, pairs in _aux_asgns_raw.items()
                         if (_orig_a := pool_orig_idx.get(cam_id, []))
                     }
+
+                # Self-calibration: feed observations when primary cam matches configured anchor.
+                if (self._self_cal is not None
+                        and primary_cam_id == self._self_cal.primary_camera.camera_idx):
+                    _R_prim, _ = cv2.Rodrigues(solution["rvec"].reshape(3, 1).astype(np.float32))
+                    _t_prim = solution["tvec"].reshape(3).astype(np.float32)
+                    _sc_aux_obs: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+                    for _aux_cid, _aux_pairs in (solution.get("aux_assignments") or {}).items():
+                        if len(_aux_pairs) < 3:
+                            continue
+                        _led_ids   = np.array([lid for _, lid in _aux_pairs], dtype=np.int32)
+                        _blob_idxs = np.array([b   for b, _  in _aux_pairs], dtype=np.int32)
+                        _led_pos   = primary_tracker.model.positions[_led_ids]       # (N, 3)
+                        _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim              # (N, 3)
+                        _blobs_aux = observations_per_camera[_aux_cid][_blob_idxs]   # (N, 2)
+                        _sc_aux_obs[_aux_cid] = (_pts_prim, _blobs_aux)
+                    if _sc_aux_obs:
+                        self._self_cal.add_frame(
+                            solution["rvec"], solution["tvec"],
+                            primary_error=solution["error"],
+                            primary_inliers=len(solution["assignment"]),
+                            aux_observations=_sc_aux_obs,
+                        )
+                        if self._self_cal.should_run():
+                            _cal = self._self_cal.run()
+                            self._self_cal.apply_to_cameras(_cal)
+                            for (_, _cam_id), _trk in self.trackers.items():
+                                _trk.T_world_cam = self.cameras[_cam_id].T_world_cam
 
                 # Strip using pool-relative IDs, then update pool_orig_idx.
                 self._strip_matched(cam_pool, radii_pool, pool_orig_idx, _pool_rel, primary_cam_id)
@@ -815,7 +919,7 @@ class TrackingSystem:
                 # Handoff check: promote an aux camera that consistently dominates.
                 # Uses full aux_assignments (snap + expansion) rather than aux_cameras
                 # (which only counts LEDs in the primary's RANSAC inlier set).
-                if bool(_cfg.get('camera_handoff', True)):
+                if bool(_cfg.get('camera_handoff', True)) and self._fixed_primary_cam is None:
                     _ratio_thr  = float(_cfg.get('handoff_coverage_ratio',   1.5))
                     _min_adv    = int(  _cfg.get('handoff_min_advantage',     3))
                     _hysteresis = int(  _cfg.get('handoff_hysteresis_frames', 3))
