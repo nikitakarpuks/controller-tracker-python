@@ -99,6 +99,7 @@ def main():
         matching_cfg=config.get("matching", {}),
         geometry_cfg=config.get("geometry", {}),
         geometry_cfg_per_ctrl=geo_cfg_per_ctrl,
+        self_calibration_cfg=config.get("self_calibration", {}),
     )
 
     if config["visualization"].get("fine_tune_alignment") and "right_controller" in enabled_ctrls:
@@ -125,7 +126,7 @@ def main():
         for cam_idx, image in cam_images.items():
             t0 = time()
             blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
-                image, config["blob_detection"], visualize=True, img_path=img_path
+                image, config["blob_detection"], visualize=config["blob_detection"]["visualize"], img_path=img_path, cam_idx=cam_idx
             )
             t1 = time()
             logger.info(f"blob detection took {t1 - t0} seconds")

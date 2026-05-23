@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from loguru import logger
 
-_pass2_memory: dict = {}  # persists pixel_threshold, max_area, large_blobs from last successful pass 2
+_pass2_memory: dict = {}  # {cam_key: {...}}  — persists per-camera pass-2 state across frames
 
 
 _NEIGHBOR_DY = np.array([-1, -1, -1,  0,  0,  1,  1,  1], dtype=np.int32)
@@ -617,7 +617,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             rejected_centroids, rejected_contours, large_rejected_contours)
 
 
-def get_centroids(image, cfg, visualize=False, img_path=None):
+def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
     pixel_threshold             = int(cfg["min_threshold"])
     required_threshold          = int(cfg.get("required_threshold", pixel_threshold * 2))
     pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
@@ -626,7 +626,12 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
     ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
     count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
 
-    vis_suffix_1 = "_pass1" if pass2_factor > 0 else ""
+    # Per-camera EMA memory — keyed by cam_idx so cameras don't bleed into each other.
+    _cam_key = cam_idx if cam_idx is not None else 0
+    _mem = _pass2_memory.setdefault(_cam_key, {})
+
+    cam_str      = f"_cam{cam_idx}" if cam_idx is not None else ""
+    vis_suffix_1 = f"{cam_str}_pass1" if pass2_factor > 0 else cam_str
     result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                             visualize, img_path, vis_suffix_1)
     large_blobs_pass1 = result[6]
@@ -656,53 +661,53 @@ def get_centroids(image, cfg, visualize=False, img_path=None):
             raw_required_thr = int(ref_brightness * pass2_required_factor)
             if raw_pixel_thr > pixel_threshold:
                 cur_count  = len(mean_vals)
-                prev_count = _pass2_memory.get("blob_count", cur_count)
+                prev_count = _mem.get("blob_count", cur_count)
                 count_stable = (max(cur_count, prev_count) / max(min(cur_count, prev_count), 1)
                                 <= count_gate_max_factor)
 
-                if count_stable or not _pass2_memory:
-                    if _pass2_memory:
+                if count_stable or not _mem:
+                    if _mem:
                         pixel_threshold_2    = int(ema_alpha * raw_pixel_thr
-                                                   + (1 - ema_alpha) * _pass2_memory.get("pixel_threshold", raw_pixel_thr))
+                                                   + (1 - ema_alpha) * _mem.get("pixel_threshold", raw_pixel_thr))
                         required_threshold_2 = int(ema_alpha * raw_required_thr
-                                                   + (1 - ema_alpha) * _pass2_memory.get("required_threshold", raw_required_thr))
+                                                   + (1 - ema_alpha) * _mem.get("required_threshold", raw_required_thr))
                     else:
                         pixel_threshold_2    = raw_pixel_thr
                         required_threshold_2 = raw_required_thr
                     update_memory = True
                 else:
                     # Blob count jumped — hold previous stable thresholds, don't update memory.
-                    pixel_threshold_2    = _pass2_memory["pixel_threshold"]
-                    required_threshold_2 = _pass2_memory.get("required_threshold", required_threshold)
+                    pixel_threshold_2    = _mem["pixel_threshold"]
+                    required_threshold_2 = _mem.get("required_threshold", required_threshold)
                     update_memory = False
 
                 max_area_pass2 = float(max(area_vals)) if area_vals else None
                 result2 = _detect_blobs(image, pixel_threshold_2, required_threshold_2, cfg,
-                                         visualize, img_path, "_pass2",
+                                         visualize, img_path, f"{cam_str}_pass2",
                                          max_area_override=max_area_pass2,
                                          min_area_override=min_area_pass2,
                                          interior_exclude_blobs=large_blobs_pass1)
                 if len(result2[0]) >= 1:
                     if update_memory:
-                        _pass2_memory["pixel_threshold"]    = pixel_threshold_2
-                        _pass2_memory["required_threshold"] = required_threshold_2
-                        _pass2_memory["max_area"]           = max_area_pass2
-                        _pass2_memory["large_blobs"]        = large_blobs_pass1
-                        _pass2_memory["blob_count"]         = cur_count
+                        _mem["pixel_threshold"]    = pixel_threshold_2
+                        _mem["required_threshold"] = required_threshold_2
+                        _mem["max_area"]           = max_area_pass2
+                        _mem["large_blobs"]        = large_blobs_pass1
+                        _mem["blob_count"]         = cur_count
                     return result2
 
-    elif pass2_factor > 0 and _pass2_memory:
+    elif pass2_factor > 0 and _mem:
         # Fallback: pass 1 didn't yield enough blobs — reuse params from last
         # successful pass 2.  Use large blobs from the current frame (not stored
         # ones) since they represent the actual exclusion zones this frame.
-        result2 = _detect_blobs(image, _pass2_memory["pixel_threshold"],
-                                 _pass2_memory.get("required_threshold", required_threshold), cfg,
-                                 visualize, img_path, "_pass2",
-                                 max_area_override=_pass2_memory["max_area"],
+        result2 = _detect_blobs(image, _mem["pixel_threshold"],
+                                 _mem.get("required_threshold", required_threshold), cfg,
+                                 visualize, img_path, f"{cam_str}_pass2",
+                                 max_area_override=_mem["max_area"],
                                  min_area_override=min_area_pass2,
                                  interior_exclude_blobs=large_blobs_pass1)
         if len(result2[0]) >= 1:
             return result2
-        _pass2_memory.clear()
+        _mem.clear()
 
     return result
