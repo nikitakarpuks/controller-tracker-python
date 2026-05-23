@@ -1134,6 +1134,7 @@ def brute_match(
     rng_seed: Optional[int] = 42,
     other_cameras_blobs: Optional[List] = None,
     blob_radii: Optional[np.ndarray] = None,
+    blob_mask: Optional[np.ndarray] = None,
 ) -> Optional[Dict]:
     """
     Exhaustive pose search via P3P over LED/blob triple correspondences.
@@ -1172,11 +1173,13 @@ def brute_match(
 
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
-    if n_blobs < 4:
+    _avail_idx  = np.where(blob_mask)[0].astype(np.int32) if blob_mask is not None else np.arange(n_blobs, dtype=np.int32)
+    n_available = len(_avail_idx)
+    if n_available < 4:
         return None
 
     if min_inlier_fraction is not None:
-        fraction_floor     = int(np.ceil(min_inlier_fraction * n_blobs))
+        fraction_floor     = int(np.ceil(min_inlier_fraction * n_available))
         min_inliers_eff    = max(min_inliers, fraction_floor)
         strong_inliers_eff = min(strong_match_inliers, fraction_floor)
     else:
@@ -1291,10 +1294,12 @@ def brute_match(
             min_blob_i2 = int(cur_prev_blob[triple_i])
             did_p3p = False
 
-            for b_anchor in range(n_blobs):
+            for b_anchor in _avail_idx:
                 if strong_found:
                     break
                 blob_neighbors   = blob_nbr[b_anchor]
+                if blob_mask is not None:
+                    blob_neighbors = blob_neighbors[blob_mask[blob_neighbors]]
                 n_blob_neighbors = min(len(blob_neighbors), blob_max)
                 if n_blob_neighbors < 2:
                     continue
@@ -1409,7 +1414,12 @@ def brute_match(
 
                             proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc)
                             cost     = cdist(blobs, proj_all)
-                            hungarian_blob_rows, hungarian_led_cols = linear_sum_assignment(cost)
+                            if blob_mask is not None:
+                                _cost_sub = cost[_avail_idx]
+                                _sub_rows, hungarian_led_cols = linear_sum_assignment(_cost_sub)
+                                hungarian_blob_rows = _avail_idx[_sub_rows]
+                            else:
+                                hungarian_blob_rows, hungarian_led_cols = linear_sum_assignment(cost)
 
                             inlier_mask    = cost[hungarian_blob_rows, hungarian_led_cols] < hungarian_threshold_px
                             inlier_blobs   = hungarian_blob_rows[inlier_mask]
@@ -1473,7 +1483,7 @@ def brute_match(
                             # neighbour pass recovers them (one cdist, no PnP).
                             matched_blob_set  = set(inlier_blobs.tolist())
                             matched_led_set   = set(inlier_leds.tolist())
-                            unmatched_blobs   = np.array([b for b in range(n_blobs) if b not in matched_blob_set], dtype=np.int32)
+                            unmatched_blobs   = np.array([b for b in _avail_idx if b not in matched_blob_set], dtype=np.int32)
                             unmatched_col_idx = np.array([j for j, lid in enumerate(vis_ids_r) if int(lid) not in matched_led_set], dtype=np.int32)
 
                             if len(unmatched_blobs) > 0 and len(unmatched_col_idx) > 0:
@@ -1801,4 +1811,6 @@ def brute_match(
     #     print("[frustum debug] inner LED occlusion check for best solution:")
     #     _visible_mask(R_best, tvec_best, positions, normals, geom, debug=True)
 
+    if best_solution is not None and blob_mask is not None:
+        best_solution['_orig_idx'] = True
     return best_solution
