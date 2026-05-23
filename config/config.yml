@@ -1,5 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/both"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -144,6 +144,10 @@ matching:
   proximity_vis_drop_threshold: 2       # also expand if prior LED count dropped by more than this
   projection_snap_px: 25.0              # projection fallback: max Hungarian cost to accept a blob-LED pair
   aux_snap_px: 15.0                     # snap cap for aux cameras (looser than primary — calibration offsets)
+  proximity_mutual_exclusion_px: 15.0  # Phase 3 radius: blobs within this of a later controller's projected
+                                        # LEDs (and closer to it) are reserved when only one controller has a pose
+  voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs
+                                        # within this distance of either controller's LEDs (full Voronoi territory)
 
   # --------------------------------------------------------------------------
   # Pose validation
