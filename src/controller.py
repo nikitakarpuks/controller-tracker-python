@@ -2,7 +2,7 @@ import copy
 import cv2
 import numpy as np
 from loguru import logger
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 
 from src.camera import Camera
 from src.debug_config import is_deep
@@ -659,30 +659,6 @@ class TrackingSystem:
             for ctrl in controllers:
                 self._designated_primary[ctrl.name] = self._fixed_primary_cam
 
-    @staticmethod
-    def _strip_matched(
-        cam_pool: Dict[int, np.ndarray],
-        radii_pool: Dict[int, Optional[np.ndarray]],
-        pool_orig_idx: Dict[int, List[int]],
-        solution: Dict,
-        primary_cam_id: int,
-    ) -> None:
-        """Remove blobs consumed by this controller from the shared pools.
-        Also updates pool_orig_idx so subsequent controllers can remap their
-        pool-relative blob IDs back to the original observation indices."""
-        def _remove(cam_id: int, indices: set) -> None:
-            if not indices or cam_id not in cam_pool or cam_pool[cam_id] is None:
-                return
-            keep = [i for i in range(len(cam_pool[cam_id])) if i not in indices]
-            cam_pool[cam_id] = cam_pool[cam_id][keep]
-            if radii_pool.get(cam_id) is not None:
-                radii_pool[cam_id] = radii_pool[cam_id][keep]
-            if cam_id in pool_orig_idx:
-                pool_orig_idx[cam_id] = [pool_orig_idx[cam_id][k] for k in keep]
-
-        _remove(primary_cam_id, {b for b, _ in solution.get("assignment", [])})
-        for cam_id, pairs in (solution.get("aux_assignments") or {}).items():
-            _remove(cam_id, {b for b, _ in pairs})
 
     def update(
         self,
@@ -693,55 +669,53 @@ class TrackingSystem:
         """
         Run tracking for every controller using a single primary camera.
 
-        For each controller:
-          - Tracking mode  (a tracker already has prev_pose):
-              use that tracker's camera — it runs proximity or brute on its own blobs.
-          - Cold start / re-acquisition:
-              pick the camera with the most blobs as the primary camera,
-              run brute_match once, and pass every other camera's blobs as
-              other_cameras_blobs so the existing aux validation scores them.
+        Blob ownership model: observations_per_camera is never mutated. Instead,
+        claimed_blobs tracks which original blob indices have been consumed by
+        earlier controllers. Each controller receives a pre-filtered view of
+        unclaimed blobs; assignments returned are remapped to original indices.
 
-        Controllers that are already tracking run first; their matched blobs are
-        removed from the shared pool before cold-starting controllers search,
-        reducing false-positive P3P candidates during re-acquisition.
+        Controllers with a prior pose run first so their high-confidence claims
+        are registered before cold-starting controllers search.
 
-        Returns {ctrl_name: solution_or_None}.  The solution dict gains a
+        Returns {ctrl_name: solution_or_None}. The solution dict gains a
         "primary_cam" key with the index of the camera that produced the pose.
         """
         results: Dict[str, Optional[Dict]] = {}
 
-        ctrl_names: set = {ctrl for ctrl, _ in self.trackers}
+        ctrl_names: List[str] = sorted({ctrl for ctrl, _ in self.trackers})
 
-        # Tracking controllers first → their blobs are stripped before cold-start search
+        # Controllers with a prior pose run first — their claims reduce the search
+        # space for cold-starting controllers.
+        # Sort by (has_prior_rank, name) for full determinism when priorities are equal.
         def _has_prior(name: str) -> bool:
             return any(
                 t.prev_pose is not None
                 for (cname, _), t in self.trackers.items()
                 if cname == name
             )
-        ordered = sorted(ctrl_names, key=lambda n: 0 if _has_prior(n) else 1)
+        ordered = sorted(ctrl_names, key=lambda n: (0 if _has_prior(n) else 1, n))
 
-        # Mutable per-camera pools; tracking controllers consume their blobs first
-        cam_pool: Dict[int, np.ndarray] = {
-            cid: blobs.copy() if blobs is not None else None
-            for cid, blobs in observations_per_camera.items()
-        }
-        radii_pool: Dict[int, Optional[np.ndarray]] = {
-            cid: (r.copy() if r is not None else None)
-            for cid, r in (radii_per_camera or {}).items()
-        }
-        brightnesses_pool: Dict[int, Optional[np.ndarray]] = {
-            cid: (b.copy() if b is not None else None)
-            for cid, b in (brightnesses_per_camera or {}).items()
-        }
-        # Maps current pool index → original observation index per camera.
-        # Stays in sync with cam_pool so later controllers can remap their
-        # pool-relative blob IDs to original indices for visualization.
-        pool_orig_idx: Dict[int, List[int]] = {
-            cid: list(range(len(blobs)))
-            for cid, blobs in observations_per_camera.items()
-            if blobs is not None
-        }
+        # Blob ownership: original observation indices claimed by controllers so far.
+        claimed_blobs: Dict[int, Set[int]] = {}
+
+        def _filter_cam(cam_id: int):
+            """Return (filtered_blobs, filtered_radii, filtered_brts, orig_indices)
+            for camera cam_id, excluding already-claimed blobs.
+            Returns (None, None, None, []) when no unclaimed blobs remain."""
+            obs = observations_per_camera.get(cam_id)
+            if obs is None or len(obs) == 0:
+                return None, None, None, []
+            claimed = claimed_blobs.get(cam_id, set())
+            keep = [i for i in range(len(obs)) if i not in claimed]
+            if not keep:
+                return None, None, None, []
+            k = np.array(keep, dtype=np.int32)
+            f_blobs = obs[k]
+            _r = (radii_per_camera or {}).get(cam_id)
+            f_radii = _r[k] if _r is not None else None
+            _b = (brightnesses_per_camera or {}).get(cam_id)
+            f_brts = _b[k] if _b is not None else None
+            return f_blobs, f_radii, f_brts, keep
 
         for ctrl_name in ordered:
             ctrl_pairs: List[Tuple[int, "SingleViewTracker"]] = [
@@ -750,15 +724,15 @@ class TrackingSystem:
                 if cname == ctrl_name
             ]
 
-            # Cameras that delivered blob observations this frame (draw from mutable pool)
-            available: Dict[int, np.ndarray] = {
-                cam_id: cam_pool[cam_id]
-                for cam_id, _ in ctrl_pairs
-                if cam_id in cam_pool
-                   and cam_pool[cam_id] is not None
-            }
+            # Build per-camera filtered views for this controller.
+            # Key: cam_id → (filtered_blobs, filtered_radii, filtered_brts, orig_idx_list)
+            avail: Dict[int, tuple] = {}
+            for cam_id, _ in ctrl_pairs:
+                fb, fr, fbt, keep = _filter_cam(cam_id)
+                if fb is not None:
+                    avail[cam_id] = (fb, fr, fbt, keep)
 
-            if not available:
+            if not avail:
                 results[ctrl_name] = None
                 continue
 
@@ -766,37 +740,48 @@ class TrackingSystem:
             _cfg = self._matching_cfg
 
             # --- Select primary camera ---
-            # Fixed primary always wins if it has blobs; fall back to most-blob cam only if absent.
+            # Fixed primary always wins when it has unclaimed blobs.
             if (self._fixed_primary_cam is not None
-                    and self._fixed_primary_cam in available):
+                    and self._fixed_primary_cam in avail):
                 primary_cam_id = self._fixed_primary_cam
             else:
-                # Prefer the designated primary (handoff winner) if it has a prior pose.
                 _designated = self._designated_primary.get(ctrl_name)
-                if (_designated is not None
-                        and _designated in available
-                        and tracker_map[_designated].prev_pose is not None):
+                _des_tracker = tracker_map.get(_designated)
+                # Require at least 3 unclaimed blobs: minimum for proximity match.
+                # When the competing controller claimed most blobs from this camera,
+                # fall through to the best available camera instead.
+                _des_ok = (
+                    _des_tracker is not None
+                    and _designated in avail
+                    and _des_tracker.prev_pose is not None
+                    and len(avail[_designated][0]) >= 3
+                )
+                if _des_ok:
                     primary_cam_id = _designated
                 else:
-                    tracking_cam = next(
-                        (cam_id for cam_id, tracker in ctrl_pairs
-                         if tracker.prev_pose is not None and cam_id in available),
-                        None,
-                    )
-                    primary_cam_id = tracking_cam if tracking_cam is not None else max(
-                        available, key=lambda cid: len(available[cid])
-                    )
+                    # Pick camera with prev_pose that has the most unclaimed blobs.
+                    # Fall back to purely blob-count if no camera has a prior pose.
+                    _with_prior = [
+                        cid for cid in avail
+                        if tracker_map[cid].prev_pose is not None
+                    ]
+                    if _with_prior:
+                        primary_cam_id = max(_with_prior, key=lambda cid: len(avail[cid][0]))
+                    else:
+                        primary_cam_id = max(avail, key=lambda cid: len(avail[cid][0]))
 
-            primary_tracker      = tracker_map[primary_cam_id]
-            primary_blobs        = available[primary_cam_id]
-            primary_radii        = radii_pool.get(primary_cam_id)
-            primary_brightnesses = brightnesses_pool.get(primary_cam_id)
+            primary_tracker = tracker_map[primary_cam_id]
+            primary_blobs, primary_radii, primary_brightnesses, primary_orig = avail[primary_cam_id]
 
             other_cameras_blobs = [
-                (self.cameras[cid], available[cid], radii_pool.get(cid))
-                for cid in available
+                (self.cameras[cid], av[0], av[1])
+                for cid, av in avail.items()
                 if cid != primary_cam_id
             ]
+            # orig-index maps for aux cameras — needed to remap solution indices.
+            aux_orig: Dict[int, List[int]] = {
+                cid: av[3] for cid, av in avail.items() if cid != primary_cam_id
+            }
 
             solution = primary_tracker.track(
                 primary_blobs,
@@ -806,65 +791,69 @@ class TrackingSystem:
             )
 
             # Primary failed — try other cameras before giving up.
-            # Sort by: prev_pose first (can do proximity), then most blobs (brute odds).
-            if solution is None and len(available) > 1:
+            # Sort by: prev_pose first (can do proximity), then most unclaimed blobs.
+            if solution is None and len(avail) > 1:
                 _fallback_order = sorted(
-                    [cid for cid in available if cid != primary_cam_id],
+                    [cid for cid in avail if cid != primary_cam_id],
                     key=lambda cid: (
                         0 if tracker_map[cid].prev_pose is not None else 1,
-                        -len(available[cid]),
+                        -len(avail[cid][0]),
                     ),
                 )
                 for _fb_cid in _fallback_order:
-                    _fb_blobs = available[_fb_cid]
+                    _fb_blobs, _fb_radii, _fb_brts, _fb_orig = avail[_fb_cid]
                     if len(_fb_blobs) < 3:
                         continue
                     _fb_tracker = tracker_map[_fb_cid]
                     _fb_other = [
-                        (self.cameras[cid], available[cid], radii_pool.get(cid))
-                        for cid in available if cid != _fb_cid
+                        (self.cameras[cid], av[0], av[1])
+                        for cid, av in avail.items() if cid != _fb_cid
                     ]
                     solution = _fb_tracker.track(
                         _fb_blobs,
-                        blob_radii=radii_pool.get(_fb_cid),
-                        blob_brightnesses=brightnesses_pool.get(_fb_cid),
+                        blob_radii=_fb_radii,
+                        blob_brightnesses=_fb_brts,
                         other_cameras_blobs=_fb_other,
                     )
                     if solution is not None:
                         primary_cam_id  = _fb_cid
                         primary_tracker = _fb_tracker
+                        primary_orig    = _fb_orig
+                        aux_orig = {
+                            cid: av[3] for cid, av in avail.items() if cid != _fb_cid
+                        }
                         break
 
             if solution is not None:
                 solution["primary_cam"] = primary_cam_id
 
-                # Persist winning camera so next frame's selection prefers it over
-                # other trackers that gained prev_pose via state propagation.
+                # Persist winning camera so next frame's selection prefers it.
                 if self._fixed_primary_cam is None:
                     self._designated_primary[ctrl_name] = primary_cam_id
 
-                # Save pool-relative blob IDs for stripping (must stay pool-relative).
-                _pool_rel = {
-                    "assignment":      list(solution["assignment"]),
-                    "aux_assignments": dict(solution.get("aux_assignments") or {}),
-                }
-
-                # Remap pool-relative blob IDs → original observation indices so
-                # visualization can index directly into the unstripped blob arrays.
-                _orig_p = pool_orig_idx.get(primary_cam_id, [])
-                if _orig_p:
-                    solution["assignment"] = [
-                        (_orig_p[b], lid) for b, lid in solution["assignment"]
-                    ]
-                _aux_asgns_raw = solution.get("aux_assignments") or {}
-                if _aux_asgns_raw:
+                # Remap filtered indices → original observation indices.
+                # Matching functions return indices into the filtered arrays we passed;
+                # translate back so all downstream code uses stable original indices.
+                solution["assignment"] = [
+                    (primary_orig[b], lid) for b, lid in solution["assignment"]
+                ]
+                _raw_aux = solution.get("aux_assignments") or {}
+                if _raw_aux:
                     solution["aux_assignments"] = {
-                        cam_id: [(_orig_a[b], lid) for b, lid in pairs]
-                        for cam_id, pairs in _aux_asgns_raw.items()
-                        if (_orig_a := pool_orig_idx.get(cam_id, []))
+                        cid: [(aux_orig[cid][b], lid) for b, lid in pairs]
+                        for cid, pairs in _raw_aux.items()
+                        if cid in aux_orig
                     }
 
-                # Self-calibration: feed observations when primary cam matches configured anchor.
+                # Register claimed blobs (original indices) so subsequent controllers
+                # receive pre-filtered views that exclude these.
+                for b, _ in solution["assignment"]:
+                    claimed_blobs.setdefault(primary_cam_id, set()).add(b)
+                for cid, pairs in (solution.get("aux_assignments") or {}).items():
+                    for b, _ in pairs:
+                        claimed_blobs.setdefault(cid, set()).add(b)
+
+                # Self-calibration: feed observations when primary cam matches anchor.
                 if (self._self_cal is not None
                         and primary_cam_id == self._self_cal.primary_camera.camera_idx):
                     _R_prim, _ = cv2.Rodrigues(solution["rvec"].reshape(3, 1).astype(np.float32))
@@ -875,9 +864,9 @@ class TrackingSystem:
                             continue
                         _led_ids   = np.array([lid for _, lid in _aux_pairs], dtype=np.int32)
                         _blob_idxs = np.array([b   for b, _  in _aux_pairs], dtype=np.int32)
-                        _led_pos   = primary_tracker.model.positions[_led_ids]       # (N, 3)
-                        _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim              # (N, 3)
-                        _blobs_aux = observations_per_camera[_aux_cid][_blob_idxs]   # (N, 2)
+                        _led_pos   = primary_tracker.model.positions[_led_ids]
+                        _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim
+                        _blobs_aux = observations_per_camera[_aux_cid][_blob_idxs]
                         _sc_aux_obs[_aux_cid] = (_pts_prim, _blobs_aux)
                     if _sc_aux_obs:
                         self._self_cal.add_frame(
@@ -891,9 +880,6 @@ class TrackingSystem:
                             self._self_cal.apply_to_cameras(_cal)
                             for (_, _cam_id), _trk in self.trackers.items():
                                 _trk.T_world_cam = self.cameras[_cam_id].T_world_cam
-
-                # Strip using pool-relative IDs, then update pool_orig_idx.
-                self._strip_matched(cam_pool, radii_pool, pool_orig_idx, _pool_rel, primary_cam_id)
 
                 # State propagation: push T_world_ctrl into every non-primary tracker
                 # so any camera can be promoted to primary without cold-start brute search.
@@ -925,7 +911,7 @@ class TrackingSystem:
                     _hysteresis = int(  _cfg.get('handoff_hysteresis_frames', 3))
                     _n_primary  = len(solution["assignment"])
                     _hctr = self._handoff_counter.setdefault(ctrl_name, {})
-                    for _aux_cid, _aux_pairs in (aux_asgns.items()):
+                    for _aux_cid, _aux_pairs in aux_asgns.items():
                         _aux_n = len(_aux_pairs)
                         if (_aux_n >= _ratio_thr * _n_primary
                                 and _aux_n - _n_primary >= _min_adv):
