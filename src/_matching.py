@@ -1250,6 +1250,7 @@ def brute_match(
     debug_blob_anchor = int(_dbg_blobs[0])    if _dbg_blobs is not None else None
     debug_blob_set    = frozenset(_dbg_blobs) if _dbg_blobs is not None else None
 
+    seen_bijections:  set                  = set()
     bijection_counts: Dict[frozenset, int] = {} if is_deep() else None
 
     for tier_idx, tier_spec in enumerate(depth_tiers):
@@ -1347,6 +1348,10 @@ def brute_match(
                         bij = frozenset(((int(led_ids[0]), b_anchor),
                                          (int(led_ids[1]), b1_ord),
                                          (int(led_ids[2]), b2_ord)))
+
+                        if bij in seen_bijections:
+                            continue
+                        seen_bijections.add(bij)
 
                         if bijection_counts is not None:
                             bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
