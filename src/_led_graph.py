@@ -127,8 +127,10 @@ def _precompute_led_quads(
     positions: np.ndarray, led_nbr: List[np.ndarray], k: int = 8
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
     """
-    Enumerate LED triples for P3P. Each unique (anchor, l1, l2) appears exactly once,
-    eliminating the duplicate P3P calls caused by varying the gate LED under C(k,3).
+    Enumerate LED triples for P3P. Each (anchor, l1, l2) ordered triple appears once per
+    anchor — i.e., the same three LEDs may appear under different anchors because each
+    anchor defines a distinct P3P geometry (different gate pool, different depth rank).
+    Duplicate bijection-level P3P calls are deduplicated later in brute_match.
 
     Returns
     -------
@@ -139,7 +141,7 @@ def _precompute_led_quads(
     idx_rows:   List[Tuple]       = []
     depth_rows: List[int]         = []
     gate_rows:  List[np.ndarray]  = []
-    seen_led:   set               = set()
+    seen_per_anchor: set          = set()   # dedup only within the same anchor's C(k,2)
     n = len(positions)
     for anchor in range(n):
         nbrs   = led_nbr[anchor][:k]
@@ -148,10 +150,10 @@ def _precompute_led_quads(
             continue
         for i1, i2 in combinations(range(nb_len), 2):
             l1, l2 = int(nbrs[i1]), int(nbrs[i2])
-            key = tuple(sorted((anchor, l1, l2)))
-            if key in seen_led:
+            key = (anchor, min(l1, l2), max(l1, l2))
+            if key in seen_per_anchor:
                 continue
-            seen_led.add(key)
+            seen_per_anchor.add(key)
             depth  = i2 + 1
             gates  = np.array(
                 [int(nbrs[j]) for j in range(nb_len) if j != i1 and j != i2],
