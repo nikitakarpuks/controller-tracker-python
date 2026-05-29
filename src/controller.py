@@ -942,7 +942,7 @@ class TrackingSystem:
             # Primary failed — try other cameras before giving up.
             # Warm: prev_pose cameras first, then most blobs (best proximity coverage).
             # Cold: prev_pose cameras first, then fewest blobs (least contamination).
-            _cold_start = not _with_prior
+            _cold_start = primary_tracker.prev_pose is None
             if solution is None and len(avail) > 1:
                 _fallback_order = sorted(
                     [cid for cid in avail if cid != primary_cam_id],
