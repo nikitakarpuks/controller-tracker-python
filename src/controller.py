@@ -890,7 +890,11 @@ class TrackingSystem:
                     primary_cam_id = _designated
                 else:
                     # Pick camera with prev_pose that has the most unclaimed blobs.
-                    # Fall back to purely blob-count if no camera has a prior pose.
+                    # Cold-start (no prev_pose anywhere): prefer the camera with the
+                    # fewest blobs — it is less likely to be contaminated by another
+                    # controller's LEDs, giving a more reliable brute-match anchor.
+                    # Require ≥ min_inliers blobs so brute_match can actually run.
+                    _min_inliers = int(_cfg.get('min_inliers', 4))
                     _with_prior = [
                         cid for cid in avail
                         if tracker_map[cid].prev_pose is not None
@@ -898,7 +902,13 @@ class TrackingSystem:
                     if _with_prior:
                         primary_cam_id = max(_with_prior, key=lambda cid: len(avail[cid][0]))
                     else:
-                        primary_cam_id = max(avail, key=lambda cid: len(avail[cid][0]))
+                        _cold_eligible = [
+                            cid for cid in avail if len(avail[cid][0]) >= _min_inliers
+                        ]
+                        if _cold_eligible:
+                            primary_cam_id = min(_cold_eligible, key=lambda cid: len(avail[cid][0]))
+                        else:
+                            primary_cam_id = max(avail, key=lambda cid: len(avail[cid][0]))
 
             primary_tracker = tracker_map[primary_cam_id]
             primary_blobs, primary_radii, primary_brightnesses, primary_orig = avail[primary_cam_id]
@@ -930,13 +940,15 @@ class TrackingSystem:
             )
 
             # Primary failed — try other cameras before giving up.
-            # Sort by: prev_pose first (can do proximity), then most unclaimed blobs.
+            # Warm: prev_pose cameras first, then most blobs (best proximity coverage).
+            # Cold: prev_pose cameras first, then fewest blobs (least contamination).
+            _cold_start = not _with_prior
             if solution is None and len(avail) > 1:
                 _fallback_order = sorted(
                     [cid for cid in avail if cid != primary_cam_id],
                     key=lambda cid: (
                         0 if tracker_map[cid].prev_pose is not None else 1,
-                        -len(avail[cid][0]),
+                        len(avail[cid][0]) if _cold_start else -len(avail[cid][0]),
                     ),
                 )
                 for _fb_cid in _fallback_order:
