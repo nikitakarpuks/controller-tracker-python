@@ -688,8 +688,6 @@ def proximity_match(
                         for _rr, _cc in zip(_row_r, _col_r):
                             if _cost_i_r[_rr, _cc] < _aux_snap_px:
                                 _pairs_i.append((_free_blob_i_r[_cc], _free_lid_i_r[_rr]))
-                                _snap_lids.add(_free_lid_i_r[_rr])
-                                _snap_blobs.add(_free_blob_i_r[_cc])
                                 _n_exp_i += 1
                         if is_deep() and _n_exp_i:
                             logger.debug(
@@ -1166,10 +1164,13 @@ def brute_match(
         strong_match_error_px  = float(_cfg.get('strong_match_error_px',  strong_match_error_px))
         min_vis_coverage       = float(_cfg.get('min_vis_coverage',       min_vis_coverage))
         rng_seed               = _cfg.get('rng_seed', rng_seed)
-    facing_threshold_deg = float(_cfg.get('led_facing_angle_deg', 86.0))
-    blob_size_min_factor = float(_cfg.get('blob_size_min_factor', 0.2))
-    blob_size_max_factor = float(_cfg.get('blob_size_max_factor', 4.0))
-    led_radius_mm        = float(_cfg.get('led_radius_mm',        2.5))
+    facing_threshold_deg  = float(_cfg.get('led_facing_angle_deg', 86.0))
+    blob_size_min_factor  = float(_cfg.get('blob_size_min_factor', 0.2))
+    blob_size_max_factor  = float(_cfg.get('blob_size_max_factor', 4.0))
+    led_radius_mm         = float(_cfg.get('led_radius_mm',        2.5))
+    # Aux-camera inlier threshold for step 6.7: looser than primary RANSAC threshold
+    # to tolerate inter-camera calibration offsets (mirrors proximity_match's aux_snap_px intent).
+    brute_aux_reproj_px   = float(_cfg.get('joint_aux_prefilter_px', reprojection_threshold * 2.0))
 
     blobs   = np.asarray(blobs, dtype=np.float32)
     n_blobs = len(blobs)
@@ -1341,6 +1342,9 @@ def brute_match(
                                 f"Target triple reached — "
                                 f"LEDs {list(led_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
                                 f"tier={tier_idx} ({_tier_label(tier_spec)})"
+                            )
+                            logger.debug(
+                                f"  gate LEDs={list(gate_led)}  gate blobs={gate_blob_idx}"
                             )
 
                         p3p_img_pts = blobs[[b_anchor, b1_ord, b2_ord]]
@@ -1571,7 +1575,7 @@ def brute_match(
                                     )
                                     _cost_i = cdist(_oblobs, _proj_i)
                                     _rows_i, _cols_i = linear_sum_assignment(_cost_i)
-                                    _inlier_i = _cost_i[_rows_i, _cols_i] < reprojection_threshold
+                                    _inlier_i = _cost_i[_rows_i, _cols_i] < brute_aux_reproj_px
                                     _led_cam_i = (_R_i @ positions[_vis_ids_i].T).T + _t_i
                                     if _oradii is not None:
                                         _focal_i = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
@@ -1585,6 +1589,14 @@ def brute_match(
                                                     <= _exp_px_k * blob_size_max_factor):
                                                 _inlier_i[_k] = False
                                     _n_aux = int(_inlier_i.sum())
+                                    if dbg:
+                                        _matched_dists = _cost_i[_rows_i, _cols_i]
+                                        logger.debug(
+                                            f"  sol {sol_i}: aux cam{_ocam.camera_idx} "
+                                            f"vis={len(_vis_ids_i)} blobs={len(_oblobs)} "
+                                            f"matched_dists={_matched_dists.round(1).tolist()} "
+                                            f"thresh={brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
+                                        )
                                     extra_inlier_count += _n_aux
                                     aux_cameras_current.append((_ocam.camera_idx, _n_aux))
                                     aux_assignments_current[_ocam.camera_idx] = [
