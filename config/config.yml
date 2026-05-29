@@ -1,5 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a/a/test"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4

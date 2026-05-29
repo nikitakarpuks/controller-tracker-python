@@ -1541,6 +1541,7 @@ def brute_match(
                             extra_vis_weight      = 0.0
                             extra_inlier_weight   = 0.0
                             extra_inlier_count    = 0
+                            aux_blob_denom        = 0
                             aux_cameras_current   = []
                             aux_assignments_current: Dict[int, List] = {}
                             if other_cameras_blobs:
@@ -1598,6 +1599,7 @@ def brute_match(
                                             f"thresh={brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
                                         )
                                     extra_inlier_count += _n_aux
+                                    aux_blob_denom     += min(len(_oblobs), len(_vis_ids_i))
                                     aux_cameras_current.append((_ocam.camera_idx, _n_aux))
                                     aux_assignments_current[_ocam.camera_idx] = [
                                         (int(_rows_i[_k]), int(_vis_ids_i[_cols_i[_k]]))
@@ -1638,14 +1640,27 @@ def brute_match(
                             weighted_visible_count = float(led_vis_weights.sum()) + extra_vis_weight
                             weighted_inlier_count  = float(led_vis_weights[inlier_idx_in_vis].sum()) + extra_inlier_weight
 
-                            if weighted_visible_count > 0 and weighted_inlier_count < min_vis_coverage * weighted_visible_count:
+                            # Balanced F1-style coverage: harmonic mean of LED recall and blob
+                            # precision. LED recall (weighted by cos θ) measures how many of the
+                            # model-visible LEDs were matched. Blob precision measures how many of
+                            # the detected blobs the pose explains, with the denominator capped at
+                            # n_visible_leds so that blobs from the other controller or noise do
+                            # not unfairly penalise a correct pose. Both sides pool aux cameras.
+                            led_cov  = (weighted_inlier_count / weighted_visible_count
+                                        if weighted_visible_count > 0 else 1.0)
+                            _blob_denom = min(n_available, n_visible_leds) + aux_blob_denom
+                            blob_cov = ((n_inlier_blobs + extra_inlier_count) / _blob_denom
+                                        if _blob_denom > 0 else 1.0)
+                            balanced_coverage = (2.0 * led_cov * blob_cov / (led_cov + blob_cov)
+                                                 if led_cov + blob_cov > 0.0 else 0.0)
+                            if balanced_coverage < min_vis_coverage:
                                 if dbg:
                                     logger.debug(
-                                        f"  sol {sol_i}: pooled weighted vis coverage "
-                                        f"{weighted_inlier_count:.2f}/{weighted_visible_count:.2f}"
-                                        f"={weighted_inlier_count/weighted_visible_count:.2f} < {min_vis_coverage:.2f}"
-                                        f"  (primary raw {n_inlier_blobs}/{n_visible_leds},"
-                                        f" +{extra_inlier_count} from aux cams)"
+                                        f"  sol {sol_i}: balanced coverage {balanced_coverage:.2f} < {min_vis_coverage:.2f}"
+                                        f"  led_cov={led_cov:.2f}  blob_cov={blob_cov:.2f}"
+                                        f"  (primary {n_inlier_blobs}/{n_visible_leds} leds,"
+                                        f" {n_inlier_blobs}/{min(n_available, n_visible_leds)} blobs"
+                                        f" +{extra_inlier_count} aux)"
                                     )
                                 continue
 
@@ -1712,13 +1727,12 @@ def brute_match(
                                         f"  ★ [{_ctrl} | cam {_cam}] new best — tier={tier_idx} "
                                         f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
                                         f"sol={sol_i}  inliers={n_inlier_blobs}+{extra_inlier_count}aux  err={err:.3f}px  "
-                                        f"vis={weighted_inlier_count:.1f}/{weighted_visible_count:.1f} (pooled)"
+                                        f"cov={balanced_coverage:.2f} (led={led_cov:.2f} blob={blob_cov:.2f})"
                                         f"  matched={n_inlier_blobs}/{n_visible_leds}"
                                         + _aux_dbg
                                     )
 
-                                if (best_error <= strong_match_error_px
-                                        and (weighted_visible_count == 0 or weighted_inlier_count >= min_vis_coverage * weighted_visible_count)):
+                                if best_error <= strong_match_error_px and balanced_coverage >= min_vis_coverage:
                                     strong_found = True
 
             cur_prev_blob[triple_i] = blob_max
