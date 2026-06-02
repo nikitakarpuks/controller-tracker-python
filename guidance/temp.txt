@@ -1,0 +1,73 @@
+  Option A — Far translation instead of scale (minimal change)
+
+  Replace the scale attempt with a large translation, and drop the recursive parent Clear (it likely fights the child transform):
+
+  # Replace the hide block at line 727-732 with:
+  for ctrl_name in self._controllers_vis:
+      if ctrl_name not in T_cam_model_per_ctrl:
+          # Move mesh off-screen instead of scaling — more reliable
+          rr.log(f"world/{ctrl_name}/mesh",
+                 rr.Transform3D(translation=[0.0, 0.0, -99999.0]))
+          # Clear per-frame per-controller components individually
+          for _sub in ("leds", "normals"):
+              rr.log(f"world/{ctrl_name}/{_sub}", rr.Clear(recursive=False))
+          for _ci in self._cameras:
+              for _sub in ("rays", "projected_leds", "led_ids", "errors", "error_values"):
+                  rr.log(f"world/{ctrl_name}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))
+
+  Pros: Tiny diff, preserves static mesh. Cons: Mesh sits at -99999m, which is ugly if you ever look at the whole scene.
+
+  ---
+  Option B — Drop static=True, log mesh only on visible frames
+
+  Remove static=True and move the mesh log into the per-controller loop. The mesh is only logged once on the first frame it appears and whenever it
+  reappears, making the rrd overhead roughly proportional to the number of controller-on transitions (not total frames):
+
+  # In start(): remove the static mesh block entirely (lines 503-514)
+
+  # In _log_frame(), inside the per-controller loop, add mesh logging:
+  if self.vis_cfg.get("show_mesh", True):
+      rr.log(f"{ctrl_path}/mesh",
+             rr.Mesh3D(
+                 vertex_positions=self._mesh_verts[ctrl_name],
+                 triangle_indices=self._mesh_faces,
+                 vertex_normals=self._mesh_vertex_normals,
+                 albedo_factor=[0.7, 0.7, 0.7, 1.0],
+             ))
+      rr.log(f"{ctrl_path}/mesh",
+             rr.Transform3D(translation=T4[:3, 3], mat3x3=T4[:3, :3]))
+
+  # In the hide block: just log Clear on the mesh entity
+  rr.log(f"world/{ctrl_name}/mesh", rr.Clear(recursive=False))
+
+  To limit repeated mesh geometry logging, you can track the previous visibility state and only re-log geometry on transitions (not every frame).
+
+  Pros: Correct and simple. Cons: Each reappearance re-logs 3D mesh geometry — depending on mesh size and transition frequency this may increase
+  file size noticeably.
+
+  ---
+  Option C — Separate pose parent entity (cleanest architecture)
+
+  Keep mesh static, but put pose on a dedicated parent entity instead of on the mesh entity itself:
+
+  # Static mesh at start() — same as now but no transform on this entity
+  rr.log(f"world/{ctrl_name}/body/mesh", rr.Mesh3D(...), static=True)
+
+  # Per frame, visible: log pose on the parent
+  rr.log(f"{ctrl_path}/body",
+         rr.Transform3D(translation=T4[:3, 3], mat3x3=T4[:3, :3]))
+
+  # Per frame, invisible: move the parent off-screen
+  rr.log(f"world/{ctrl_name}/body",
+         rr.Transform3D(translation=[0.0, 0.0, -99999.0]))
+
+  This cleanly separates static geometry from per-frame pose. The transform on the parent propagates to all children (mesh, leds, etc.)
+  automatically.
+
+  Pros: Clean, reliable, static mesh file-size benefit is preserved. Cons: Requires renaming world/{ctrl_name}/mesh → world/{ctrl_name}/body/mesh
+  throughout, and the other per-frame components (leds, rays) that are currently logged in world space would need to be restructured too, otherwise
+  they'd get the transform applied twice.
+
+  ---
+  My recommendation: Start with Option A — it's a 5-line change and the -99999m position won't matter in practice since the camera views are focused
+  close to the scene. If file size is critical and transitions are rare, Option B with change-tracking is the right long-term answer.

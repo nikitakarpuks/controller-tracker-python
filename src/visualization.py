@@ -723,6 +723,19 @@ class ControllerAnimatorRerun:
                 matched_bids=matched_bids_per_cam.get(cam_idx),
             )
 
+        # ── Hide controllers with no valid pose this frame ──────────────────
+        for ctrl_name in self._controllers_vis:
+            if ctrl_name not in T_cam_model_per_ctrl:
+                # Collapse static mesh to a point at the origin so it is invisible
+                # and does not affect Rerun's auto-fit bounding box.
+                rr.log(f"world/{ctrl_name}/mesh",
+                       rr.Transform3D(mat3x3=np.eye(3, dtype=np.float32) * 1e-9))
+                for _sub in ("leds", "normals"):
+                    rr.log(f"world/{ctrl_name}/{_sub}", rr.Clear(recursive=False))
+                for _ci in self._cameras:
+                    for _sub in ("rays", "projected_leds", "led_ids", "errors", "error_values"):
+                        rr.log(f"world/{ctrl_name}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))
+
         # ── Per-controller loop ─────────────────────────────────────────────
         for ctrl_name, T_cam_model in T_cam_model_per_ctrl.items():
             cs          = self._ctrl_state[ctrl_name]
