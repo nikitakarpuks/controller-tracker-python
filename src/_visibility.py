@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from typing import Optional
 
-from src.geometry import ControllerGeometry, tangent_frame
+from src.geometry import Box3D, Cylinder3D, ControllerGeometry, tangent_frame
 from src._pnp import _to_rvec
 
 
@@ -436,3 +436,109 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                 print(f"  [body]    LED {led_id:2d}: BLOCKED by {label}")
 
     return mask
+
+
+# ── Cross-controller occlusion ───────────────────────────────────────────────
+
+def _box_to_cam(box: Box3D, R: np.ndarray, t: np.ndarray) -> Box3D:
+    """Return a new Box3D with center and axes transformed into camera frame."""
+    axes_mat = np.asarray(box.axes, float) if box.axes is not None else np.eye(3)
+    return Box3D(
+        center=R @ np.asarray(box.center, float) + t,
+        half_dims=box.half_dims,
+        axes=R @ axes_mat,
+        name=box.name,
+    )
+
+
+def _cylinder_to_cam(cy: Cylinder3D, R: np.ndarray, t: np.ndarray) -> Cylinder3D:
+    """Return a new Cylinder3D with center and axis transformed into camera frame."""
+    return Cylinder3D(
+        center=R @ np.asarray(cy.center, float) + t,
+        axis=R @ np.asarray(cy.axis, float),
+        radius=cy.radius,
+        half_length=cy.half_length,
+        radius_v=cy.radius_v,
+        angle=cy.angle,
+        name=cy.name,
+    )
+
+
+def _occlusion_gate(
+    tvec_A: np.ndarray,
+    tvec_B: np.ndarray,
+    br_A: float,
+    br_B: float,
+    focal_px: float,
+    margin_px: float = 20.0,
+) -> bool:
+    """
+    Fast 2-D projection gate.  Returns True (run the full ray test) when the
+    two controllers' bounding circles could overlap on the image plane.
+
+    Projects both controller origins with simplified pinhole and checks whether
+    the pixel distance between them is less than the sum of their projected
+    bounding radii plus margin_px slack.
+
+    Returns False immediately if either controller is behind the camera.
+    """
+    if tvec_A[2] <= 0.0 or tvec_B[2] <= 0.0:
+        return False
+    px_A = tvec_A[:2] / tvec_A[2] * focal_px
+    px_B = tvec_B[:2] / tvec_B[2] * focal_px
+    dist = float(np.linalg.norm(px_A - px_B))
+    r_proj_A = focal_px * br_A / float(tvec_A[2])
+    r_proj_B = focal_px * br_B / float(tvec_B[2])
+    return dist < r_proj_A + r_proj_B + margin_px
+
+
+def _cross_occluded_mask(
+    R_B: np.ndarray, tvec_B: np.ndarray,
+    positions_B: np.ndarray,
+    R_A: np.ndarray, tvec_A: np.ndarray,
+    geom_A: ControllerGeometry,
+    br_A: float,
+    br_B: float,
+    focal_px: float,
+    gate_margin_px: float = 20.0,
+) -> np.ndarray:
+    """
+    Boolean mask (N,) — True for each LED of controller B whose camera→LED
+    ray is blocked by controller A's handle body (boxes + cylinders).
+
+    All geometry is expressed in camera frame: the camera sits at the origin,
+    controller A's primitives are rotated/translated by T_cam_A (R_A, tvec_A),
+    and controller B's LED positions are rotated/translated by T_cam_B (R_B, tvec_B).
+
+    Returns all-False immediately when the 2-D projection gate determines that
+    the two controllers cannot occlude each other from this camera.
+
+    Parameters
+    ----------
+    R_B, tvec_B   : T_cam_B — controller B pose in camera frame (target).
+    positions_B   : (N, 3) LED positions in controller-B frame.
+    R_A, tvec_A   : T_cam_A — controller A pose in camera frame (occluder).
+    geom_A        : ControllerGeometry of the occluder (boxes + cylinders).
+    br_A, br_B    : bounding sphere radii of A and B for the 2-D gate.
+    focal_px      : focal length in pixels (max of fx, fy).
+    gate_margin_px: extra pixel slack on the gate threshold.
+    """
+    n = len(positions_B)
+    if not _occlusion_gate(tvec_A, tvec_B, br_A, br_B, focal_px, gate_margin_px):
+        return np.zeros(n, dtype=bool)
+
+    # Transform A's primitives into camera frame.
+    boxes_cam = [_box_to_cam(b,  R_A, tvec_A) for b  in geom_A.boxes]
+    cyls_cam  = [_cylinder_to_cam(cy, R_A, tvec_A) for cy in geom_A.cylinders]
+
+    # B's LEDs in camera frame; camera origin is [0, 0, 0].
+    led_cam_B  = (R_B @ positions_B.T).T + tvec_B
+    cam_origin = np.zeros(3, dtype=np.float64)
+
+    blocked = np.zeros(n, dtype=bool)
+    for box in boxes_cam:
+        blocked |= _rays_blocked_by_box(cam_origin, led_cam_B, box)
+    for cy in cyls_cam:
+        blocked |= _rays_blocked_by_cylinder(cam_origin, led_cam_B, cy)
+
+    return blocked

@@ -166,6 +166,13 @@ matching:
   joint_aux_prefilter_px: 10.0      # drop aux pairs with reprojection > this before joint LM
 
   # --------------------------------------------------------------------------
+  # Cross-controller occlusion
+  # --------------------------------------------------------------------------
+  cross_controller_occlusion: false        # mask LEDs of controller B that are occluded by controller A's body
+  cross_occlusion_bounding_radius_m: 0.18  # controller body bounding sphere radius (tune manually)
+  cross_occlusion_gate_margin_px: 20.0     # slack added to the 2D projection gate threshold
+
+  # --------------------------------------------------------------------------
   # Primary camera selection
   # --------------------------------------------------------------------------
   fixed_primary_camera: null       # integer camera index to always use as primary, or null = auto-select

@@ -395,7 +395,8 @@ class SingleViewTracker:
     def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
               blob_brightnesses: Optional[np.ndarray] = None,
               other_cameras_blobs: Optional[List] = None,
-              blob_mask: Optional[np.ndarray] = None) -> Optional[Dict]:
+              blob_mask: Optional[np.ndarray] = None,
+              occluders_per_cam: Optional[Dict] = None) -> Optional[Dict]:
         """
         State machine:
 
@@ -490,6 +491,7 @@ class SingleViewTracker:
                     blob_radii=radii_prox,
                     blob_brightnesses=brts_prox,
                     other_cameras_blobs=other_cameras_blobs,
+                    occluders_per_cam=occluders_per_cam,
                 )
                 # Remap proximity result indices from filtered → full array space.
                 if solution is not None and blob_mask is not None:
@@ -502,7 +504,8 @@ class SingleViewTracker:
                 brute = self.brute_match(blobs, pose_prior=predicted_pose,
                                          other_cameras_blobs=other_cameras_blobs,
                                          blob_radii=blob_radii,
-                                         blob_mask=blob_mask)
+                                         blob_mask=blob_mask,
+                                         occluders_per_cam=occluders_per_cam)
                 if brute is not None:
                     solution = brute
 
@@ -512,7 +515,8 @@ class SingleViewTracker:
                 logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] no prev_pose → cold-start brute")
                 solution = self.brute_match(blobs, other_cameras_blobs=other_cameras_blobs,
                                             blob_radii=blob_radii,
-                                            blob_mask=blob_mask)
+                                            blob_mask=blob_mask,
+                                            occluders_per_cam=occluders_per_cam)
 
                 # In deep-debug mode frames are non-consecutive, so the last_good_pose
                 # plausibility check is skipped — the controller can be anywhere.
@@ -932,12 +936,42 @@ class TrackingSystem:
             _prim_mask = np.zeros(len(_prim_obs_full), dtype=bool)
             _prim_mask[primary_orig] = True
 
+            # ── Cross-controller occlusion: build occluder dict from any
+            # controller already matched this frame (guard: current-frame only).
+            _occluders_per_cam = None
+            if bool(_cfg.get('cross_controller_occlusion', False)) and len(ordered) > 1:
+                for _occ_ctrl in ordered:
+                    if _occ_ctrl == ctrl_name:
+                        break
+                    _occ_result = results.get(_occ_ctrl)
+                    if not (_occ_result and _occ_result.get('T_world_ctrl') is not None):
+                        continue
+                    _occ_T_world = _occ_result['T_world_ctrl']
+                    _occ_tracker = next(
+                        (t for (cn, _), t in self.trackers.items() if cn == _occ_ctrl),
+                        None,
+                    )
+                    if _occ_tracker is None:
+                        continue
+                    _occluders_per_cam = {}
+                    for _cam_id, _cam in self.cameras.items():
+                        if _cam.T_world_cam is None:
+                            continue
+                        _T_cam_occ = _cam.T_world_cam.inverse().compose(_occ_T_world)
+                        _occluders_per_cam[_cam_id] = (
+                            _T_cam_occ.R.astype(np.float32),
+                            _T_cam_occ.t.astype(np.float32),
+                            _occ_tracker._geometry,
+                        )
+                    break  # first valid preceding controller is the occluder
+
             solution = primary_tracker.track(
                 _prim_obs_full,
                 blob_radii=_prim_rad_full,
                 blob_brightnesses=_prim_brt_full,
                 other_cameras_blobs=other_cameras_blobs,
                 blob_mask=_prim_mask,
+                occluders_per_cam=_occluders_per_cam,
             )
 
             # Primary failed — try other cameras before giving up.
@@ -972,6 +1006,7 @@ class TrackingSystem:
                         blob_brightnesses=_fb_brt_full,
                         other_cameras_blobs=_fb_other,
                         blob_mask=_fb_mask,
+                        occluders_per_cam=_occluders_per_cam,
                     )
                     if solution is not None:
                         primary_cam_id  = _fb_cid
