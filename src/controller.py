@@ -9,7 +9,7 @@ from src.camera import Camera
 from src.debug_config import is_deep
 from src.geometry import Box3D, Cylinder3D, ControllerGeometry
 from src.transformations import Transform
-from src._self_calibration import SelfCalibrator
+# from src._self_calibration import SelfCalibrator
 
 
 # =========================================================
@@ -655,7 +655,8 @@ class TrackingSystem:
 
         # Self-calibration: optionally apply saved extrinsics before tracker creation
         # so every tracker's T_world_cam starts with the correct (calibrated) value.
-        self._self_cal: Optional[SelfCalibrator] = None
+        # self._self_cal: Optional[SelfCalibrator] = None
+        self._self_cal = None
         sc_cfg = self_calibration_cfg or {}
         _sc_primary_idx: Optional[int] = None
 

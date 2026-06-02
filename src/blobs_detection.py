@@ -617,6 +617,33 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             rejected_centroids, rejected_contours, large_rejected_contours)
 
 
+def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
+                                 thr1: int, thr2: int) -> np.ndarray:
+    """Scale pass-2 radii to approximate the physical apparent LED size.
+
+    Pass 2 uses a higher pixel threshold (thr2 > thr1), so its contours only
+    cover the bright core — smaller than the true LED disc.  For a Gaussian
+    intensity profile with peak P the blob radius at threshold T satisfies
+    r(T) ∝ sqrt(ln(P/T)), giving the correction:
+
+        r_corrected = r_pass2 * sqrt( ln(P/thr1) / ln(P/thr2) )
+
+    Scale is capped at 4 to guard against near-threshold blobs where the
+    denominator approaches zero.
+    """
+    if thr2 <= thr1 or len(radii) == 0:
+        return radii
+    r = radii.copy()
+    P = np.asarray(brightnesses, dtype=np.float64)
+    safe_P = np.maximum(P, thr2 + 1)              # ensure ln > 0 in denominator
+    ln_t2  = np.log(safe_P / thr2)
+    ln_t1  = np.log(np.maximum(safe_P / thr1, 1.0 + 1e-9))
+    scale  = np.where(ln_t2 > 1e-9, np.sqrt(ln_t1 / ln_t2), 1.0)
+    scale  = np.minimum(scale, 4.0)
+    r *= scale.astype(np.float32)
+    return r
+
+
 def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
     pixel_threshold             = int(cfg["min_threshold"])
     required_threshold          = int(cfg.get("required_threshold", pixel_threshold * 2))
@@ -694,7 +721,10 @@ def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
                         _mem["max_area"]           = max_area_pass2
                         _mem["large_blobs"]        = large_blobs_pass1
                         _mem["blob_count"]         = cur_count
-                    return result2
+                    corrected = list(result2)
+                    corrected[2] = _correct_radii_for_threshold(
+                        result2[2], result2[3], pixel_threshold, pixel_threshold_2)
+                    return tuple(corrected)
 
     elif pass2_factor > 0 and _mem:
         # Fallback: pass 1 didn't yield enough blobs — reuse params from last
@@ -707,7 +737,10 @@ def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
                                  min_area_override=min_area_pass2,
                                  interior_exclude_blobs=large_blobs_pass1)
         if len(result2[0]) >= 1:
-            return result2
+            corrected = list(result2)
+            corrected[2] = _correct_radii_for_threshold(
+                result2[2], result2[3], pixel_threshold, _mem["pixel_threshold"])
+            return tuple(corrected)
         _mem.clear()
 
     return result

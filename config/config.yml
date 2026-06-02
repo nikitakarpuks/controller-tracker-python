@@ -1,5 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
+  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/ctrl_occlusion"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -56,7 +56,7 @@ controllers:
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
 blob_detection:
-  visualize: false
+  visualize: true
   min_threshold: 6       # pixels >= this are included in a blob
   required_threshold: 13  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 3
@@ -108,8 +108,9 @@ matching:
   # --------------------------------------------------------------------------
   # Blob size filtering  (shared pre-filter for both brute and proximity)
   # --------------------------------------------------------------------------
-  blob_size_max_factor: 3.0       # blob radius > expected * this → rejected (merged blob / noise)
-  blob_size_min_factor: 0.3       # blob radius < expected * this → rejected (sub-pixel noise)
+  log_size_filter: false
+  blob_size_max_factor: 2.0       # blob radius > expected * this → rejected (merged blob / noise)
+  blob_size_min_factor: 0.5 # 0.3       # blob radius < expected * this → rejected (sub-pixel noise)
   blob_size_score_weight: 0.5     # px penalty per px of size mismatch added to argmin score
 
   # --------------------------------------------------------------------------

@@ -277,6 +277,7 @@ def proximity_match(
     snap_factor            = float(_cfg.get('proximity_snap_factor',     4.0))
     blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
     blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',      0.2))
+    _log_size_filter       = is_deep() and bool(_cfg.get('log_size_filter', False))
     blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',       0.5))
     blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight', 0.3))
     _accept_err_px               = float(_cfg.get('accept_error_px',               3.0))
@@ -370,6 +371,12 @@ def proximity_match(
                 if not (expected_pxs[i] * blob_size_min_factor
                         <= blob_radii[j]
                         <= expected_pxs[i] * blob_size_max_factor):
+                    if _log_size_filter:
+                        logger.debug(
+                            f"  LED {lid}: blob {j} size-filtered (ID-path)"
+                            f"  r={blob_radii[j]:.2f}  expected"
+                            f" {expected_pxs[i]*blob_size_min_factor:.2f}–{expected_pxs[i]*blob_size_max_factor:.2f}px"
+                        )
                     continue
             locked_pairs.append((j, lid))
             locked_obj.append(self.model.positions[lid])
@@ -398,6 +405,12 @@ def proximity_match(
                 if not (expected_pxs[i] * blob_size_min_factor
                         <= blob_r
                         <= expected_pxs[i] * blob_size_max_factor):
+                    if _log_size_filter:
+                        logger.debug(
+                            f"  LED {prior_lids[i]}: blob {j} size-filtered (greedy)"
+                            f"  r={blob_r:.2f}  expected"
+                            f" {expected_pxs[i]*blob_size_min_factor:.2f}–{expected_pxs[i]*blob_size_max_factor:.2f}px"
+                        )
                     continue
             size_err       = float(abs(blob_r - expected_pxs[i])) if blob_r is not None else 0.0
             brightness_err = (abs(float(_brightness_norm[j]) - prior_facing[i])
@@ -483,6 +496,14 @@ def proximity_match(
                         (free_blob_radii > expected_px * blob_size_max_factor)
                     )
                     cost[k, ineligible] = 1e9
+                    if _log_size_filter:
+                        for _c in np.where(ineligible)[0]:
+                            logger.debug(
+                                f"  LED {free_led_idx[k]}: blob {free_blob_idx[_c]}"
+                                f" size-filtered (Hungarian)"
+                                f"  r={free_blob_radii[_c]:.2f}  expected"
+                                f" {expected_px*blob_size_min_factor:.2f}–{expected_px*blob_size_max_factor:.2f}px"
+                            )
 
             if _brightness_norm is not None:
                 free_normals_cam   = (R_exp @ self.model.normals[free_led_idx].T).T
@@ -557,8 +578,17 @@ def proximity_match(
                 for _k in range(len(_vis_ids)):
                     _d  = float(max(_lc_p[_k, 2], 0.01))
                     _ep = focal_px * (led_radius_mm / 1000.0) / _d
-                    _cost_p[_k, (blob_radii < _ep * blob_size_min_factor) |
-                                 (blob_radii > _ep * blob_size_max_factor)] = 1e9
+                    _inelig_p = ((blob_radii < _ep * blob_size_min_factor) |
+                                 (blob_radii > _ep * blob_size_max_factor))
+                    _cost_p[_k, _inelig_p] = 1e9
+                    if _log_size_filter:
+                        for _c in np.where(_inelig_p)[0]:
+                            logger.debug(
+                                f"  LED {int(_vis_ids[_k])}: blob {_c}"
+                                f" size-filtered (proj-fallback Hungarian)"
+                                f"  r={blob_radii[_c]:.2f}  expected"
+                                f" {_ep*blob_size_min_factor:.2f}–{_ep*blob_size_max_factor:.2f}px"
+                            )
             _row_p, _col_p = linear_sum_assignment(_cost_p)
             _pp, _lo_pp, _li_pp = [], [], []
             for _r, _c in zip(_row_p, _col_p):
@@ -681,8 +711,17 @@ def proximity_match(
                             for _k in range(len(_free_lid_i_r)):
                                 _depth_k  = float(max(_led_ci_r2[_k, 2], 0.01))
                                 _exp_px_k = _focal_i_r * (led_radius_mm / 1000.0) / _depth_k
-                                _cost_i_r[_k, ((_oradii[_free_blob_i_r] < _exp_px_k * blob_size_min_factor) |
-                                               (_oradii[_free_blob_i_r] > _exp_px_k * blob_size_max_factor))] = 1e9
+                                _inelig_r = ((_oradii[_free_blob_i_r] < _exp_px_k * blob_size_min_factor) |
+                                             (_oradii[_free_blob_i_r] > _exp_px_k * blob_size_max_factor))
+                                _cost_i_r[_k, _inelig_r] = 1e9
+                                if _log_size_filter:
+                                    for _c in np.where(_inelig_r)[0]:
+                                        logger.debug(
+                                            f"  LED {_free_lid_i_r[_k]}: blob {_free_blob_i_r[_c]}"
+                                            f" size-filtered (aux-expansion cam{_ocam.camera_idx} Hungarian)"
+                                            f"  r={_oradii[_free_blob_i_r[_c]]:.2f}  expected"
+                                            f" {_exp_px_k*blob_size_min_factor:.2f}–{_exp_px_k*blob_size_max_factor:.2f}px"
+                                        )
                         _row_r, _col_r = linear_sum_assignment(_cost_i_r)
                         _n_exp_i = 0
                         for _rr, _cc in zip(_row_r, _col_r):
@@ -1167,6 +1206,7 @@ def brute_match(
     facing_threshold_deg  = float(_cfg.get('led_facing_angle_deg', 86.0))
     blob_size_min_factor  = float(_cfg.get('blob_size_min_factor', 0.2))
     blob_size_max_factor  = float(_cfg.get('blob_size_max_factor', 4.0))
+    _log_size_filter      = is_deep() and bool(_cfg.get('log_size_filter', False))
     led_radius_mm         = float(_cfg.get('led_radius_mm',        2.5))
     # Aux-camera inlier threshold for step 6.7: looser than primary RANSAC threshold
     # to tolerate inter-camera calibration offsets (mirrors proximity_match's aux_snap_px intent).
@@ -1521,6 +1561,13 @@ def brute_match(
                                                 _exp_px_rc * blob_size_min_factor
                                                 <= float(blob_radii[b])
                                                 <= _exp_px_rc * blob_size_max_factor)):
+                                            if _log_size_filter:
+                                                logger.debug(
+                                                    f"  LED {led_id}: blob {b}"
+                                                    f" size-filtered (brute extra-blob)"
+                                                    f"  r={float(blob_radii[b]):.2f}  expected"
+                                                    f" {_exp_px_rc*blob_size_min_factor:.2f}–{_exp_px_rc*blob_size_max_factor:.2f}px"
+                                                )
                                             continue
                                         matched_blob_set.add(b)
                                         extra_blobs.append(b)
@@ -1588,6 +1635,13 @@ def brute_match(
                                             if not (_exp_px_k * blob_size_min_factor
                                                     <= float(_oradii[_rows_i[_k]])
                                                     <= _exp_px_k * blob_size_max_factor):
+                                                if _log_size_filter:
+                                                    logger.debug(
+                                                        f"  LED {int(_vis_ids_i[_cols_i[_k]])}: blob {int(_rows_i[_k])}"
+                                                        f" size-filtered (brute aux-inlier cam{_ocam.camera_idx})"
+                                                        f"  r={float(_oradii[_rows_i[_k]]):.2f}  expected"
+                                                        f" {_exp_px_k*blob_size_min_factor:.2f}–{_exp_px_k*blob_size_max_factor:.2f}px"
+                                                    )
                                                 _inlier_i[_k] = False
                                     _n_aux = int(_inlier_i.sum())
                                     if dbg:
