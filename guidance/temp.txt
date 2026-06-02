@@ -71,3 +71,182 @@
   ---
   My recommendation: Start with Option A — it's a 5-line change and the -99999m position won't matter in practice since the camera views are focused
   close to the scene. If file size is critical and transitions are rare, Option B with change-tracking is the right long-term answer.
+
+
+
+
+
+
+
+
+
+  The parallelization plan is clean — faster result becomes the occluder, slower gets the mask, current-frame guard is satisfied by construction. No
+  design change needed when you parallelize, just the invocation order changes.
+
+  Here is the full refined plan.
+
+  ---
+  Cross-Controller LED Occlusion — Full Implementation Plan
+
+  ---
+  Step 1 — config.yml: Three new keys
+
+  Under the matching section:
+
+  matching:
+    cross_controller_occlusion: false         # master switch, opt-in
+    cross_occlusion_bounding_radius_m: 0.18  # manually tuned controller bounding sphere
+    cross_occlusion_gate_margin_px: 20.0     # slack added to the 2D gate threshold
+
+  Bounding radius is user-defined — primitive stacking makes computed values unreliable, and a single hand-tuned number per controller type is
+  simpler and more accurate.
+
+  ---
+  Step 2 — _visibility.py: Two geometry-transform helpers
+
+  Placed alongside the existing _rays_blocked_by_* functions:
+
+  _box_to_cam(box: Box3D, R: np.ndarray, t: np.ndarray) -> Box3D
+  Returns a new Box3D instance. center_new = R @ box.center + t, axes_new = R @ axes_matrix (each column rotated), half_dims unchanged.
+
+  _cylinder_to_cam(cy: Cylinder3D, R: np.ndarray, t: np.ndarray) -> Cylinder3D
+  Returns a new Cylinder3D instance. center_new = R @ cy.center + t, axis_new = R @ cy.axis, all scalar fields unchanged.
+
+  Both return new instances — originals are never mutated, since the same geometry objects are reused every frame for self-occlusion checks.
+
+  ---
+  Step 3 — _visibility.py: 2D projection gate
+
+  _occlusion_gate(tvec_A, tvec_B, br_A, br_B, focal_px, margin_px) -> bool
+
+  Projects both controller origins with simplified pinhole (x_proj = tvec[0]/tvec[2] * focal). Returns True (gate open, run the full check) when:
+
+  dist_2d(proj_A, proj_B)  <  focal * (br_A / tvec_A[2]  +  br_B / tvec_B[2])  +  margin_px
+
+  Hard-return False immediately if either tvec[2] <= 0. Pinhole projection is fine here — the gate is intentionally conservative and margin_px
+  absorbs any distortion-induced error.
+
+  ---
+  Step 4 — _visibility.py: _cross_occluded_mask
+
+  def _cross_occluded_mask(
+      R_B, tvec_B,       # T_cam_B: B's current predicted pose in this camera
+      positions_B,       # (N, 3) B's LED positions in controller-B frame
+      R_A, tvec_A,       # T_cam_A: A's current-frame pose in this camera
+      geom_A,            # ControllerGeometry of the occluder (controller A)
+      br_A, br_B,        # bounding radii for gate
+      focal_px,
+      gate_margin_px,
+  ) -> np.ndarray        # bool (N,), True = LED occluded by A's body
+
+  Execution order:
+
+  1. Call _occlusion_gate → return np.zeros(N, bool) immediately if gate fails.
+  2. Transform A's primitives to camera frame using _box_to_cam / _cylinder_to_cam with R_A, tvec_A.
+  3. Transform B's LEDs to camera frame: led_cam_B = (R_B @ positions_B.T).T + tvec_B.
+  4. cam_origin = np.zeros(3).
+  5. blocked = np.zeros(N, bool). Iterate A's transformed boxes and cylinders, OR-accumulate: blocked |= _rays_blocked_by_box(cam_origin, led_cam_B,
+  box) / _rays_blocked_by_cylinder(...).
+  6. Return blocked.
+
+  Zero new intersection mathematics — entirely reuses the existing vectorized functions.
+
+  ---
+  Step 5 — _matching.py: New parameter + injection at visibility-mask call sites
+
+  New parameter added to proximity_match and brute_match:
+
+  occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, ControllerGeometry]]] = None
+  # cam_idx → (R_occ_in_cam, tvec_occ_in_cam, geom_occ)
+
+  br_A, br_B, gate_margin_px are read from _cfg (already the pattern for all config inside these functions). focal_px is already computed inside
+  both.
+
+  Injection pattern — applied after every _visible_mask(...) call:
+
+  vis_mask = _visible_mask(R, tvec, ...)
+  if occluders_per_cam:
+      _occ = occluders_per_cam.get(cam_idx)
+      if _occ is not None:
+          _R_occ, _t_occ, _geom_occ = _occ
+          vis_mask &= ~_cross_occluded_mask(
+              R, tvec, self.model.positions,
+              _R_occ, _t_occ, _geom_occ,
+              br_A, br_B, focal_px, gate_margin_px,
+          )
+
+  Three call sites to update:
+
+  ┌───────────────────────────────────────────────────────────────┬────────────────────────┐
+  │                           Location                            │     cam_idx to use     │
+  ├───────────────────────────────────────────────────────────────┼────────────────────────┤
+  │ proximity_match — main vis_mask_pred                          │ self.camera.camera_idx │
+  ├───────────────────────────────────────────────────────────────┼────────────────────────┤
+  │ proximity_match — aux expansion loop _vis_i_r                 │ _ocam.camera_idx       │
+  ├───────────────────────────────────────────────────────────────┼────────────────────────┤
+  │ brute_match — initial visibility before LED triple generation │ self.camera.camera_idx │
+  └───────────────────────────────────────────────────────────────┴────────────────────────┘
+
+  ControllerTracker.track() is also updated to accept occluders_per_cam and forward it unchanged to both proximity_match and brute_match.
+
+  ---
+  Step 6 — controller.py: Guard, build, and pass the occluder
+
+  Injection point: in the per-controller ordered loop, immediately before calling primary_tracker.track() for controller B.
+
+  Guard chain — all conditions must hold, evaluated in order:
+
+  1. bool(_cfg.get('cross_controller_occlusion', False)) — feature enabled
+  2. At least two controllers are being processed this frame
+  3. Controller A has a solution from the current frame — solution_A is present in this frame's results dict, not a prev_pose carry-over. This is
+  the freshness guard: a stale occluder pose during fast motion is worse than no occlusion mask at all.
+  4. solution_A["T_world_ctrl"] is present.
+
+  If any guard fails → pass occluders_per_cam=None.
+
+  Building the dict when guards pass:
+
+  T_world_A = solution_A["T_world_ctrl"]
+  _br    = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+  _geom_A = <controller A's ControllerGeometry object>
+
+  occluders_per_cam = {}
+  for _cam_id, _cam in self.cameras.items():
+      _T_cam_A = _cam.T_world_cam.inverse().compose(T_world_A)
+      occluders_per_cam[_cam_id] = (
+          _T_cam_A.R.astype(np.float32),
+          _T_cam_A.t.astype(np.float32),
+          _geom_A,
+      )
+
+  Parallelization note (future): when A and B run in parallel, the faster result becomes the occluder; the slower one receives the dict. The
+  current-frame guard is satisfied by construction — no design change required, only the invocation pattern changes.
+
+  ---
+  Step 7 — Validation in Rerun
+
+  No algorithmic unit tests needed — the existing pipeline tests cover the modified code paths. Manual validation:
+
+  1. Enable cross_controller_occlusion: true, run a sequence with controllers overlapping.
+  2. In Rerun, LEDs of B behind A's body should appear as not visible (no projected disk, no ray) rather than unmatched (orange ray to empty
+  frustum). That's the visible signal the feature is working.
+  3. Run a standard non-overlapping sequence and confirm no regression in match counts or error.
+  4. Tune cross_occlusion_bounding_radius_m until the gate fires at a sensible distance and cross_occlusion_gate_margin_px until no spurious misses
+  occur near the boundary.
+
+  ---
+  Summary
+
+  ┌────────────────┬──────────────────────────────────────────────────────────────────────────┬────────┐
+  │      File      │                                  Change                                  │ ~Lines │
+  ├────────────────┼──────────────────────────────────────────────────────────────────────────┼────────┤
+  │ config.yml     │ 3 new keys                                                               │ 3      │
+  ├────────────────┼──────────────────────────────────────────────────────────────────────────┼────────┤
+  │ _visibility.py │ 2 transform helpers + gate + _cross_occluded_mask                        │ ~65    │
+  ├────────────────┼──────────────────────────────────────────────────────────────────────────┼────────┤
+  │ _matching.py   │ occluders_per_cam param + injection at 3 call sites + forward in track() │ ~30    │
+  ├────────────────┼──────────────────────────────────────────────────────────────────────────┼────────┤
+  │ controller.py  │ Guard + build dict + pass through                                        │ ~35    │
+  └────────────────┴──────────────────────────────────────────────────────────────────────────┴────────┘
+
+  Total: ~133 lines. Zero new algorithms. Zero new dependencies.

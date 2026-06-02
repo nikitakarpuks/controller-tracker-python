@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from src.debug_config import is_deep, get_debug_triple, is_verbose_all, log_best
 from src._pnp import _ransac_pnp, _project_points, _check_z_range
-from src._visibility import _visible_mask
+from src._visibility import _visible_mask, _cross_occluded_mask
 from src._led_graph import _build_blob_neighbor_lists
 from src.transformations import Transform
 
@@ -249,6 +249,7 @@ def proximity_match(
     blob_radii: Optional[np.ndarray] = None,
     blob_brightnesses: Optional[np.ndarray] = None,
     other_cameras_blobs: Optional[List] = None,
+    occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = None,
 ) -> Optional[Dict]:
     """
     Refine a predicted pose using the assignment-locked nearest-neighbour path.
@@ -278,6 +279,8 @@ def proximity_match(
     blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
     blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',      0.2))
     _log_size_filter       = is_deep() and bool(_cfg.get('log_size_filter', False))
+    _br                    = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+    _gate_margin_px        = float(_cfg.get('cross_occlusion_gate_margin_px',   20.0))
     blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',       0.5))
     blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight', 0.3))
     _accept_err_px               = float(_cfg.get('accept_error_px',               3.0))
@@ -310,6 +313,15 @@ def proximity_match(
         cam_rpmax=self.camera.rpmax,
         facing_threshold_deg=facing_threshold_deg,
     )
+    if occluders_per_cam:
+        _occ = occluders_per_cam.get(self.camera.camera_idx)
+        if _occ is not None:
+            _R_occ, _t_occ, _geom_occ = _occ
+            vis_mask_pred &= ~_cross_occluded_mask(
+                R_pred_arr, tvec_pred, self.model.positions,
+                _R_occ, _t_occ, _geom_occ,
+                _br, _br, focal_px, _gate_margin_px,
+            )
     n_model_visible = int(vis_mask_pred.sum())
 
     # Snap: assign blobs to prior LEDs in two passes.
@@ -693,6 +705,15 @@ def proximity_match(
                     cam_w=_ocam.width, cam_h=_ocam.height, cam_rpmax=_ocam.rpmax,
                     facing_threshold_deg=facing_threshold_deg,
                 )
+                if occluders_per_cam:
+                    _occ_i_r = occluders_per_cam.get(_ocam.camera_idx)
+                    if _occ_i_r is not None:
+                        _R_occ_i_r, _t_occ_i_r, _geom_occ_i_r = _occ_i_r
+                        _vis_i_r &= ~_cross_occluded_mask(
+                            _R_i_r, _t_i_r, self.model.positions,
+                            _R_occ_i_r, _t_occ_i_r, _geom_occ_i_r,
+                            _br, _br, _focal_i_r, _gate_margin_px,
+                        )
                 _n_vis_i_r  = int(np.sum(_vis_i_r))
                 _snap_lids  = {lid for _, lid in _pairs_i}
                 _snap_blobs = {b   for b, _   in _pairs_i}
@@ -1172,6 +1193,7 @@ def brute_match(
     other_cameras_blobs: Optional[List] = None,
     blob_radii: Optional[np.ndarray] = None,
     blob_mask: Optional[np.ndarray] = None,
+    occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = None,
 ) -> Optional[Dict]:
     """
     Exhaustive pose search via P3P over LED/blob triple correspondences.
@@ -1207,6 +1229,8 @@ def brute_match(
     blob_size_min_factor  = float(_cfg.get('blob_size_min_factor', 0.2))
     blob_size_max_factor  = float(_cfg.get('blob_size_max_factor', 4.0))
     _log_size_filter      = is_deep() and bool(_cfg.get('log_size_filter', False))
+    _br                   = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+    _gate_margin_px       = float(_cfg.get('cross_occlusion_gate_margin_px',   20.0))
     led_radius_mm         = float(_cfg.get('led_radius_mm',        2.5))
     # Aux-camera inlier threshold for step 6.7: looser than primary RANSAC threshold
     # to tolerate inter-camera calibration offsets (mirrors proximity_match's aux_snap_px intent).
@@ -1514,6 +1538,15 @@ def brute_match(
                                 cam_rpmax=self.camera.rpmax,
                                 facing_threshold_deg=facing_threshold_deg,
                             )
+                            if occluders_per_cam:
+                                _occ_r = occluders_per_cam.get(self.camera.camera_idx)
+                                if _occ_r is not None:
+                                    _R_occ_r, _t_occ_r, _geom_occ_r = _occ_r
+                                    vis_mask_r &= ~_cross_occluded_mask(
+                                        R_r, tvec_r_flat, positions,
+                                        _R_occ_r, _t_occ_r, _geom_occ_r,
+                                        _br, _br, focal_px, _gate_margin_px,
+                                    )
                             # Drop inliers that became occluded under the refined pose.
                             inlier_still_visible = vis_mask_r[inlier_leds]
                             inlier_leds  = inlier_leds[inlier_still_visible]
@@ -1613,6 +1646,17 @@ def brute_match(
                                         cam_rpmax=_ocam.rpmax,
                                         facing_threshold_deg=facing_threshold_deg,
                                     )
+                                    if occluders_per_cam:
+                                        _occ_i = occluders_per_cam.get(_ocam.camera_idx)
+                                        if _occ_i is not None:
+                                            _R_occ_i, _t_occ_i, _geom_occ_i = _occ_i
+                                            _focal_i_b = float(max(_ocam.camera_matrix[0, 0],
+                                                                    _ocam.camera_matrix[1, 1]))
+                                            _vis_i &= ~_cross_occluded_mask(
+                                                _R_i, _t_i, positions,
+                                                _R_occ_i, _t_occ_i, _geom_occ_i,
+                                                _br, _br, _focal_i_b, _gate_margin_px,
+                                            )
                                     _vis_ids_i = np.where(_vis_i)[0]
                                     if len(_vis_ids_i) == 0:
                                         continue
