@@ -2,8 +2,11 @@ import cv2
 import numpy as np
 from typing import Optional
 
+from loguru import logger
+
 from src.geometry import Box3D, Cylinder3D, ControllerGeometry, tangent_frame
 from src._pnp import _to_rvec
+from src.debug_config import is_deep
 
 
 def _rays_blocked_by_box(cam: np.ndarray, leds: np.ndarray, box) -> np.ndarray:
@@ -501,6 +504,8 @@ def _cross_occluded_mask(
     br_B: float,
     focal_px: float,
     gate_margin_px: float = 20.0,
+    log_tag: str = "",
+    vis_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Boolean mask (N,) — True for each LED of controller B whose camera→LED
@@ -540,5 +545,17 @@ def _cross_occluded_mask(
         blocked |= _rays_blocked_by_box(cam_origin, led_cam_B, box)
     for cy in cyls_cam:
         blocked |= _rays_blocked_by_cylinder(cam_origin, led_cam_B, cy)
+
+    if log_tag and is_deep():
+        n_blocked = int(blocked.sum())
+        if vis_mask is not None:
+            newly_hidden = blocked & vis_mask
+            blocked_ids = np.where(newly_hidden)[0].tolist()
+        else:
+            blocked_ids = np.where(blocked)[0].tolist()
+        logger.debug(
+            f"{log_tag} cross-controller occlusion: gate passed — "
+            f"{n_blocked}/{n} LEDs masked  self-visible ids={blocked_ids}"
+        )
 
     return blocked

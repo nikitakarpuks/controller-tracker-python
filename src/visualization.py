@@ -5,7 +5,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from src.transformations import Transform
-from src._visibility import _visible_mask
+from src._visibility import _visible_mask, _cross_occluded_mask
 from src.controller import _compute_geometry
 
 
@@ -53,6 +53,8 @@ VIS_CONFIG = {
     "camera_center_radius":  0.004,   # metres
     "world_origin_radius":   0.006,   # metres
     "world_origin_color":    [255, 255, 255],
+    # Ghost (frozen last-known pose) appearance
+    "ghost_led_color":       [110, 110, 130],  # dim blue-gray LEDs
 }
 
 # One distinct colour per camera index (cyan / orange / purple / green).
@@ -451,7 +453,8 @@ class ControllerAnimatorRerun:
               contours_all=None,
               save_path: str = None,
               primary_cams_all: dict = None,
-              aux_assignments_all: dict = None):
+              aux_assignments_all: dict = None,
+              frozen_poses_all: dict = None):
         """
         Log all frames to rerun.
         Opens the viewer automatically (spawn=True).
@@ -463,6 +466,10 @@ class ControllerAnimatorRerun:
             primary_cams_all:     {ctrl_name: [cam_idx_or_None, ...]}
             aux_assignments_all:  {ctrl_name: [aux_asgn_or_None, ...]}
             save_path:            Optional path for an .rrd recording file.
+            frozen_poses_all:     {ctrl_name: [T_world_ctrl_or_None, ...]}
+                                  Non-None entries are used when the current
+                                  pose is None but blobs were visible (case 3:
+                                  between cameras).  None hides the controller.
         """
         self._cameras = cameras
 
@@ -530,6 +537,18 @@ class ControllerAnimatorRerun:
                 T_ctrl_model = self._ctrl_state[ctrl_name]["T_model_ctrl"].inverse()
                 T_cam_model_per_ctrl[ctrl_name] = T_cam_ctrl.compose(T_ctrl_model)
 
+            # Build ghost world-frame transforms for case-3 lost frames.
+            # T_world_ctrl → T_world_model (camera-independent display transform).
+            ghost_T_world_model_per_ctrl: dict = {}
+            for ctrl_name in self._controllers_vis:
+                if ctrl_name in T_cam_model_per_ctrl:
+                    continue
+                frozen_list = (frozen_poses_all or {}).get(ctrl_name, [])
+                T_world_ctrl = frozen_list[idx] if idx < len(frozen_list) else None
+                if T_world_ctrl is not None:
+                    T_ctrl_model = self._ctrl_state[ctrl_name]["T_model_ctrl"].inverse()
+                    ghost_T_world_model_per_ctrl[ctrl_name] = T_world_ctrl.compose(T_ctrl_model)
+
             blobs    = blobs_all[idx]    if blobs_all    is not None and idx < len(blobs_all)    else None
             contours = contours_all[idx] if contours_all is not None and idx < len(contours_all) else None
 
@@ -556,7 +575,8 @@ class ControllerAnimatorRerun:
 
             self._log_frame(idx, T_cam_model_per_ctrl, assignments_frame, blobs, contours,
                             primary_cam_per_ctrl=primary_cams_frame,
-                            aux_assignments_per_ctrl=aux_assignments_frame)
+                            aux_assignments_per_ctrl=aux_assignments_frame,
+                            ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl)
 
         msg = f"[rerun] Logged {n_frames} frames."
         if save_path:
@@ -686,7 +706,8 @@ class ControllerAnimatorRerun:
                    assignments_per_ctrl: dict, blobs_per_cam: dict,
                    contours_per_cam: dict = None,
                    primary_cam_per_ctrl: dict = None,
-                   aux_assignments_per_ctrl: dict = None):
+                   aux_assignments_per_ctrl: dict = None,
+                   ghost_T_world_model_per_ctrl: dict = None):
 
         ray_radius            = self.vis_cfg.get("ray_radius",            0.0002)
         led_disk_radius       = self.vis_cfg.get("led_disk_radius",       0.003)
@@ -723,11 +744,43 @@ class ControllerAnimatorRerun:
                 matched_bids=matched_bids_per_cam.get(cam_idx),
             )
 
-        # ── Hide controllers with no valid pose this frame ──────────────────
+        # ── Hide or ghost controllers with no valid pose this frame ─────────
+        ghost_led_color = self.vis_cfg.get("ghost_led_color", [110, 110, 130])
         for ctrl_name in self._controllers_vis:
-            if ctrl_name not in T_cam_model_per_ctrl:
-                # Collapse static mesh to a point at the origin so it is invisible
-                # and does not affect Rerun's auto-fit bounding box.
+            if ctrl_name in T_cam_model_per_ctrl:
+                continue
+            ghost_T_world_model = (ghost_T_world_model_per_ctrl or {}).get(ctrl_name)
+            if ghost_T_world_model is not None:
+                # Case 3: blobs present but pose unsolvable → hold last known pose.
+                # Show mesh + dim LEDs at frozen position; no rays/projections.
+                cs        = self._ctrl_state[ctrl_name]
+                ctrl_path = f"world/{ctrl_name}"
+                R_disp = ghost_T_world_model.R
+                t_disp = ghost_T_world_model.t
+                pts_disp     = (R_disp @ cs["model_positions"].T).T + t_disp + offset
+                normals_disp = (R_disp @ cs["model_normals"].T).T
+
+                if self.vis_cfg.get("show_mesh", True):
+                    T4 = np.eye(4)
+                    T4[:3, :3] = R_disp
+                    T4[:3,  3] = t_disp + offset
+                    rr.log(f"{ctrl_path}/mesh",
+                           rr.Transform3D(translation=T4[:3, 3], mat3x3=T4[:3, :3]))
+
+                if self.vis_cfg.get("show_leds", True):
+                    colors = np.tile(ghost_led_color, (len(pts_disp), 1)).astype(np.uint8)
+                    verts, faces, vcols = make_disk_mesh(pts_disp, normals_disp, colors,
+                                                         radius=led_disk_radius)
+                    rr.log(f"{ctrl_path}/leds",
+                           rr.Mesh3D(vertex_positions=verts, triangle_indices=faces,
+                                     vertex_colors=vcols))
+
+                rr.log(f"{ctrl_path}/normals", rr.Clear(recursive=False))
+                for _ci in self._cameras:
+                    for _sub in ("rays", "projected_leds", "led_ids", "errors", "error_values"):
+                        rr.log(f"{ctrl_path}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))
+            else:
+                # Cases 1/2: never tracked or out of all cameras → collapse to invisible.
                 rr.log(f"world/{ctrl_name}/mesh",
                        rr.Transform3D(mat3x3=np.eye(3, dtype=np.float32) * 1e-9))
                 for _sub in ("leds", "normals"):
@@ -796,6 +849,32 @@ class ControllerAnimatorRerun:
                 cam_rpmax=camera.rpmax,
                 facing_threshold_deg=float(self._matching_cfg.get('led_facing_angle_deg', 86.0)),
             )
+            if (bool(self._matching_cfg.get('cross_controller_occlusion', False))
+                    and T_world_cam is not None):
+                _br          = float(self._matching_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+                _gate_margin = float(self._matching_cfg.get('cross_occlusion_gate_margin_px', 20.0))
+                _focal_px    = float(max(camera.camera_matrix[0, 0], camera.camera_matrix[1, 1]))
+                for _occ_name, _T_cam_model_occ in T_cam_model_per_ctrl.items():
+                    if _occ_name == ctrl_name:
+                        continue
+                    _occ_cs  = self._ctrl_state[_occ_name]
+                    _occ_pci = (primary_cam_per_ctrl or {}).get(_occ_name, next(iter(self._cameras)))
+                    if _occ_pci not in self._cameras:
+                        _occ_pci = next(iter(self._cameras))
+                    _T_world_cam_occ = self._cameras[_occ_pci].T_world_cam
+                    if _T_world_cam_occ is None:
+                        continue
+                    # Express occluder pose in the primary camera frame of the current controller.
+                    _T_world_model_occ     = _T_world_cam_occ.compose(_T_cam_model_occ)
+                    _T_cam_model_occ_local = T_world_cam.inverse().compose(_T_world_model_occ)
+                    _T_cam_ctrl_occ        = _T_cam_model_occ_local.compose(_occ_cs["T_model_ctrl"])
+                    vis_mask &= ~_cross_occluded_mask(
+                        T_cam_ctrl.R.astype(np.float32), T_cam_ctrl.t.astype(np.float32),
+                        cs["ctrl_positions"],
+                        _T_cam_ctrl_occ.R.astype(np.float32), _T_cam_ctrl_occ.t.astype(np.float32),
+                        _occ_cs["geom"],
+                        _br, _br, _focal_px, _gate_margin,
+                    )
             vis_set = set(np.where(vis_mask)[0].tolist())
 
             # ── LED disks ───────────────────────────────────────────────────

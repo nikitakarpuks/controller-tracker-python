@@ -107,10 +107,15 @@ def main():
         fine_tune_alignment(ctrl_leds["right_controller"], mesh, right_ctrl_cfg)
 
     # ── Tracking loop ──────────────────────────────────────────────────────
-    poses_all           = {n: [] for n in enabled_ctrls}
-    assignments_all     = {n: [] for n in enabled_ctrls}
-    primary_cams_all    = {n: [] for n in enabled_ctrls}
-    aux_assignments_all = {n: [] for n in enabled_ctrls}
+    poses_all            = {n: [] for n in enabled_ctrls}
+    assignments_all      = {n: [] for n in enabled_ctrls}
+    primary_cams_all     = {n: [] for n in enabled_ctrls}
+    aux_assignments_all  = {n: [] for n in enabled_ctrls}
+    # Per-frame T_world_ctrl for frames where tracking failed but blobs were
+    # present (case 3: between cameras / ambiguous).  None for truly invisible
+    # frames (case 1/2).  Visualiser holds the last known pose frozen.
+    frozen_poses_all     = {n: [] for n in enabled_ctrls}
+    last_good_T_world    = {n: None for n in enabled_ctrls}
     blobs        = []
     contours_all = []
 
@@ -144,6 +149,8 @@ def main():
                                          brightnesses_per_camera=cam_brightnesses)
         elapsed = time() - t0
 
+        total_blobs = sum(len(b) for b in cam_blobs.values())
+
         for ctrl_name in enabled_ctrls:
             sol = results.get(ctrl_name)
             if sol:
@@ -156,6 +163,8 @@ def main():
                 assignments_all[ctrl_name].append(sol["assignment"].copy())
                 primary_cams_all[ctrl_name].append(primary_cam_idx)
                 aux_assignments_all[ctrl_name].append(sol.get("aux_assignments"))
+                last_good_T_world[ctrl_name] = T_world_ctrl
+                frozen_poses_all[ctrl_name].append(T_world_ctrl)
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -174,6 +183,14 @@ def main():
                 assignments_all[ctrl_name].append(None)
                 primary_cams_all[ctrl_name].append(None)
                 aux_assignments_all[ctrl_name].append(None)
+                # Case 3: had a prior good pose and cameras still see blobs →
+                # controller is between cameras or ambiguous; freeze last pose.
+                # Cases 1/2: never tracked or truly out of view → None (hidden).
+                last_good = last_good_T_world[ctrl_name]
+                if last_good is not None and total_blobs > 0:
+                    frozen_poses_all[ctrl_name].append(last_good)
+                else:
+                    frozen_poses_all[ctrl_name].append(None)
                 logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  TRACKING LOST")
 
         if out_slow is not None and elapsed > SLOW_MATCH_THRESHOLD_S:
@@ -213,6 +230,7 @@ def main():
             save_path=config["visualization"].get("save_recording"),
             primary_cams_all=primary_cams_all,
             aux_assignments_all=aux_assignments_all,
+            frozen_poses_all=frozen_poses_all,
         )
 
 

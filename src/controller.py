@@ -454,6 +454,12 @@ class SingleViewTracker:
                 np.asarray(rvec, dtype=np.float32).reshape(3, 1),
                 np.asarray(tvec, dtype=np.float32).reshape(3),
             )
+        if self.prev_prev_pose is not None:
+            rvec, tvec = self.prev_prev_pose
+            self.prev_prev_pose = (
+                np.asarray(rvec, dtype=np.float32).reshape(3, 1),
+                np.asarray(tvec, dtype=np.float32).reshape(3),
+            )
 
         # Pose prediction: constant-velocity extrapolation from the last two frames.
         if self.prev_pose is not None and self.prev_prev_pose is not None:
@@ -692,6 +698,7 @@ class TrackingSystem:
         self._matching_cfg:       dict                       = matching_cfg or {}
         self._designated_primary: Dict[str, Optional[int]]  = {}
         self._handoff_counter:    Dict[str, Dict[int, int]] = {}
+        self._prev_primary:       Dict[str, Optional[int]]  = {}
 
         # Resolve fixed primary camera: matching cfg wins, then self-cal lock_primary.
         _fpc = self._matching_cfg.get("fixed_primary_camera")
@@ -730,14 +737,21 @@ class TrackingSystem:
 
         # Controllers with a prior pose run first — their claims reduce the search
         # space for cold-starting controllers.
-        # Sort by (has_prior_rank, name) for full determinism when priorities are equal.
+        # first_controller config breaks ties when both controllers have equal status.
         def _has_prior(name: str) -> bool:
             return any(
                 t.prev_pose is not None
                 for (cname, _), t in self.trackers.items()
                 if cname == name
             )
-        ordered = sorted(ctrl_names, key=lambda n: (0 if _has_prior(n) else 1, n))
+        _first = self._matching_cfg.get('first_controller', None)
+
+        def _order_key(name: str):
+            has_prior_rank = 0 if _has_prior(name) else 1
+            preferred_rank = (0 if name == f"{_first}_controller" else 1) if _first else 0
+            return (has_prior_rank, preferred_rank, name)
+
+        ordered = sorted(ctrl_names, key=_order_key)
 
         # Blob ownership: original observation indices claimed by controllers so far.
         claimed_blobs: Dict[int, Set[int]] = {}
@@ -991,6 +1005,17 @@ class TrackingSystem:
                     if len(_fb_blobs) < 3:
                         continue
                     _fb_tracker = tracker_map[_fb_cid]
+                    # Camera switch via fallback: clear the state-propagated pose so
+                    # track() runs brute instead of proximity from a pose derived
+                    # through a different camera's extrinsic calibration.
+                    _fb_prev_prim = self._prev_primary.get(ctrl_name)
+                    if _fb_prev_prim is not None and _fb_cid != _fb_prev_prim:
+                        logger.debug(
+                            f"[{ctrl_name} | cam {_fb_cid}] fallback would switch primary "
+                            f"cam{_fb_prev_prim} → cam{_fb_cid}: clearing state-prop pose, forcing brute"
+                        )
+                        _fb_tracker.prev_pose      = None
+                        _fb_tracker.prev_prev_pose = None
                     _fb_other = [
                         (self.cameras[cid], av[0], av[1])
                         for cid, av in avail.items() if cid != _fb_cid
@@ -1019,6 +1044,21 @@ class TrackingSystem:
 
             if solution is not None:
                 solution["primary_cam"] = primary_cam_id
+
+                # Track primary camera changes for logging and the fallback-brute rule.
+                # We no longer clear prev_pose here: by the time this guard fires,
+                # track() has already stored a fresh solution as prev_pose, so there
+                # is nothing biased to clear.  Clearing it caused an oscillation:
+                # the newly-designated primary became ineligible (_des_ok requires
+                # prev_pose) on the very next frame, handing control back to the old
+                # camera, which triggered a new handoff, repeating indefinitely.
+                _prev_prim = self._prev_primary.get(ctrl_name)
+                if _prev_prim is not None and primary_cam_id != _prev_prim:
+                    logger.info(
+                        f"[{ctrl_name}] Primary camera switched "
+                        f"cam{_prev_prim} → cam{primary_cam_id}"
+                    )
+                self._prev_primary[ctrl_name] = primary_cam_id
 
                 # Persist winning camera so next frame's selection prefers it.
                 if self._fixed_primary_cam is None:

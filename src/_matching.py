@@ -273,7 +273,8 @@ def proximity_match(
     _ctrl = self.model.name.replace("_controller", "")
     facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',     86.0))
     reprojection_threshold = float(_cfg.get('proximity_reprojection_threshold', 2.0))
-    min_inliers            = int(  _cfg.get('min_inliers',               4))
+    min_inliers            = int(  _cfg.get('proximity_min_inliers',
+                                          _cfg.get('min_inliers', 4)))
     led_radius_mm          = float(_cfg.get('led_radius_mm',             2.5))
     snap_factor            = float(_cfg.get('proximity_snap_factor',     4.0))
     blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
@@ -321,6 +322,8 @@ def proximity_match(
                 R_pred_arr, tvec_pred, self.model.positions,
                 _R_occ, _t_occ, _geom_occ,
                 _br, _br, focal_px, _gate_margin_px,
+                log_tag=f"[{_ctrl} | cam {_cam}]",
+                vis_mask=vis_mask_pred,
             )
     n_model_visible = int(vis_mask_pred.sum())
 
@@ -713,6 +716,8 @@ def proximity_match(
                             _R_i_r, _t_i_r, self.model.positions,
                             _R_occ_i_r, _t_occ_i_r, _geom_occ_i_r,
                             _br, _br, _focal_i_r, _gate_margin_px,
+                            log_tag=f"[{_ctrl} | cam {_cam} aux_cam {_ocam.camera_idx}]",
+                            vis_mask=_vis_i_r,
                         )
                 _n_vis_i_r  = int(np.sum(_vis_i_r))
                 _snap_lids  = {lid for _, lid in _pairs_i}
@@ -1546,6 +1551,8 @@ def brute_match(
                                         R_r, tvec_r_flat, positions,
                                         _R_occ_r, _t_occ_r, _geom_occ_r,
                                         _br, _br, focal_px, _gate_margin_px,
+                                        log_tag=f"[{_ctrl} | cam {_cam}]",
+                                        vis_mask=vis_mask_r,
                                     )
                             # Drop inliers that became occluded under the refined pose.
                             inlier_still_visible = vis_mask_r[inlier_leds]
@@ -1656,6 +1663,8 @@ def brute_match(
                                                 _R_i, _t_i, positions,
                                                 _R_occ_i, _t_occ_i, _geom_occ_i,
                                                 _br, _br, _focal_i_b, _gate_margin_px,
+                                                log_tag=f"[{_ctrl} | cam {_cam} aux_cam {_ocam.camera_idx}]",
+                                                vis_mask=_vis_i,
                                             )
                                     _vis_ids_i = np.where(_vis_i)[0]
                                     if len(_vis_ids_i) == 0:

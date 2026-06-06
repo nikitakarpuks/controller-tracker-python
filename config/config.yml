@@ -1,5 +1,6 @@
 data:
-  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/ctrl_occlusion"
+  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
+#  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/ctrl_occlusion"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -109,8 +110,8 @@ matching:
   # Blob size filtering  (shared pre-filter for both brute and proximity)
   # --------------------------------------------------------------------------
   log_size_filter: false
-  blob_size_max_factor: 2.0       # blob radius > expected * this → rejected (merged blob / noise)
-  blob_size_min_factor: 0.5 # 0.3       # blob radius < expected * this → rejected (sub-pixel noise)
+  blob_size_max_factor: 10.0       # blob radius > expected * this → rejected (merged blob / noise)
+  blob_size_min_factor: 0.01       # blob radius < expected * this → rejected (sub-pixel noise)
   blob_size_score_weight: 0.5     # px penalty per px of size mismatch added to argmin score
 
   # --------------------------------------------------------------------------
@@ -136,6 +137,8 @@ matching:
   # Proximity match
   # --------------------------------------------------------------------------
   use_proximity_match: true              # set to false to always use brute force
+  proximity_min_inliers: 3               # min inliers for proximity match (can be lower than min_inliers
+                                          # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
   blob_tracking_snap_px: 25.0           # max pixel distance to carry a led_id from prev frame to current
   proximity_snap_factor: 3.0            # depth-scaled snap: focal * (led_radius_mm/1000) / depth * factor
@@ -149,6 +152,12 @@ matching:
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
   voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs
                                         # within this distance of either controller's LEDs (full Voronoi territory)
+
+  # --------------------------------------------------------------------------
+  # Multi-controller ordering
+  # --------------------------------------------------------------------------
+  first_controller: "right"            # "right" or "left": which controller runs first and claims blobs first
+                                        # when both controllers have equal tracking status (both tracked or both cold)
 
   # --------------------------------------------------------------------------
   # Pose validation
@@ -168,7 +177,7 @@ matching:
   # --------------------------------------------------------------------------
   # Cross-controller occlusion
   # --------------------------------------------------------------------------
-  cross_controller_occlusion: false        # mask LEDs of controller B that are occluded by controller A's body
+  cross_controller_occlusion: true        # mask LEDs of controller B that are occluded by controller A's body
   cross_occlusion_bounding_radius_m: 0.18  # controller body bounding sphere radius (tune manually)
   cross_occlusion_gate_margin_px: 20.0     # slack added to the 2D projection gate threshold
 
@@ -204,8 +213,8 @@ debug:
   split_to_folders: false
   verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
   log_best: true                  # log each new best solution update
-  debug_led_ids: null            # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
-  debug_blob_ids: null          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
+  debug_led_ids: [4, 15, 17]            # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
+  debug_blob_ids: [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
