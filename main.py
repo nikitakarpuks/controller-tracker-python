@@ -1,3 +1,4 @@
+import csv
 import sys
 from pathlib import Path
 from shutil import copy
@@ -10,7 +11,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from src import debug_config
-from src.blobs_detection import get_centroids
+from src.blobs_detection import get_centroids, get_pass2_params
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.debug_config import DebugMode
@@ -119,6 +120,16 @@ def main():
     blobs        = []
     contours_all = []
 
+    _csv_path = debug_cfg.get("calibration_csv")
+    _csv_file = _csv_writer = None
+    if _csv_path:
+        Path(_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        _csv_file = open(_csv_path, "w", newline="")
+        _csv_writer = csv.writer(_csv_file)
+        _csv_writer.writerow(["frame", "ctrl_name", "cam_idx", "depth_m",
+                               "pixel_threshold", "required_threshold", "max_area"])
+        logger.info(f"Calibration CSV → {_csv_path}")
+
     for batch in tqdm(get_data(config["data"])):
         img_path, cam_images = batch[0][0], batch[0][1]
         # cam_images: {cam_idx: numpy array}
@@ -129,6 +140,8 @@ def main():
         cam_brightnesses = {}
 
         for cam_idx, image in cam_images.items():
+            if cam_idx not in cameras:
+                continue
             t0 = time()
             blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
                 image, config["blob_detection"], visualize=config["blob_detection"]["visualize"], img_path=img_path, cam_idx=cam_idx
@@ -178,6 +191,17 @@ def main():
                             f"cam={primary_cam}  err={sol['error']:.2f}px  "
                             f"matches={len(sol['assignment'])}{aux_str}  "
                             f"method={sol.get('method', '?')}")
+                if _csv_writer:
+                    _p2 = get_pass2_params(primary_cam_idx)
+                    if _p2 is not None:
+                        depth_m = float(np.asarray(sol["tvec"]).reshape(3)[2])
+                        _csv_writer.writerow([
+                            img_path.name, ctrl_name, primary_cam_idx,
+                            f"{depth_m:.4f}",
+                            _p2["pixel_threshold"],
+                            _p2["required_threshold"],
+                            _p2["max_area"],
+                        ])
             else:
                 poses_all[ctrl_name].append(None)
                 assignments_all[ctrl_name].append(None)
@@ -198,6 +222,10 @@ def main():
             logger.info(f"  → saved to deep_search_required (slow: {elapsed:.1f}s)")
         if out_tracking_lost is not None and any(poses_all[n][-1] is None for n in enabled_ctrls):
             copy(img_path, out_tracking_lost / img_path.name)
+
+    if _csv_file:
+        _csv_file.close()
+        logger.info(f"Calibration CSV saved → {_csv_path}")
 
     # ── Sanity check ───────────────────────────────────────────────────────
     for ctrl_name in enabled_ctrls:
