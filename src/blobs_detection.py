@@ -176,23 +176,13 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     """
     min_area           = float(min_area_override if min_area_override is not None else cfg["min_area"])
     max_area           = float(max_area_override if max_area_override is not None else cfg["max_area"])
-    max_wh             = int(cfg.get("max_wh", 35))
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
-    area_outlier_k     = float(cfg.get("area_outlier_k", 6.0))
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
     split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
     min_circularity    = float(cfg.get("min_circularity", 0.5))
 
-    # H1: interior-of-large-blob exclusion
+    # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
     interior_edge_margin_px = float(cfg.get("interior_edge_margin_px", 10.0))
-
-    # H2: smooth-gradient filter
-    gradient_radius_factor    = float(cfg.get("gradient_radius_factor", 2.5))
-    gradient_num_rays         = int(cfg.get("gradient_num_rays", 16))
-    gradient_valley_ratio     = float(cfg.get("gradient_valley_ratio", split_valley_ratio))
-    gradient_step_tolerance   = float(cfg.get("gradient_step_tolerance", 0.15))
-    gradient_max_bad_ray_frac = float(cfg.get("gradient_max_bad_ray_fraction", 0.4))
-    gradient_min_radius       = float(cfg.get("gradient_min_radius", 5.0))
 
     _dbbox = cfg.get("debug_bbox")  # [x1, y1, x2, y2] or null
 
@@ -212,14 +202,13 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     blob_contours    = []
     blob_pixels_list = []
     blob_max_pixels  = []
-    # Large blobs rejected by area/wh — always tracked; passed to pass-2 as H1 exclusion zones.
+    # Large blobs rejected by area — always tracked; passed to pass-2 as H1 exclusion zones.
     large_rejected_contours = []
     # Per-reason rejection lists — populated only when visualize=True.
     det_rej_area_small = []
     det_rej_area_large = []
-    det_rej_wh         = []
     det_rej_threshold  = []
-    det_rej_interior   = []   # H1: centroid deep inside a large blob
+    det_rej_interior   = []   # H1: centroid deep inside a large blob (no-prior path only)
     intensities = image.astype(np.float32)
 
     for cnt in contours:
@@ -227,12 +216,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         x_b, y_b, w_b, h_b = cv2.boundingRect(cnt)
         bx, by = x_b + w_b / 2.0, y_b + h_b / 2.0  # position proxy before centroid is known
 
-        # ── Reject by area ────────────────────────────────────────────────────
-        if area < min_area:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} < min_area {min_area}")
-            if visualize: det_rej_area_small.append(cnt)
-            continue
+        # ── Reject by max area and bounding-box size (cheap, before mask) ─────
         if area > max_area:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} > max_area {max_area}")
@@ -240,19 +224,10 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             if visualize: det_rej_area_large.append(cnt)
             continue
 
-        # ── Reject 1×1 blobs (pure noise) ────────────────────────────────────
         if w_b == 1 and h_b == 1:
             if _in_bbox(bx, by):
                 logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: 1×1 blob")
             if visualize: det_rej_area_small.append(cnt)
-            continue
-
-        # ── Reject blobs that are too large to be LEDs ───────────────────────
-        if w_b > max_wh or h_b > max_wh:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: size {w_b}×{h_b} > max_wh {max_wh}")
-            large_rejected_contours.append(cnt)
-            if visualize: det_rej_wh.append(cnt)
             continue
 
         # ── Build pixel mask for this blob (ROI-sized, not full-image) ──────
@@ -264,6 +239,14 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         ys_roi, xs_roi = np.nonzero(roi_mask)
         ys = ys_roi + y_b
         xs = xs_roi + x_b
+
+        # ── Reject by pixel count (cv2.contourArea underestimates for small
+        #    irregular blobs — a 3-px L-shape has geometric area ≈ 0.5) ────────
+        if len(ys_roi) < min_area:
+            if _in_bbox(bx, by):
+                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: pixels {len(ys_roi)} < min_area {min_area}")
+            if visualize: det_rej_area_small.append(cnt)
+            continue
 
         # ── Required-threshold gate: need at least one bright pixel ───────────
         if ys.size == 0:
@@ -372,13 +355,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         dtype=np.float32,
     ) if blob_contours else np.empty(0, dtype=np.float32)
 
-    keep_mask          = np.ones(len(centroids_arr), dtype=bool)
-    area_keep_mask     = np.ones(len(centroids_arr), dtype=bool)
-    circ_keep_mask     = np.ones(len(centroids_arr), dtype=bool)
-    gradient_keep_mask = np.ones(len(centroids_arr), dtype=bool)
-    upper_limit        = np.inf
-    median_area        = mad = 0.0
-    epsilon            = np.inf
+    keep_mask      = np.ones(len(centroids_arr), dtype=bool)
+    circ_keep_mask = np.ones(len(centroids_arr), dtype=bool)
+    epsilon        = np.inf
 
     # ── 3a. Circularity filter: reject non-circular blobs (4π·area/perimeter²)
     for i, cnt in enumerate(blob_contours):
@@ -391,16 +370,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             circ_keep_mask[i] = False
     keep_mask &= circ_keep_mask
 
-    # ── 3b. Area filter: reject blobs with area > median + area_outlier_k * MAD
-    if len(areas_arr) >= 3:
-        median_area = float(np.median(areas_arr))
-        mad         = float(np.median(np.abs(areas_arr - median_area)))
-        if mad > 0:
-            upper_limit    = median_area + area_outlier_k * mad
-            area_keep_mask = areas_arr <= upper_limit
-            keep_mask     &= area_keep_mask
-
-    # ── 3c. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
+    # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
     candidates   = centroids_arr[keep_mask]
     min_nn_full  = np.full(len(centroids_arr), np.inf)
     if len(candidates) > 1:
@@ -413,80 +383,6 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         min_nn_full[cand_idx] = min_nn
         keep_mask[cand_idx[min_nn > epsilon]] = False
 
-    # ── 3d. Gradient smoothness filter (vectorized ray casting)
-    h_img, w_img = image.shape[:2]
-    _ray_angles = (2.0 * np.pi / gradient_num_rays) * np.arange(gradient_num_rays)
-    _ray_dy = np.sin(_ray_angles)   # (R,) — precomputed, same for every blob
-    _ray_dx = np.cos(_ray_angles)   # (R,)
-    for i in np.where(keep_mask)[0]:
-        cnt_i       = blob_contours[i]
-        blob_radius = np.sqrt(max(float(areas_arr[i]), 1.0) / np.pi)
-        nr_int      = max(int(gradient_radius_factor * blob_radius), int(gradient_min_radius))
-
-        # ROI-sized mask — avoids allocating / scanning a full (H×W) image.
-        x_b, y_b, w_b, h_b = cv2.boundingRect(cnt_i.reshape(-1, 1, 2).astype(np.int32))
-        roi_mask = np.zeros((h_b, w_b), dtype=np.uint8)
-        cnt_roi  = cnt_i.reshape(-1, 2).copy()
-        cnt_roi[:, 0] -= x_b
-        cnt_roi[:, 1] -= y_b
-        cv2.drawContours(roi_mask, [cnt_roi.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
-        ys_roi, xs_roi = np.nonzero(roi_mask)
-        if ys_roi.size == 0:
-            continue
-        ys_b = ys_roi + y_b
-        xs_b = xs_roi + x_b
-
-        cached_peak = blob_peaks[i]
-        if cached_peak is None:
-            continue
-        peak_y, peak_x = cached_peak
-        peak_val = int(image[peak_y, peak_x])
-        if peak_val == 0:
-            continue
-
-        valley_floor = gradient_valley_ratio * peak_val
-
-        # Vectorized: compute all (R × S) pixel coords at once and read image in one shot.
-        steps  = np.arange(1, nr_int + 1, dtype=np.float32)             # (S,)
-        py_all = np.round(peak_y + _ray_dy[:, None] * steps).astype(np.int32)  # (R, S)
-        px_all = np.round(peak_x + _ray_dx[:, None] * steps).astype(np.int32)  # (R, S)
-
-        in_bounds = ((py_all >= 0) & (py_all < h_img) &
-                     (px_all >= 0) & (px_all < w_img))                   # (R, S)
-        py_clip = np.clip(py_all, 0, h_img - 1)
-        px_clip = np.clip(px_all, 0, w_img - 1)
-
-        vals = image[py_clip, px_clip].astype(np.float32)                # (R, S)
-
-        # Active range: each ray stops at the first valley or first out-of-bounds step.
-        valley_hit  = in_bounds & (vals < valley_floor)
-        oob_hit     = ~in_bounds
-        first_valley = np.where(valley_hit.any(1), np.argmax(valley_hit, axis=1), nr_int)
-        first_oob    = np.where(oob_hit.any(1),    np.argmax(oob_hit,    axis=1), nr_int)
-        active_end   = np.minimum(first_valley, first_oob)               # (R,)
-
-        # Monotonicity: detect any step where intensity rises beyond tolerance.
-        prev_vals = np.empty_like(vals)
-        prev_vals[:, 0] = float(peak_val)
-        if nr_int > 1:
-            prev_vals[:, 1:] = vals[:, :-1]
-        step_idx  = np.arange(nr_int)[None, :]                           # (1, S)
-        in_active = step_idx < active_end[:, None]                       # (R, S)
-        bad_rays  = int(
-            (in_active & in_bounds & (vals > prev_vals * (1.0 + gradient_step_tolerance)))
-            .any(axis=1).sum()
-        )
-
-        if bad_rays / gradient_num_rays > gradient_max_bad_ray_frac:
-            gradient_keep_mask[i] = False
-            if _in_bbox(float(centroids_arr[i, 0]), float(centroids_arr[i, 1])):
-                logger.debug(
-                    f"[blob_debug] ({centroids_arr[i, 0]:.1f},{centroids_arr[i, 1]:.1f}) "
-                    f"dropped: gradient not smooth, bad_rays={bad_rays}/{gradient_num_rays}"
-                )
-
-    keep_mask &= gradient_keep_mask
-
     kept_indices     = np.where(keep_mask)[0]
     rejected_indices = np.where(~keep_mask)[0]
 
@@ -496,13 +392,6 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             if _in_bbox(cx_r, cy_r):
                 if not circ_keep_mask[i]:
                     logger.debug(f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: not circular")
-                elif not area_keep_mask[i]:
-                    logger.debug(
-                        f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: area outlier "
-                        f"area={areas_arr[i]:.1f} > {median_area:.1f}+{area_outlier_k}×{mad:.1f}"
-                    )
-                elif not gradient_keep_mask[i]:
-                    pass  # already logged in the gradient loop above
                 else:
                     logger.debug(
                         f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: spatial outlier "
@@ -533,34 +422,26 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         # BGR colours per category
         # Highly distinct debug colors (BGR)
 
-        C_AREA_SM = (255, 0, 255)  # pink         — area < min_area or 1×1
-        C_AREA_LG = (0, 140, 255)  # dark orange  — area > max_area (hard limit)
-        C_WH = (255, 255, 0)  # dark blue    — bounding-box too wide/tall
-        C_THRESH = (180, 0, 0)  # magenta      — below required brightness
-        C_CIRC = (0, 255, 255)  # yellow       — circularity filter
-        C_AREA_OUT = (0, 0, 255)  # orange       — area outlier filter
-        C_SPAT = (128, 128, 128)  # red          — spatial (DBSCAN) outlier
-        C_INTERIOR = (128, 0, 255)  # purple       — H1: deep inside large blob
-        C_GRAD = (0, 255, 0)  # teal         — H2: no smooth gradient
-        C_KEPT = (255, 255, 255)  # green        — kept
-        C_SPLT = (0, 255, 128)  # cyan         — kept (split)
+        C_AREA_SM  = (255, 0, 255)    # pink        — pixels < min_area or 1×1
+        C_AREA_LG  = (0, 140, 255)   # dark orange — area > max_area (hard limit)
+        C_THRESH   = (180, 0, 0)     # dark red    — below required brightness
+        C_CIRC     = (0, 255, 255)   # yellow      — circularity filter
+        C_SPAT     = (128, 128, 128) # grey        — spatial (DBSCAN) outlier
+        C_INTERIOR = (100, 180, 255) # light blue  — H1: deep inside large blob (no-prior only)
+        C_KEPT     = (255, 255, 255) # white       — kept
+        C_SPLT     = (0, 255, 128)   # cyan        — kept (split)
 
         def _draw_cnt(cnt, color):
             cv2.drawContours(vis, [cnt.reshape(-1, 1, 2).astype(np.int32)], -1, color, 1)
 
         for cnt in det_rej_area_small: _draw_cnt(cnt, C_AREA_SM)
         for cnt in det_rej_area_large: _draw_cnt(cnt, C_AREA_LG)
-        for cnt in det_rej_wh:         _draw_cnt(cnt, C_WH)
         for cnt in det_rej_threshold:  _draw_cnt(cnt, C_THRESH)
         for cnt in det_rej_interior:   _draw_cnt(cnt, C_INTERIOR)
 
         for i in rejected_indices:
             if not circ_keep_mask[i]:
                 _draw_cnt(blob_contours[i], C_CIRC)
-            elif not area_keep_mask[i]:
-                _draw_cnt(blob_contours[i], C_AREA_OUT)
-            elif not gradient_keep_mask[i]:
-                _draw_cnt(blob_contours[i], C_GRAD)
             else:
                 _draw_cnt(blob_contours[i], C_SPAT)
 
@@ -577,15 +458,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         strip_entries = [
             (C_KEPT,     "kept"),
             (C_SPLT,     "split"),
-            (C_AREA_OUT, "area outlier"),
             (C_CIRC,     f"not circular (< {min_circularity})"),
             (C_SPAT,     "spatial outlier"),
-            (C_GRAD,     "no gradient"),
-            (C_INTERIOR, "deep in large blob"),
+            (C_INTERIOR, "deep in large blob (no-prior)"),
             (C_THRESH,   f"too dim (< {required_threshold})"),
-            (C_WH,       f"wh > {max_wh}px"),
             (C_AREA_LG,  f"area > {int(max_area)}px"),
-            (C_AREA_SM,  f"area < {int(min_area)}px"),
+            (C_AREA_SM,  f"pixels < {int(min_area)}"),
         ]
         row_h = 20
         half = len(strip_entries) // 2 + len(strip_entries) % 2
@@ -642,6 +520,18 @@ def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
     scale  = np.minimum(scale, 4.0)
     r *= scale.astype(np.float32)
     return r
+
+
+def get_pass2_params(cam_idx) -> dict | None:
+    """Return the pass-2 thresholds last used for cam_idx, or None if pass-2 did not run."""
+    mem = _pass2_memory.get(cam_idx if cam_idx is not None else 0)
+    if not mem or "pixel_threshold" not in mem:
+        return None
+    return {
+        "pixel_threshold":    mem["pixel_threshold"],
+        "required_threshold": mem.get("required_threshold"),
+        "max_area":           mem.get("max_area"),
+    }
 
 
 def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):

@@ -270,200 +270,157 @@
 
 
 
-
-❯ I see that the problem is in blob detection, thresholds are set not in the best way. But first, check again how we calculate expected radii; my
-  blob_size_min_factor was set to 0.3. But I had to lower it to 0.1 not to filter good blobs. Why our radii is so overestimated?
-
-● Let me look at both how expected_px is computed in matching and how blob_radii are actually measured in blob detection.
-
-  Searched for 1 pattern, read 1 file (ctrl+o to expand)
-
-● Now I have the full picture. Let me check how focal_px is set in matching:
-
-  Searched for 1 pattern (ctrl+o to expand)
-
-● There are two compounding issues:
-
-  1. focal_px = max(fx, fy) — small systematic overestimate
-
-  Using the maximum instead of the geometric mean sqrt(fx*fy) slightly inflates expected_px. Minor unless fx and fy differ significantly.
-
-  2. The fundamental mismatch: physical projection vs threshold-based measurement
-
-  The formula computes:
-  expected_px = focal * led_radius_mm / depth   # physical disc projection
-
-  But blob detection returns:
-  sqrt(cv2.contourArea(cnt) / π)   # equivalent-circle radius at the detection threshold
-
-  These measure completely different things. expected_px is the radius of the LED's physical image on the sensor. blob_radius is the radius of the
-  region where pixel intensity exceeded pixel_threshold (or pass2_threshold if pass-2 is active). The detected region is the bright core, not the
-  physical disc size.
-
-  3. Pass-2 adaptive threshold compounds it at close range
-
-  At close range, depth decreases, so expected_px grows as 1/depth. But simultaneously, because the LEDs appear brighter at close range,
-  pass2_threshold is driven up adaptively — so the detected blob shrinks (only the very bright core is above the higher threshold). The
-  _correct_radii_for_threshold function tries to compensate using sqrt(ln(P/thr1) / ln(P/thr2)), but:
-  - It only corrects back to pass-1 level, not to physical size
-  - It assumes a Gaussian profile which may not hold for saturated pixels
-
-  The net result: as depth decreases, expected_px goes up and blob_radius goes down simultaneously. At close range the ratio blob_radius /
-  expected_px can easily fall below 0.1, explaining why 0.3 was too tight.
-
-  The pragmatic fix is exactly what you did — calibrate blob_size_min_factor (and possibly led_radius_mm) empirically to match what blobs actually
-  measure across the depth range you care about, rather than relying on the physical model.
-
-✻ Baked for 2m 48s
-
-❯ okay. Now please tell me how can I ensure that during pass 2 both min and required thresholds will be higher? I faced a case when I don't have
-  pseudo oks in pass 1, but in pass 2 threshold is too small; how can I adjust this?
-
-● Let me re-read the pass-2 threshold calculation closely.
-
-  Read 1 file (ctrl+o to expand)
-
-● The issue is clear. There are two separate cases where the pass-2 threshold ends up too small:
-
-  1. raw_pixel_thr is only slightly above pixel_threshold — the guard raw_pixel_thr > pixel_threshold passes but the increase is tiny, so pass-2
-  barely filters anything extra. This happens when ref_brightness is low (dim scene, or low pass2_brightness_percentile picks a faint blob).
-  2. raw_required_thr has no floor at all — ref_brightness * pass2_required_factor could even be below pass-1's required_threshold since the two are
-  computed independently. There is no guarantee required_threshold_2 > required_threshold.
-
-  The fix: add two config params that act as absolute floors — pass2_min_pixel_threshold and pass2_min_required_threshold. Applied after the
-  brightness-derived values, before the EMA and the > pixel_threshold guard:
-
-● Update(~\PyCharmProjects\controller-tracker-python\src\blobs_detection.py)
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- Edit file
- ..\src\blobs_detection.py
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
- 652      pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
-
-  1. raw_pixel_thr is only slightly above pixel_threshold — the guard raw_pixel_thr > pixel_threshold passes but the increase is tiny, so pass-2
-  barely filters anything extra. This happens when ref_brightness is low (dim scene, or low pass2_brightness_percentile picks a faint blob).
-  2. raw_required_thr has no floor at all — ref_brightness * pass2_required_factor could even be below pass-1's required_threshold since the two are
-  computed independently. There is no guarantee required_threshold_2 > required_threshold.
-
-  The fix: add two config params that act as absolute floors — pass2_min_pixel_threshold and pass2_min_required_threshold. Applied after the
-  brightness-derived values, before the EMA and the > pixel_threshold guard:
-
-● Update(~\PyCharmProjects\controller-tracker-python\src\blobs_detection.py)
-  ⎿  User rejected update to ..\src\blobs_detection.py
-      652      pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
-      653      ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
-      654      count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
-      655 +    # Absolute floors for pass-2 thresholds — ensures pass-2 is meaningfully
-      656 +    # stricter than pass-1 even when ref_brightness comes out low.
-      657 +    pass2_min_pixel_thr    = int(cfg.get("pass2_min_pixel_threshold",    0))
-      658 +    pass2_min_required_thr = int(cfg.get("pass2_min_required_threshold", 0))
-      659
-      660      # Per-camera EMA memory — keyed by cam_idx so cameras don't bleed into each other.
-      661      _cam_key = cam_idx if cam_idx is not None else 0
-
-❯ no. I understood what is the issue. The problem is that we have 2 controllers in a single scene. Previously I also thought about this problem,
-  and the initial solution that we currently have is that we take 25 percentile and set threshold according to that. Issue is that if controller
-  that doesnt have 25 perc led but is higher (has brighter blobs) then in case it is places in noisy big zone, then its edge leds are merged with
-  background. We need to think how to handle this properly. Maybe for each controller we can calculate separate min and required values, or use
-  different stats. Think about this deeply and suggest solution
-
-● The core issue is that a single global brightness reference can't serve two controllers at different brightness levels simultaneously. Let me
-  think through this properly.
-
-  What's actually happening:
-
-  The 25th percentile anchors ref_brightness to the dim controller's blobs. The bright controller needs a threshold high enough to isolate its LEDs
-  from nearby noise — but it's getting the same low threshold derived from the other controller's faint blobs. The fix of lowering
-  blob_size_min_factor to 0.1 was treating the symptom, not the cause.
-
-  ---
-  Why per-controller thresholds are the right framing:
-
-  Two controllers produce two distinct brightness clusters in the mean_vals distribution — one cluster per controller. Each cluster needs its own
-  ref_brightness for pass-2. The current code collapses them into one value at the 25th percentile, throwing away that structure.
-
-  ---
-  Proposed solution: bimodal split → two separate pass-2 detections, merged spatially
-
-  Step 1 — detect the split.
-  After collecting mean_vals from pass-1, check if the brightness distribution is bimodal. A robust way without full k-means: sort mean_vals, find
-  the largest gap between consecutive sorted values (or check if np.percentile(mean_vals, 75) / np.percentile(mean_vals, 25) > split_factor, e.g.
-  split_factor=1.8). If gap found, split at the midpoint.
-
-  Step 2 — one pass-2 per cluster.
-  For each cluster compute its own ref_brightness (median of that cluster) and derive independent pixel_threshold_2 and required_threshold_2. The
-  bright cluster gets a high threshold — which is exactly what cleans up noise merging near it. The dim cluster gets a low threshold — which is what
-  keeps its faint blobs detectable.
-
-  Step 3 — spatial merge of two pass-2 results.
-  Each controller occupies a different spatial region, so blobs from the two passes don't overlap. Deduplication is simple: for any two blobs from
-  different passes within a merge distance (e.g. 5 px), keep the one from the higher-threshold pass (it's the better-isolated detection). All others
-  enter the final result as-is.
-
-  Step 4 — fallback.
-  If mean_vals is unimodal (single controller visible, or both at similar brightness), keep the current single-percentile behavior unchanged.
-
-  ---
-  Why not per-blob local threshold instead?
-
-  Adapting threshold per blob sounds appealing, but has a chicken-and-egg problem: the noisy merged blob has already consumed the edge LED in
-  pass-1. Re-thresholding a blob that was already merged with noise doesn't recover the original LED — you need to re-run detection on the raw image
-  at a higher threshold for that region. The cluster-split approach naturally does this because pass-2 runs on the full raw image.
-
-  ---
-  Why not just switch from 25th to 75th percentile globally?
-
-  That would flip the problem: the dim controller's blobs would be too aggressively filtered by the bright-calibrated threshold. You'd lose blobs
-  from the dim controller instead.
-
-  ---
-  Summary of what to implement:
-
-  1. Add pass2_split_factor config param (default 1.8) — ratio at which bimodal split is triggered
-  2. When split detected: two pass-2 runs, each with cluster-calibrated thresholds, merged by proximity
-  3. When no split: current single-pass behavior unchanged
-
-  The EMA memory would need to track per-cluster thresholds separately (keyed by cluster index), so the temporal smoothing still works across
-  frames.
-
-✻ Cogitated for 2m 44s
-
-❯ 1) how would you derive independent pixel_threshold_2 and required_threshold_2? Would you set a percentile like now for each cluster, which is
-  now 0.25?
-  2) the isssue is that 2 clusters have its brigth and dim blobs; so, dim blob from closer controller could have less brightness than bright from
-  further controller. We should somehow handle this; we can't mix two controllers blobs
-  3) it can happen that 2 controllers relatively to camera are close but in 3d they are far apart, and one will have dim blobs, other very bright.
-  How can we handle this case?
-
-● Good challenges. Let me address each.
-
-  Q1: Per-cluster threshold derivation
-
-  Within a cluster, all blobs are already of similar brightness so the distribution is tight. The 25th percentile loses its meaning at cluster scale
-  (if a cluster has 6 blobs, the 25th percentile is just the 2nd lowest value). Better: use the cluster median directly as ref_brightness. No
-  percentile needed within a cluster — the percentile's original purpose was to be robust against the other cluster pulling the global value up or
-  down. Once clusters are separated, that problem is gone.
-
-  Q2 and Q3: Brightness clustering is the wrong axis entirely
-
-  Both questions expose the same fundamental issue: brightness is determined by depth, LED angle to camera, and exposure — it's a consequence of
-  physical position, not an identity of the controller. A dim LED on the close controller can be darker than a bright LED on the far controller.
-  Brightness clustering will always mix controllers in some configurations.
-
-  The correct grouping axis is spatial position in the image, not brightness. Controllers are physical objects — they occupy different regions of
-  the image (except for severe overlap, which is the hard case). Two options depending on tracker state:
-
-  When tracking is active (have previous pose): project each controller's predicted LED positions into the camera. Assign each pass-1 blob to
-  whichever controller's projection is nearest. Each controller now has its own blob set with correct attribution regardless of relative brightness.
-  Compute ref_brightness per controller from its attributed blobs. This handles Q3 cleanly: even if both controllers are spatially close in the
-  image, their projected LED patterns are distinct.
-
-  When tracking is lost / cold start: fall back to k-means (k=2) clustering on 2D blob image positions. This works when controllers are in different
-  image regions. When they're also spatially overlapping in the image (rare at cold start, since the user hasn't brought them close yet), accept
-  the current global single-threshold behavior.
-
-  Architectural implication: this requires get_centroids (or the pass-2 logic) to optionally accept projected LED positions per controller as hints
-  — currently it runs fully blind to tracker state. The cleanest approach: compute per-controller ref_brightness values outside blob detection in
-  the tracking loop (where pose predictions exist), then pass target thresholds into get_centroids as overrides rather than having blob detection
-  rediscover them from scratch.
+# Session Summary — Pose-Guided Threshold System
+    2
+    3 ## What we did
+    4
+    5 ### 1. Code cleanup in `blobs_detection.py`
+    6
+    7 **Fixed `min_area` bug (critical)**
+    8 - `cv2.contourArea` computes the geometric Shoelace area, not pixel count. For small
+    9   irregular blobs (e.g. a 3-pixel L-shape) this returns ~0.5, causing valid blobs to
+   10   be rejected even with `min_area: 3`.
+   11 - Fix: build the ROI pixel mask first, then check `len(ys_roi) < min_area` (pixel count).
+   12 - Max-area check still uses `cv2.contourArea` — accurate for larger blobs.
+   13
+   14 **Removed dead/redundant filters**
+   15 - `max_wh` check — redundant with `max_area` + circularity filter.
+   16 - Area outlier filter (MAD-based, step 3b) — redundant once `max_area` is well-calibrated
+   17   (which pose-guided detection will ensure).
+   18 - Gradient smoothness filter (step 3d, ray casting) — almost never fired; removed entirely.
+   19
+   20 **H1 ("deep in large blob") color changed to light blue**
+   21 - H1 is only active in the 2-pass cold-start path. It will be inactive in the future
+   22   pose-guided single-pass path (no pass-1 large blobs to check against).
+   23 - Color change signals "no-prior path only" in visualisation.
+   24
+   25 ### 2. `main.py` — selected cameras guard
+   26 Added `if cam_idx not in cameras: continue` in the blob detection loop.
+   27 `cameras` dict is the authoritative source (built from `selected_cameras` config key).
+   28 Prevents any non-selected camera from running detection or saving visualisation files.
+   29
+   30 ### 3. Calibration data collection infrastructure
+   31
+   32 **`blobs_detection.py` — `get_pass2_params(cam_idx)`**
+   33 - New public function that reads `_pass2_memory` for the given camera.
+   34 - Returns `{pixel_threshold, required_threshold, max_area}` or `None` if pass-2 didn't run.
+   35
+   36 **`config.yml` — `debug.calibration_csv`**
+   37 - New opt-in key (default `null`). Set to a file path to enable CSV logging.
+   38
+   39 **`main.py` — CSV writing**
+   40 - After each `tracking_system.update()`, for each successful solution:
+   41   - `depth_m = sol["tvec"].reshape(3)[2]` (ring-center depth, origin is LED ring centroid)
+   42   - Calls `get_pass2_params(primary_cam_idx)`
+   43   - Writes one row if pass-2 ran
+   44 - CSV columns: `frame, ctrl_name, cam_idx, depth_m, pixel_threshold, required_threshold, max_area`
+   45 - File opened before loop, closed and logged after.
+   46
+   47 ### 4. `data/filter_csv.py` — calibration analysis tool
+   48
+   49 Offline script to process raw CSV into a clean calibration curve:
+   50
+   51 1. Load + drop NaN rows
+   52 2. Sort by `depth_m`
+   53 3. Rolling-window outlier removal (local median ± `OUTLIER_K × MAD`, window=50)
+   54 4. Equal-count quantile binning (50 bins) → median per bin
+   55 5. Save filtered CSV
+   56 6. Fit both `a/d + b` and `a/d² + b` for each column; print R² for each
+   57 7. Print config-ready YAML block with best model + coefficients
+   58 8. 2×3 matplotlib figure:
+   59    - Top row: depth vs each threshold column, both fitted curves + R² in legend
+   60    - Bottom row: linearisation space (`1/d` for thresholds, `1/d²` for max_area)
+   61
+   62 **Key finding from data analysis:**
+   63 - Controllers are symmetrical — data from both can be pooled.
+   64 - Model origin (0,0,0) is the LED ring centroid; `tvec[2]` is an excellent depth proxy
+   65   (LED z-spread is < ±1 cm, negligible at tracking distances).
+   66 - Current raw CSV covers 0.07–0.3 m. This range is **insufficient** — extrapolation to
+   67   1 m (3.3× beyond calibration range) is unreliable due to model uncertainty (`1/d` vs
+   68   `1/d²` diverge substantially at that distance).
+   69 - Fitted parametric curve is better than bin-median interpolation: bin medians are
+   70   integer-quantized and noisy; the curve averages all data and is physically grounded.
+   71
+   72 ---
+   73
+   74 ## What needs to be done
+   75
+   76 ### Step 1 — Collect calibration data across full depth range
+   77
+   78 - Run with `debug.calibration_csv` set and `pass2_threshold_factor > 0`
+   79 - Use **single-controller datasets only** (two controllers contaminate the adaptive
+   80   thresholds)
+   81 - Dataset must cover **0.07 m to at least 1.5 m** with continuous movement
+   82   (slowly move controller from close to far and back)
+   83 - Aim: meaningful coverage at 5–6 distinct depth levels across the full range
+   84 - Orientation: tilt controller so inner LEDs are just visible (worst-case brightness
+   85   scenario for threshold calibration)
+   86
+   87 ### Step 2 — Run `filter_csv.py` and choose model
+   88
+   89 - Run on the new full-range CSV
+   90 - Check the bottom-row linearisation plots:
+   91   - If `pixel_threshold` vs `1/d` is a straight line → use `a/d + b`
+   92   - If `max_area` vs `1/d²` is a straight line → use `a/d² + b`
+   93 - Note R² values for each column and model
+   94 - Paste the printed config block into `config.yml` under `pose_guided_thresholds`
+   95
+   96 ### Step 3 — Implement pose-guided detection in `blobs_detection.py`
+   97
+   98 - `get_centroids` accepts new parameter `predicted_depth: float | None`
+   99 - When `predicted_depth` is provided:
+  100   - Compute `pixel_threshold` and `required_threshold` from fitted model coefficients
+  101     (`cfg["pose_guided_thresholds"]`)
+  102   - Compute `max_area` from its fitted model
+  103   - Call `_detect_blobs` **once** with these values (skip the entire 2-pass adaptive system)
+  104 - When `predicted_depth` is `None` (cold start): current 2-pass behavior unchanged
+  105 - No EMA, no count gate, no percentile logic when depth is known
+  106
+  107 ### Step 4 — Expose predicted depth from `TrackingSystem`
+  108
+  109 Add `get_predicted_depths_per_camera() -> Dict[int, List[float | None]]` to `TrackingSystem`
+  110 in `controller.py`:
+  111 - Iterate `self.trackers`; for each `(ctrl_name, cam_id)` with `prev_pose` set:
+  112   - Extract `tvec[2]` as depth (or median LED depth for higher accuracy)
+  113 - Return `{cam_id: [depth_ctrl0, depth_ctrl1, ...]}` ordered by ctrl_names sorted
+  114
+  115 ### Step 5 — Wire into `main.py`
+  116
+  117 Before the inner camera loop each frame:
+  118 ```python
+  119 depth_hints = tracking_system.get_predicted_depths_per_camera()
+  120 ```
+  121
+  122 For each controller, call `get_centroids` with the matching depth hint:
+  123 ```python
+  124 blob_centroids, ... = get_centroids(
+  125     image, config["blob_detection"], ...,
+  126     predicted_depth=depth_hints.get(cam_idx, [None])[ctrl_idx],
+  127 )
+  128 ```
+  129
+  130 Note: in future this becomes one `get_centroids` call per controller (parallel),
+  131 each with its own depth-derived thresholds. For now, a single call per camera
+  132 with the depth of the controller that is currently tracked (or None).
+  133
+  134 ### Step 6 — Validate
+  135
+  136 - Compare blob detection visualisations (pass-1 vs pose-guided single-pass)
+  137 - Check that inner LEDs at far range are still detected with pose-guided thresholds
+  138 - Confirm no regression for close-range detection
+  139 - Verify that `pixel_threshold` and `required_threshold` in pose-guided mode are
+  140   always >= base `min_threshold` / `required_threshold` config values (add clamp)
+  141
+  142 ---
+  143
+  142 ---
+  143
+  144 ## Open decisions
+  145
+  146 | Topic | Decision needed |
+  147 |---|---|
+  148 | One `get_centroids` call per camera (current) vs one per controller | For now: one per camera, pass depth of primary tracked controller |
+  149 | Fallback when pose-guided threshold < base config threshold | Clamp to `max(pose_guided, base_config)` |
+  150 | `max_area` model: `a/d+b` vs `a/d²+b` | Determine from Step 2 R² values |
+  151 | How to handle frame where one controller is tracked, other is cold | Pose-guided for tracked one; 2-pass adaptive for cold one — needs th
+      ought |
