@@ -522,6 +522,13 @@ def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
     return r
 
 
+def _eval_model(block: dict, depth: float) -> float:
+    a, b = block["a"], block["b"]
+    if block["model"] == "inv_depth_sq":
+        return a / depth ** 2 + b
+    return a / depth + b
+
+
 def get_pass2_params(cam_idx) -> dict | None:
     """Return the pass-2 thresholds last used for cam_idx, or None if pass-2 did not run."""
     mem = _pass2_memory.get(cam_idx if cam_idx is not None else 0)
@@ -534,9 +541,24 @@ def get_pass2_params(cam_idx) -> dict | None:
     }
 
 
-def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
-    pixel_threshold             = int(cfg["min_threshold"])
-    required_threshold          = int(cfg.get("required_threshold", pixel_threshold * 2))
+def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None,
+                  predicted_depth=None, ctrl_label=""):
+    pixel_threshold    = int(cfg["min_threshold"])
+    required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
+
+    cam_str  = f"_cam{cam_idx}" if cam_idx is not None else ""
+    ctrl_str = f"_{ctrl_label}" if ctrl_label else ""
+
+    # ── Pose-guided single-pass path ──────────────────────────────────────────
+    pg = cfg.get("pose_guided_thresholds") if predicted_depth is not None else None
+    if pg is not None:
+        pg_pixel = max(int(_eval_model(pg["pixel_threshold"],    predicted_depth)), pixel_threshold)
+        pg_req   = max(int(_eval_model(pg["required_threshold"], predicted_depth)), required_threshold)
+        pg_area  =     _eval_model(pg["max_area"],               predicted_depth)
+        return _detect_blobs(image, pg_pixel, pg_req, cfg,
+                             visualize, img_path, f"{cam_str}{ctrl_str}_pose",
+                             max_area_override=pg_area)
+
     pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
     pass2_required_factor       = float(cfg.get("pass2_required_factor", 0.7))
     pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
@@ -547,8 +569,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
     _cam_key = cam_idx if cam_idx is not None else 0
     _mem = _pass2_memory.setdefault(_cam_key, {})
 
-    cam_str      = f"_cam{cam_idx}" if cam_idx is not None else ""
-    vis_suffix_1 = f"{cam_str}_pass1" if pass2_factor > 0 else cam_str
+    vis_suffix_1 = f"{cam_str}{ctrl_str}_pass1" if pass2_factor > 0 else f"{cam_str}{ctrl_str}"
     result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                             visualize, img_path, vis_suffix_1)
     large_blobs_pass1 = result[6]
@@ -600,7 +621,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
 
                 max_area_pass2 = float(max(area_vals)) if area_vals else None
                 result2 = _detect_blobs(image, pixel_threshold_2, required_threshold_2, cfg,
-                                         visualize, img_path, f"{cam_str}_pass2",
+                                         visualize, img_path, f"{cam_str}{ctrl_str}_pass2",
                                          max_area_override=max_area_pass2,
                                          min_area_override=min_area_pass2,
                                          interior_exclude_blobs=large_blobs_pass1)
@@ -622,7 +643,7 @@ def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None):
         # ones) since they represent the actual exclusion zones this frame.
         result2 = _detect_blobs(image, _mem["pixel_threshold"],
                                  _mem.get("required_threshold", required_threshold), cfg,
-                                 visualize, img_path, f"{cam_str}_pass2",
+                                 visualize, img_path, f"{cam_str}{ctrl_str}_pass2",
                                  max_area_override=_mem["max_area"],
                                  min_area_override=min_area_pass2,
                                  interior_exclude_blobs=large_blobs_pass1)

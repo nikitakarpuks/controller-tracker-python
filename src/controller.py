@@ -380,7 +380,7 @@ class SingleViewTracker:
         Translation: tvec_{n+1} = 2*tvec_n - tvec_{n-1}
         Rotation: R_delta = R_n @ R_{n-1}.T; R_{n+1} = R_delta @ R_n
         """
-        tvec_pred = 2.0 * np.asarray(tvec_n, np.float64) - np.asarray(tvec_nm1, np.float64)
+        tvec_pred = 2.0 * np.asarray(tvec_n, np.float64).reshape(3) - np.asarray(tvec_nm1, np.float64).reshape(3)
 
         R_n,   _ = cv2.Rodrigues(np.asarray(rvec_n,   np.float32).reshape(3, 1))
         R_nm1, _ = cv2.Rodrigues(np.asarray(rvec_nm1, np.float32).reshape(3, 1))
@@ -711,11 +711,60 @@ class TrackingSystem:
                 self._designated_primary[ctrl.name] = self._fixed_primary_cam
 
 
+    def get_predicted_depths_per_camera(self) -> Dict[int, Dict[str, Optional[float]]]:
+        """Return {cam_id: {ctrl_name: depth}} using extrapolated tvec[2].
+
+        Uses constant-velocity extrapolation when prev_prev_pose is available;
+        falls back to prev_pose depth. None where no prior pose exists.
+        """
+        ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
+        result: Dict[int, Dict[str, Optional[float]]] = {}
+        for cam_id in self.cameras:
+            depths: Dict[str, Optional[float]] = {}
+            for ctrl_name in ctrl_names:
+                tracker = self.trackers.get((ctrl_name, cam_id))
+                if tracker is None or tracker.prev_pose is None:
+                    depths[ctrl_name] = None
+                    continue
+                if tracker.prev_prev_pose is not None:
+                    _, tvec_pred = SingleViewTracker._extrapolate_pose(
+                        tracker.prev_pose[0],      tracker.prev_pose[1],
+                        tracker.prev_prev_pose[0], tracker.prev_prev_pose[1],
+                    )
+                    depths[ctrl_name] = float(tvec_pred[2])
+                else:
+                    depths[ctrl_name] = float(np.asarray(tracker.prev_pose[1]).reshape(3)[2])
+            result[cam_id] = depths
+        return result
+
+    def get_ctrl_processing_order(self) -> List[str]:
+        """Return controller names in the same priority order used by update()."""
+        ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
+        _first = self._matching_cfg.get('first_controller', None)
+
+        def _has_prior(name: str) -> bool:
+            return any(
+                t.prev_pose is not None
+                for (cname, _), t in self.trackers.items()
+                if cname == name
+            )
+
+        def _order_key(name: str):
+            has_prior_rank = 0 if _has_prior(name) else 1
+            preferred_rank = (0 if name == f"{_first}_controller" else 1) if _first else 0
+            return (has_prior_rank, preferred_rank, name)
+
+        return sorted(ctrl_names, key=_order_key)
+
     def update(
         self,
         observations_per_camera: Dict[int, np.ndarray],
         radii_per_camera: Optional[Dict[int, np.ndarray]] = None,
         brightnesses_per_camera: Optional[Dict[int, np.ndarray]] = None,
+        per_ctrl_observations: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
+        per_ctrl_radii: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
+        per_ctrl_brightnesses: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
+        ctrl_name_filter: Optional[str] = None,
     ) -> Dict[str, Optional[Dict]]:
         """
         Run tracking for every controller using a single primary camera.
@@ -752,16 +801,19 @@ class TrackingSystem:
             return (has_prior_rank, preferred_rank, name)
 
         ordered = sorted(ctrl_names, key=_order_key)
+        if ctrl_name_filter is not None:
+            ordered = [n for n in ordered if n == ctrl_name_filter]
 
         # Blob ownership: original observation indices claimed by controllers so far.
         claimed_blobs: Dict[int, Set[int]] = {}
 
-        def _filter_cam(cam_id: int, extra_excluded: Optional[Set[int]] = None):
+        def _filter_cam(cam_id: int, obs_map: dict, rad_map: dict, brt_map: dict,
+                        extra_excluded: Optional[Set[int]] = None):
             """Return (filtered_blobs, filtered_radii, filtered_brts, orig_indices)
             for camera cam_id, excluding already-claimed blobs and any extra_excluded
             original indices (Phase 3 reservations for later controllers).
             Returns (None, None, None, []) when no unclaimed blobs remain."""
-            obs = observations_per_camera.get(cam_id)
+            obs = obs_map.get(cam_id)
             if obs is None or len(obs) == 0:
                 return None, None, None, []
             claimed = claimed_blobs.get(cam_id, set())
@@ -771,37 +823,35 @@ class TrackingSystem:
                 return None, None, None, []
             k = np.array(keep, dtype=np.int32)
             f_blobs = obs[k]
-            _r = (radii_per_camera or {}).get(cam_id)
+            _r = rad_map.get(cam_id) if rad_map else None
             f_radii = _r[k] if _r is not None else None
-            _b = (brightnesses_per_camera or {}).get(cam_id)
+            _b = brt_map.get(cam_id) if brt_map else None
             f_brts = _b[k] if _b is not None else None
             return f_blobs, f_radii, f_brts, keep
 
-        # ── Phase 3: Proximity mutual exclusion ───────────────────────────────
-        # When multiple controllers have prior poses, pre-reserve blobs that are
-        # clearly "owned" by a later-ordered controller so the earlier controller
-        # cannot steal them via aux-camera joint optimisation.
-        #
-        # A blob is reserved for controller J (index j > i in ordered) if:
-        #   • it is within reserve_px of J's projected LEDs, AND
-        #   • it is closer to J's projection than to I's projection (Voronoi).
-        # When I has no projection for that camera, all blobs near J are reserved.
         _cfg = self._matching_cfg
-        # Phase 3 radius: used when only one controller has a projection on a camera.
-        _reserve_px  = float(_cfg.get(
-            'proximity_mutual_exclusion_px',
-            _cfg.get('aux_snap_px', 15.0),
-        ))
-        # Phase 4 radius: when both controllers have projections, extend the Voronoi
-        # partition to cover the full controller body region (ring + handle area).
-        # Blobs within this distance of EITHER controller's LEDs are partitioned;
-        # blobs beyond it are unpartitioned (available to both, helps brute recovery).
-        _voronoi_px  = float(_cfg.get('voronoi_max_dist_px', 100.0))
 
-        # Cache per-controller, per-camera projected LED positions.
-        # {ctrl_name → {cam_id → (N,2) float32 or None}}
-        _ctrl_proj: Dict[str, Dict[int, Optional[np.ndarray]]] = {}
-        if len(ordered) >= 2:
+        # Reservation sets: _reservations[ctrl_i][cam_id] = blob indices ctrl_i must not use.
+        # Populated by the Voronoi block below when sharing a blob pool; empty when each
+        # controller has its own per-ctrl blob set (per_ctrl_observations provided).
+        _reservations: Dict[str, Dict[int, Set[int]]] = {_cn: {} for _cn in ordered}
+
+        # ── Phase 3: Proximity mutual exclusion ───────────────────────────────
+        # Skipped when per_ctrl_observations is provided: each controller already has
+        # its own independent blob set, so cross-controller reservation is unnecessary.
+        if per_ctrl_observations is None and len(ordered) >= 2:
+            # Phase 3 radius: used when only one controller has a projection on a camera.
+            _reserve_px = float(_cfg.get(
+                'proximity_mutual_exclusion_px',
+                _cfg.get('aux_snap_px', 15.0),
+            ))
+            # Phase 4 radius: when both controllers have projections, extend the Voronoi
+            # partition to cover the full controller body region (ring + handle area).
+            _voronoi_px = float(_cfg.get('voronoi_max_dist_px', 100.0))
+
+            # Cache per-controller, per-camera projected LED positions.
+            # {ctrl_name → {cam_id → (N,2) float32 or None}}
+            _ctrl_proj: Dict[str, Dict[int, Optional[np.ndarray]]] = {}
             for _cn in ordered:
                 _ctrl_proj[_cn] = {}
                 for _cid, _cam in self.cameras.items():
@@ -822,46 +872,40 @@ class TrackingSystem:
                         _cam.camera_matrix, _cam.dist_coeffs,
                     )
 
-        # Build reservation sets: _reservations[ctrl_i][cam_id] = set of original
-        # blob indices that ctrl_i must NOT use (reserved for later controllers).
-        _reservations: Dict[str, Dict[int, Set[int]]] = {_cn: {} for _cn in ordered}
-        for _i, _cn_i in enumerate(ordered[:-1]):
-            _proj_i = _ctrl_proj.get(_cn_i, {})
-            for _j in range(_i + 1, len(ordered)):
-                _cn_j = ordered[_j]
-                _proj_j = _ctrl_proj.get(_cn_j, {})
-                for _cid, _obs in observations_per_camera.items():
-                    if _obs is None or len(_obs) == 0:
-                        continue
-                    _pj = _proj_j.get(_cid)
-                    if _pj is None or len(_pj) == 0:
-                        continue  # j has no projection on this camera — nothing to reserve
-                    # Min distance from each blob to j's visible LED projections.
-                    _d_j = np.linalg.norm(
-                        _obs[:, None, :] - _pj[None, :, :], axis=2
-                    ).min(axis=1)
-                    _pi = _proj_i.get(_cid)
-                    if _pi is not None and len(_pi) > 0:
-                        # Phase 4 — Full Voronoi: both controllers have projections.
-                        # Partition every blob within voronoi_px of EITHER controller.
-                        # Blobs closer to j than i are reserved for j.
-                        _d_i = np.linalg.norm(
-                            _obs[:, None, :] - _pi[None, :, :], axis=2
+            for _i, _cn_i in enumerate(ordered[:-1]):
+                _proj_i = _ctrl_proj.get(_cn_i, {})
+                for _j in range(_i + 1, len(ordered)):
+                    _cn_j = ordered[_j]
+                    _proj_j = _ctrl_proj.get(_cn_j, {})
+                    for _cid, _obs in observations_per_camera.items():
+                        if _obs is None or len(_obs) == 0:
+                            continue
+                        _pj = _proj_j.get(_cid)
+                        if _pj is None or len(_pj) == 0:
+                            continue  # j has no projection on this camera — nothing to reserve
+                        _d_j = np.linalg.norm(
+                            _obs[:, None, :] - _pj[None, :, :], axis=2
                         ).min(axis=1)
-                        _near_either = (_d_j < _voronoi_px) | (_d_i < _voronoi_px)
-                        if not _near_either.any():
+                        _pi = _proj_i.get(_cid)
+                        if _pi is not None and len(_pi) > 0:
+                            # Phase 4 — Full Voronoi: both controllers have projections.
+                            _d_i = np.linalg.norm(
+                                _obs[:, None, :] - _pi[None, :, :], axis=2
+                            ).min(axis=1)
+                            _near_either = (_d_j < _voronoi_px) | (_d_i < _voronoi_px)
+                            if not _near_either.any():
+                                continue
+                            _reserve_mask = _near_either & (_d_j < _d_i)
+                        else:
+                            # Phase 3 — only j has projection: radius-bounded reservation.
+                            _near_j = _d_j < _reserve_px
+                            if not _near_j.any():
+                                continue
+                            _reserve_mask = _near_j
+                        if not _reserve_mask.any():
                             continue
-                        _reserve_mask = _near_either & (_d_j < _d_i)
-                    else:
-                        # Phase 3 — only j has projection: radius-bounded reservation.
-                        _near_j = _d_j < _reserve_px
-                        if not _near_j.any():
-                            continue
-                        _reserve_mask = _near_j
-                    if not _reserve_mask.any():
-                        continue
-                    _res_set = _reservations[_cn_i].setdefault(_cid, set())
-                    _res_set.update(int(k) for k in np.where(_reserve_mask)[0])
+                        _res_set = _reservations[_cn_i].setdefault(_cid, set())
+                        _res_set.update(int(k) for k in np.where(_reserve_mask)[0])
 
         for ctrl_name in ordered:
             ctrl_pairs: List[Tuple[int, "SingleViewTracker"]] = [
@@ -870,15 +914,26 @@ class TrackingSystem:
                 if cname == ctrl_name
             ]
 
+            # Select obs source: per-controller blobs if provided, else shared pool.
+            if per_ctrl_observations is not None and ctrl_name in per_ctrl_observations:
+                _obs_src = per_ctrl_observations[ctrl_name]
+                _rad_src = (per_ctrl_radii or {}).get(ctrl_name) or {}
+                _brt_src = (per_ctrl_brightnesses or {}).get(ctrl_name) or {}
+            else:
+                _obs_src = observations_per_camera
+                _rad_src = radii_per_camera or {}
+                _brt_src = brightnesses_per_camera or {}
+
             # Build per-camera filtered views for this controller.
-            # Exclude both claimed blobs (Phase 1) and blobs reserved for later
-            # controllers whose projected LEDs are closer (Phase 3).
+            # Exclude already-claimed blobs (Phase 1) and Voronoi-reserved blobs (Phase 3).
+            # Phase 3 reservations are empty when per_ctrl_observations is active.
             # Key: cam_id → (filtered_blobs, filtered_radii, filtered_brts, orig_idx_list)
             _ctrl_reservations = _reservations.get(ctrl_name, {})
             avail: Dict[int, tuple] = {}
             for cam_id, _ in ctrl_pairs:
                 _extra = _ctrl_reservations.get(cam_id) or None
-                fb, fr, fbt, keep = _filter_cam(cam_id, extra_excluded=_extra)
+                fb, fr, fbt, keep = _filter_cam(cam_id, _obs_src, _rad_src, _brt_src,
+                                                 extra_excluded=_extra)
                 if fb is not None:
                     avail[cam_id] = (fb, fr, fbt, keep)
 
@@ -944,9 +999,9 @@ class TrackingSystem:
 
             # Phase 5: pass the full camera observation array + availability mask so
             # brute_match can search across all blobs (not just the pre-filtered subset).
-            _prim_obs_full = observations_per_camera[primary_cam_id]
-            _prim_rad_full = (radii_per_camera or {}).get(primary_cam_id)
-            _prim_brt_full = (brightnesses_per_camera or {}).get(primary_cam_id)
+            _prim_obs_full = _obs_src[primary_cam_id]
+            _prim_rad_full = _rad_src.get(primary_cam_id) if _rad_src else None
+            _prim_brt_full = _brt_src.get(primary_cam_id) if _brt_src else None
             _prim_mask = np.zeros(len(_prim_obs_full), dtype=bool)
             _prim_mask[primary_orig] = True
 
@@ -1020,9 +1075,9 @@ class TrackingSystem:
                         (self.cameras[cid], av[0], av[1])
                         for cid, av in avail.items() if cid != _fb_cid
                     ]
-                    _fb_obs_full = observations_per_camera[_fb_cid]
-                    _fb_rad_full = (radii_per_camera or {}).get(_fb_cid)
-                    _fb_brt_full = (brightnesses_per_camera or {}).get(_fb_cid)
+                    _fb_obs_full = _obs_src[_fb_cid]
+                    _fb_rad_full = _rad_src.get(_fb_cid) if _rad_src else None
+                    _fb_brt_full = _brt_src.get(_fb_cid) if _brt_src else None
                     _fb_mask = np.zeros(len(_fb_obs_full), dtype=bool)
                     _fb_mask[_fb_orig] = True
                     solution = _fb_tracker.track(
@@ -1099,7 +1154,7 @@ class TrackingSystem:
                         _blob_idxs = np.array([b   for b, _  in _aux_pairs], dtype=np.int32)
                         _led_pos   = primary_tracker.model.positions[_led_ids]
                         _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim
-                        _blobs_aux = observations_per_camera[_aux_cid][_blob_idxs]
+                        _blobs_aux = _obs_src[_aux_cid][_blob_idxs]
                         _sc_aux_obs[_aux_cid] = (_pts_prim, _blobs_aux)
                     if _sc_aux_obs:
                         self._self_cal.add_frame(

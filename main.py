@@ -134,33 +134,106 @@ def main():
         img_path, cam_images = batch[0][0], batch[0][1]
         # cam_images: {cam_idx: numpy array}
 
-        cam_blobs        = {}
-        cam_contours     = {}
-        cam_radii        = {}
-        cam_brightnesses = {}
+        cam_blobs    = {}
+        cam_contours = {}
 
-        for cam_idx, image in cam_images.items():
-            if cam_idx not in cameras:
-                continue
+        depth_hints        = tracking_system.get_predicted_depths_per_camera()
+        ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
+        _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
+
+        per_ctrl_blobs = {}
+        per_ctrl_radii = {}
+        per_ctrl_brts  = {}
+
+        # ── Phase 1: detect blobs for every controller on the original images ──
+        for ctrl_name in ctrl_names_ordered:
+            per_ctrl_blobs[ctrl_name] = {}
+            per_ctrl_radii[ctrl_name] = {}
+            per_ctrl_brts[ctrl_name]  = {}
+
+            for cam_idx in cameras:
+                if cam_idx not in cam_images:
+                    continue
+                predicted_depth = depth_hints.get(cam_idx, {}).get(ctrl_name)
+                if predicted_depth is not None and predicted_depth <= 0:
+                    predicted_depth = None
+                t0 = time()
+                blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
+                    cam_images[cam_idx], config["blob_detection"],
+                    visualize=config["blob_detection"]["visualize"],
+                    img_path=img_path, cam_idx=cam_idx, predicted_depth=predicted_depth,
+                    ctrl_label=ctrl_name.replace("_controller", ""),
+                )
+                logger.info(f"blob detection took {time() - t0} seconds")
+
+                per_ctrl_blobs[ctrl_name][cam_idx] = blob_centroids
+                per_ctrl_radii[ctrl_name][cam_idx] = blob_radii
+                per_ctrl_brts[ctrl_name][cam_idx]  = blob_brightnesses
+                cam_contours.setdefault(cam_idx, []).extend(blob_contours)
+
+        # ── Phase 2: track controllers in order, filtering matched blobs at the
+        # centroid level (no image copy / pixel drawing needed) ─────────────────
+        results = {}
+        elapsed = 0.0
+
+        for ctrl_idx, ctrl_name in enumerate(ctrl_names_ordered):
+            # Remove blobs from preceding controllers' LED-matched positions.
+            if ctrl_idx > 0:
+                for cam_idx in list(per_ctrl_blobs[ctrl_name]):
+                    _blobs = per_ctrl_blobs[ctrl_name][cam_idx]
+                    if len(_blobs) == 0:
+                        continue
+                    keep = np.ones(len(_blobs), dtype=bool)
+                    for prev_ctrl in ctrl_names_ordered[:ctrl_idx]:
+                        sol = results.get(prev_ctrl)
+                        if sol is None:
+                            continue
+                        primary_cam = sol["primary_cam"]
+                        if cam_idx == primary_cam:
+                            matched_pairs = sol["assignment"]
+                            src_blobs = per_ctrl_blobs[prev_ctrl].get(cam_idx)
+                            src_radii = per_ctrl_radii[prev_ctrl].get(cam_idx)
+                        elif cam_idx in (sol.get("aux_assignments") or {}):
+                            matched_pairs = sol["aux_assignments"][cam_idx]
+                            src_blobs = per_ctrl_blobs[prev_ctrl].get(cam_idx)
+                            src_radii = per_ctrl_radii[prev_ctrl].get(cam_idx)
+                        else:
+                            continue
+                        if not matched_pairs or src_blobs is None or src_radii is None:
+                            continue
+                        m_idx = [b for b, _ in matched_pairs]
+                        m_pos = src_blobs[m_idx]
+                        m_rad = src_radii[m_idx]
+                        dists = np.linalg.norm(
+                            _blobs[:, None, :] - m_pos[None, :, :], axis=2
+                        )  # (N_curr, N_matched)
+                        too_close = (dists < (m_rad + _mask_margin)[None, :]).any(axis=1)
+                        keep &= ~too_close
+                    per_ctrl_blobs[ctrl_name][cam_idx] = _blobs[keep]
+                    per_ctrl_radii[ctrl_name][cam_idx] = per_ctrl_radii[ctrl_name][cam_idx][keep]
+                    per_ctrl_brts[ctrl_name][cam_idx]  = per_ctrl_brts[ctrl_name][cam_idx][keep]
+
             t0 = time()
-            blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
-                image, config["blob_detection"], visualize=config["blob_detection"]["visualize"], img_path=img_path, cam_idx=cam_idx
+            sol_map = tracking_system.update(
+                {},
+                per_ctrl_observations={ctrl_name: per_ctrl_blobs[ctrl_name]},
+                per_ctrl_radii={ctrl_name: per_ctrl_radii[ctrl_name]},
+                per_ctrl_brightnesses={ctrl_name: per_ctrl_brts[ctrl_name]},
+                ctrl_name_filter=ctrl_name,
             )
-            t1 = time()
-            logger.info(f"blob detection took {t1 - t0} seconds")
+            elapsed += time() - t0
+            results[ctrl_name] = sol_map.get(ctrl_name)
 
-            cam_blobs[cam_idx]        = blob_centroids.copy()
-            cam_contours[cam_idx]     = blob_contours
-            cam_radii[cam_idx]        = blob_radii
-            cam_brightnesses[cam_idx] = blob_brightnesses
+        # Union per-ctrl blobs per camera for visualization and total_blobs count.
+        for ctrl_blobs in per_ctrl_blobs.values():
+            for cam_idx, blobs_arr in ctrl_blobs.items():
+                if cam_idx not in cam_blobs:
+                    cam_blobs[cam_idx] = blobs_arr
+                elif len(blobs_arr):
+                    cam_blobs[cam_idx] = np.concatenate([cam_blobs[cam_idx], blobs_arr])
 
         blobs.append(cam_blobs)
         contours_all.append(cam_contours)
-
-        t0      = time()
-        results = tracking_system.update(cam_blobs, radii_per_camera=cam_radii,
-                                         brightnesses_per_camera=cam_brightnesses)
-        elapsed = time() - t0
 
         total_blobs = sum(len(b) for b in cam_blobs.values())
 
