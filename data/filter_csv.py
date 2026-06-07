@@ -125,19 +125,15 @@ for col in ["pixel_threshold", "required_threshold", "max_area"]:
 # ── 7. Print config-ready block ───────────────────────────────────────────────
 print("\n── Config-ready coefficients (best model per column) ────────────────────")
 print("pose_guided_thresholds:")
-labels = {
-    "pixel_threshold":    ("pixel_thr",  "pixel_threshold    = a/d + b  or  a/d² + b"),
-    "required_threshold": ("req_thr",    "required_threshold = a/d + b  or  a/d² + b"),
-    "max_area":           ("max_area",   "max_area           = a/d + b  or  a/d² + b"),
-}
-for col, (prefix, desc) in labels.items():
+for col in ["pixel_threshold", "required_threshold", "max_area"]:
     if col not in fits or fits[col] is None:
         continue
     popt, fn, name, r2 = fits[col]
     model_tag = "inv_depth" if fn is inv_depth else "inv_depth_sq"
-    print(f"  {prefix}_model: {model_tag!r}   # {name}  R²={r2:.4f}")
-    print(f"  {prefix}_a: {popt[0]:.6f}")
-    print(f"  {prefix}_b: {popt[1]:.6f}")
+    print(f"  {col}:")
+    print(f"    model: {model_tag!r}   # {name}  R²={r2:.4f}")
+    print(f"    a: {popt[0]:.6f}")
+    print(f"    b: {popt[1]:.6f}")
 
 # ── 8. Plots ──────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(2, 3, figsize=(18, 9))

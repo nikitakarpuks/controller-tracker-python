@@ -1,6 +1,6 @@
 data:
-#  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
-  root: "./data/datasets/first_ds"
+  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a/a"
+#  root: "./data/datasets/first_ds"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -51,12 +51,25 @@ controllers:
           half_length: 0.037
           color: [255, 55, 55]
   left_controller:
-    enabled: false
+    enabled: true
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
 blob_detection:
+  pose_guided_thresholds:
+    pixel_threshold:
+      model: 'inv_depth_sq'   # a/d²+b  R²=0.8949
+      a: 0.190531
+      b: 11.161717
+    required_threshold:
+      model: 'inv_depth_sq'   # a/d²+b  R²=0.9078
+      a: 0.327807
+      b: 15.391317
+    max_area:
+      model: 'inv_depth_sq'   # a/d²+b  R²=0.8473
+      a: 0.759220
+      b: 27.190591
   visualize: true
   min_threshold: 6       # pixels >= this are included in a blob
   required_threshold: 13  # blob must contain at least one pixel >= this (filters dim noise)
@@ -72,6 +85,8 @@ blob_detection:
   pass2_min_area: 2             # null = use min_area; override minimum blob area for pass 2 (blobs shrink under higher threshold, so this can be smaller)
   pass2_threshold_ema_alpha: 0.25       # EMA weight on the newly computed threshold (0=frozen, 1=no smoothing); smooths frame-to-frame instability
   pass2_count_gate_max_factor: 1.7      # skip EMA update if blob count changes by more than this factor between frames (count jump = scene transition, not brightness change)
+
+  blob_cross_mask_margin_px: 3          # extra pixels added to each matched-blob radius when masking ctrl A's blobs from ctrl B's detection image
 
   # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
   interior_edge_margin_px: 10.0    # centroid farther inside a large rejected blob than this is dropped
@@ -106,9 +121,9 @@ matching:
     - [2, 3]
     - [2, 4]
     - [2, 4, "edge"]
-    - [3, 5]
-    - [3, 5, "edge"]
-    - [4, 6]
+#    - [3, 5]
+#    - [3, 5, "edge"]
+#    - [4, 6]
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
   reprojection_threshold: 2.5    # RANSAC inlier threshold
@@ -194,7 +209,7 @@ self_calibration:
   apply_on_load: false             # apply saved calibration at startup if output file exists
 
 debug:
-  calibration_csv: "./data/calib_thresholds_raw.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
+  calibration_csv: null #  "./data/calib_thresholds_raw.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
   mode_active: true
   split_to_folders: false
   verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
