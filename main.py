@@ -134,22 +134,21 @@ def main():
         img_path, cam_images = batch[0][0], batch[0][1]
         # cam_images: {cam_idx: numpy array}
 
-        cam_blobs    = {}
-        cam_contours = {}
-
         depth_hints        = tracking_system.get_predicted_depths_per_camera()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
 
-        per_ctrl_blobs = {}
-        per_ctrl_radii = {}
-        per_ctrl_brts  = {}
+        per_ctrl_blobs    = {}
+        per_ctrl_radii    = {}
+        per_ctrl_brts     = {}
+        per_ctrl_contours = {}
 
         # ── Phase 1: detect blobs for every controller on the original images ──
         for ctrl_name in ctrl_names_ordered:
-            per_ctrl_blobs[ctrl_name] = {}
-            per_ctrl_radii[ctrl_name] = {}
-            per_ctrl_brts[ctrl_name]  = {}
+            per_ctrl_blobs[ctrl_name]    = {}
+            per_ctrl_radii[ctrl_name]    = {}
+            per_ctrl_brts[ctrl_name]     = {}
+            per_ctrl_contours[ctrl_name] = {}
 
             for cam_idx in cameras:
                 if cam_idx not in cam_images:
@@ -166,15 +165,15 @@ def main():
                 )
                 logger.info(f"blob detection took {time() - t0} seconds")
 
-                per_ctrl_blobs[ctrl_name][cam_idx] = blob_centroids
-                per_ctrl_radii[ctrl_name][cam_idx] = blob_radii
-                per_ctrl_brts[ctrl_name][cam_idx]  = blob_brightnesses
-                cam_contours.setdefault(cam_idx, []).extend(blob_contours)
+                per_ctrl_blobs[ctrl_name][cam_idx]    = blob_centroids
+                per_ctrl_radii[ctrl_name][cam_idx]    = blob_radii
+                per_ctrl_brts[ctrl_name][cam_idx]     = blob_brightnesses
+                per_ctrl_contours[ctrl_name][cam_idx] = blob_contours
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
         # centroid level (no image copy / pixel drawing needed) ─────────────────
-        results = {}
-        elapsed = 0.0
+        results         = {}
+        elapsed_per_ctrl = {}
 
         for ctrl_idx, ctrl_name in enumerate(ctrl_names_ordered):
             # Remove blobs from preceding controllers' LED-matched positions.
@@ -212,6 +211,10 @@ def main():
                     per_ctrl_blobs[ctrl_name][cam_idx] = _blobs[keep]
                     per_ctrl_radii[ctrl_name][cam_idx] = per_ctrl_radii[ctrl_name][cam_idx][keep]
                     per_ctrl_brts[ctrl_name][cam_idx]  = per_ctrl_brts[ctrl_name][cam_idx][keep]
+                    kept_idx = np.where(keep)[0]
+                    per_ctrl_contours[ctrl_name][cam_idx] = [
+                        per_ctrl_contours[ctrl_name][cam_idx][i] for i in kept_idx
+                    ]
 
             t0 = time()
             sol_map = tracking_system.update(
@@ -221,21 +224,17 @@ def main():
                 per_ctrl_brightnesses={ctrl_name: per_ctrl_brts[ctrl_name]},
                 ctrl_name_filter=ctrl_name,
             )
-            elapsed += time() - t0
+            elapsed_per_ctrl[ctrl_name] = time() - t0
             results[ctrl_name] = sol_map.get(ctrl_name)
 
-        # Union per-ctrl blobs per camera for visualization and total_blobs count.
-        for ctrl_blobs in per_ctrl_blobs.values():
-            for cam_idx, blobs_arr in ctrl_blobs.items():
-                if cam_idx not in cam_blobs:
-                    cam_blobs[cam_idx] = blobs_arr
-                elif len(blobs_arr):
-                    cam_blobs[cam_idx] = np.concatenate([cam_blobs[cam_idx], blobs_arr])
+        blobs.append({c: dict(cb) for c, cb in per_ctrl_blobs.items()})
+        contours_all.append({c: dict(cc) for c, cc in per_ctrl_contours.items()})
 
-        blobs.append(cam_blobs)
-        contours_all.append(cam_contours)
-
-        total_blobs = sum(len(b) for b in cam_blobs.values())
+        total_blobs = sum(
+            len(blobs_arr)
+            for ctrl_blobs in per_ctrl_blobs.values()
+            for blobs_arr in ctrl_blobs.values()
+        )
 
         for ctrl_name in enabled_ctrls:
             sol = results.get(ctrl_name)
@@ -260,7 +259,7 @@ def main():
                     aux_str = f"  +{sol['aux_inliers']}aux"
                 else:
                     aux_str = ""
-                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  "
+                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed_per_ctrl.get(ctrl_name, 0.0):.3f}s  "
                             f"cam={primary_cam}  err={sol['error']:.2f}px  "
                             f"matches={len(sol['assignment'])}{aux_str}  "
                             f"method={sol.get('method', '?')}")
@@ -288,9 +287,9 @@ def main():
                     frozen_poses_all[ctrl_name].append(last_good)
                 else:
                     frozen_poses_all[ctrl_name].append(None)
-                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed:.3f}s  TRACKING LOST")
+                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed_per_ctrl.get(ctrl_name, 0.0):.3f}s  TRACKING LOST")
 
-        if out_slow is not None and elapsed > SLOW_MATCH_THRESHOLD_S:
+        if out_slow is not None and sum(elapsed_per_ctrl.values()) > SLOW_MATCH_THRESHOLD_S:
             copy(img_path, out_slow / img_path.name)
             logger.info(f"  → saved to deep_search_required (slow: {elapsed:.1f}s)")
         if out_tracking_lost is not None and any(poses_all[n][-1] is None for n in enabled_ctrls):

@@ -4,13 +4,16 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-INPUT_CSV           = r".\calib_thresholds_raw.csv"
-OUTPUT_CSV          = r".\calib_thresholds_raw_filtered.csv"
+INPUT_CSV           = "./calib_thresholds_raw.csv"
+OUTPUT_CSV          = "./calib_thresholds_raw_filtered.csv"
 
-N_BINS              = 50   # output rows (depth levels)
-OUTLIER_K           = 2.0  # reject > this many MADs from local median
-ROLLING_WINDOW      = 50   # window size (depth-sorted rows) for outlier detection
-MIN_SAMPLES_PER_BIN = 5    # drop bins with fewer surviving samples
+N_BINS               = 50    # output rows (depth levels)
+OUTLIER_K            = 2.0   # reject > this many MADs from local median
+ROLLING_WINDOW       = 50    # window size (depth-sorted rows) for outlier detection
+MIN_SAMPLES_PER_BIN  = 5     # drop bins with fewer surviving samples
+# Use a low percentile for thresholds so the fit anchors to the lower envelope —
+# occluded-LED frames inflate the median upward; the low percentile ignores them.
+THRESHOLD_PERCENTILE = 0.25  # 0.25 = 25th percentile; lower = more aggressive
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _r2(y_true, y_pred):
@@ -72,15 +75,17 @@ outlier_df = df[outlier_mask].copy()
 clean_df   = df[~outlier_mask].reset_index(drop=True)
 print(f"Outlier removal: dropped {len(outlier_df)} → {len(clean_df)} remaining")
 
-# ── 4. Equal-count quantile bins → median per bin ────────────────────────────
+# ── 4. Equal-count quantile bins → low-percentile per bin ────────────────────
+_pct = THRESHOLD_PERCENTILE
+_pct_label = f"p{int(_pct * 100)}"
 clean_df["_bin"] = pd.qcut(clean_df["depth_m"], q=N_BINS, duplicates="drop")
 
 agg = (
     clean_df.groupby("_bin", observed=True)
     .agg(
         depth_m            = ("depth_m",            "median"),
-        pixel_threshold    = ("pixel_threshold",    "median"),
-        required_threshold = ("required_threshold", "median"),
+        pixel_threshold    = ("pixel_threshold",    lambda x: x.quantile(_pct)),
+        required_threshold = ("required_threshold", lambda x: x.quantile(_pct)),
         max_area           = ("max_area",           "median"),
         count              = ("depth_m",            "count"),
         pixel_thr_std      = ("pixel_threshold",    "std"),
@@ -113,7 +118,7 @@ print(f"\nSaved → {OUTPUT_CSV}")
 # ── 6. Fit both models for each column ───────────────────────────────────────
 depths = agg["depth_m"].values.astype(float)
 
-print("\n── Model fits (on bin medians) ──────────────────────────────────────────")
+print(f"\n── Model fits (on bin {_pct_label} — thresholds; median — max_area) ──────────")
 fits = {}
 for col in ["pixel_threshold", "required_threshold", "max_area"]:
     if col not in agg.columns:
@@ -157,9 +162,10 @@ for ax, col, std_col, title in col_specs:
     ax.scatter(depth_raw[~outlier_mask], df.loc[~outlier_mask, col], **raw_kw)
     if len(outlier_df):
         ax.scatter(outlier_df["depth_m"], outlier_df[col], **out_kw)
+    _lbl = f"bin {_pct_label} ± std" if col != "max_area" else "bin median ± std"
     ax.errorbar(agg["depth_m"], agg[col], yerr=agg[std_col],
                 fmt="o", color="navy", zorder=5,
-                markersize=6, capsize=3, label="bin median ± std")
+                markersize=6, capsize=3, label=_lbl)
     vals = agg[col].values.astype(float)
     for fn, kw in [(inv_depth, fit1_kw), (inv_depth_sq, fit2_kw)]:
         try:
@@ -207,4 +213,6 @@ for ax, col, x_fn, x_label, title_suffix in [
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.show()
+out_png = OUTPUT_CSV.replace(".csv", "_plots.png")
+plt.savefig(out_png, dpi=150)
+print(f"Plot saved → {out_png}")

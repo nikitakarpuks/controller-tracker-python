@@ -70,6 +70,19 @@ def _camera_color(cam_idx: int) -> list:
     return CAMERA_COLORS[cam_idx % len(CAMERA_COLORS)]
 
 
+# One distinct colour per controller index — used for blob contours.
+# Warm / cool alternation makes the two sets easy to tell apart at a glance.
+CONTROLLER_BLOB_COLORS = [
+    [255, 160,  40],   # ctrl 0 — amber
+    [ 40, 200, 255],   # ctrl 1 — sky blue
+    [160, 255,  40],   # ctrl 2 — lime
+    [255,  60, 200],   # ctrl 3 — magenta
+]
+
+def _controller_blob_color(ctrl_idx: int) -> list:
+    return CONTROLLER_BLOB_COLORS[ctrl_idx % len(CONTROLLER_BLOB_COLORS)]
+
+
 # =========================================================
 # Utility
 # =========================================================
@@ -573,7 +586,8 @@ class ControllerAnimatorRerun:
                 for n in self._controllers_vis
             }
 
-            self._log_frame(idx, T_cam_model_per_ctrl, assignments_frame, blobs, contours,
+            self._log_frame(idx, T_cam_model_per_ctrl, assignments_frame,
+                            blobs_per_ctrl=blobs, contours_per_ctrl=contours,
                             primary_cam_per_ctrl=primary_cams_frame,
                             aux_assignments_per_ctrl=aux_assignments_frame,
                             ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl)
@@ -647,64 +661,76 @@ class ControllerAnimatorRerun:
     # ------------------------------------------------------------------
 
     def _log_camera_blobs(self, cam_idx: int, cam,
-                          blobs, contours,
+                          blobs_per_ctrl: dict, contours_per_ctrl: dict,
                           blob_z: float,
-                          matched_bids: set = None):
-        """Log blob contours and IDs; matched blobs are bright, unmatched are dim."""
+                          matched_bids_per_ctrl_cam: dict = None):
+        """Log per-controller blob contours with distinct colours per controller.
+
+        Each controller's blobs are rendered in their own colour layer so the
+        user can immediately see which blobs each controller detected and which
+        are matched (bright) vs unmatched (dim).
+        """
         T_world_cam = cam.T_world_cam
-        color       = _camera_color(cam_idx)
-        color_dim   = [int(c * 0.5) for c in color]
 
         def _wc(pts):
             if T_world_cam is None:
                 return pts
             return T_world_cam.apply(np.asarray(pts, dtype=np.float64))
 
-        path = f"world/camera_{cam_idx}"
+        path      = f"world/camera_{cam_idx}"
+        ctrl_list = list(self._controllers_vis.keys())
 
-        if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blobs", True) and contours is not None:
-            if matched_bids is not None:
+        for ctrl_idx, ctrl_name in enumerate(ctrl_list):
+            ctrl_path    = f"{path}/ctrl_{ctrl_idx}"
+            color        = _controller_blob_color(ctrl_idx)
+            color_dim    = [int(c * 0.45) for c in color]
+            # Tiny z-stagger per controller avoids z-fighting between layers.
+            ctrl_z       = blob_z - ctrl_idx * 0.00005
+
+            blobs        = (blobs_per_ctrl    or {}).get(ctrl_name, {}).get(cam_idx)
+            contours     = (contours_per_ctrl or {}).get(ctrl_name, {}).get(cam_idx)
+            matched_bids = ((matched_bids_per_ctrl_cam or {}).get(ctrl_name) or {}).get(cam_idx, set())
+
+            if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blobs", True) and contours:
                 blob_colors = np.array(
                     [color if i in matched_bids else color_dim
                      for i in range(len(contours))],
                     dtype=np.uint8,
                 )
+                bv, bf, bc = make_contour_mesh_3d(contours, cam, ctrl_z, blob_colors, undistort=True)
+                if bv is not None:
+                    rr.log(f"{ctrl_path}/blobs",
+                           rr.Mesh3D(vertex_positions=_wc(bv), triangle_indices=bf, vertex_colors=bc))
+                else:
+                    rr.log(f"{ctrl_path}/blobs", rr.Clear(recursive=False))
             else:
-                blob_colors = np.array([color] * len(contours), dtype=np.uint8)
-            bv, bf, bc = make_contour_mesh_3d(contours, cam, blob_z, blob_colors, undistort=True)
-            if bv is not None:
-                rr.log(f"{path}/blobs", rr.Mesh3D(vertex_positions=_wc(bv),
-                                                   triangle_indices=bf, vertex_colors=bc))
-            else:
-                rr.log(f"{path}/blobs", rr.Clear(recursive=False))
-        else:
-            rr.log(f"{path}/blobs", rr.Clear(recursive=False))
+                rr.log(f"{ctrl_path}/blobs", rr.Clear(recursive=False))
 
-        if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blob_ids", True):
-            blobs_ud = cv2.undistortPoints(
-                blobs.reshape(-1, 1, 2).astype(np.float32),
-                cam.camera_matrix, cam.dist_coeffs, P=cam.camera_matrix,
-            ).reshape(-1, 2)
-            bdx, bdy = self.vis_cfg.get("blob_id_label_offset", [-0.0013, 0.0008])
-            label_pts = backproject_to_plane(blobs_ud, cam, z=blob_z).copy()
-            label_pts[:, 0] += bdx
-            label_pts[:, 1] += bdy
-            rr.log(f"{path}/blob_ids", rr.Points3D(
-                positions=_wc(label_pts),
-                labels=[str(i) for i in range(len(blobs))],
-                colors=[color] * len(blobs),
-                radii=0.0,
-            ))
-        else:
-            rr.log(f"{path}/blob_ids", rr.Clear(recursive=False))
+            if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blob_ids", True):
+                blobs_ud = cv2.undistortPoints(
+                    blobs.reshape(-1, 1, 2).astype(np.float32),
+                    cam.camera_matrix, cam.dist_coeffs, P=cam.camera_matrix,
+                ).reshape(-1, 2)
+                bdx, bdy = self.vis_cfg.get("blob_id_label_offset", [-0.0013, 0.0008])
+                label_pts = backproject_to_plane(blobs_ud, cam, z=ctrl_z).copy()
+                label_pts[:, 0] += bdx
+                label_pts[:, 1] += bdy
+                rr.log(f"{ctrl_path}/blob_ids", rr.Points3D(
+                    positions=_wc(label_pts),
+                    labels=[str(i) for i in range(len(blobs))],
+                    colors=[color] * len(blobs),
+                    radii=0.0,
+                ))
+            else:
+                rr.log(f"{ctrl_path}/blob_ids", rr.Clear(recursive=False))
 
     # ------------------------------------------------------------------
     # Per-frame logging
     # ------------------------------------------------------------------
 
     def _log_frame(self, idx: int, T_cam_model_per_ctrl: dict,
-                   assignments_per_ctrl: dict, blobs_per_cam: dict,
-                   contours_per_cam: dict = None,
+                   assignments_per_ctrl: dict, blobs_per_ctrl: dict,
+                   contours_per_ctrl: dict = None,
                    primary_cam_per_ctrl: dict = None,
                    aux_assignments_per_ctrl: dict = None,
                    ghost_T_world_model_per_ctrl: dict = None):
@@ -722,26 +748,27 @@ class ControllerAnimatorRerun:
         error_z               = frustum_z - error_z_offset
         offset                = self.visual_offset
 
-        # ── matched_bids per camera, aggregated across all controllers ───────
-        matched_bids_per_cam: dict = {ci: set() for ci in self._cameras}
+        # ── matched_bids per controller per camera ───────────────────────────
+        matched_bids_per_ctrl_cam: dict = {}
         for ctrl_name in self._controllers_vis:
             pri = (primary_cam_per_ctrl or {}).get(ctrl_name, next(iter(self._cameras)))
             if pri not in self._cameras:
                 pri = next(iter(self._cameras))
+            ctrl_bids: dict = {pri: set()}
             for bid, _ in ((assignments_per_ctrl or {}).get(ctrl_name) or []):
-                matched_bids_per_cam[pri].add(bid)
+                ctrl_bids[pri].add(bid)
             for aux_ci, pairs in ((aux_assignments_per_ctrl or {}).get(ctrl_name) or {}).items():
-                for bid, _ in pairs:
-                    matched_bids_per_cam.setdefault(aux_ci, set()).add(bid)
+                ctrl_bids[aux_ci] = {bid for bid, _ in pairs}
+            matched_bids_per_ctrl_cam[ctrl_name] = ctrl_bids
 
-        # ── Blobs for all cameras (shared, controller-independent) ──────────
+        # ── Blobs per controller per camera ─────────────────────────────────
         for cam_idx, cam in self._cameras.items():
             self._log_camera_blobs(
                 cam_idx, cam,
-                blobs_per_cam.get(cam_idx) if blobs_per_cam else None,
-                contours_per_cam.get(cam_idx) if contours_per_cam else None,
+                blobs_per_ctrl,
+                contours_per_ctrl,
                 blob_z,
-                matched_bids=matched_bids_per_cam.get(cam_idx),
+                matched_bids_per_ctrl_cam=matched_bids_per_ctrl_cam,
             )
 
         # ── Hide or ghost controllers with no valid pose this frame ─────────
@@ -903,7 +930,7 @@ class ControllerAnimatorRerun:
                     matched_lids.add(lid)
 
             # ── blob positions on the error plane (used by error lines below) ─
-            blobs = blobs_per_cam.get(primary_cam_idx) if blobs_per_cam else None
+            blobs = (blobs_per_ctrl or {}).get(ctrl_name, {}).get(primary_cam_idx)
             if blobs is not None and len(blobs) > 0:
                 blobs_undist_disp = cv2.undistortPoints(
                     blobs.reshape(-1, 1, 2).astype(np.float32),
@@ -1051,7 +1078,7 @@ class ControllerAnimatorRerun:
                                 if _T_world_aux is not None else T_disp_model)
                 _pts_aux_cam = (_T_aux_model.R @ model_positions.T).T + _T_aux_model.t
                 _aux_color   = _camera_color(_aux_ci)
-                _aux_blobs_raw = blobs_per_cam.get(_aux_ci) if blobs_per_cam else None
+                _aux_blobs_raw = (blobs_per_ctrl or {}).get(ctrl_name, {}).get(_aux_ci)
                 _aux_blobs_arr = (np.asarray(_aux_blobs_raw, dtype=np.float32)
                                   if _aux_blobs_raw is not None and len(_aux_blobs_raw) > 0 else None)
 
