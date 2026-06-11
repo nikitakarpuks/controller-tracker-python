@@ -259,9 +259,8 @@ def proximity_match(
     _gate_margin_px              = float(_cfg.get('cross_occlusion_gate_margin_px',    20.0))
     blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',             0.5))
     blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight',       0.3))
-    proximity_expansion_px            = float(_cfg.get('proximity_expansion_px',             8.0))
-    expansion_threshold          = float(_cfg.get('proximity_expansion_threshold',      0.6))
-    _aux_snap_px                 = float(_cfg.get('aux_snap_px', proximity_expansion_px * 3))
+    proximity_expansion_px = float(_cfg.get('proximity_expansion_px',             8.0))
+    _aux_snap_px           = float(_cfg.get('aux_snap_px', proximity_expansion_px * 3))
 
     R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
     focal_px = float(max(K[0, 0], K[1, 1]))
@@ -376,9 +375,9 @@ def proximity_match(
 
     aux_snapped_per_cam: Dict[int, List] = {}
 
-    # Post-RANSAC aux snap: re-project RANSAC-inlier LEDs into each aux camera using
-    # the refined pose, then greedy-snap with radii filter, followed by Hungarian
-    # expansion for any remaining visible-but-unmatched LEDs.
+    # Aux cameras: Hungarian over all model-visible LEDs × all aux blobs.
+    # Same dummy-column pattern as the primary path prevents LEDs without a
+    # nearby blob from stealing real blobs from LEDs that have one.
     if other_cameras_blobs:
         _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
         _T_world_ref = self.T_world_cam.compose(Transform(_R_ref, np.asarray(tvec, dtype=np.float32).reshape(3)))
@@ -386,42 +385,12 @@ def proximity_match(
             _oblobs = np.asarray(_oblobs, dtype=np.float32)
             _pairs_i: List = []
             if len(_oblobs) > 0:
-                _T_ci_r   = _ocam.T_world_cam.inverse().compose(_T_world_ref)
-                _R_i_r    = _T_ci_r.R.astype(np.float32)
-                _t_i_r    = _T_ci_r.t.astype(np.float32)
+                _T_ci_r    = _ocam.T_world_cam.inverse().compose(_T_world_ref)
+                _R_i_r     = _T_ci_r.R.astype(np.float32)
+                _t_i_r     = _T_ci_r.t.astype(np.float32)
                 _rv_i_r, _ = cv2.Rodrigues(_R_i_r)
-                _proj_i_r  = _project_points(_rv_i_r, _t_i_r, final_obj,
-                                              _ocam.camera_matrix, _ocam.dist_coeffs)
-                _led_ci_r  = (_R_i_r @ final_obj.T).T + _t_i_r
                 _focal_i_r = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
-                _exp_px_i_r = _focal_i_r * (led_radius_mm / 1000.0) / np.maximum(_led_ci_r[:, 2], 0.01)
 
-                _used_l_r: set = set()
-                for _j in range(len(_oblobs)):
-                    _blob_r_j = float(_oradii[_j]) if _oradii is not None else None
-                    _best_ii  = -1
-                    _best_sc  = float('inf')
-                    for _ii, _lid in enumerate(final_lids):
-                        if _ii in _used_l_r:
-                            continue
-                        _dist = float(np.linalg.norm(_oblobs[_j] - _proj_i_r[_ii]))
-                        if _dist >= _aux_snap_px:
-                            continue
-                        if _blob_r_j is not None:
-                            _ep = float(_exp_px_i_r[_ii])
-                            if not (_ep * blob_size_min_factor <= _blob_r_j <= _ep * blob_size_max_factor):
-                                continue
-                        _size_err = abs(_blob_r_j - float(_exp_px_i_r[_ii])) if _blob_r_j is not None else 0.0
-                        _score    = _dist + blob_size_score_weight * _size_err
-                        if _score < _best_sc:
-                            _best_sc = _score
-                            _best_ii = _ii
-                    if _best_ii >= 0:
-                        _pairs_i.append((_j, final_lids[_best_ii]))
-                        _used_l_r.add(_best_ii)
-
-                # Independent aux expansion: re-evaluate coverage with the refined pose
-                # and run Hungarian for visible-but-unmatched LEDs if coverage is low.
                 _vis_i_r = _visible_mask(
                     _R_i_r, _t_i_r, self.model.positions, self.model.normals, geom,
                     cam_K=_ocam.camera_matrix, cam_dc=_ocam.dist_coeffs,
@@ -439,48 +408,38 @@ def proximity_match(
                             log_tag=f"[{_ctrl} | cam {_cam} aux_cam {_ocam.camera_idx}]",
                             vis_mask=_vis_i_r,
                         )
-                _n_vis_i_r  = int(np.sum(_vis_i_r))
-                _snap_lids  = {lid for _, lid in _pairs_i}
-                _snap_blobs = {b   for b, _   in _pairs_i}
-                if _n_vis_i_r > 0 and len(_pairs_i) / _n_vis_i_r < expansion_threshold:
-                    _free_lid_i_r  = [int(lid) for lid in np.where(_vis_i_r)[0]
-                                      if int(lid) not in _snap_lids]
-                    _free_blob_i_r = [_jj for _jj in range(len(_oblobs))
-                                      if _jj not in _snap_blobs]
-                    if _free_lid_i_r and _free_blob_i_r:
-                        _free_obj_i_r  = self.model.positions[_free_lid_i_r].astype(np.float32)
-                        _proj_free_i_r = _project_points(_rv_i_r, _t_i_r, _free_obj_i_r,
-                                                         _ocam.camera_matrix, _ocam.dist_coeffs)
-                        _cost_i_r = cdist(_proj_free_i_r, _oblobs[_free_blob_i_r])
-                        if _oradii is not None:
-                            _led_ci_r2 = (_R_i_r @ _free_obj_i_r.T).T + _t_i_r
-                            for _k in range(len(_free_lid_i_r)):
-                                _depth_k  = float(max(_led_ci_r2[_k, 2], 0.01))
-                                _exp_px_k = _focal_i_r * (led_radius_mm / 1000.0) / _depth_k
-                                _inelig_r = ((_oradii[_free_blob_i_r] < _exp_px_k * blob_size_min_factor) |
-                                             (_oradii[_free_blob_i_r] > _exp_px_k * blob_size_max_factor))
-                                _cost_i_r[_k, _inelig_r] = 1e9
-                                if _log_size_filter:
-                                    for _c in np.where(_inelig_r)[0]:
-                                        logger.debug(
-                                            f"  LED {_free_lid_i_r[_k]}: blob {_free_blob_i_r[_c]}"
-                                            f" size-filtered (aux-expansion cam{_ocam.camera_idx} Hungarian)"
-                                            f"  r={_oradii[_free_blob_i_r[_c]]:.2f}  expected"
-                                            f" {_exp_px_k*blob_size_min_factor:.2f}–{_exp_px_k*blob_size_max_factor:.2f}px"
-                                        )
-                        _row_r, _col_r = linear_sum_assignment(_cost_i_r)
-                        _n_exp_i = 0
-                        for _rr, _cc in zip(_row_r, _col_r):
-                            if _cost_i_r[_rr, _cc] < _aux_snap_px:
-                                _pairs_i.append((_free_blob_i_r[_cc], _free_lid_i_r[_rr]))
-                                _n_exp_i += 1
-                        if is_deep() and _n_exp_i:
-                            logger.debug(
-                                f"[{_ctrl} | cam {_cam}] Proximity aux expansion cam{_ocam.camera_idx}: "
-                                f"+{_n_exp_i} via Hungarian (refined pose, "
-                                f"coverage {len(_pairs_i) - _n_exp_i}/{_n_vis_i_r}"
-                                f"→{len(_pairs_i)}/{_n_vis_i_r})"
-                            )
+
+                _vis_ids_i  = np.where(_vis_i_r)[0]
+                if len(_vis_ids_i) > 0:
+                    _vis_pos_i  = self.model.positions[_vis_ids_i].astype(np.float32)
+                    _proj_i_r   = _project_points(_rv_i_r, _t_i_r, _vis_pos_i,
+                                                  _ocam.camera_matrix, _ocam.dist_coeffs)
+                    _led_ci_r   = (_R_i_r @ _vis_pos_i.T).T + _t_i_r
+                    _exp_px_i_r = _focal_i_r * (led_radius_mm / 1000.0) / np.maximum(_led_ci_r[:, 2], 0.01)
+
+                    _cost_i_r = cdist(_proj_i_r, _oblobs)
+
+                    if _oradii is not None:
+                        for _k in range(len(_vis_ids_i)):
+                            _inelig_r = ((_oradii < _exp_px_i_r[_k] * blob_size_min_factor) |
+                                         (_oradii > _exp_px_i_r[_k] * blob_size_max_factor))
+                            _cost_i_r[_k, _inelig_r] = 1e9
+                            if _log_size_filter:
+                                for _c in np.where(_inelig_r)[0]:
+                                    logger.debug(
+                                        f"  LED {int(_vis_ids_i[_k])}: blob {_c}"
+                                        f" size-filtered (aux cam{_ocam.camera_idx})"
+                                        f"  r={_oradii[_c]:.2f}  expected"
+                                        f" {_exp_px_i_r[_k]*blob_size_min_factor:.2f}–{_exp_px_i_r[_k]*blob_size_max_factor:.2f}px"
+                                    )
+
+                    _n_vis_i   = len(_vis_ids_i)
+                    _cost_i_aug = np.hstack([_cost_i_r,
+                                             np.full((_n_vis_i, _n_vis_i), _aux_snap_px - 1e-6)])
+                    _row_r, _col_r = linear_sum_assignment(_cost_i_aug)
+                    for _rr, _cc in zip(_row_r, _col_r):
+                        if _cc < len(_oblobs) and _cost_i_r[_rr, _cc] < _aux_snap_px:
+                            _pairs_i.append((int(_cc), int(_vis_ids_i[_rr])))
 
             aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
             if is_deep() and _pairs_i:
