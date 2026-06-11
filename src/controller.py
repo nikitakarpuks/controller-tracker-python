@@ -220,11 +220,6 @@ class SingleViewTracker:
         self.last_good_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.last_good_assignment = None
 
-        # Blob ID persistence: each blob carries the LED ID it was matched to
-        # last frame, carried forward via spatial nearest-neighbour matching.
-        self.prev_blob_positions: Optional[np.ndarray] = None  # (N, 2)
-        self.prev_blob_led_ids:   Optional[np.ndarray] = None  # (N,) int, -1 = unknown
-
         # Consecutive frames without a valid solution.
         self.consecutive_failures: int = 0
 
@@ -257,13 +252,12 @@ class SingleViewTracker:
 
         # Bind strategies
         from src._matching import (
-            proximity_match, brute_match, prior_constrained_match, _carry_led_ids,
+            proximity_match, brute_match, prior_constrained_match,
         )
 
         self.proximity_match          = proximity_match.__get__(self)
         self.brute_match              = brute_match.__get__(self)
         self.prior_constrained_match  = prior_constrained_match.__get__(self)
-        self._carry_led_ids           = _carry_led_ids
 
     # # -----------------------------------------------------
     # # Custom projection
@@ -437,7 +431,6 @@ class SingleViewTracker:
         # Per-axis jump thresholds from config (fall back to scalar defaults if absent).
         _cfg = self._matching_cfg
         _use_proximity = bool(_cfg.get('use_proximity_match', True))
-        _blob_snap_px  = float(_cfg.get('blob_tracking_snap_px', 25.0))
         _accept_err_px = float(_cfg.get('accept_error_px', 3.0))
         _pos_ax = _cfg.get('pose_jump_pos_thresh_m')
         _rot_ax = _cfg.get('pose_jump_rot_thresh_deg')
@@ -471,18 +464,6 @@ class SingleViewTracker:
             predicted_pose = self.prev_pose
 
         # ------------------------------------------------------------------
-        # Blob LED-ID carry: inherit LED IDs from previous frame's blobs
-        # ------------------------------------------------------------------
-        blob_led_ids = None
-        if self.prev_blob_positions is not None and self.prev_blob_led_ids is not None:
-            blob_led_ids = self._carry_led_ids(
-                blobs_prox,
-                self.prev_blob_positions,
-                self.prev_blob_led_ids,
-                snap_px=_blob_snap_px,
-            )
-
-        # ------------------------------------------------------------------
         # Candidate search
         # ------------------------------------------------------------------
         solution = None
@@ -492,8 +473,6 @@ class SingleViewTracker:
             if _use_proximity and n_available >= 3:
                 solution = self.proximity_match(
                     blobs_prox, predicted_pose,
-                    prior_assignment=self.prev_assignment,
-                    blob_led_ids=blob_led_ids,
                     blob_radii=radii_prox,
                     blob_brightnesses=brts_prox,
                     other_cameras_blobs=other_cameras_blobs,
@@ -617,24 +596,6 @@ class SingleViewTracker:
             T_cam_ctrl = Transform(R_ctrl, solution["tvec"].reshape(3))
             solution["T_world_ctrl"] = self.T_world_cam.compose(T_cam_ctrl)
 
-            # Update blob ID state for next frame.
-            # State is always stored against blobs_prox so _carry_led_ids remains consistent.
-            n_prox = len(blobs_prox)
-            blob_led_ids_out = np.full(n_prox, -1, dtype=np.int32)
-            if blob_mask is not None:
-                # assignment indices are in full-array space; convert to prox space.
-                _full_to_prox = -np.ones(n_blobs, dtype=np.int32)
-                _full_to_prox[_avail_idx] = np.arange(n_prox, dtype=np.int32)
-                for b_full, l_id in solution["assignment"]:
-                    b_prox = int(_full_to_prox[b_full])
-                    if b_prox >= 0:
-                        blob_led_ids_out[b_prox] = l_id
-            else:
-                for b_idx, l_id in solution["assignment"]:
-                    blob_led_ids_out[b_idx] = l_id
-            self.prev_blob_positions = blobs_prox.copy()
-            self.prev_blob_led_ids   = blob_led_ids_out
-
             return solution
 
         # Tracking lost — clear velocity history and blob ID state so re-acquisition starts fresh
@@ -643,11 +604,9 @@ class SingleViewTracker:
         else:
             logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
         self.consecutive_failures += 1
-        self.prev_pose           = None
-        self.prev_prev_pose      = None
-        self.prev_assignment     = None
-        self.prev_blob_positions = None
-        self.prev_blob_led_ids   = None
+        self.prev_pose       = None
+        self.prev_prev_pose  = None
+        self.prev_assignment = None
         return None
 
 
@@ -951,14 +910,13 @@ class TrackingSystem:
             else:
                 _designated = self._designated_primary.get(ctrl_name)
                 _des_tracker = tracker_map.get(_designated)
-                # Require at least 3 unclaimed blobs: minimum for proximity match.
-                # When the competing controller claimed most blobs from this camera,
-                # fall through to the best available camera instead.
+                _min_inliers = int(_cfg.get('min_inliers', 4))
+                # Require enough unclaimed blobs; do NOT require prev_pose — a
+                # just-promoted camera starts cold (brute) and that is fine.
                 _des_ok = (
                     _des_tracker is not None
                     and _designated in avail
-                    and _des_tracker.prev_pose is not None
-                    and len(avail[_designated][0]) >= 3
+                    and len(avail[_designated][0]) >= _min_inliers
                 )
                 if _des_ok:
                     primary_cam_id = _designated
@@ -968,7 +926,6 @@ class TrackingSystem:
                     # fewest blobs — it is less likely to be contaminated by another
                     # controller's LEDs, giving a more reliable brute-match anchor.
                     # Require ≥ min_inliers blobs so brute_match can actually run.
-                    _min_inliers = int(_cfg.get('min_inliers', 4))
                     _with_prior = [
                         cid for cid in avail
                         if tracker_map[cid].prev_pose is not None
@@ -1209,8 +1166,13 @@ class TrackingSystem:
                                     f"[{ctrl_name}] Camera handoff: "
                                     f"cam{primary_cam_id}({_n_primary} LEDs)"
                                     f" → cam{_aux_cid}({_aux_n} LEDs)"
+                                    f" — clearing state-prop pose, new primary starts cold"
                                 )
                                 self._designated_primary[ctrl_name] = _aux_cid
+                                _new_primary_trk = tracker_map.get(_aux_cid)
+                                if _new_primary_trk is not None:
+                                    _new_primary_trk.prev_pose      = None
+                                    _new_primary_trk.prev_prev_pose = None
                                 _hctr.clear()
                         else:
                             _hctr[_aux_cid] = 0

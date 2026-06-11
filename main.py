@@ -132,6 +132,8 @@ def main():
 
     for batch in tqdm(get_data(config["data"])):
         img_path, cam_images = batch[0][0], batch[0][1]
+        if img_path.name == "30633126936118.png":
+            pass
         # cam_images: {cam_idx: numpy array}
 
         depth_hints        = tracking_system.get_predicted_depths_per_camera()

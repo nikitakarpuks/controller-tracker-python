@@ -1,6 +1,6 @@
 data:
 #  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves/data"
-  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
+  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/aa"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -51,7 +51,7 @@ controllers:
           half_length: 0.037
           color: [255, 55, 55]
   left_controller:
-    enabled: true
+    enabled: false
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
@@ -61,7 +61,7 @@ blob_detection:
     pixel_threshold:
       model: 'inv_depth_sq'   # a/d²+b  R²=0.8532
       a: 0.179539
-      b: 7.242778
+      b: 13.0
     required_threshold:
       model: 'inv_depth_sq'   # a/d²+b  R²=0.8764
       a: 0.312337
@@ -69,9 +69,9 @@ blob_detection:
     max_area:
       model: 'inv_depth_sq'   # a/d²+b  R²=0.8473
       a: 0.759220
-      b: 27.190591
+      b: 32.0
   visualize: true
-  min_threshold: 6       # pixels >= this are included in a blob
+  min_threshold: 8       # pixels >= this are included in a blob
   required_threshold: 13  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 3
   max_area: 250
@@ -140,13 +140,8 @@ matching:
   proximity_min_inliers: 3               # min inliers for proximity match (can be lower than min_inliers
                                           # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
-  blob_tracking_snap_px: 25.0           # max pixel distance to carry a led_id from prev frame to current
-  proximity_snap_factor: 3.0            # depth-scaled snap: focal * (led_radius_mm/1000) / depth * factor
-  proximity_argmin_max_dist_px: 5.0     # hard cap on argmin (non-ID-path) snap; ID-path uses full depth-scaled snap_px
-  proximity_expansion_threshold: 0.7    # run Hungarian expansion if locked/model_visible < this after snap
-  proximity_expansion_px: 4.0           # max reprojection distance to accept a Hungarian-expanded pair (primary cam)
-  proximity_vis_drop_threshold: 2       # also expand if prior LED count dropped by more than this
-  projection_snap_px: 25.0              # projection fallback: max Hungarian cost to accept a blob-LED pair
+  proximity_expansion_px: 10.0           # Hungarian acceptance gate (px): max cost-matrix distance to accept a pair
+  proximity_expansion_threshold: 0.7    # aux-camera expansion: run Hungarian for unmatched LEDs if pairs/visible < this
   aux_snap_px: 15.0                     # snap cap for aux cameras (looser than primary — calibration offsets)
   proximity_mutual_exclusion_px: 15.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
