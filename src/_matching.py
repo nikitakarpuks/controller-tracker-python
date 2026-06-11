@@ -81,27 +81,6 @@ def _tier_label(t):
 # blob LED-ID carry helper
 # ---------------------------------------------------------------------------
 
-def _carry_led_ids(
-    current_blobs: np.ndarray,   # (N, 2)
-    prev_positions: np.ndarray,  # (M, 2)
-    prev_led_ids: np.ndarray,    # (M,) int, -1 = unmatched
-    snap_px: float,
-) -> np.ndarray:                 # (N,) int, -1 = unmatched
-    """
-    Nearest-neighbour blob tracking across frames.
-    Each current blob inherits the led_id of its nearest previous blob if within snap_px.
-    No 1-to-1 enforcement: conflicts (two blobs claiming the same id) are resolved
-    downstream by proximity_match dropping to argmin when len(candidates) != 1.
-    """
-    led_ids = np.full(len(current_blobs), -1, dtype=np.int32)
-    if len(prev_positions) == 0:
-        return led_ids
-    for i, blob in enumerate(current_blobs):
-        dists = np.linalg.norm(prev_positions - blob, axis=1)
-        j = int(np.argmin(dists))
-        if dists[j] < snap_px and prev_led_ids[j] != -1:
-            led_ids[i] = int(prev_led_ids[j])
-    return led_ids
 
 
 # ---------------------------------------------------------------------------
@@ -244,20 +223,17 @@ def proximity_match(
     self,
     blobs: np.ndarray,
     predicted_pose: Tuple[np.ndarray, np.ndarray],
-    prior_assignment: Optional[List] = None,
-    blob_led_ids: Optional[np.ndarray] = None,
     blob_radii: Optional[np.ndarray] = None,
     blob_brightnesses: Optional[np.ndarray] = None,
     other_cameras_blobs: Optional[List] = None,
     occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = None,
 ) -> Optional[Dict]:
     """
-    Refine a predicted pose using the assignment-locked nearest-neighbour path.
+    Refine a predicted pose via global Hungarian matching over all model-visible LEDs.
 
-    For each LED from the previous frame's assignment, project it with the
-    predicted pose and snap to its nearest blob. The snap radius is
-    depth-scaled: snap_px = focal * (led_radius_mm/1000) / depth * snap_factor.
-    RANSAC + visibility recheck then filter the locked pairs.
+    Projects every visible LED with the predicted pose, builds a cost matrix
+    (distance + size + brightness penalties) against detected blobs, and solves
+    globally via linear_sum_assignment. RANSAC filters inliers.
     Returns None when too few pairs survive; caller falls back to brute_match.
     """
     rvec_pred, tvec_pred = predicted_pose
@@ -271,40 +247,24 @@ def proximity_match(
     _cfg = getattr(self, '_matching_cfg', None) or {}
     _cam = self.camera.camera_idx
     _ctrl = self.model.name.replace("_controller", "")
-    facing_threshold_deg   = float(_cfg.get('led_facing_angle_deg',     86.0))
-    reprojection_threshold = float(_cfg.get('proximity_reprojection_threshold', 2.0))
-    min_inliers            = int(  _cfg.get('proximity_min_inliers',
-                                          _cfg.get('min_inliers', 4)))
-    led_radius_mm          = float(_cfg.get('led_radius_mm',             2.5))
-    snap_factor            = float(_cfg.get('proximity_snap_factor',     4.0))
-    blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',      4.0))
-    blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',      0.2))
-    _log_size_filter       = is_deep() and bool(_cfg.get('log_size_filter', False))
-    _br                    = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
-    _gate_margin_px        = float(_cfg.get('cross_occlusion_gate_margin_px',   20.0))
-    blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',       0.5))
-    blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight', 0.3))
-    _accept_err_px               = float(_cfg.get('accept_error_px',               3.0))
-    _proj_snap_px          = float(_cfg.get('projection_snap_px',
-                                   _cfg.get('proximity_expansion_px',    8.0)))
+    facing_threshold_deg         = float(_cfg.get('led_facing_angle_deg',              86.0))
+    reprojection_threshold       = float(_cfg.get('proximity_reprojection_threshold',   2.0))
+    min_inliers                  = int(  _cfg.get('proximity_min_inliers',
+                                               _cfg.get('min_inliers', 4)))
+    led_radius_mm                = float(_cfg.get('led_radius_mm',                      2.5))
+    blob_size_max_factor         = float(_cfg.get('blob_size_max_factor',               4.0))
+    blob_size_min_factor         = float(_cfg.get('blob_size_min_factor',               0.2))
+    _log_size_filter             = is_deep() and bool(_cfg.get('log_size_filter', False))
+    _br                          = float(_cfg.get('cross_occlusion_bounding_radius_m',  0.18))
+    _gate_margin_px              = float(_cfg.get('cross_occlusion_gate_margin_px',    20.0))
+    blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',             0.5))
+    blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight',       0.3))
+    proximity_expansion_px            = float(_cfg.get('proximity_expansion_px',             8.0))
+    expansion_threshold          = float(_cfg.get('proximity_expansion_threshold',      0.6))
+    _aux_snap_px                 = float(_cfg.get('aux_snap_px', proximity_expansion_px * 3))
 
-    if prior_assignment is None or len(prior_assignment) < min_inliers:
-        return None
-
-    prior_lids = [lid for _, lid in prior_assignment]
-    prior_obj  = self.model.positions[prior_lids].astype(np.float32)
-    proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc)
-
-    # Pre-rotate all prior LED positions into camera frame to get per-LED depth.
     R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
-    led_cam = (R_pred_arr @ prior_obj.T).T + tvec_pred  # (N, 3)
     focal_px = float(max(K[0, 0], K[1, 1]))
-
-    # Compute model visibility with the predicted pose up front — needed both for
-    # the vis-drop expansion trigger and for the post-snap expansion block.
-    expansion_threshold   = float(_cfg.get('proximity_expansion_threshold', 0.6))
-    expansion_px          = float(_cfg.get('proximity_expansion_px',        5.0))
-    vis_drop_threshold    = int(  _cfg.get('proximity_vis_drop_threshold',  1))
 
     vis_mask_pred = _visible_mask(
         R_pred_arr, tvec_pred,
@@ -327,336 +287,98 @@ def proximity_match(
             )
     n_model_visible = int(vis_mask_pred.sum())
 
-    # Snap: assign blobs to prior LEDs in two passes.
-    # Direction is blob→LED: each blob claims its nearest unclaimed prior LED.
-    # This prevents an occluded LED's projection from stealing a blob that belongs
-    # to a still-visible neighbour — occluded LEDs simply receive no blob and are
-    # absent from locked_pairs (natural occlusion inference, no vis_mask needed).
-    #
-    # Pass 1 (ID fast path): blobs that carry a LED ID from the previous frame are
-    #   matched to that LED directly, subject to size + distance checks.
-    # Pass 2 (blob→LED greedy): each remaining blob finds its nearest unclaimed
-    #   prior LED within the LED's depth-scaled snap radius and argmin_max_px cap.
-    #   Score = dist + blob_size_score_weight * size_err to prefer size-correct matches.
-    argmin_max_px = float(_cfg.get('proximity_argmin_max_dist_px',
-                                    float(_cfg.get('proximity_expansion_px', 8.0))))
-    # Aux cameras may have larger calibration offsets; use a looser cap there.
-    _aux_snap_px  = float(_cfg.get('aux_snap_px', argmin_max_px * 3))
-
-    # Precompute per-LED depth-scaled snap parameters.
-    expected_pxs = np.zeros(len(prior_lids))
-    snap_pxs     = np.zeros(len(prior_lids))
-    for i in range(len(prior_lids)):
-        depth            = float(max(led_cam[i, 2], 0.01))
-        expected_pxs[i]  = focal_px * (led_radius_mm / 1000.0) / depth
-        snap_pxs[i]      = expected_pxs[i] * snap_factor
-
-    # Per-prior-LED facing factor: dot product of rotated normal with camera +Z axis.
-    prior_normals_cam = (R_pred_arr @ self.model.normals[prior_lids].T).T  # (N, 3)
-    prior_facing      = np.maximum(0.0, prior_normals_cam[:, 2])           # (N,)
-
-    # Normalise blob brightnesses to [0, 1] relative to the brightest blob this frame.
     _brightness_norm = None
     if blob_brightnesses is not None and len(blob_brightnesses) > 0:
         _bmax = float(blob_brightnesses.max())
         if _bmax > 0:
             _brightness_norm = blob_brightnesses / _bmax
 
-    # Index for O(1) LED-ID → prior index lookup used in the ID fast path.
-    prior_lid_to_idx = {lid: i for i, lid in enumerate(prior_lids)}
+    # Hungarian: project all model-visible LEDs and match to detected blobs globally.
+    pairs      = []
+    locked_obj = []
+    locked_img = []
 
-    locked_pairs, locked_obj, locked_img = [], [], []
-    used_blobs: set = set()
-    used_led_idxs: set = set()
-    n_id_locked = 0
+    if n_model_visible > 0 and len(blobs) > 0:
+        vis_ids     = np.where(vis_mask_pred)[0]
+        vis_pos     = self.model.positions[vis_ids].astype(np.float32)
+        proj_vis    = _project_points(rvec_pred, tvec_pred, vis_pos, K, dc)
+        led_cam_vis = (R_pred_arr @ vis_pos.T).T + tvec_pred
 
-    # Pass 1: ID fast path.
-    if blob_led_ids is not None:
-        for j in range(len(blobs)):
-            lid = int(blob_led_ids[j])
-            if lid == -1:
-                continue
-            i = prior_lid_to_idx.get(lid, -1)
-            if i == -1 or i in used_led_idxs:
-                continue
-            dist = float(np.linalg.norm(blobs[j] - proj_prior[i]))
-            if dist >= snap_pxs[i]:
-                continue
-            if blob_radii is not None:
-                if not (expected_pxs[i] * blob_size_min_factor
-                        <= blob_radii[j]
-                        <= expected_pxs[i] * blob_size_max_factor):
-                    if _log_size_filter:
+        cost = cdist(proj_vis, blobs)
+
+        if blob_radii is not None:
+            for k in range(len(vis_ids)):
+                depth       = float(max(led_cam_vis[k, 2], 0.01))
+                expected_px = focal_px * (led_radius_mm / 1000.0) / depth
+                ineligible  = (
+                    (blob_radii < expected_px * blob_size_min_factor) |
+                    (blob_radii > expected_px * blob_size_max_factor)
+                )
+                cost[k, ineligible] = 1e9
+                if _log_size_filter:
+                    for _c in np.where(ineligible)[0]:
                         logger.debug(
-                            f"  LED {lid}: blob {j} size-filtered (ID-path)"
-                            f"  r={blob_radii[j]:.2f}  expected"
-                            f" {expected_pxs[i]*blob_size_min_factor:.2f}–{expected_pxs[i]*blob_size_max_factor:.2f}px"
+                            f"  LED {int(vis_ids[k])}: blob {_c} size-filtered"
+                            f"  r={blob_radii[_c]:.2f}  expected"
+                            f" {expected_px*blob_size_min_factor:.2f}–{expected_px*blob_size_max_factor:.2f}px"
                         )
-                    continue
-            locked_pairs.append((j, lid))
-            locked_obj.append(self.model.positions[lid])
-            locked_img.append(blobs[j])
-            used_blobs.add(j)
-            used_led_idxs.add(i)
-            n_id_locked += 1
-            if is_deep():
-                logger.debug(f"  LED {lid}: ID-path → blob {j}")
 
-    # Pass 2: blob→LED greedy for unmatched blobs.
-    for j in range(len(blobs)):
-        if j in used_blobs:
-            continue
-        blob_r     = blob_radii[j] if blob_radii is not None else None
-        best_i     = -1
-        best_score = float('inf')
-        best_dist  = float('inf')
-        for i, lid in enumerate(prior_lids):
-            if i in used_led_idxs:
-                continue
-            dist = float(np.linalg.norm(blobs[j] - proj_prior[i]))
-            if dist >= snap_pxs[i] or dist >= argmin_max_px:
-                continue
-            if blob_r is not None:
-                if not (expected_pxs[i] * blob_size_min_factor
-                        <= blob_r
-                        <= expected_pxs[i] * blob_size_max_factor):
-                    if _log_size_filter:
-                        logger.debug(
-                            f"  LED {prior_lids[i]}: blob {j} size-filtered (greedy)"
-                            f"  r={blob_r:.2f}  expected"
-                            f" {expected_pxs[i]*blob_size_min_factor:.2f}–{expected_pxs[i]*blob_size_max_factor:.2f}px"
-                        )
-                    continue
-            size_err       = float(abs(blob_r - expected_pxs[i])) if blob_r is not None else 0.0
-            brightness_err = (abs(float(_brightness_norm[j]) - prior_facing[i])
-                              if _brightness_norm is not None else 0.0)
-            score = dist + blob_size_score_weight * size_err + blob_brightness_score_weight * brightness_err
-            if score < best_score:
-                best_score = score
-                best_i     = i
-                best_dist  = dist
-        if best_i >= 0:
-            lid = prior_lids[best_i]
-            locked_pairs.append((j, lid))
-            locked_obj.append(self.model.positions[lid])
-            locked_img.append(blobs[j])
-            used_blobs.add(j)
-            used_led_idxs.add(best_i)
-            if is_deep():
-                logger.debug(f"  LED {lid}: blob {j} → nearest ({best_dist:.1f}px)")
+        if _brightness_norm is not None:
+            normals_cam = (R_pred_arr @ self.model.normals[vis_ids].T).T
+            facing      = np.maximum(0.0, normals_cam[:, 2])
+            cost += blob_brightness_score_weight * np.abs(facing[:, None] - _brightness_norm[None, :])
+
+        n_vis    = len(vis_ids)
+        cost_aug = np.hstack([cost, np.full((n_vis, n_vis), proximity_expansion_px - 1e-6)])
+        row_ind, col_ind = linear_sum_assignment(cost_aug)
+        for r, c in zip(row_ind, col_ind):
+            if c < len(blobs) and cost[r, c] < proximity_expansion_px:
+                led_id = int(vis_ids[r])
+                pairs.append((c, led_id))
+                locked_obj.append(self.model.positions[led_id])
+                locked_img.append(blobs[c])
 
     logger.debug(
-        f"[{_ctrl} | cam {_cam}] Proximity snap: {len(locked_pairs)}/{len(blobs)} blobs locked "
-        f"({n_id_locked} ID-path, {len(locked_pairs) - n_id_locked} nearest) "
-        f"of {len(prior_lids)} prior LEDs"
-        + ("  [size filter active]" if blob_radii is not None else "")
+        f"[{_ctrl} | cam {_cam}] Proximity Hungarian: {len(pairs)}/{len(blobs)} blobs matched "
+        f"of {n_model_visible} visible LEDs"
     )
-    if len(locked_pairs) < min_inliers:
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: few snap pairs ({len(locked_pairs)} < {min_inliers}), will attempt projection fallback")
 
-    # First-pass RANSAC on snap-only pairs to get a refined pose before Hungarian
-    # expansion. Using the predicted pose for expansion projects LEDs from a stale
-    # estimate; the refined pose is typically much closer, giving Hungarian better
-    # projections and lower error on the final inlier set.
-    # Falls back to predicted pose if first-pass RANSAC fails (degenerate geometry).
-    rvec_exp, tvec_exp, R_exp = rvec_pred, tvec_pred, R_pred_arr
-    _ok_snap, _rvec_snap, _tvec_snap, _ = _ransac_pnp(
-        np.array(locked_obj, dtype=np.float32),
-        np.array(locked_img, dtype=np.float32),
-        K, dc, rvec_pred, tvec_pred,
-        reprojection_px=reprojection_threshold,
-    )
-    if _ok_snap:
-        rvec_exp = _rvec_snap
-        tvec_exp = np.asarray(_tvec_snap, dtype=np.float32).reshape(3)
-        R_exp, _ = cv2.Rodrigues(np.asarray(_rvec_snap, dtype=np.float32).reshape(3, 1))
-
-    aux_snapped_per_cam: Dict[int, List] = {}
-
-    # Hungarian expansion: triggered when proximity locked fewer than expansion_threshold
-    # of model-visible LEDs, OR when visible LED count dropped significantly from the
-    # prior (vis_drop_threshold) and there are still unassigned blobs to place.
-    # Projects free LEDs from the first-pass refined pose (rvec_exp) so Hungarian
-    # correspondences are grounded in a better estimate than the raw prediction.
-    locked_blob_set = {b for b, _ in locked_pairs}
-    locked_led_set  = {l for _, l in locked_pairs}
-
-    free_blob_idx = [i for i in range(len(blobs)) if i not in locked_blob_set]
-    free_led_idx  = [int(lid) for lid in np.where(vis_mask_pred)[0]
-                     if int(lid) not in locked_led_set]
-
-    n_prior_gone = sum(1 for lid in prior_lids if not vis_mask_pred[lid])
-    vis_dropped  = n_prior_gone > vis_drop_threshold
-    did_expand  = False
-
-    if n_model_visible > 0 and (
-        len(locked_pairs) / n_model_visible < expansion_threshold
-        or (vis_dropped and len(free_blob_idx) > 0)
-    ):
-        if free_blob_idx and free_led_idx:
-            free_led_obj = self.model.positions[free_led_idx].astype(np.float32)
-            proj_free    = _project_points(rvec_exp, tvec_exp, free_led_obj, K, dc)
-            free_blobs   = blobs[free_blob_idx]
-
-            cost = cdist(proj_free, free_blobs)  # (n_free_leds, n_free_blobs)
-
-            if blob_radii is not None:
-                free_blob_radii = blob_radii[free_blob_idx]
-                free_led_cam    = (R_exp @ free_led_obj.T).T + tvec_exp
-                for k in range(len(free_led_idx)):
-                    depth       = float(max(free_led_cam[k, 2], 0.01))
-                    expected_px = focal_px * (led_radius_mm / 1000.0) / depth
-                    ineligible  = (
-                        (free_blob_radii < expected_px * blob_size_min_factor) |
-                        (free_blob_radii > expected_px * blob_size_max_factor)
-                    )
-                    cost[k, ineligible] = 1e9
-                    if _log_size_filter:
-                        for _c in np.where(ineligible)[0]:
-                            logger.debug(
-                                f"  LED {free_led_idx[k]}: blob {free_blob_idx[_c]}"
-                                f" size-filtered (Hungarian)"
-                                f"  r={free_blob_radii[_c]:.2f}  expected"
-                                f" {expected_px*blob_size_min_factor:.2f}–{expected_px*blob_size_max_factor:.2f}px"
-                            )
-
-            if _brightness_norm is not None:
-                free_normals_cam   = (R_exp @ self.model.normals[free_led_idx].T).T
-                free_facing        = np.maximum(0.0, free_normals_cam[:, 2])          # (n_free_leds,)
-                free_b_norm        = _brightness_norm[free_blob_idx]                  # (n_free_blobs,)
-                cost += blob_brightness_score_weight * np.abs(
-                    free_facing[:, None] - free_b_norm[None, :]
-                )
-
-            row_ind, col_ind = linear_sum_assignment(cost)
-
-            n_expanded = 0
-            for r, c in zip(row_ind, col_ind):
-                if cost[r, c] < expansion_px:
-                    blob_j = free_blob_idx[c]
-                    led_id = free_led_idx[r]
-                    locked_pairs.append((blob_j, led_id))
-                    locked_obj.append(self.model.positions[led_id])
-                    locked_img.append(blobs[blob_j])
-                    n_expanded += 1
-
-            if n_expanded:
-                did_expand = True
-                logger.debug(
-                    f"[{_ctrl} | cam {_cam}] Proximity expansion: +{n_expanded} via Hungarian "
-                    f"(coverage {len(locked_pairs) - n_expanded}/{n_model_visible} "
-                    f"→ {len(locked_pairs)}/{n_model_visible})"
-                )
+    if len(pairs) < min_inliers:
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few pairs ({len(pairs)} < {min_inliers}) → None")
+        return None
 
     lo = np.array(locked_obj, dtype=np.float32)
     li = np.array(locked_img, dtype=np.float32)
 
     ok, rvec, tvec, ransac_idx = _ransac_pnp(
-        lo, li, K, dc, rvec_exp, tvec_exp,
+        lo, li, K, dc, rvec_pred, tvec_pred,
         reprojection_px=reprojection_threshold,
     )
 
-    # Evaluate snap-path result without early-returning — projection fallback below may recover.
-    # Keep all RANSAC inliers: the visibility check is an approximation and
-    # the blob's physical presence is stronger evidence than the model geometry.
-    final_pairs = lo_f = li_f = None
-    error = max_error = float('inf')
-    if ok:
-        _fp = [locked_pairs[k] for k in ransac_idx]
-        if len(_fp) >= min_inliers:
-            _lo_f = self.model.positions[[l for _, l in _fp]].astype(np.float32)
-            _li_f = blobs[[b for b, _ in _fp]].astype(np.float32)
-            _pe   = np.linalg.norm(_project_points(rvec, tvec, _lo_f, K, dc) - _li_f, axis=1)
-            final_pairs = _fp
-            lo_f, li_f  = _lo_f, _li_f
-            error       = float(_pe.mean())
-            max_error   = float(_pe.max())
-        else:
-            logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC gave too few inliers ({len(_fp)})")
-    else:
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC failed")
-
-    # Projection fallback: if the snap path failed or returned a high-error solution,
-    # discard all blob-tracking locked pairs and run a fresh full Hungarian over ALL
-    # blobs vs ALL model-visible LEDs projected from the refined predicted pose.
-    # Unlike the expansion above (which only handles "free" blobs/LEDs left after snapping),
-    # this completely ignores locked pairs and is therefore immune to ID swap errors from Pass 1.
-    _did_proj_fallback = False
-    if final_pairs is None or error >= _accept_err_px:
-        _vis_ids = np.where(vis_mask_pred)[0]
-        if len(_vis_ids) >= min_inliers:
-            _vis_pos = self.model.positions[_vis_ids].astype(np.float32)
-            _proj_p  = _project_points(rvec_exp, tvec_exp, _vis_pos, K, dc)
-            _lc_p    = (R_exp @ _vis_pos.T).T + tvec_exp.reshape(3)
-            _cost_p  = cdist(_proj_p, blobs)
-            if blob_radii is not None:
-                for _k in range(len(_vis_ids)):
-                    _d  = float(max(_lc_p[_k, 2], 0.01))
-                    _ep = focal_px * (led_radius_mm / 1000.0) / _d
-                    _inelig_p = ((blob_radii < _ep * blob_size_min_factor) |
-                                 (blob_radii > _ep * blob_size_max_factor))
-                    _cost_p[_k, _inelig_p] = 1e9
-                    if _log_size_filter:
-                        for _c in np.where(_inelig_p)[0]:
-                            logger.debug(
-                                f"  LED {int(_vis_ids[_k])}: blob {_c}"
-                                f" size-filtered (proj-fallback Hungarian)"
-                                f"  r={blob_radii[_c]:.2f}  expected"
-                                f" {_ep*blob_size_min_factor:.2f}–{_ep*blob_size_max_factor:.2f}px"
-                            )
-            _row_p, _col_p = linear_sum_assignment(_cost_p)
-            _pp, _lo_pp, _li_pp = [], [], []
-            for _r, _c in zip(_row_p, _col_p):
-                if _cost_p[_r, _c] < _proj_snap_px:
-                    _lid = int(_vis_ids[_r])
-                    _pp.append((int(_c), _lid))
-                    _lo_pp.append(self.model.positions[_lid])
-                    _li_pp.append(blobs[_c])
-            logger.debug(
-                f"[{_ctrl} | cam {_cam}] Proximity projection fallback attempt: "
-                f"{len(_pp)}/{len(_vis_ids)} visible LEDs matched (snap_px={_proj_snap_px:.1f})"
-            )
-            if len(_pp) >= min_inliers:
-                _ok_p, _rv_p, _tv_p, _ri_p = _ransac_pnp(
-                    np.array(_lo_pp, np.float32), np.array(_li_pp, np.float32),
-                    K, dc, rvec_exp, tvec_exp,
-                    reprojection_px=reprojection_threshold,
-                )
-                if _ok_p and _ri_p is not None:
-                    _fp_p = [_pp[_k] for _k in _ri_p]
-                    if len(_fp_p) >= min_inliers:
-                        _lo_p = self.model.positions[[_l for _, _l in _fp_p]].astype(np.float32)
-                        _li_p = blobs[[_b for _b, _ in _fp_p]].astype(np.float32)
-                        _pe_p = np.linalg.norm(_project_points(_rv_p, _tv_p, _lo_p, K, dc) - _li_p, axis=1)
-                        _err_p = float(_pe_p.mean())
-                        if _err_p < error:
-                            rvec, tvec = _rv_p, _tv_p
-                            final_pairs = _fp_p
-                            lo_f, li_f  = _lo_p, _li_p
-                            error       = _err_p
-                            max_error   = float(_pe_p.max())
-                            _did_proj_fallback = True
-                            logger.debug(
-                                f"[{_ctrl} | cam {_cam}] Proximity projection fallback: "
-                                f"inliers={len(_fp_p)}  err={_err_p:.2f}px"
-                            )
-                        else:
-                            logger.debug(
-                                f"[{_ctrl} | cam {_cam}] Proximity projection fallback: "
-                                f"err={_err_p:.2f}px not better than snap err={error:.2f}px → snap kept"
-                            )
-                else:
-                    logger.debug(f"[{_ctrl} | cam {_cam}] Proximity projection fallback: RANSAC failed or too few inliers")
-            else:
-                logger.debug(f"[{_ctrl} | cam {_cam}] Proximity projection fallback: too few Hungarian pairs ({len(_pp)} < {min_inliers})")
-
-    if final_pairs is None:
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: no valid solution → None")
+    if not ok or ransac_idx is None:
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC failed → None")
         return None
 
-    # Post-RANSAC aux snap: re-project prior LEDs into each aux camera using the refined
-    # pose, then greedy-snap with radii filter. Expanded pairs (new LEDs found during
-    # gen-cam expansion) are merged in, deduplicating by LED and blob index.
+    final_pairs = [pairs[k] for k in ransac_idx]
+    if len(final_pairs) < min_inliers:
+        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC too few inliers ({len(final_pairs)}) → None")
+        return None
+
+    lo_f = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
+    li_f = blobs[[b for b, _ in final_pairs]].astype(np.float32)
+    pe   = np.linalg.norm(_project_points(rvec, tvec, lo_f, K, dc) - li_f, axis=1)
+    error     = float(pe.mean())
+    max_error = float(pe.max())
+
+    # RANSAC-confirmed inlier LEDs used as anchors for aux camera snapping.
+    final_lids = [lid for _, lid in final_pairs]
+    final_obj  = self.model.positions[final_lids].astype(np.float32)
+
+    aux_snapped_per_cam: Dict[int, List] = {}
+
+    # Post-RANSAC aux snap: re-project RANSAC-inlier LEDs into each aux camera using
+    # the refined pose, then greedy-snap with radii filter, followed by Hungarian
+    # expansion for any remaining visible-but-unmatched LEDs.
     if other_cameras_blobs:
         _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
         _T_world_ref = self.T_world_cam.compose(Transform(_R_ref, np.asarray(tvec, dtype=np.float32).reshape(3)))
@@ -668,24 +390,22 @@ def proximity_match(
                 _R_i_r    = _T_ci_r.R.astype(np.float32)
                 _t_i_r    = _T_ci_r.t.astype(np.float32)
                 _rv_i_r, _ = cv2.Rodrigues(_R_i_r)
-                _proj_i_r  = _project_points(_rv_i_r, _t_i_r, prior_obj,
+                _proj_i_r  = _project_points(_rv_i_r, _t_i_r, final_obj,
                                               _ocam.camera_matrix, _ocam.dist_coeffs)
-                _led_ci_r  = (_R_i_r @ prior_obj.T).T + _t_i_r
+                _led_ci_r  = (_R_i_r @ final_obj.T).T + _t_i_r
                 _focal_i_r = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
-                _depth_i_r = np.maximum(_led_ci_r[:, 2], 0.01)
-                _snap_i_r  = _focal_i_r * (led_radius_mm / 1000.0) / _depth_i_r * snap_factor
-                _exp_px_i_r = _focal_i_r * (led_radius_mm / 1000.0) / _depth_i_r
+                _exp_px_i_r = _focal_i_r * (led_radius_mm / 1000.0) / np.maximum(_led_ci_r[:, 2], 0.01)
 
                 _used_l_r: set = set()
                 for _j in range(len(_oblobs)):
                     _blob_r_j = float(_oradii[_j]) if _oradii is not None else None
                     _best_ii  = -1
                     _best_sc  = float('inf')
-                    for _ii, _lid in enumerate(prior_lids):
+                    for _ii, _lid in enumerate(final_lids):
                         if _ii in _used_l_r:
                             continue
                         _dist = float(np.linalg.norm(_oblobs[_j] - _proj_i_r[_ii]))
-                        if _dist >= _snap_i_r[_ii] or _dist >= _aux_snap_px:
+                        if _dist >= _aux_snap_px:
                             continue
                         if _blob_r_j is not None:
                             _ep = float(_exp_px_i_r[_ii])
@@ -697,7 +417,7 @@ def proximity_match(
                             _best_sc = _score
                             _best_ii = _ii
                     if _best_ii >= 0:
-                        _pairs_i.append((_j, prior_lids[_best_ii]))
+                        _pairs_i.append((_j, final_lids[_best_ii]))
                         _used_l_r.add(_best_ii)
 
                 # Independent aux expansion: re-evaluate coverage with the refined pose
@@ -778,9 +498,6 @@ def proximity_match(
         aux_cameras_result.append((_aux_cam_idx, _n_aux))
 
     # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
-    _method_suffix = ("_proj_fallback" if _did_proj_fallback
-                      else "_expanded" if did_expand
-                      else "_locked")
     if bool(_cfg.get('joint_optimization', True)) and aux_snapped_per_cam:
         _aux_joint = [
             (_ocam, np.asarray(_oblobs, dtype=np.float32),
@@ -831,7 +548,6 @@ def proximity_match(
                         f"err={_err_aux_j:.2f}px  ({len(_aux_pr_j)} pairs)"
                     )
                 rvec, tvec, error = _rv_j, _tv_j, _err_j
-                _method_suffix += "_mc"
 
     _aux_log = ""
     if aux_cameras_result:
@@ -842,7 +558,7 @@ def proximity_match(
         "tvec":       tvec,
         "error":      error,
         "assignment": final_pairs,
-        "method":          "proximity" + _method_suffix,
+        "method":          "proximity_hungarian",
         "aux_inliers":     aux_inlier_count,
         "aux_cameras":     aux_cameras_result or None,
         "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,

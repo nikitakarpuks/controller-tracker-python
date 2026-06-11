@@ -758,7 +758,8 @@ class ControllerAnimatorRerun:
             for bid, _ in ((assignments_per_ctrl or {}).get(ctrl_name) or []):
                 ctrl_bids[pri].add(bid)
             for aux_ci, pairs in ((aux_assignments_per_ctrl or {}).get(ctrl_name) or {}).items():
-                ctrl_bids[aux_ci] = {bid for bid, _ in pairs}
+                if aux_ci != pri:
+                    ctrl_bids[aux_ci] = {bid for bid, _ in pairs}
             matched_bids_per_ctrl_cam[ctrl_name] = ctrl_bids
 
         # ── Blobs per controller per camera ─────────────────────────────────
@@ -1066,6 +1067,8 @@ class ControllerAnimatorRerun:
 
             # ── Aux cameras overlay ─────────────────────────────────────────
             for _aux_ci, _aux_pairs in (aux_assignments or {}).items():
+                if _aux_ci == primary_cam_idx:
+                    continue  # primary already rendered above
                 _acp     = f"{ctrl_path}/camera_{_aux_ci}"
                 _aux_cam = self._cameras.get(_aux_ci)
                 if _aux_cam is None or not _aux_pairs:

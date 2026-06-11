@@ -486,9 +486,16 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         vis = np.vstack([vis, strip])
 
         if img_path is not None:
-            out_dir = Path("./visualization/blobs")
+            suffix_stripped = vis_suffix.lstrip("_")
+            pass_type = "main"
+            for _pt in ("pass1", "pass2", "pose"):
+                if suffix_stripped.endswith("_" + _pt):
+                    pass_type = _pt
+                    suffix_stripped = suffix_stripped[: -len("_" + _pt)]
+                    break
+            out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / pass_type
             out_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}_blobs{vis_suffix}.png"), vis)
+            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), vis)
 
     return (filtered_centroids, filtered_contours, filtered_radii,
             filtered_brightnesses,

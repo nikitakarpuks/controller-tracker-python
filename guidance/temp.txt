@@ -424,3 +424,24 @@
   150 | `max_area` model: `a/d+b` vs `a/d²+b` | Determine from Step 2 R² values |
   151 | How to handle frame where one controller is tracked, other is cold | Pose-guided for tracked one; 2-pass adaptive for cold one — needs th
       ought |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      I think passing large areas and handle all possible cases is the wrong way.
+  So, answering your question, we now are talking about only the pose-based blob detection. Current 2 pass cold approach should stay the same.
+  So, with warm case we have a prediction for our controller next position, this is the frame we are looking blobs in.
+  Currently we use just the controller depth. What about extending this idea:
+  1) so we have this pose prediction. We can easily check which leds are theoretically visible in this pose and
