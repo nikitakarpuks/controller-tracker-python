@@ -140,10 +140,9 @@ matching:
   proximity_min_inliers: 3               # min inliers for proximity match (can be lower than min_inliers
                                           # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
-  proximity_expansion_px: 10.0           # Hungarian acceptance gate (px): max cost-matrix distance to accept a pair
-  proximity_expansion_threshold: 0.7    # aux-camera expansion: run Hungarian for unmatched LEDs if pairs/visible < this
-  aux_snap_px: 15.0                     # snap cap for aux cameras (looser than primary — calibration offsets)
-  proximity_mutual_exclusion_px: 15.0  # Phase 3 radius: blobs within this of a later controller's projected
+  proximity_expansion_px: 8.0           # Hungarian acceptance gate (px): max cost-matrix distance to accept a pair
+  aux_snap_px: 15.0                     # Hungarian acceptance gate for aux cameras (looser — calibration offsets)
+  proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
   voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs
                                         # within this distance of either controller's LEDs (full Voronoi territory)
