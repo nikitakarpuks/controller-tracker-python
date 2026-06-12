@@ -5,6 +5,7 @@ from loguru import logger
 from typing import List, Tuple, Optional, Dict, Set
 
 from src._pnp import _project_points
+from src._visibility import _visible_mask
 from src.camera import Camera
 from src.debug_config import is_deep
 from src.geometry import Box3D, Cylinder3D, ControllerGeometry
@@ -694,6 +695,84 @@ class TrackingSystem:
                 else:
                     depths[ctrl_name] = float(np.asarray(tracker.prev_pose[1]).reshape(3)[2])
             result[cam_id] = depths
+        return result
+
+    def get_designated_primary_cameras(self) -> Dict[str, Optional[int]]:
+        """Return {ctrl_name: primary_cam_id} as of the last successful tracking frame.
+
+        Used at detection time to choose per-camera search radii before tracking runs.
+        None means no designation exists yet (cold start); callers should treat all
+        cameras as equally primary in that case.
+        """
+        ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
+        return {name: self._designated_primary.get(name) for name in ctrl_names}
+
+    def get_predicted_led_projections_per_camera(self) -> Dict[int, Dict[str, Optional[np.ndarray]]]:
+        """Return {cam_id: {ctrl_name: Nx4 array or None}}.
+
+        Each row: [proj_x, proj_y, depth_m, facing_cos]
+        for each LED visible from the predicted pose.
+        facing_cos is the cosine of the LED's emission angle toward the camera
+        (positive = LED faces the camera, 1.0 = head-on).
+        None when no prior pose exists for this (ctrl, cam) pair.
+        """
+        ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
+        _facing_deg  = float(self._matching_cfg.get('led_facing_angle_deg', 86.0))
+        result: Dict[int, Dict[str, Optional[np.ndarray]]] = {}
+
+        for cam_id, camera in self.cameras.items():
+            proj_per_ctrl: Dict[str, Optional[np.ndarray]] = {}
+            for ctrl_name in ctrl_names:
+                tracker = self.trackers.get((ctrl_name, cam_id))
+                if tracker is None or tracker.prev_pose is None:
+                    proj_per_ctrl[ctrl_name] = None
+                    continue
+
+                if tracker.prev_prev_pose is not None:
+                    rvec_pred, tvec_pred = SingleViewTracker._extrapolate_pose(
+                        tracker.prev_pose[0], tracker.prev_pose[1],
+                        tracker.prev_prev_pose[0], tracker.prev_prev_pose[1],
+                    )
+                else:
+                    rvec_pred = np.asarray(tracker.prev_pose[0], np.float32).reshape(3, 1)
+                    tvec_pred = np.asarray(tracker.prev_pose[1], np.float32).reshape(3)
+
+                R_pred, _ = cv2.Rodrigues(rvec_pred.reshape(3, 1))
+                R_pred    = R_pred.astype(np.float32)
+                tvec_pred = tvec_pred.reshape(3).astype(np.float32)
+
+                positions = tracker.model.positions
+                normals   = tracker.model.normals
+
+                vis_mask = _visible_mask(
+                    R_pred, tvec_pred, positions, normals, tracker._geometry,
+                    cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
+                    cam_w=camera.width, cam_h=camera.height, cam_rpmax=camera.rpmax,
+                    facing_threshold_deg=_facing_deg,
+                )
+                vis_ids = np.where(vis_mask)[0]
+                if len(vis_ids) == 0:
+                    proj_per_ctrl[ctrl_name] = None
+                    continue
+
+                proj_pts = _project_points(
+                    rvec_pred, tvec_pred, positions[vis_ids],
+                    camera.camera_matrix, camera.dist_coeffs,
+                )  # (M, 2)
+
+                led_cam     = (R_pred @ positions[vis_ids].T).T + tvec_pred  # (M, 3)
+                depths      = led_cam[:, 2]                                   # (M,)
+                view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
+                normals_cam = (R_pred @ normals[vis_ids].T).T                 # (M, 3)
+                facing_cos  = -(normals_cam * view_dir).sum(axis=1)           # positive = faces cam
+
+                proj_per_ctrl[ctrl_name] = np.column_stack([
+                    proj_pts.astype(np.float32),
+                    depths.astype(np.float32).reshape(-1, 1),
+                    facing_cos.astype(np.float32).reshape(-1, 1),
+                ])  # (M, 4)
+
+            result[cam_id] = proj_per_ctrl
         return result
 
     def get_ctrl_processing_order(self) -> List[str]:

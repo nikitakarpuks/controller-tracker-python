@@ -86,6 +86,10 @@ blob_detection:
   pass2_threshold_ema_alpha: 0.25       # EMA weight on the newly computed threshold (0=frozen, 1=no smoothing); smooths frame-to-frame instability
   pass2_count_gate_max_factor: 1.7      # skip EMA update if blob count changes by more than this factor between frames (count jump = scene transition, not brightness change)
 
+  # Per-LED local search (active when a predicted pose is available)
+  # Search radius is read from matching.proximity_expansion_px / matching.aux_snap_px
+  # so detection and matching operate over the identical distance gate.
+  local_search_depth_k: 0.0            # extra radius added on top of the base: r = base + k/depth_m (0 = fixed radius)
   blob_cross_mask_margin_px: 3          # extra pixels added to each matched-blob radius when masking ctrl A's blobs from ctrl B's detection image
 
   # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
@@ -140,8 +144,8 @@ matching:
   proximity_min_inliers: 3               # min inliers for proximity match (can be lower than min_inliers
                                           # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
-  proximity_expansion_px: 8.0           # Hungarian acceptance gate (px): max cost-matrix distance to accept a pair
-  aux_snap_px: 15.0                     # Hungarian acceptance gate for aux cameras (looser — calibration offsets)
+  proximity_expansion_px: 15.0           # Hungarian acceptance gate (px): max cost-matrix distance to accept a pair
+  aux_snap_px: 20.0                     # Hungarian acceptance gate for aux cameras (looser — calibration offsets)
   proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
   voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs
