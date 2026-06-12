@@ -99,7 +99,8 @@ def _split_blob_at_seeds(image, intensities, ys, xs, seed_a, seed_b):
 def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    visualize=False, img_path=None, vis_suffix="",
                    max_area_override=None, min_area_override=None,
-                   interior_exclude_blobs=None):
+                   interior_exclude_blobs=None,
+                   skip_spatial_outlier=False):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -371,9 +372,11 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     keep_mask &= circ_keep_mask
 
     # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
+    # Skipped in local-search mode: LED projections are spatially spread across
+    # the image so outer-ring LEDs would be wrongly rejected as isolated.
     candidates   = centroids_arr[keep_mask]
     min_nn_full  = np.full(len(centroids_arr), np.inf)
-    if len(candidates) > 1:
+    if not skip_spatial_outlier and len(candidates) > 1:
         diffs    = candidates[:, None, :] - candidates[None, :, :]
         sq_dists = (diffs ** 2).sum(axis=-1)
         np.fill_diagonal(sq_dists, np.inf)
@@ -488,7 +491,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         if img_path is not None:
             suffix_stripped = vis_suffix.lstrip("_")
             pass_type = "main"
-            for _pt in ("pass1", "pass2", "pose"):
+            for _pt in ("pass1", "pass2", "pose", "local"):
                 if suffix_stripped.endswith("_" + _pt):
                     pass_type = _pt
                     suffix_stripped = suffix_stripped[: -len("_" + _pt)]
@@ -536,6 +539,83 @@ def _eval_model(block: dict, depth: float) -> float:
     return a / depth + b
 
 
+def _detect_blobs_local(image, led_projections, cfg,
+                        visualize=False, img_path=None, vis_suffix="",
+                        search_radius_px=None):
+    """
+    Pose-guided local blob detection using predicted LED projections.
+
+    led_projections : (N, 4) float32 — [proj_x, proj_y, depth_m, facing_cos]
+                      for each theoretically visible LED from the predicted pose.
+                      facing_cos (reserved for future per-zone threshold logic).
+
+    Builds a binary search mask from circular ROIs around each LED projection,
+    zeros out image pixels outside those regions, then runs the full _detect_blobs()
+    pipeline on the masked image.  The spatial-outlier (DBSCAN) filter is disabled
+    because LED projections are spread across the image and outer-ring LEDs would
+    be wrongly rejected as isolated.  All other filters (circularity, split) run
+    as normal.
+
+    Thresholds use the existing pose_guided_thresholds model evaluated at the median
+    LED depth.  Per-zone adaptive thresholds will be added in a later pass.
+
+    Returns the same 7-tuple as _detect_blobs().
+    """
+    pg      = cfg.get("pose_guided_thresholds")
+    base_px = float(search_radius_px if search_radius_px is not None else 8.0)
+    depth_k = float(cfg.get("local_search_depth_k",  0.0))
+
+    base_pixel_thr = int(cfg["min_threshold"])
+    base_req_thr   = int(cfg.get("required_threshold", base_pixel_thr * 2))
+
+    # Global thresholds from median LED depth (per-zone will replace this later)
+    depths       = led_projections[:, 2]
+    valid_depths = depths[depths > 0]
+    median_depth = float(np.median(valid_depths)) if len(valid_depths) > 0 else None
+
+    if pg and median_depth is not None:
+        pixel_thr = max(int(_eval_model(pg["pixel_threshold"],    median_depth)), base_pixel_thr)
+        req_thr   = max(int(_eval_model(pg["required_threshold"], median_depth)), base_req_thr)
+        max_area  = _eval_model(pg["max_area"], median_depth)
+    else:
+        pixel_thr = base_pixel_thr
+        req_thr   = base_req_thr
+        max_area  = None
+
+    # Build search mask: union of circles around each LED projection
+    h_img, w_img = image.shape[:2]
+    search_mask  = np.zeros((h_img, w_img), dtype=np.uint8)
+    for proj_x, proj_y, depth_m, _facing_cos in led_projections:
+        search_r = int(round(base_px + (depth_k / max(float(depth_m), 0.01))))
+        cv2.circle(search_mask, (int(round(proj_x)), int(round(proj_y))), search_r, 255, -1)
+
+    masked_image = cv2.bitwise_and(image, image, mask=search_mask)
+
+    result = _detect_blobs(masked_image, pixel_thr, req_thr, cfg,
+                           visualize=visualize, img_path=img_path,
+                           vis_suffix=f"{vis_suffix}_local",
+                           max_area_override=max_area,
+                           skip_spatial_outlier=True)
+
+    # Overlay search circles on the saved visualization
+    if visualize and img_path is not None:
+        suffix_stripped = vis_suffix.lstrip("_")
+        out_dir  = Path("./visualization/blobs") / (suffix_stripped or "default") / "local"
+        out_path = out_dir / f"{Path(img_path).stem}.png"
+        if out_path.exists():
+            vis = cv2.imread(str(out_path))
+            if vis is not None:
+                C_ROI  = (0, 180, 0)    # green — search circle
+                C_PRED = (80,  80, 255) # red   — predicted centre
+                for proj_x, proj_y, depth_m, _facing_cos in led_projections:
+                    sr = int(round(base_px + (depth_k / max(float(depth_m), 0.01))))
+                    cv2.circle(vis, (int(round(proj_x)), int(round(proj_y))), sr,  C_ROI,  1)
+                    cv2.circle(vis, (int(round(proj_x)), int(round(proj_y))), 2,   C_PRED, -1)
+                cv2.imwrite(str(out_path), vis)
+
+    return result
+
+
 def get_pass2_params(cam_idx) -> dict | None:
     """Return the pass-2 thresholds last used for cam_idx, or None if pass-2 did not run."""
     mem = _pass2_memory.get(cam_idx if cam_idx is not None else 0)
@@ -549,12 +629,20 @@ def get_pass2_params(cam_idx) -> dict | None:
 
 
 def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None,
-                  predicted_depth=None, ctrl_label=""):
+                  predicted_depth=None, ctrl_label="", predicted_leds=None,
+                  local_search_radius_px=None):
     pixel_threshold    = int(cfg["min_threshold"])
     required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
 
     cam_str  = f"_cam{cam_idx}" if cam_idx is not None else ""
     ctrl_str = f"_{ctrl_label}" if ctrl_label else ""
+
+    # ── Per-LED local search (preferred when predicted projections are available) ─
+    if predicted_leds is not None and len(predicted_leds) > 0:
+        return _detect_blobs_local(image, predicted_leds, cfg,
+                                   visualize, img_path,
+                                   f"{cam_str}{ctrl_str}",
+                                   search_radius_px=local_search_radius_px)
 
     # ── Pose-guided single-pass path ──────────────────────────────────────────
     pg = cfg.get("pose_guided_thresholds") if predicted_depth is not None else None

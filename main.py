@@ -137,6 +137,8 @@ def main():
         # cam_images: {cam_idx: numpy array}
 
         depth_hints        = tracking_system.get_predicted_depths_per_camera()
+        proj_hints         = tracking_system.get_predicted_led_projections_per_camera()
+        primary_cams       = tracking_system.get_designated_primary_cameras()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
 
@@ -158,12 +160,24 @@ def main():
                 predicted_depth = depth_hints.get(cam_idx, {}).get(ctrl_name)
                 if predicted_depth is not None and predicted_depth <= 0:
                     predicted_depth = None
+                predicted_leds  = proj_hints.get(cam_idx, {}).get(ctrl_name)
+                # No visible LEDs on this camera → suppress depth hint so the
+                # pose-guided single-pass doesn't fire; fall through to two-pass.
+                if predicted_leds is None:
+                    predicted_depth = None
+                _primary_cam   = primary_cams.get(ctrl_name)
+                _is_primary    = (_primary_cam is None or cam_idx == _primary_cam)
+                _match_cfg     = config["matching"]
+                _local_r_px    = (_match_cfg.get("proximity_expansion_px", 8.0) if _is_primary
+                                  else _match_cfg.get("aux_snap_px", 15.0))
                 t0 = time()
                 blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
                     cam_images[cam_idx], config["blob_detection"],
                     visualize=config["blob_detection"]["visualize"],
                     img_path=img_path, cam_idx=cam_idx, predicted_depth=predicted_depth,
                     ctrl_label=ctrl_name.replace("_controller", ""),
+                    predicted_leds=predicted_leds,
+                    local_search_radius_px=_local_r_px,
                 )
                 logger.info(f"blob detection took {time() - t0} seconds")
 
