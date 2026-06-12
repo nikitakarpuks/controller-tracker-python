@@ -1,10 +1,10 @@
 data:
 #  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves/data"
-  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/aa"
+  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
-  selected_cameras: [0, 1, 2, 3] # [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0] # [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
   intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -61,7 +61,7 @@ blob_detection:
     pixel_threshold:
       model: 'inv_depth_sq'   # a/d²+b  R²=0.8532
       a: 0.179539
-      b: 13.0
+      b: 7.0
     required_threshold:
       model: 'inv_depth_sq'   # a/d²+b  R²=0.8764
       a: 0.312337
@@ -71,7 +71,7 @@ blob_detection:
       a: 0.759220
       b: 32.0
   visualize: true
-  min_threshold: 8       # pixels >= this are included in a blob
+  min_threshold: 6       # pixels >= this are included in a blob
   required_threshold: 13  # blob must contain at least one pixel >= this (filters dim noise)
   min_area: 3
   max_area: 250
@@ -156,6 +156,11 @@ matching:
   # --------------------------------------------------------------------------
   first_controller: "right"            # "right" or "left": which controller runs first and claims blobs first
                                         # when both controllers have equal tracking status (both tracked or both cold)
+
+  # --------------------------------------------------------------------------
+  # Pose prediction
+  # --------------------------------------------------------------------------
+  pose_history_window: 5    # max poses kept for _predict_pose; 1=constant pos, 2=const vel, 3+=polynomial fit
 
   # --------------------------------------------------------------------------
   # Pose validation

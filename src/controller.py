@@ -1,6 +1,7 @@
 import copy
 import cv2
 import numpy as np
+from collections import deque
 from loguru import logger
 from typing import List, Tuple, Optional, Dict, Set
 
@@ -226,6 +227,9 @@ class SingleViewTracker:
 
         self._matching_cfg = matching_cfg or {}
 
+        _window = int(self._matching_cfg.get('pose_history_window', 5))
+        self.pose_history: deque = deque(maxlen=_window)
+
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
 
@@ -368,21 +372,75 @@ class SingleViewTracker:
         return False
 
     @staticmethod
-    def _extrapolate_pose(rvec_n, tvec_n, rvec_nm1, tvec_nm1):
+    def _predict_pose(
+        pose_history,
+        weight_decay: float = 0.7,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Predict pose at frame n+1 from pose history.
+
+        pose_history[0] = most recent (rvec, tvec); index increases toward older frames.
+
+        n=0 → None (no information)
+        n=1 → constant position (same pose)
+        n=2 → constant-velocity extrapolation (original behavior, matrix-based rotation)
+        n>=3 → weighted degree-2 polynomial fit; exponential weights (weight_decay^i)
         """
-        Constant-velocity extrapolation: predict pose at frame n+1.
+        n = len(pose_history)
 
-        Translation: tvec_{n+1} = 2*tvec_n - tvec_{n-1}
-        Rotation: R_delta = R_n @ R_{n-1}.T; R_{n+1} = R_delta @ R_n
-        """
-        tvec_pred = 2.0 * np.asarray(tvec_n, np.float64).reshape(3) - np.asarray(tvec_nm1, np.float64).reshape(3)
+        if n == 0:
+            return None
 
-        R_n,   _ = cv2.Rodrigues(np.asarray(rvec_n,   np.float32).reshape(3, 1))
-        R_nm1, _ = cv2.Rodrigues(np.asarray(rvec_nm1, np.float32).reshape(3, 1))
-        R_pred    = (R_n @ R_nm1.T) @ R_n
-        rvec_pred, _ = cv2.Rodrigues(R_pred.astype(np.float32))
+        if n == 1:
+            return (
+                np.asarray(pose_history[0][0], np.float32).reshape(3, 1),
+                np.asarray(pose_history[0][1], np.float32).reshape(3),
+            )
 
-        return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3).astype(np.float32)
+        if n == 2:
+            rvec_n   = np.asarray(pose_history[0][0], np.float32).reshape(3, 1)
+            tvec_n   = np.asarray(pose_history[0][1], np.float64).reshape(3)
+            rvec_nm1 = np.asarray(pose_history[1][0], np.float32).reshape(3, 1)
+            tvec_nm1 = np.asarray(pose_history[1][1], np.float64).reshape(3)
+
+            tvec_pred = (2.0 * tvec_n - tvec_nm1).astype(np.float32)
+
+            R_n,   _ = cv2.Rodrigues(rvec_n)
+            R_nm1, _ = cv2.Rodrigues(rvec_nm1)
+            R_pred    = (R_n @ R_nm1.T) @ R_n
+            rvec_pred, _ = cv2.Rodrigues(R_pred.astype(np.float32))
+
+            return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
+
+        # n >= 3: weighted degree-2 polynomial fit
+        # time axis: most recent pose = t=0, one frame older = t=-1, …; predict at t=+1
+        t_pts   = -np.arange(n, dtype=np.float64)
+        weights = weight_decay ** np.arange(n, dtype=np.float64)
+
+        # Translation: polynomial fit per axis
+        tvecs = np.stack([np.asarray(p[1], np.float64).reshape(3) for p in pose_history])
+        tvec_pred = np.empty(3, dtype=np.float32)
+        for ax in range(3):
+            tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=2, w=weights), 1.0)
+
+        # Rotation: polynomial fit in the tangent space of R_0 (most recent rotation).
+        # rel_rvecs[i] = log(R_0^T @ R_i) — rotation from current pose back to the i-th
+        # historical pose, expressed as a Rodrigues vector. These are always small-angle
+        # deltas and avoid the ±π discontinuity of fitting absolute Rodrigues components.
+        R_0, _ = cv2.Rodrigues(np.asarray(pose_history[0][0], np.float32).reshape(3, 1))
+        rel_rvecs = np.zeros((n, 3), dtype=np.float64)  # rel_rvecs[0] = [0,0,0] by definition
+        for i in range(1, n):
+            R_i, _ = cv2.Rodrigues(np.asarray(pose_history[i][0], np.float32).reshape(3, 1))
+            rv, _ = cv2.Rodrigues((R_0.T @ R_i).astype(np.float32))
+            rel_rvecs[i] = rv.reshape(3)
+
+        rvec_rel_pred = np.empty(3, dtype=np.float32)
+        for ax in range(3):
+            rvec_rel_pred[ax] = np.polyval(np.polyfit(t_pts, rel_rvecs[:, ax], deg=2, w=weights), 1.0)
+
+        R_rel_pred, _ = cv2.Rodrigues(rvec_rel_pred.reshape(3, 1).astype(np.float32))
+        rvec_pred, _ = cv2.Rodrigues((R_0 @ R_rel_pred).astype(np.float32))
+
+        return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
 
     # -----------------------------------------------------
     # Tracking
@@ -455,14 +513,7 @@ class SingleViewTracker:
                 np.asarray(tvec, dtype=np.float32).reshape(3),
             )
 
-        # Pose prediction: constant-velocity extrapolation from the last two frames.
-        if self.prev_pose is not None and self.prev_prev_pose is not None:
-            predicted_pose = self._extrapolate_pose(
-                self.prev_pose[0],      self.prev_pose[1],
-                self.prev_prev_pose[0], self.prev_prev_pose[1],
-            )
-        else:
-            predicted_pose = self.prev_pose
+        predicted_pose = self._predict_pose(self.pose_history)
 
         # ------------------------------------------------------------------
         # Candidate search
@@ -585,8 +636,12 @@ class SingleViewTracker:
                 f"[{ctrl_name} | cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
             )
-            self.prev_prev_pose  = self.prev_pose  # shift window for next-frame extrapolation
+            self.prev_prev_pose  = self.prev_pose
             self.prev_pose       = (solution["rvec"], solution["tvec"])
+            self.pose_history.appendleft((
+                np.asarray(solution["rvec"], np.float32).reshape(3, 1),
+                np.asarray(solution["tvec"], np.float32).reshape(3),
+            ))
             self.prev_assignment = solution["assignment"]
             self.last_good_pose       = self.prev_pose
             self.last_good_assignment = self.prev_assignment
@@ -608,6 +663,7 @@ class SingleViewTracker:
         self.prev_pose       = None
         self.prev_prev_pose  = None
         self.prev_assignment = None
+        self.pose_history.clear()
         return None
 
 
@@ -672,10 +728,9 @@ class TrackingSystem:
 
 
     def get_predicted_depths_per_camera(self) -> Dict[int, Dict[str, Optional[float]]]:
-        """Return {cam_id: {ctrl_name: depth}} using extrapolated tvec[2].
+        """Return {cam_id: {ctrl_name: depth}} using predicted tvec[2].
 
-        Uses constant-velocity extrapolation when prev_prev_pose is available;
-        falls back to prev_pose depth. None where no prior pose exists.
+        Uses _predict_pose over full pose history. None where no prior pose exists.
         """
         ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
         result: Dict[int, Dict[str, Optional[float]]] = {}
@@ -683,17 +738,11 @@ class TrackingSystem:
             depths: Dict[str, Optional[float]] = {}
             for ctrl_name in ctrl_names:
                 tracker = self.trackers.get((ctrl_name, cam_id))
-                if tracker is None or tracker.prev_pose is None:
+                pred = SingleViewTracker._predict_pose(tracker.pose_history) if tracker else None
+                if pred is None:
                     depths[ctrl_name] = None
                     continue
-                if tracker.prev_prev_pose is not None:
-                    _, tvec_pred = SingleViewTracker._extrapolate_pose(
-                        tracker.prev_pose[0],      tracker.prev_pose[1],
-                        tracker.prev_prev_pose[0], tracker.prev_prev_pose[1],
-                    )
-                    depths[ctrl_name] = float(tvec_pred[2])
-                else:
-                    depths[ctrl_name] = float(np.asarray(tracker.prev_pose[1]).reshape(3)[2])
+                depths[ctrl_name] = float(pred[1][2])
             result[cam_id] = depths
         return result
 
@@ -724,18 +773,11 @@ class TrackingSystem:
             proj_per_ctrl: Dict[str, Optional[np.ndarray]] = {}
             for ctrl_name in ctrl_names:
                 tracker = self.trackers.get((ctrl_name, cam_id))
-                if tracker is None or tracker.prev_pose is None:
+                pred = SingleViewTracker._predict_pose(tracker.pose_history) if tracker else None
+                if pred is None:
                     proj_per_ctrl[ctrl_name] = None
                     continue
-
-                if tracker.prev_prev_pose is not None:
-                    rvec_pred, tvec_pred = SingleViewTracker._extrapolate_pose(
-                        tracker.prev_pose[0], tracker.prev_pose[1],
-                        tracker.prev_prev_pose[0], tracker.prev_prev_pose[1],
-                    )
-                else:
-                    rvec_pred = np.asarray(tracker.prev_pose[0], np.float32).reshape(3, 1)
-                    tvec_pred = np.asarray(tracker.prev_pose[1], np.float32).reshape(3)
+                rvec_pred, tvec_pred = pred
 
                 R_pred, _ = cv2.Rodrigues(rvec_pred.reshape(3, 1))
                 R_pred    = R_pred.astype(np.float32)
@@ -1107,6 +1149,7 @@ class TrackingSystem:
                         )
                         _fb_tracker.prev_pose      = None
                         _fb_tracker.prev_prev_pose = None
+                        _fb_tracker.pose_history.clear()
                     _fb_other = [
                         (self.cameras[cid], av[0], av[1])
                         for cid, av in avail.items() if cid != _fb_cid
@@ -1218,6 +1261,7 @@ class TrackingSystem:
                     _tracker.prev_prev_pose = _tracker.prev_pose
                     _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
                     _tracker.last_good_pose = _tracker.prev_pose
+                    _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np))
                     _aux_asgn = aux_asgns.get(_cid)
                     if _aux_asgn is not None:
                         _tracker.prev_assignment      = _aux_asgn
@@ -1252,6 +1296,7 @@ class TrackingSystem:
                                 if _new_primary_trk is not None:
                                     _new_primary_trk.prev_pose      = None
                                     _new_primary_trk.prev_prev_pose = None
+                                    _new_primary_trk.pose_history.clear()
                                 _hctr.clear()
                         else:
                             _hctr[_aux_cid] = 0
