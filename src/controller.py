@@ -727,24 +727,6 @@ class TrackingSystem:
                 self._designated_primary[ctrl.name] = self._fixed_primary_cam
 
 
-    def get_predicted_depths_per_camera(self) -> Dict[int, Dict[str, Optional[float]]]:
-        """Return {cam_id: {ctrl_name: depth}} using predicted tvec[2].
-
-        Uses _predict_pose over full pose history. None where no prior pose exists.
-        """
-        ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
-        result: Dict[int, Dict[str, Optional[float]]] = {}
-        for cam_id in self.cameras:
-            depths: Dict[str, Optional[float]] = {}
-            for ctrl_name in ctrl_names:
-                tracker = self.trackers.get((ctrl_name, cam_id))
-                pred = SingleViewTracker._predict_pose(tracker.pose_history) if tracker else None
-                if pred is None:
-                    depths[ctrl_name] = None
-                    continue
-                depths[ctrl_name] = float(pred[1][2])
-            result[cam_id] = depths
-        return result
 
     def get_designated_primary_cameras(self) -> Dict[str, Optional[int]]:
         """Return {ctrl_name: primary_cam_id} as of the last successful tracking frame.
@@ -757,12 +739,13 @@ class TrackingSystem:
         return {name: self._designated_primary.get(name) for name in ctrl_names}
 
     def get_predicted_led_projections_per_camera(self) -> Dict[int, Dict[str, Optional[np.ndarray]]]:
-        """Return {cam_id: {ctrl_name: Nx4 array or None}}.
+        """Return {cam_id: {ctrl_name: Nx5 array or None}}.
 
-        Each row: [proj_x, proj_y, depth_m, facing_cos]
+        Each row: [proj_x, proj_y, depth_m, facing_cos, led_id]
         for each LED visible from the predicted pose.
         facing_cos is the cosine of the LED's emission angle toward the camera
         (positive = LED faces the camera, 1.0 = head-on).
+        led_id is the index of the LED in the controller's full LED model.
         None when no prior pose exists for this (ctrl, cam) pair.
         """
         ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
@@ -812,7 +795,8 @@ class TrackingSystem:
                     proj_pts.astype(np.float32),
                     depths.astype(np.float32).reshape(-1, 1),
                     facing_cos.astype(np.float32).reshape(-1, 1),
-                ])  # (M, 4)
+                    vis_ids.astype(np.float32).reshape(-1, 1),
+                ])  # (M, 5): proj_x, proj_y, depth_m, facing_cos, led_id
 
             result[cam_id] = proj_per_ctrl
         return result

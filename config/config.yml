@@ -1,10 +1,10 @@
 data:
 #  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves/data"
-  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
+  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only/lost_track"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
-  selected_cameras: [0] # [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 2] # [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
   intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -57,45 +57,45 @@ controllers:
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
 blob_detection:
-  pose_guided_thresholds:
-    pixel_threshold:
-      model: 'inv_depth_sq'   # a/d²+b  R²=0.8532
-      a: 0.179539
-      b: 7.0
-    required_threshold:
-      model: 'inv_depth_sq'   # a/d²+b  R²=0.8764
-      a: 0.312337
-      b: 13.850565
-    max_area:
-      model: 'inv_depth_sq'   # a/d²+b  R²=0.8473
-      a: 0.759220
-      b: 32.0
+
+  # ── Common (both warm and cold paths) ────────────────────────────────────
   visualize: true
-  min_threshold: 6       # pixels >= this are included in a blob
-  required_threshold: 13  # blob must contain at least one pixel >= this (filters dim noise)
-  min_area: 3
+  min_threshold: 6                  # pixels >= this are included in a blob
+  min_area: 2
   max_area: 250
   min_split_dist: 4.0
-  split_valley_ratio: 0.6  # saddle_min/lower_peak must be below this to allow splitting; suppresses false splits in single bright blobs
-  min_circularity: 0.5     # 4π·area/perimeter² must exceed this; rejects elongated non-circular shapes
-  outlier_factor: 2.5      # blob with 1-NN distance > this * median(1-NN) is rejected as spatially isolated noise
-  pass2_threshold_factor: 0.7       # 0 = disabled; pixel_threshold_2 = percentile(mean_per_blob) * factor
-  pass2_required_factor: 1.2        # required_threshold_2 = percentile(mean_per_blob) * factor; must be > pass2_threshold_factor
-  pass2_brightness_percentile: 25   # percentile of per-blob mean intensities used as brightness reference (low = anchor to dimmer cluster)
-  pass2_min_area: 2             # null = use min_area; override minimum blob area for pass 2 (blobs shrink under higher threshold, so this can be smaller)
-  pass2_threshold_ema_alpha: 0.25       # EMA weight on the newly computed threshold (0=frozen, 1=no smoothing); smooths frame-to-frame instability
-  pass2_count_gate_max_factor: 1.7      # skip EMA update if blob count changes by more than this factor between frames (count jump = scene transition, not brightness change)
+  split_valley_ratio: 0.6           # saddle_min/lower_peak must be below this to allow splitting
+  min_circularity: 0.5              # 4π·area/perimeter² must exceed this; rejects elongated shapes
+  required_threshold_factor: 1.5   # required_threshold = clip(pixel_threshold * factor, 255)
 
-  # Per-LED local search (active when a predicted pose is available)
-  # Search radius is read from matching.proximity_expansion_px / matching.aux_snap_px
-  # so detection and matching operate over the identical distance gate.
-  local_search_depth_k: 0.0            # extra radius added on top of the base: r = base + k/depth_m (0 = fixed radius)
-  blob_cross_mask_margin_px: 3          # extra pixels added to each matched-blob radius when masking ctrl A's blobs from ctrl B's detection image
+  # ── Warm path (active when a predicted pose is available) ─────────────────
+  pose_guided_thresholds:
+    # Formula: threshold = a * facing_cos / depth_m² + b
+    #   a  — scales the Lambertian + inverse-square physics term
+    #   b  — constant floor independent of geometry (noise baseline)
+    pixel_threshold:
+      a: 0.622
+      b: 15.17
+    max_area:
+      a: 0.20779
+      b: 20.0
+    min_area:
+      a: 0.20779    # placeholder until fitted from calib_warm.csv
+      b: -9.0
+  local_search_depth_k: 0.0         # extra radius: r = base + k/depth_m (0 = fixed radius)
+  blob_cross_mask_margin_px: 3      # extra px added to matched-blob radius when masking ctrl A from ctrl B
 
-  # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
+  # ── Cold path – pass 1 (full-image detection, no prior) ───────────────────
+  outlier_factor: 2.5               # 1-NN distance > this * median(1-NN) → spatial outlier
   interior_edge_margin_px: 10.0    # centroid farther inside a large rejected blob than this is dropped
 
-  debug_bbox: null        # [x1, y1, x2, y2] — log why any centroid inside this pixel bbox was dropped
+  # ── Cold path – pass 2 (adaptive re-threshold, optional) ──────────────────
+  pass2_threshold_factor: 0.7       # 0 = disabled; pixel_threshold_2 = percentile(mean_per_blob) * factor
+  pass2_required_factor: 1.2        # required_threshold_2 = percentile(mean_per_blob) * factor; must be > pass2_threshold_factor
+  pass2_brightness_percentile: 25   # percentile of per-blob mean intensities used as brightness reference
+  pass2_min_area: 2                 # null = use min_area; blobs shrink under higher threshold so can be smaller
+  pass2_threshold_ema_alpha: 0.25   # EMA weight on the new threshold (0=frozen, 1=no smoothing)
+  pass2_count_gate_max_factor: 1.7  # skip EMA update if blob count changes by more than this factor
 
 geometry:
   z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
@@ -125,9 +125,9 @@ matching:
     - [2, 3]
     - [2, 4]
     - [2, 4, "edge"]
-#    - [3, 5]
-#    - [3, 5, "edge"]
-#    - [4, 6]
+    - [3, 5]
+    - [3, 5, "edge"]
+    - [4, 6]
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
   reprojection_threshold: 2.5    # RANSAC inlier threshold
@@ -212,13 +212,13 @@ self_calibration:
   apply_on_load: false             # apply saved calibration at startup if output file exists
 
 debug:
-  calibration_csv: null # "./data/calib_thresholds_raw.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
+  calibration_csv: null # "./data/calib_warm.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
   mode_active: true
   split_to_folders: false
   verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
   log_best: true                  # log each new best solution update
-  debug_led_ids: [4, 15, 17]            # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
-  debug_blob_ids: [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
+  debug_led_ids: null # [4, 15, 17]            # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
+  debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"

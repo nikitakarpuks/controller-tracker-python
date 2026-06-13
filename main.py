@@ -126,8 +126,9 @@ def main():
         Path(_csv_path).parent.mkdir(parents=True, exist_ok=True)
         _csv_file = open(_csv_path, "w", newline="")
         _csv_writer = csv.writer(_csv_file)
-        _csv_writer.writerow(["frame", "ctrl_name", "cam_idx", "depth_m",
-                               "pixel_threshold", "required_threshold", "max_area"])
+        _csv_writer.writerow(["frame", "ctrl_name", "cam_idx",
+                               "led_id", "depth_m", "facing_cos",
+                               "brightness", "area"])
         logger.info(f"Calibration CSV → {_csv_path}")
 
     for batch in tqdm(get_data(config["data"])):
@@ -136,7 +137,6 @@ def main():
             pass
         # cam_images: {cam_idx: numpy array}
 
-        depth_hints        = tracking_system.get_predicted_depths_per_camera()
         proj_hints         = tracking_system.get_predicted_led_projections_per_camera()
         primary_cams       = tracking_system.get_designated_primary_cameras()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
@@ -157,14 +157,7 @@ def main():
             for cam_idx in cameras:
                 if cam_idx not in cam_images:
                     continue
-                predicted_depth = depth_hints.get(cam_idx, {}).get(ctrl_name)
-                if predicted_depth is not None and predicted_depth <= 0:
-                    predicted_depth = None
                 predicted_leds  = proj_hints.get(cam_idx, {}).get(ctrl_name)
-                # No visible LEDs on this camera → suppress depth hint so the
-                # pose-guided single-pass doesn't fire; fall through to two-pass.
-                if predicted_leds is None:
-                    predicted_depth = None
                 _primary_cam   = primary_cams.get(ctrl_name)
                 _is_primary    = (_primary_cam is None or cam_idx == _primary_cam)
                 _match_cfg     = config["matching"]
@@ -174,7 +167,7 @@ def main():
                 blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
                     cam_images[cam_idx], config["blob_detection"],
                     visualize=config["blob_detection"]["visualize"],
-                    img_path=img_path, cam_idx=cam_idx, predicted_depth=predicted_depth,
+                    img_path=img_path, cam_idx=cam_idx,
                     ctrl_label=ctrl_name.replace("_controller", ""),
                     predicted_leds=predicted_leds,
                     local_search_radius_px=_local_r_px,
@@ -280,16 +273,27 @@ def main():
                             f"matches={len(sol['assignment'])}{aux_str}  "
                             f"method={sol.get('method', '?')}")
                 if _csv_writer:
-                    _p2 = get_pass2_params(primary_cam_idx)
-                    if _p2 is not None:
-                        depth_m = float(np.asarray(sol["tvec"]).reshape(3)[2])
-                        _csv_writer.writerow([
-                            img_path.name, ctrl_name, primary_cam_idx,
-                            f"{depth_m:.4f}",
-                            _p2["pixel_threshold"],
-                            _p2["required_threshold"],
-                            _p2["max_area"],
-                        ])
+                    _proj = proj_hints.get(primary_cam_idx, {}).get(ctrl_name)
+                    if _proj is not None:  # warm path was active for this camera
+                        led_lookup = {
+                            int(row[4]): (float(row[2]), float(row[3]))
+                            for row in _proj
+                        }
+                        _brts  = per_ctrl_brts[ctrl_name].get(primary_cam_idx)
+                        _radii = per_ctrl_radii[ctrl_name].get(primary_cam_idx)
+                        if _brts is not None and _radii is not None:
+                            for blob_idx, led_id in sol["assignment"]:
+                                if led_id not in led_lookup:
+                                    continue
+                                _depth_m, _facing_cos = led_lookup[led_id]
+                                _csv_writer.writerow([
+                                    img_path.name, ctrl_name, primary_cam_idx,
+                                    led_id,
+                                    f"{_depth_m:.5f}",
+                                    f"{_facing_cos:.5f}",
+                                    f"{float(_brts[blob_idx]):.1f}",
+                                    f"{float(np.pi * _radii[blob_idx] ** 2):.2f}",
+                                ])
             else:
                 poses_all[ctrl_name].append(None)
                 assignments_all[ctrl_name].append(None)

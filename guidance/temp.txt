@@ -445,3 +445,40 @@
   So, with warm case we have a prediction for our controller next position, this is the frame we are looking blobs in.
   Currently we use just the controller depth. What about extending this idea:
   1) so we have this pose prediction. We can easily check which leds are theoretically visible in this pose and
+
+
+   great, it works.
+  Now please think - we have 3 important thresholds for which the calculation is data-driven - max area, min and reuired thresholds.
+  I want it now to be led-specific and BE DEPENDENT ON A PRATICULAR LED DISTANCE TO CAMERA AND ITS ANGLE TOWARDS IT.
+  We have a calibration_csv idea when we calulate stats based on only whole controller depth.
+  Issue is that we have algorithms that use general thresholds for whole image.
+  Do you think that the only and rigth way is to theoretically assume how this dependency should be modelled and then adjsut params based on the real case? What are your thoughts?
+  ⎿  ⧉ Selected 1 lines from ../config/config.yml in PyCharm
+
+● Good question, worth thinking through carefully.
+
+  Yes, theory + data fitting is the right approach, and here's why it's not just "the only way" but genuinely the correct engineering choice:
+
+  The functional form is already known from physics:
+  - Blob area ∝ cos(θ) / d² — projected solid angle of a tilted LED disk
+  - Blob brightness ∝ cos(θ) / d² — Lambertian emission + inverse-square falloff
+
+  Your existing model a/d² + b is already this, just without the cos(θ) factor (because you only had per-controller depth, so angle variation was averaged out). The extension is a *
+  facing_cos / d² + b for each LED individually.
+
+  Why not pure data-driven?
+  You'd need a massive calibration dataset covering the full (d, θ) space, and the result would be a lookup table that doesn't generalize well to new camera positions or LED layouts.
+
+  Why not pure theory?
+  Real LEDs aren't ideal Lambertian emitters, camera sensors are non-linear, lenses have falloff. The a and b parameters absorb all that.
+
+  What you already have:
+  get_predicted_led_projections_per_camera already returns [proj_x, proj_y, depth_m, facing_cos] per visible LED. Both d and cos(θ) are right there. The calibration CSV just needs to
+  record per-LED (not per-controller) observations: (d_i, facing_cos_i, brightness_i, area_i) during frames where tracking is confirmed good — then re-fit a * facing_cos / d² + b.
+
+  The harder problem is the one you pointed out: blob detection currently runs globally with scalar thresholds before any LED assignment is known. The per-LED thresholds only become
+  usable after you have a predicted pose. So realistically you end up with two regimes:
+  1. Cold start / no pose: global thresholds as now
+  2. Warm / pose available: per-LED local search with thresholds computed from predicted (d_i, facing_cos_i) — this is the pose-guided path you already partially have
+
+  That's not a limitation, it's the natural architecture. Does this align with what you were thinking?

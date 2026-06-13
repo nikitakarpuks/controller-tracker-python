@@ -1,8 +1,6 @@
 import cv2
 import numpy as np
 from pathlib import Path
-from loguru import logger
-
 _pass2_memory: dict = {}  # {cam_key: {...}}  — persists per-camera pass-2 state across frames
 
 
@@ -100,7 +98,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    visualize=False, img_path=None, vis_suffix="",
                    max_area_override=None, min_area_override=None,
                    interior_exclude_blobs=None,
-                   skip_spatial_outlier=False):
+                   warm_mode=False,
+                   vis_patch_out=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -185,14 +184,6 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
     interior_edge_margin_px = float(cfg.get("interior_edge_margin_px", 10.0))
 
-    _dbbox = cfg.get("debug_bbox")  # [x1, y1, x2, y2] or null
-
-    def _in_bbox(cx, cy):
-        if _dbbox is None:
-            return False
-        x1, y1, x2, y2 = _dbbox
-        return x1 <= cx <= x2 and y1 <= cy <= y2
-
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
     _, mask = cv2.threshold(image, pixel_threshold, 255, cv2.THRESH_BINARY)
 
@@ -215,20 +206,11 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     for cnt in contours:
         area = cv2.contourArea(cnt)
         x_b, y_b, w_b, h_b = cv2.boundingRect(cnt)
-        bx, by = x_b + w_b / 2.0, y_b + h_b / 2.0  # position proxy before centroid is known
 
         # ── Reject by max area and bounding-box size (cheap, before mask) ─────
         if area > max_area:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: area {area:.1f} > max_area {max_area}")
             large_rejected_contours.append(cnt)
             if visualize: det_rej_area_large.append(cnt)
-            continue
-
-        if w_b == 1 and h_b == 1:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: 1×1 blob")
-            if visualize: det_rej_area_small.append(cnt)
             continue
 
         # ── Build pixel mask for this blob (ROI-sized, not full-image) ──────
@@ -244,8 +226,6 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         # ── Reject by pixel count (cv2.contourArea underestimates for small
         #    irregular blobs — a 3-px L-shape has geometric area ≈ 0.5) ────────
         if len(ys_roi) < min_area:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: pixels {len(ys_roi)} < min_area {min_area}")
             if visualize: det_rej_area_small.append(cnt)
             continue
 
@@ -256,17 +236,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         w_pix = intensities[ys, xs]
         max_pix = int(w_pix.max())
         if max_pix < required_threshold:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: max pixel "
-                             f"{max_pix} < required_threshold {required_threshold}")
             if visualize: det_rej_threshold.append(cnt)
             continue
 
         # ── Intensity-weighted centroid (greysum, 1-based coords) ─────────────
         total_weight = float(w_pix.sum())
         if total_weight == 0:
-            if _in_bbox(bx, by):
-                logger.debug(f"[blob_debug] ({bx:.0f},{by:.0f}) dropped: zero total weight")
             if visualize: det_rej_threshold.append(cnt)
             continue
 
@@ -276,17 +251,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         cy = float(np.sum((ys + 1) * w_pix)) / total_weight - 1.0
 
         # ── H1: reject if centroid is deep inside a large pass-1 blob ────────
-        if interior_exclude_blobs:
+        if not warm_mode and interior_exclude_blobs:
             deep_inside = False
             for large_cnt in interior_exclude_blobs:
                 dist = cv2.pointPolygonTest(large_cnt, (float(cx), float(cy)), True)
                 if dist > interior_edge_margin_px:
                     deep_inside = True
-                    if _in_bbox(cx, cy):
-                        logger.debug(
-                            f"[blob_debug] ({cx:.0f},{cy:.0f}) dropped: deep inside large blob "
-                            f"dist_to_edge={dist:.1f} > margin={interior_edge_margin_px:.1f}"
-                        )
                     break
             if deep_inside:
                 if visualize: det_rej_interior.append(cnt)
@@ -376,7 +346,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # the image so outer-ring LEDs would be wrongly rejected as isolated.
     candidates   = centroids_arr[keep_mask]
     min_nn_full  = np.full(len(centroids_arr), np.inf)
-    if not skip_spatial_outlier and len(candidates) > 1:
+    if not warm_mode and len(candidates) > 1:
         diffs    = candidates[:, None, :] - candidates[None, :, :]
         sq_dists = (diffs ** 2).sum(axis=-1)
         np.fill_diagonal(sq_dists, np.inf)
@@ -388,22 +358,6 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
 
     kept_indices     = np.where(keep_mask)[0]
     rejected_indices = np.where(~keep_mask)[0]
-
-    if _dbbox is not None:
-        for i in rejected_indices:
-            cx_r, cy_r = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
-            if _in_bbox(cx_r, cy_r):
-                if not circ_keep_mask[i]:
-                    logger.debug(f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: not circular")
-                else:
-                    logger.debug(
-                        f"[blob_debug] ({cx_r:.1f},{cy_r:.1f}) dropped: spatial outlier "
-                        f"1-NN={min_nn_full[i]:.1f}px > epsilon={epsilon:.1f}px"
-                    )
-        for i in kept_indices:
-            cx_k, cy_k = float(centroids_arr[i, 0]), float(centroids_arr[i, 1])
-            if _in_bbox(cx_k, cy_k):
-                logger.debug(f"[blob_debug] ({cx_k:.1f},{cy_k:.1f}) survived all stages → kept")
 
     filtered_centroids   = centroids_arr[kept_indices]
     filtered_contours    = [blob_contours[i] for i in kept_indices]
@@ -422,15 +376,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     if visualize:
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-        # BGR colours per category
-        # Highly distinct debug colors (BGR)
-
         C_AREA_SM  = (255, 0, 255)    # pink        — pixels < min_area or 1×1
         C_AREA_LG  = (0, 140, 255)   # dark orange — area > max_area (hard limit)
         C_THRESH   = (180, 0, 0)     # dark red    — below required brightness
         C_CIRC     = (0, 255, 255)   # yellow      — circularity filter
-        C_SPAT     = (128, 128, 128) # grey        — spatial (DBSCAN) outlier
-        C_INTERIOR = (100, 180, 255) # light blue  — H1: deep inside large blob (no-prior only)
+        C_SPAT     = (128, 128, 128) # grey        — spatial (DBSCAN) outlier (cold path only)
+        C_INTERIOR = (100, 180, 255) # light blue  — H1: deep inside large blob (cold path only)
         C_KEPT     = (255, 255, 255) # white       — kept
         C_SPLT     = (0, 255, 128)   # cyan        — kept (split)
 
@@ -440,12 +391,13 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         for cnt in det_rej_area_small: _draw_cnt(cnt, C_AREA_SM)
         for cnt in det_rej_area_large: _draw_cnt(cnt, C_AREA_LG)
         for cnt in det_rej_threshold:  _draw_cnt(cnt, C_THRESH)
-        for cnt in det_rej_interior:   _draw_cnt(cnt, C_INTERIOR)
+        if not warm_mode:
+            for cnt in det_rej_interior: _draw_cnt(cnt, C_INTERIOR)
 
         for i in rejected_indices:
             if not circ_keep_mask[i]:
                 _draw_cnt(blob_contours[i], C_CIRC)
-            else:
+            elif not warm_mode:
                 _draw_cnt(blob_contours[i], C_SPAT)
 
         for i, (pt_f, cnt) in enumerate(zip(filtered_centroids, filtered_contours)):
@@ -454,51 +406,54 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             _draw_cnt(cnt, color)
             pt = (int(round(pt_f[0])), int(round(pt_f[1])))
             cv2.circle(vis, pt, 2, color, -1)
-            cv2.putText(vis, str(i), (pt[0] + 5, pt[1] + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
-        # Legend — horizontal strip below image
-        strip_entries = [
-            (C_KEPT,     "kept"),
-            (C_SPLT,     "split"),
-            (C_CIRC,     f"not circular (< {min_circularity})"),
-            (C_SPAT,     "spatial outlier"),
-            (C_INTERIOR, "deep in large blob (no-prior)"),
-            (C_THRESH,   f"too dim (< {required_threshold})"),
-            (C_AREA_LG,  f"area > {int(max_area)}px"),
-            (C_AREA_SM,  f"pixels < {int(min_area)}"),
-        ]
-        row_h = 20
-        half = len(strip_entries) // 2 + len(strip_entries) % 2
-        rows = [strip_entries[:half], strip_entries[half:]]
-        strip = np.zeros((row_h * 3, vis.shape[1], 3), dtype=np.uint8)
-        for row_idx, row in enumerate(rows):
-            x = 6
-            y_sq_top = row_idx * row_h + 5
-            y_sq_bot = y_sq_top + 10
-            y_text   = y_sq_bot - 1
-            for color, label in row:
-                cv2.rectangle(strip, (x, y_sq_top), (x + 10, y_sq_bot), color, -1)
-                x += 13
-                cv2.putText(strip, label, (x, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
-                (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-                x += tw + 10
-        thr_label = f"pixel_thr={pixel_threshold}  required_thr={required_threshold}"
-        cv2.putText(strip, thr_label, (6, row_h * 2 + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
-        vis = np.vstack([vis, strip])
+        if warm_mode:
+            # Return the annotated crop patch; the caller composites and saves.
+            if vis_patch_out is not None:
+                vis_patch_out.append(vis)
+        else:
+            # Cold path: add legend strip and save.
+            strip_entries = [
+                (C_KEPT,     "kept"),
+                (C_SPLT,     "split"),
+                (C_CIRC,     f"not circular (< {min_circularity})"),
+                (C_SPAT,     "spatial outlier"),
+                (C_INTERIOR, "deep in large blob (no-prior)"),
+                (C_THRESH,   f"too dim (< {required_threshold})"),
+                (C_AREA_LG,  f"area > {int(max_area)}px"),
+                (C_AREA_SM,  f"pixels < {int(min_area)}"),
+            ]
+            row_h = 20
+            half = len(strip_entries) // 2 + len(strip_entries) % 2
+            rows = [strip_entries[:half], strip_entries[half:]]
+            strip = np.zeros((row_h * 3, vis.shape[1], 3), dtype=np.uint8)
+            for row_idx, row in enumerate(rows):
+                x = 6
+                y_sq_top = row_idx * row_h + 5
+                y_sq_bot = y_sq_top + 10
+                y_text   = y_sq_bot - 1
+                for color, label in row:
+                    cv2.rectangle(strip, (x, y_sq_top), (x + 10, y_sq_bot), color, -1)
+                    x += 13
+                    cv2.putText(strip, label, (x, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+                    (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+                    x += tw + 10
+            thr_label = f"pixel_thr={pixel_threshold}  required_thr={required_threshold}"
+            cv2.putText(strip, thr_label, (6, row_h * 2 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+            vis = np.vstack([vis, strip])
 
-        if img_path is not None:
-            suffix_stripped = vis_suffix.lstrip("_")
-            pass_type = "main"
-            for _pt in ("pass1", "pass2", "pose", "local"):
-                if suffix_stripped.endswith("_" + _pt):
-                    pass_type = _pt
-                    suffix_stripped = suffix_stripped[: -len("_" + _pt)]
-                    break
-            out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / pass_type
-            out_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), vis)
+            if img_path is not None:
+                suffix_stripped = vis_suffix.lstrip("_")
+                pass_type = "main"
+                for _pt in ("pass1", "pass2", "pose", "local"):
+                    if suffix_stripped.endswith("_" + _pt):
+                        pass_type = _pt
+                        suffix_stripped = suffix_stripped[: -len("_" + _pt)]
+                        break
+                out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / pass_type
+                out_dir.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), vis)
 
     return (filtered_centroids, filtered_contours, filtered_radii,
             filtered_brightnesses,
@@ -532,88 +487,249 @@ def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
     return r
 
 
-def _eval_model(block: dict, depth: float) -> float:
-    a, b = block["a"], block["b"]
-    if block["model"] == "inv_depth_sq":
-        return a / depth ** 2 + b
-    return a / depth + b
+def _eval_model(block: dict, depth, facing_cos=1.0):
+    """Evaluate threshold model: a * facing_cos / depth_m² + b.
+    depth and facing_cos may be scalars or numpy arrays.
+    """
+    return block["a"] * np.asarray(facing_cos) / np.asarray(depth) ** 2 + block["b"]
+
+
+def _nms_blobs(all_blobs, min_split_dist):
+    """
+    Deduplicate blobs from per-LED detection runs.
+
+    Two blobs are considered the same physical detection when their centroids are
+    within min_split_dist pixels of each other.  In that case the blob detected
+    under the higher pixel_threshold is kept (more discriminating detection).
+    Blobs with genuinely different centroids always both survive — even if one is
+    brighter, they may belong to different LEDs from different controllers.
+    """
+    # Higher pixel_threshold = more discriminating = preferred in a tie.
+    all_blobs = sorted(all_blobs, key=lambda b: -b["pixel_threshold"])
+    kept = []
+    for blob in all_blobs:
+        cx, cy = blob["cx"], blob["cy"]
+        is_dup = any(
+            np.hypot(cx - k["cx"], cy - k["cy"]) < min_split_dist
+            for k in kept
+        )
+        if not is_dup:
+            kept.append(blob)
+    return kept
 
 
 def _detect_blobs_local(image, led_projections, cfg,
                         visualize=False, img_path=None, vis_suffix="",
                         search_radius_px=None):
     """
-    Pose-guided local blob detection using predicted LED projections.
+    Pose-guided per-LED local blob detection.
 
-    led_projections : (N, 4) float32 — [proj_x, proj_y, depth_m, facing_cos]
-                      for each theoretically visible LED from the predicted pose.
-                      facing_cos (reserved for future per-zone threshold logic).
+    led_projections : (N, 5) float32 — [proj_x, proj_y, depth_m, facing_cos, led_id]
 
-    Builds a binary search mask from circular ROIs around each LED projection,
-    zeros out image pixels outside those regions, then runs the full _detect_blobs()
-    pipeline on the masked image.  The spatial-outlier (DBSCAN) filter is disabled
-    because LED projections are spread across the image and outer-ring LEDs would
-    be wrongly rejected as isolated.  All other filters (circularity, split) run
-    as normal.
-
-    Thresholds use the existing pose_guided_thresholds model evaluated at the median
-    LED depth.  Per-zone adaptive thresholds will be added in a later pass.
+    For each LED a small ROI crop is extracted and _detect_blobs() is run with
+    per-LED thresholds computed from: a * facing_cos / depth_m² + b.
+    Centroids and contours are remapped to full-image coordinates.
+    Near-duplicate blobs (centroid distance < min_split_dist) from overlapping
+    ROIs are deduplicated by NMS, preferring the detection with the higher
+    pixel_threshold.
 
     Returns the same 7-tuple as _detect_blobs().
     """
-    pg      = cfg.get("pose_guided_thresholds")
-    base_px = float(search_radius_px if search_radius_px is not None else 8.0)
-    depth_k = float(cfg.get("local_search_depth_k",  0.0))
-
+    pg             = cfg.get("pose_guided_thresholds")
+    base_px        = float(search_radius_px if search_radius_px is not None else 8.0)
+    depth_k        = float(cfg.get("local_search_depth_k", 0.0))
     base_pixel_thr = int(cfg["min_threshold"])
-    base_req_thr   = int(cfg.get("required_threshold", base_pixel_thr * 2))
+    req_factor     = float(cfg.get("required_threshold_factor", 1.5))
+    min_split_dist = float(cfg.get("min_split_dist", 4.0))
 
-    # Global thresholds from median LED depth (per-zone will replace this later)
-    depths       = led_projections[:, 2]
-    valid_depths = depths[depths > 0]
-    median_depth = float(np.median(valid_depths)) if len(valid_depths) > 0 else None
-
-    if pg and median_depth is not None:
-        pixel_thr = max(int(_eval_model(pg["pixel_threshold"],    median_depth)), base_pixel_thr)
-        req_thr   = max(int(_eval_model(pg["required_threshold"], median_depth)), base_req_thr)
-        max_area  = _eval_model(pg["max_area"], median_depth)
-    else:
-        pixel_thr = base_pixel_thr
-        req_thr   = base_req_thr
-        max_area  = None
-
-    # Build search mask: union of circles around each LED projection
     h_img, w_img = image.shape[:2]
-    search_mask  = np.zeros((h_img, w_img), dtype=np.uint8)
-    for proj_x, proj_y, depth_m, _facing_cos in led_projections:
-        search_r = int(round(base_px + (depth_k / max(float(depth_m), 0.01))))
-        cv2.circle(search_mask, (int(round(proj_x)), int(round(proj_y))), search_r, 255, -1)
+    n_leds       = len(led_projections)
 
-    masked_image = cv2.bitwise_and(image, image, mask=search_mask)
+    # ── Vectorised per-LED threshold computation ──────────────────────────────
+    depths    = led_projections[:, 2].astype(np.float64)
+    cos_vals  = led_projections[:, 3].astype(np.float64)
+    safe_d    = np.maximum(depths, 0.01)
 
-    result = _detect_blobs(masked_image, pixel_thr, req_thr, cfg,
-                           visualize=visualize, img_path=img_path,
-                           vis_suffix=f"{vis_suffix}_local",
-                           max_area_override=max_area,
-                           skip_spatial_outlier=True)
+    base_min_area = float(cfg["min_area"])
+    if pg is not None:
+        pixel_thrs = np.maximum(
+            _eval_model(pg["pixel_threshold"], safe_d, cos_vals).astype(int),
+            base_pixel_thr,
+        )
+        max_areas  = _eval_model(pg["max_area"], safe_d, cos_vals)
+        if "min_area" in pg:
+            min_areas = np.maximum(_eval_model(pg["min_area"], safe_d, cos_vals), base_min_area)
+        else:
+            min_areas = np.full(n_leds, base_min_area)
+    else:
+        pixel_thrs = np.full(n_leds, base_pixel_thr, dtype=int)
+        max_areas  = np.full(n_leds, None,            dtype=object)
+        min_areas  = np.full(n_leds, base_min_area)
+    req_thrs = np.clip((pixel_thrs * req_factor).astype(int), 0, 255)
 
-    # Overlay search circles on the saved visualization
+    # Per-LED search radii
+    search_rs = np.round(base_px + depth_k / safe_d).astype(int)
+
+    # ── Per-LED ROI detection ─────────────────────────────────────────────────
+    all_blobs           = []   # list of dicts for NMS
+    all_large_rejected  = []   # union of large blobs for the return tuple
+    vis_patches         = []   # (patch_bgr, x1, y1, led_idx) — warm vis only
+
+    for i in range(n_leds):
+        proj_x, proj_y, depth_m, facing_cos, led_id = led_projections[i]
+        led_id = int(led_id)
+        sr = int(search_rs[i])
+
+        # Bounding box of the circular ROI, clamped to image bounds
+        cx_i = int(round(proj_x))
+        cy_i = int(round(proj_y))
+        x1 = max(0, cx_i - sr)
+        y1 = max(0, cy_i - sr)
+        x2 = min(w_img, cx_i + sr + 1)
+        y2 = min(h_img, cy_i + sr + 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        # Mask pixels outside the circle within the crop
+        crop = image[y1:y2, x1:x2].copy()
+        ch, cw = crop.shape[:2]
+        gy, gx = np.ogrid[:ch, :cw]
+        circle_mask = ((gx - (cx_i - x1)) ** 2 + (gy - (cy_i - y1)) ** 2) <= sr ** 2
+        crop[~circle_mask] = 0
+
+        pixel_thr_i = int(pixel_thrs[i])
+        req_thr_i   = int(req_thrs[i])
+        max_area_i  = float(max_areas[i]) if max_areas[i] is not None else None
+        min_area_i  = float(min_areas[i])
+
+        patch_out = [] if visualize else None
+        result = _detect_blobs(
+            crop, pixel_thr_i, req_thr_i, cfg,
+            visualize=visualize, img_path=None, vis_suffix="",
+            max_area_override=max_area_i,
+            min_area_override=min_area_i,
+            warm_mode=True,
+            vis_patch_out=patch_out,
+        )
+
+        if visualize and patch_out:
+            vis_patches.append((patch_out[0], x1, y1, i, pixel_thr_i, req_thr_i))
+
+        centroids_crop, contours_crop, radii, brightnesses, \
+            rej_centroids_crop, rej_contours_crop, large_rejected = result
+
+        # Remap centroids and contours to full-image coordinates
+        if len(centroids_crop) > 0:
+            centroids_full = centroids_crop + np.array([[x1, y1]], dtype=np.float32)
+        else:
+            centroids_full = centroids_crop
+
+        contours_full     = [cnt + np.array([[x1, y1]], dtype=np.float32) for cnt in contours_crop]
+        rej_centroids_full = (rej_centroids_crop + np.array([[x1, y1]], dtype=np.float32)
+                              if len(rej_centroids_crop) > 0 else rej_centroids_crop)
+        rej_contours_full = [cnt + np.array([[x1, y1]], dtype=np.float32) for cnt in rej_contours_crop]
+
+        all_large_rejected.extend(
+            cnt + np.array([[x1, y1]], dtype=np.float32) for cnt in large_rejected
+        )
+
+        for j in range(len(centroids_full)):
+            all_blobs.append({
+                "cx":              float(centroids_full[j, 0]),
+                "cy":              float(centroids_full[j, 1]),
+                "contour":         contours_full[j],
+                "radius":          float(radii[j]),
+                "brightness":      float(brightnesses[j]),
+                "pixel_threshold": pixel_thr_i,
+                "source_led_idx":  i,
+            })
+
+    # ── NMS deduplication ─────────────────────────────────────────────────────
+    kept_blobs = _nms_blobs(all_blobs, min_split_dist)
+
+    if kept_blobs:
+        filtered_centroids   = np.array([[b["cx"], b["cy"]] for b in kept_blobs], dtype=np.float32)
+        filtered_contours    = [b["contour"]  for b in kept_blobs]
+        filtered_radii       = np.array([b["radius"]     for b in kept_blobs], dtype=np.float32)
+        filtered_brightnesses = np.array([b["brightness"] for b in kept_blobs], dtype=np.float32)
+    else:
+        filtered_centroids    = np.empty((0, 2), dtype=np.float32)
+        filtered_contours     = []
+        filtered_radii        = np.empty(0, dtype=np.float32)
+        filtered_brightnesses = np.empty(0, dtype=np.float32)
+
+    # ── Composite visualization ───────────────────────────────────────────────
     if visualize and img_path is not None:
-        suffix_stripped = vis_suffix.lstrip("_")
-        out_dir  = Path("./visualization/blobs") / (suffix_stripped or "default") / "local"
-        out_path = out_dir / f"{Path(img_path).stem}.png"
-        if out_path.exists():
-            vis = cv2.imread(str(out_path))
-            if vis is not None:
-                C_ROI  = (0, 180, 0)    # green — search circle
-                C_PRED = (80,  80, 255) # red   — predicted centre
-                for proj_x, proj_y, depth_m, _facing_cos in led_projections:
-                    sr = int(round(base_px + (depth_k / max(float(depth_m), 0.01))))
-                    cv2.circle(vis, (int(round(proj_x)), int(round(proj_y))), sr,  C_ROI,  1)
-                    cv2.circle(vis, (int(round(proj_x)), int(round(proj_y))), 2,   C_PRED, -1)
-                cv2.imwrite(str(out_path), vis)
+        C_ROI  = (0, 180, 0)    # green — search circle
+        C_KEPT = (255, 255, 255)
+        C_AREA_SM = (255, 0, 255)
+        C_AREA_LG = (0, 140, 255)
+        C_THRESH  = (180, 0, 0)
+        C_CIRC    = (0, 255, 255)
+        min_circularity = float(cfg.get("min_circularity", 0.5))
 
-    return result
+        canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+        # Blit per-LED annotated patches
+        for patch, x1, y1, led_idx, pix_thr, req_thr in vis_patches:
+            ph, pw = patch.shape[:2]
+            canvas[y1:y1 + ph, x1:x1 + pw] = patch
+
+        # Search circles + LED ID labels on top
+        for i in range(n_leds):
+            proj_x, proj_y = float(led_projections[i, 0]), float(led_projections[i, 1])
+            led_id_vis     = int(led_projections[i, 4])
+            sr = int(search_rs[i])
+            cx_draw = int(round(proj_x))
+            cy_draw = int(round(proj_y))
+            cv2.circle(canvas, (cx_draw, cy_draw), sr, C_ROI, 1)
+            label_pos = (cx_draw + sr + 2, cy_draw - sr // 2 if cy_draw - sr // 2 > 10 else cy_draw + sr + 10)
+            cv2.putText(canvas, str(led_id_vis), label_pos,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, C_ROI, 1, cv2.LINE_AA)
+
+        # Warm-mode legend strip
+        strip_entries = [
+            (C_KEPT,     "kept"),
+            ((0, 255, 128), "split"),
+            (C_CIRC,     f"not circular (< {min_circularity})"),
+            (C_THRESH,   f"too dim (< req_thr)"),
+            (C_AREA_LG,  f"area > max_area"),
+            (C_AREA_SM,  "pixels < min_area"),
+        ]
+        row_h = 20
+        half  = len(strip_entries) // 2 + len(strip_entries) % 2
+        rows  = [strip_entries[:half], strip_entries[half:]]
+        strip = np.zeros((row_h * 3, canvas.shape[1], 3), dtype=np.uint8)
+        for row_idx, row in enumerate(rows):
+            x = 6
+            y_sq_top = row_idx * row_h + 5
+            y_sq_bot = y_sq_top + 10
+            y_text   = y_sq_bot - 1
+            for color, label in row:
+                cv2.rectangle(strip, (x, y_sq_top), (x + 10, y_sq_bot), color, -1)
+                x += 13
+                cv2.putText(strip, label, (x, y_text),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+                (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+                x += tw + 10
+        cv2.putText(strip, f"warm: {n_leds} LEDs  NMS min_dist={min_split_dist:.1f}px",
+                    (6, row_h * 2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+        canvas = np.vstack([canvas, strip])
+
+        suffix_stripped = vis_suffix.lstrip("_")
+        out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / "local"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), canvas)
+
+    return (
+        filtered_centroids,
+        filtered_contours,
+        filtered_radii,
+        filtered_brightnesses,
+        np.empty((0, 2), dtype=np.float32),  # rejected centroids (pre-NMS rejects are in patches)
+        [],                                   # rejected contours
+        all_large_rejected,
+    )
 
 
 def get_pass2_params(cam_idx) -> dict | None:
@@ -629,30 +745,21 @@ def get_pass2_params(cam_idx) -> dict | None:
 
 
 def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None,
-                  predicted_depth=None, ctrl_label="", predicted_leds=None,
+                  ctrl_label="", predicted_leds=None,
                   local_search_radius_px=None):
     pixel_threshold    = int(cfg["min_threshold"])
-    required_threshold = int(cfg.get("required_threshold", pixel_threshold * 2))
+    _req_factor        = float(cfg.get("required_threshold_factor", 1.5))
+    required_threshold = min(int(pixel_threshold * _req_factor), 255)
 
     cam_str  = f"_cam{cam_idx}" if cam_idx is not None else ""
     ctrl_str = f"_{ctrl_label}" if ctrl_label else ""
 
-    # ── Per-LED local search (preferred when predicted projections are available) ─
+    # ── Per-LED local search (active when a predicted pose is available) ─────
     if predicted_leds is not None and len(predicted_leds) > 0:
         return _detect_blobs_local(image, predicted_leds, cfg,
                                    visualize, img_path,
                                    f"{cam_str}{ctrl_str}",
                                    search_radius_px=local_search_radius_px)
-
-    # ── Pose-guided single-pass path ──────────────────────────────────────────
-    pg = cfg.get("pose_guided_thresholds") if predicted_depth is not None else None
-    if pg is not None:
-        pg_pixel = max(int(_eval_model(pg["pixel_threshold"],    predicted_depth)), pixel_threshold)
-        pg_req   = max(int(_eval_model(pg["required_threshold"], predicted_depth)), required_threshold)
-        pg_area  =     _eval_model(pg["max_area"],               predicted_depth)
-        return _detect_blobs(image, pg_pixel, pg_req, cfg,
-                             visualize, img_path, f"{cam_str}{ctrl_str}_pose",
-                             max_area_override=pg_area)
 
     pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
     pass2_required_factor       = float(cfg.get("pass2_required_factor", 0.7))
