@@ -229,6 +229,7 @@ class SingleViewTracker:
 
         _window = int(self._matching_cfg.get('pose_history_window', 5))
         self.pose_history: deque = deque(maxlen=_window)
+        self.vel_ema: Optional[np.ndarray] = None  # shape (3,) float32, m/frame
 
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
@@ -375,10 +376,14 @@ class SingleViewTracker:
     def _predict_pose(
         pose_history,
         weight_decay: float = 0.7,
+        vel_ema: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Predict pose at frame n+1 from pose history.
 
         pose_history[0] = most recent (rvec, tvec); index increases toward older frames.
+
+        vel_ema: if provided, overrides translation prediction with pose_history[0].tvec + vel_ema.
+                 Rotation prediction is always derived from pose history.
 
         n=0 → None (no information)
         n=1 → constant position (same pose)
@@ -398,13 +403,20 @@ class SingleViewTracker:
                 np.asarray(pose_history[0][1], np.float32).reshape(3),
             )
 
+        if vel_ema is not None:
+            tvec_pred = (np.asarray(pose_history[0][1], np.float32).reshape(3)
+                         + vel_ema.reshape(3)).astype(np.float32)
+        else:
+            tvec_pred = None  # filled in by the branch below
+
         if n == 2:
             rvec_n   = np.asarray(pose_history[0][0], np.float32).reshape(3, 1)
             tvec_n   = np.asarray(pose_history[0][1], np.float64).reshape(3)
             rvec_nm1 = np.asarray(pose_history[1][0], np.float32).reshape(3, 1)
             tvec_nm1 = np.asarray(pose_history[1][1], np.float64).reshape(3)
 
-            tvec_pred = (2.0 * tvec_n - tvec_nm1).astype(np.float32)
+            if tvec_pred is None:
+                tvec_pred = (2.0 * tvec_n - tvec_nm1).astype(np.float32)
 
             R_n,   _ = cv2.Rodrigues(rvec_n)
             R_nm1, _ = cv2.Rodrigues(rvec_nm1)
@@ -420,11 +432,12 @@ class SingleViewTracker:
         t_pts   = -np.arange(n, dtype=np.float64)
         weights = weight_decay ** np.arange(n, dtype=np.float64)
 
-        # Translation: linear fit per axis
-        tvecs = np.stack([np.asarray(p[1], np.float64).reshape(3) for p in pose_history])
-        tvec_pred = np.empty(3, dtype=np.float32)
-        for ax in range(3):
-            tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=1, w=weights), 1.0)
+        # Translation: linear fit per axis (skipped when vel_ema already set tvec_pred)
+        if tvec_pred is None:
+            tvecs = np.stack([np.asarray(p[1], np.float64).reshape(3) for p in pose_history])
+            tvec_pred = np.empty(3, dtype=np.float32)
+            for ax in range(3):
+                tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=1, w=weights), 1.0)
 
         # Rotation: linear fit in the tangent space of R_0 (most recent rotation).
         # rel_rvecs[i] = log(R_0^T @ R_i) — rotation from current pose back to the i-th
@@ -520,7 +533,19 @@ class SingleViewTracker:
         predicted_pose = self._predict_pose(
             self.pose_history,
             weight_decay=float(self._matching_cfg.get("pose_prediction_weight_decay", 0.7)),
+            vel_ema=self.vel_ema,
         )
+
+        # Velocity-scaled search gates: expand proximity radius proportionally to speed.
+        # v_px = ‖predicted.t − prev.t‖ × fx / depth  (pixels/frame, camera-agnostic)
+        _v_px = 0.0
+        if predicted_pose is not None and self.prev_pose is not None:
+            _v_vec = predicted_pose[1].reshape(3) - np.asarray(self.prev_pose[1], np.float64).reshape(3)
+            _depth = max(float(np.asarray(self.prev_pose[1]).reshape(3)[2]), 0.1)
+            _v_px  = float(np.linalg.norm(_v_vec)) * self.camera.fx / _depth
+        _base_expansion = float(_cfg.get('proximity_expansion_px', 8.0))
+        _prox_vel_k     = float(_cfg.get('proximity_expansion_velocity_k', 0.0))
+        _eff_expansion  = _base_expansion + _prox_vel_k * _v_px
 
         # ------------------------------------------------------------------
         # Candidate search
@@ -536,6 +561,7 @@ class SingleViewTracker:
                     blob_brightnesses=brts_prox,
                     other_cameras_blobs=other_cameras_blobs,
                     occluders_per_cam=occluders_per_cam,
+                    expansion_px=_eff_expansion,
                 )
                 # Remap proximity result indices from filtered → full array space.
                 if solution is not None and blob_mask is not None:
@@ -649,6 +675,12 @@ class SingleViewTracker:
                 f"[{ctrl_name} | cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
             )
+            if self.prev_pose is not None:
+                _step = (np.asarray(solution["tvec"], np.float64).reshape(3)
+                         - np.asarray(self.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
+                _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
+                self.vel_ema = (_beta * _step + (1.0 - _beta) * self.vel_ema
+                               if self.vel_ema is not None else _step)
             self.prev_prev_pose  = self.prev_pose
             self.prev_pose       = (solution["rvec"], solution["tvec"])
             self.pose_history.appendleft((
@@ -676,6 +708,7 @@ class SingleViewTracker:
         self.prev_pose       = None
         self.prev_prev_pose  = None
         self.prev_assignment = None
+        self.vel_ema         = None
         self.pose_history.clear()
         return None
 
@@ -745,29 +778,44 @@ class TrackingSystem:
         ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
         return {name: self._designated_primary.get(name) for name in ctrl_names}
 
-    def get_predicted_led_projections_per_camera(self) -> Dict[int, Dict[str, Optional[np.ndarray]]]:
-        """Return {cam_id: {ctrl_name: Nx5 array or None}}.
+    def get_predicted_led_projections_per_camera(
+        self,
+    ) -> Tuple[Dict[int, Dict[str, Optional[np.ndarray]]], Dict[int, Dict[str, float]]]:
+        """Return (proj_hints, vel_hints).
 
-        Each row: [proj_x, proj_y, depth_m, facing_cos, led_id]
-        for each LED visible from the predicted pose.
-        facing_cos is the cosine of the LED's emission angle toward the camera
-        (positive = LED faces the camera, 1.0 = head-on).
-        led_id is the index of the LED in the controller's full LED model.
-        None when no prior pose exists for this (ctrl, cam) pair.
+        proj_hints: {cam_id: {ctrl_name: Nx5 array or None}}
+          Each row: [proj_x, proj_y, depth_m, facing_cos, led_id]
+          for each LED visible from the predicted pose.
+          None when no prior pose exists for this (ctrl, cam) pair.
+
+        vel_hints: {cam_id: {ctrl_name: v_px}}
+          Estimated controller speed in pixels/frame for this camera.
+          0.0 when no prediction is available.
         """
         ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
         _facing_deg  = float(self._matching_cfg.get('led_facing_angle_deg', 86.0))
-        result: Dict[int, Dict[str, Optional[np.ndarray]]] = {}
+        result:    Dict[int, Dict[str, Optional[np.ndarray]]] = {}
+        vel_hints: Dict[int, Dict[str, float]]                = {}
 
         for cam_id, camera in self.cameras.items():
             proj_per_ctrl: Dict[str, Optional[np.ndarray]] = {}
+            vel_per_ctrl:  Dict[str, float]                = {}
             for ctrl_name in ctrl_names:
                 tracker = self.trackers.get((ctrl_name, cam_id))
                 pred = SingleViewTracker._predict_pose(tracker.pose_history) if tracker else None
                 if pred is None:
                     proj_per_ctrl[ctrl_name] = None
+                    vel_per_ctrl[ctrl_name]  = 0.0
                     continue
                 rvec_pred, tvec_pred = pred
+                _ph = tracker.pose_history
+                if tracker.vel_ema is not None:
+                    vel_3d = tracker.vel_ema.astype(np.float64)
+                elif len(_ph) >= 2:
+                    vel_3d = (np.asarray(_ph[0][1], np.float64).reshape(3)
+                              - np.asarray(_ph[1][1], np.float64).reshape(3))
+                else:
+                    vel_3d = np.zeros(3, np.float64)
 
                 R_pred, _ = cv2.Rodrigues(rvec_pred.reshape(3, 1))
                 R_pred    = R_pred.astype(np.float32)
@@ -785,6 +833,7 @@ class TrackingSystem:
                 vis_ids = np.where(vis_mask)[0]
                 if len(vis_ids) == 0:
                     proj_per_ctrl[ctrl_name] = None
+                    vel_per_ctrl[ctrl_name]  = 0.0
                     continue
 
                 proj_pts = _project_points(
@@ -805,8 +854,12 @@ class TrackingSystem:
                     vis_ids.astype(np.float32).reshape(-1, 1),
                 ])  # (M, 5): proj_x, proj_y, depth_m, facing_cos, led_id
 
-            result[cam_id] = proj_per_ctrl
-        return result
+                _depth_pred = max(float(tvec_pred[2]), 0.1)
+                vel_per_ctrl[ctrl_name] = float(np.linalg.norm(vel_3d)) * camera.fx / _depth_pred
+
+            result[cam_id]    = proj_per_ctrl
+            vel_hints[cam_id] = vel_per_ctrl
+        return result, vel_hints
 
     def get_ctrl_processing_order(self) -> List[str]:
         """Return controller names in the same priority order used by update()."""
@@ -1232,6 +1285,12 @@ class TrackingSystem:
                     _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
                     _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
                     _tv_np = _T_cam_ctrl.t.astype(np.float32)
+                    if _tracker.prev_pose is not None:
+                        _step = (_tv_np.reshape(3).astype(np.float64)
+                                 - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
+                        _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
+                        _tracker.vel_ema = (_beta * _step + (1.0 - _beta) * _tracker.vel_ema
+                                           if _tracker.vel_ema is not None else _step)
                     _tracker.prev_prev_pose = _tracker.prev_pose
                     _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
                     _tracker.last_good_pose = _tracker.prev_pose
