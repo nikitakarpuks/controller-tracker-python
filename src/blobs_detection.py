@@ -520,7 +520,7 @@ def _nms_blobs(all_blobs, min_split_dist):
 
 def _detect_blobs_local(image, led_projections, cfg,
                         visualize=False, img_path=None, vis_suffix="",
-                        search_radius_px=None):
+                        search_radius_px=None, threshold_scale: float = 1.0):
     """
     Pose-guided per-LED local blob detection.
 
@@ -565,6 +565,8 @@ def _detect_blobs_local(image, led_projections, cfg,
         pixel_thrs = np.full(n_leds, base_pixel_thr, dtype=int)
         max_areas  = np.full(n_leds, None,            dtype=object)
         min_areas  = np.full(n_leds, base_min_area)
+    if threshold_scale != 1.0:
+        pixel_thrs = np.maximum((pixel_thrs * threshold_scale).astype(int), 1)
     req_thrs = np.clip((pixel_thrs * req_factor).astype(int), 0, 255)
 
     # Per-LED search radii
@@ -746,8 +748,8 @@ def get_pass2_params(cam_idx) -> dict | None:
 
 def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None,
                   ctrl_label="", predicted_leds=None,
-                  local_search_radius_px=None):
-    pixel_threshold    = int(cfg["min_threshold"])
+                  local_search_radius_px=None, threshold_scale: float = 1.0):
+    pixel_threshold    = max(int(cfg["min_threshold"] * threshold_scale), 1)
     _req_factor        = float(cfg.get("required_threshold_factor", 1.5))
     required_threshold = min(int(pixel_threshold * _req_factor), 255)
 
@@ -759,7 +761,8 @@ def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None,
         return _detect_blobs_local(image, predicted_leds, cfg,
                                    visualize, img_path,
                                    f"{cam_str}{ctrl_str}",
-                                   search_radius_px=local_search_radius_px)
+                                   search_radius_px=local_search_radius_px,
+                                   threshold_scale=threshold_scale)
 
     pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
     pass2_required_factor       = float(cfg.get("pass2_required_factor", 0.7))

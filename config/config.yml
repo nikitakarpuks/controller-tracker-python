@@ -1,5 +1,5 @@
 data:
-  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_fast"
+  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
@@ -66,6 +66,8 @@ blob_detection:
   split_valley_ratio: 0.6           # saddle_min/lower_peak must be below this to allow splitting
   min_circularity: 0.5              # 4π·area/perimeter² must exceed this; rejects elongated shapes
   required_threshold_factor: 1.5   # required_threshold = clip(pixel_threshold * factor, 255)
+  velocity_threshold_k: 0.013          # scale = 1/(1 + k*v_px); lowers threshold at speed; 0 = disabled
+  velocity_threshold_min_factor: 0.75  # floor: threshold never drops below this fraction of base
 
   # ── Warm path (active when a predicted pose is available) ─────────────────
   pose_guided_thresholds:
@@ -143,8 +145,8 @@ matching:
   proximity_min_inliers: 3               # min inliers for proximity match (can be lower than min_inliers
                                           # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
-  proximity_expansion_px: 40.0           # Hungarian acceptance gate (px): max cost-matrix distance to accept a pair
-  aux_snap_px: 40.0                     # Hungarian acceptance gate for aux cameras
+  proximity_expansion_px: 15.0           # Hungarian acceptance gate (px) for all cameras; velocity-scaled: gate = base + k * v_px
+  proximity_expansion_velocity_k: 0.7   # extra px per px/frame of estimated velocity
   proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
   voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs
@@ -159,8 +161,9 @@ matching:
   # --------------------------------------------------------------------------
   # Pose prediction
   # --------------------------------------------------------------------------
-  pose_history_window: 5             # max poses kept for _predict_pose; 1=constant pos, 2=const vel, 3+=quadratic fit
+  pose_history_window: 4             # max poses kept for _predict_pose; 1=constant pos, 2=const vel, 3+=linear fit
   pose_prediction_weight_decay: 0.7  # exponential weight decay per frame (0→only last frame, 1→equal weights)
+  pose_prediction_vel_ema_beta: 0.3  # EMA weight on newest velocity step (0=frozen, 1=no smoothing)
 
   # --------------------------------------------------------------------------
   # Pose validation

@@ -133,11 +133,11 @@ def main():
 
     for batch in tqdm(get_data(config["data"])):
         img_path, cam_images = batch[0][0], batch[0][1]
-        if img_path.name == "30633126936118.png":
-            pass
+        # if img_path.name == "30633726268015.png":
+        #     pass
         # cam_images: {cam_idx: numpy array}
 
-        proj_hints         = tracking_system.get_predicted_led_projections_per_camera()
+        proj_hints, vel_hints = tracking_system.get_predicted_led_projections_per_camera()
         primary_cams       = tracking_system.get_designated_primary_cameras()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
@@ -157,20 +157,25 @@ def main():
             for cam_idx in cameras:
                 if cam_idx not in cam_images:
                     continue
-                predicted_leds  = proj_hints.get(cam_idx, {}).get(ctrl_name)
-                _primary_cam   = primary_cams.get(ctrl_name)
-                _is_primary    = (_primary_cam is None or cam_idx == _primary_cam)
+                predicted_leds = proj_hints.get(cam_idx, {}).get(ctrl_name)
                 _match_cfg     = config["matching"]
-                _local_r_px    = (_match_cfg.get("proximity_expansion_px", 8.0) if _is_primary
-                                  else _match_cfg.get("aux_snap_px", 15.0))
+                _base_r        = float(_match_cfg.get("proximity_expansion_px", 8.0))
+                _vel_k         = float(_match_cfg.get("proximity_expansion_velocity_k", 0.0))
+                _v_px          = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
+                _local_r_px    = _base_r + _vel_k * _v_px
+                _blob_cfg      = config["blob_detection"]
+                _thr_k         = float(_blob_cfg.get("velocity_threshold_k", 0.0))
+                _thr_min       = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
+                _thr_scale     = max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0
                 t0 = time()
                 blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
-                    cam_images[cam_idx], config["blob_detection"],
-                    visualize=config["blob_detection"]["visualize"],
+                    cam_images[cam_idx], _blob_cfg,
+                    visualize=_blob_cfg["visualize"],
                     img_path=img_path, cam_idx=cam_idx,
                     ctrl_label=ctrl_name.replace("_controller", ""),
                     predicted_leds=predicted_leds,
                     local_search_radius_px=_local_r_px,
+                    threshold_scale=_thr_scale,
                 )
                 logger.info(f"blob detection took {time() - t0} seconds")
 

@@ -227,6 +227,7 @@ def proximity_match(
     blob_brightnesses: Optional[np.ndarray] = None,
     other_cameras_blobs: Optional[List] = None,
     occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = None,
+    expansion_px: Optional[float] = None,
 ) -> Optional[Dict]:
     """
     Refine a predicted pose via global Hungarian matching over all model-visible LEDs.
@@ -259,8 +260,8 @@ def proximity_match(
     _gate_margin_px              = float(_cfg.get('cross_occlusion_gate_margin_px',    20.0))
     blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',             0.5))
     blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight',       0.3))
-    proximity_expansion_px = float(_cfg.get('proximity_expansion_px',             8.0))
-    _aux_snap_px           = float(_cfg.get('aux_snap_px', proximity_expansion_px * 3))
+    proximity_expansion_px = expansion_px if expansion_px is not None \
+                             else float(_cfg.get('proximity_expansion_px', 8.0))
 
     R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
     focal_px = float(max(K[0, 0], K[1, 1]))
@@ -435,10 +436,10 @@ def proximity_match(
 
                     _n_vis_i   = len(_vis_ids_i)
                     _cost_i_aug = np.hstack([_cost_i_r,
-                                             np.full((_n_vis_i, _n_vis_i), _aux_snap_px - 1e-6)])
+                                             np.full((_n_vis_i, _n_vis_i), proximity_expansion_px - 1e-6)])
                     _row_r, _col_r = linear_sum_assignment(_cost_i_aug)
                     for _rr, _cc in zip(_row_r, _col_r):
-                        if _cc < len(_oblobs) and _cost_i_r[_rr, _cc] < _aux_snap_px:
+                        if _cc < len(_oblobs) and _cost_i_r[_rr, _cc] < proximity_expansion_px:
                             _pairs_i.append((int(_cc), int(_vis_ids_i[_rr])))
 
             aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
@@ -912,8 +913,7 @@ def brute_match(
     _br                   = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
     _gate_margin_px       = float(_cfg.get('cross_occlusion_gate_margin_px',   20.0))
     led_radius_mm         = float(_cfg.get('led_radius_mm',        2.5))
-    # Aux-camera inlier threshold for step 6.7: looser than primary RANSAC threshold
-    # to tolerate inter-camera calibration offsets (mirrors proximity_match's aux_snap_px intent).
+    # Aux-camera inlier threshold for step 6.7: looser than primary RANSAC threshold.
     brute_aux_reproj_px   = float(_cfg.get('joint_aux_prefilter_px', reprojection_threshold * 2.0))
 
     blobs   = np.asarray(blobs, dtype=np.float32)
