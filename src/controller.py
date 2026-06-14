@@ -11,7 +11,7 @@ from src.camera import Camera
 from src.debug_config import is_deep
 from src.geometry import Box3D, Cylinder3D, ControllerGeometry
 from src.transformations import Transform
-# from src._self_calibration import SelfCalibrator
+from src._self_calibration import SelfCalibrator
 
 
 # =========================================================
@@ -382,8 +382,10 @@ class SingleViewTracker:
 
         n=0 → None (no information)
         n=1 → constant position (same pose)
-        n=2 → constant-velocity extrapolation (original behavior, matrix-based rotation)
-        n>=3 → weighted degree-2 polynomial fit; exponential weights (weight_decay^i)
+        n=2 → constant-velocity extrapolation (matrix-based rotation)
+        n>=3 → weighted degree-1 (linear) fit; exponential weights (weight_decay^i)
+               Computes a weighted mean velocity across the window — averaging out
+               the alternating big/small step oscillation from fast hand motion.
         """
         n = len(pose_history)
 
@@ -411,18 +413,20 @@ class SingleViewTracker:
 
             return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
 
-        # n >= 3: weighted degree-2 polynomial fit
+        # n >= 3: weighted degree-1 (linear) fit — estimates a single average velocity
+        # across the window. Degree-2 would add an acceleration term that amplifies
+        # the alternating big/small step oscillation typical of fast hand motion.
         # time axis: most recent pose = t=0, one frame older = t=-1, …; predict at t=+1
         t_pts   = -np.arange(n, dtype=np.float64)
         weights = weight_decay ** np.arange(n, dtype=np.float64)
 
-        # Translation: polynomial fit per axis
+        # Translation: linear fit per axis
         tvecs = np.stack([np.asarray(p[1], np.float64).reshape(3) for p in pose_history])
         tvec_pred = np.empty(3, dtype=np.float32)
         for ax in range(3):
-            tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=2, w=weights), 1.0)
+            tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=1, w=weights), 1.0)
 
-        # Rotation: polynomial fit in the tangent space of R_0 (most recent rotation).
+        # Rotation: linear fit in the tangent space of R_0 (most recent rotation).
         # rel_rvecs[i] = log(R_0^T @ R_i) — rotation from current pose back to the i-th
         # historical pose, expressed as a Rodrigues vector. These are always small-angle
         # deltas and avoid the ±π discontinuity of fitting absolute Rodrigues components.
@@ -435,7 +439,7 @@ class SingleViewTracker:
 
         rvec_rel_pred = np.empty(3, dtype=np.float32)
         for ax in range(3):
-            rvec_rel_pred[ax] = np.polyval(np.polyfit(t_pts, rel_rvecs[:, ax], deg=2, w=weights), 1.0)
+            rvec_rel_pred[ax] = np.polyval(np.polyfit(t_pts, rel_rvecs[:, ax], deg=1, w=weights), 1.0)
 
         R_rel_pred, _ = cv2.Rodrigues(rvec_rel_pred.reshape(3, 1).astype(np.float32))
         rvec_pred, _ = cv2.Rodrigues((R_0 @ R_rel_pred).astype(np.float32))
@@ -513,7 +517,10 @@ class SingleViewTracker:
                 np.asarray(tvec, dtype=np.float32).reshape(3),
             )
 
-        predicted_pose = self._predict_pose(self.pose_history)
+        predicted_pose = self._predict_pose(
+            self.pose_history,
+            weight_decay=float(self._matching_cfg.get("pose_prediction_weight_decay", 0.7)),
+        )
 
         # ------------------------------------------------------------------
         # Candidate search
@@ -606,15 +613,21 @@ class SingleViewTracker:
                       f"attempting brute recovery.")
                 solution = None
                 if n_available >= 4:
-                    brute = self.brute_match(blobs, pose_prior=self.prev_pose,
+                    _jump_prior = predicted_pose if predicted_pose is not None else self.prev_pose
+                    brute = self.brute_match(blobs, pose_prior=_jump_prior,
                                              other_cameras_blobs=other_cameras_blobs,
                                              blob_radii=blob_radii,
                                              blob_mask=blob_mask)
-                    if brute is not None and not self._pose_jump_too_large(
-                        brute["rvec"], brute["tvec"], rvec_p, tvec_p,
-                        **_jump_kw,
-                    ):
-                        solution = brute
+                    if brute is not None:
+                        _near_prev = not self._pose_jump_too_large(
+                            brute["rvec"], brute["tvec"], rvec_p, tvec_p, **_jump_kw
+                        )
+                        _near_pred = (predicted_pose is not None and not self._pose_jump_too_large(
+                            brute["rvec"], brute["tvec"],
+                            predicted_pose[0], predicted_pose[1], **_jump_kw
+                        ))
+                        if _near_prev or _near_pred:
+                            solution = brute
 
         # ------------------------------------------------------------------
         # Accept / reject
@@ -681,7 +694,7 @@ class TrackingSystem:
 
         # Self-calibration: optionally apply saved extrinsics before tracker creation
         # so every tracker's T_world_cam starts with the correct (calibrated) value.
-        # self._self_cal: Optional[SelfCalibrator] = None
+        self._self_cal: Optional[SelfCalibrator] = None
         self._self_cal = None
         sc_cfg = self_calibration_cfg or {}
         _sc_primary_idx: Optional[int] = None
@@ -695,12 +708,6 @@ class TrackingSystem:
             _aux_cams = [self.cameras[cid] for cid in _aux_cam_idxs if cid in self.cameras]
 
             if _primary_cam and _aux_cams:
-                if sc_cfg.get("apply_on_load", True):
-                    from pathlib import Path
-                    _out = Path(sc_cfg.get("output_path",
-                                           "./data/cameras/self_calibrated_extrinsics.json"))
-                    SelfCalibrator.load_and_apply(_out, self.cameras, _sc_primary_idx)
-
                 self._self_cal = SelfCalibrator(_primary_cam, _aux_cams, sc_cfg)
 
         self.trackers: Dict[Tuple[str, int], SingleViewTracker] = {}
@@ -1122,18 +1129,6 @@ class TrackingSystem:
                     if len(_fb_blobs) < 3:
                         continue
                     _fb_tracker = tracker_map[_fb_cid]
-                    # Camera switch via fallback: clear the state-propagated pose so
-                    # track() runs brute instead of proximity from a pose derived
-                    # through a different camera's extrinsic calibration.
-                    _fb_prev_prim = self._prev_primary.get(ctrl_name)
-                    if _fb_prev_prim is not None and _fb_cid != _fb_prev_prim:
-                        logger.debug(
-                            f"[{ctrl_name} | cam {_fb_cid}] fallback would switch primary "
-                            f"cam{_fb_prev_prim} → cam{_fb_cid}: clearing state-prop pose, forcing brute"
-                        )
-                        _fb_tracker.prev_pose      = None
-                        _fb_tracker.prev_prev_pose = None
-                        _fb_tracker.pose_history.clear()
                     _fb_other = [
                         (self.cameras[cid], av[0], av[1])
                         for cid, av in avail.items() if cid != _fb_cid
@@ -1226,11 +1221,6 @@ class TrackingSystem:
                             primary_inliers=len(solution["assignment"]),
                             aux_observations=_sc_aux_obs,
                         )
-                        if self._self_cal.should_run():
-                            _cal = self._self_cal.run()
-                            self._self_cal.apply_to_cameras(_cal)
-                            for (_, _cam_id), _trk in self.trackers.items():
-                                _trk.T_world_cam = self.cameras[_cam_id].T_world_cam
 
                 # State propagation: push T_world_ctrl into every non-primary tracker
                 # so any camera can be promoted to primary without cold-start brute search.
@@ -1273,14 +1263,9 @@ class TrackingSystem:
                                     f"[{ctrl_name}] Camera handoff: "
                                     f"cam{primary_cam_id}({_n_primary} LEDs)"
                                     f" → cam{_aux_cid}({_aux_n} LEDs)"
-                                    f" — clearing state-prop pose, new primary starts cold"
+                                    f" — warm start from propagated pose"
                                 )
                                 self._designated_primary[ctrl_name] = _aux_cid
-                                _new_primary_trk = tracker_map.get(_aux_cid)
-                                if _new_primary_trk is not None:
-                                    _new_primary_trk.prev_pose      = None
-                                    _new_primary_trk.prev_prev_pose = None
-                                    _new_primary_trk.pose_history.clear()
                                 _hctr.clear()
                         else:
                             _hctr[_aux_cid] = 0
