@@ -482,3 +482,79 @@
   2. Warm / pose available: per-LED local search with thresholds computed from predicted (d_i, facing_cos_i) — this is the pose-guided path you already partially have
 
   That's not a limitation, it's the natural architecture. Does this align with what you were thinking?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Both files share identical T_imu_cam for all cameras, and distortion is identical across files for cams 0, 2, 3. The only real difference is cam1 fx/fy (+1.1px) and cx/cy (~0.8px
+  shift). Here's the full per-parameter risk breakdown:
+
+  ---
+
+  ┌────────┬────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────┬──────────┐
+  │ Param  │ Value range (across cams)  │                               Physical cause of change                               │           Drift risk            │ Priority │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ cx, cy │ 316–327 / 235–250 px       │ Lens shift on sensor from mechanical shock or nose-pad deformation from regular wear │ HIGH                            │ 1st      │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ fx, fy │ ~268–270 px                │ Thermal expansion of lens barrel during session warmup (~0.1–0.5%)                   │ MEDIUM                          │ 2nd      │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ p1, p2 │                            │ p1                                                                                   │ ≤0.0003,                        │ p2       │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ k1, k2 │ 0.43–0.76 / 0.25–0.66      │ Lens shape — glass doesn't change with use                                           │ NONE (but high impact if wrong) │ 4th      │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ k3–k6  │ small–large rational denom │ Same as k1/k2                                                                        │ NONE                            │ 5th      │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ rpmax  │ ~2.79 all cameras          │ Model boundary, not a physical quantity                                              │ NEVER                           │ —        │
+  └────────┴────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────┴──────────┘
+
+  ---
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ rpmax  │ ~2.79 all cameras          │ Model boundary, not a physical quantity                                              │ NEVER                           │ —        │
+  └────────┴────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────┴──────────┘
+  ---
+  Key observations from the data:  │ p1, p2 │                            │ p1                                                                                   │ ≤0.0003,                        │ p2       │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ k1, k2 │ 0.43–0.76 / 0.25–0.66      │ Lens shape — glass doesn't change with use                                           │ NONE (but high impact if wrong) │ 4th      │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ k3–k6  │ small–large rational denom │ Same as k1/k2                                                                        │ NONE                            │ 5th      │
+  ├────────┼────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────┼──────────┤
+  │ rpmax  │ ~2.79 all cameras          │ Model boundary, not a physical quantity                                              │ NEVER                           │ —        │
+  └────────┴────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────┴──────────┘
+
+  └────────┴────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────┴──────────┘
+
+  ---
+  Key observations from the data:
+
+  1. cx/cy is already off-center: cam0 has cx=326.5 on a 640px-wide sensor (center would be ~320). That 6.5px offset is real optical decentering — any small lens shift amplifies into
+  └────────┴────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────┴──────────┘
+
+  ---
+  Key observations from the data:
+
+  1. cx/cy is already off-center: cam0 has cx=326.5 on a 640px-wide sensor (center would be ~320). That 6.5px offset is real optical decentering — any small lens shift amplifies into
+  significant projection error, especially for the high-distortion fisheye model you're using.
+  2. k1 is huge (0.43–0.76) — this is fisheye-level. The distortion correction near image edges is enormous, so if k1 is wrong even by 1%, the edge error can be many pixels. But
+  crucially: both calibration files agree on k1-k6 exactly for all cameras, so these are stable and likely correct from the factory.
+  3. The only actual drift you observed between the two calibrations is cam1's fx/fy (+1.1px). That's thermal/mechanical and is already in your optimize_params.
+
+  Recommendation: your current optimize_params: [fx, fy, cx, cy] is exactly right. The distortion coefficients shouldn't be added unless reprojection error stays high after cx/cy/fx/fy
+  are tuned — and with sparse LED data you won't have enough coverage near image edges to reliably recover k1/k2 anyway.

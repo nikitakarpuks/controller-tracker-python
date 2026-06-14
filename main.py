@@ -319,6 +319,9 @@ def main():
         _csv_file.close()
         logger.info(f"Calibration CSV saved → {_csv_path}")
 
+    if tracking_system._self_cal is not None:
+        tracking_system._self_cal.run()
+
     # ── Sanity check ───────────────────────────────────────────────────────
     for ctrl_name in enabled_ctrls:
         if all(p is None for p in poses_all[ctrl_name]):
