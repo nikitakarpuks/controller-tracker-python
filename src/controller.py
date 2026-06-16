@@ -9,7 +9,6 @@ from src._pnp import _project_points
 from src._visibility import _visible_mask
 from src.camera import Camera
 from src.debug_config import is_deep
-from src.geometry import Box3D, Cylinder3D, ControllerGeometry
 from src.transformations import Transform
 from src._self_calibration import SelfCalibrator
 
@@ -64,146 +63,11 @@ def mirror_primitives(prim_cfg: dict) -> dict:
     return p
 
 
-def _primitives_from_cfg(prim_cfg: dict):
-    """Parse Box3D / Cylinder3D lists from a handle_primitives config dict."""
-    boxes = []
-    for b in prim_cfg.get("boxes", []):
-        axes = np.asarray(b["axes"], float) if "axes" in b else None
-        boxes.append(Box3D(
-            name=b["name"],
-            center=np.array(b["center"], float),
-            half_dims=np.array(b["half_dims"], float),
-            axes=axes,
-            color=b.get("color", [220, 180, 80]),
-        ))
-    cylinders = []
-    for cy in prim_cfg.get("cylinders", []):
-        cylinders.append(Cylinder3D(
-            name=cy["name"],
-            center=np.array(cy["center"], float),
-            axis=np.array(cy["axis"], float),
-            radius=float(cy["radius"]),
-            radius_v=float(cy["radius_v"]) if cy.get("radius_v") is not None else None,
-            half_length=float(cy["half_length"]),
-            angle=float(cy.get("angle", 0.0)),
-            color=cy.get("color", [100, 180, 255]),
-        ))
-    return boxes, cylinders
-
-
-def _compute_geometry(positions: np.ndarray, normals: np.ndarray, geometry_cfg: dict = None) -> ControllerGeometry:
-    """
-    Fit the LED-ring frustum and bundle it with the hardcoded handle body
-    primitives (finalized in handle_vis.py) into one ControllerGeometry object.
-
-    This replaces _compute_frustum_geometry which is now retired from _matching.
-    """
-    # ── Frustum: ring axis, inner/outer classification, cone fit ─────────────
-    centroid  = np.array([0.0, 0.0, 0.0])
-    ring_axis = np.array([0.0, 0.0, -1.0])
-
-    rel        = positions - centroid
-    rel_proj   = rel - np.outer(rel @ ring_axis, ring_axis)
-    radial_out = rel_proj / (np.linalg.norm(rel_proj, axis=1, keepdims=True) + 1e-8)
-
-    is_inner   = (normals * radial_out).sum(axis=1) < 0
-    outer_mask = ~is_inner
-
-    # orient axis toward the wider (large-radius) base → frustum_slope > 0
-    big_ring_axis = -ring_axis if float((normals[outer_mask] @ ring_axis).mean()) > 0 else ring_axis
-
-    axial_projs    = positions @ big_ring_axis
-    ring_center_ax = float(axial_projs.mean())
-    z_rel          = axial_projs - ring_center_ax
-
-    outer_idx    = np.where(outer_mask)[0]
-    outer_radial = np.linalg.norm(rel_proj[outer_idx], axis=1)
-    outer_z_rel  = z_rel[outer_idx]
-
-    A = np.column_stack([np.ones(len(outer_idx)), outer_z_rel])
-    coeffs, _, _, _ = np.linalg.lstsq(A, outer_radial, rcond=None)
-    R_fc          = float(coeffs[0])
-    frustum_slope = float(coeffs[1])
-
-    cfg = geometry_cfg or {}
-    z_frustum_top = float(outer_z_rel.max()) + float(cfg.get("z_frustum_top_padding", 0.0045))
-    z_frustum_bot = float(outer_z_rel.min()) - float(cfg.get("z_frustum_bot_padding", 0.0055))
-
-    ## ── Inner cone radius (wall thickness from inner LED h_corpus) ────────────
-    # r_led = np.linalg.norm(rel_proj, axis=1)
-    # if is_inner.any():
-    #     h_corpus       = np.maximum(0.0, R_fc + frustum_slope * z_rel[is_inner] - r_led[is_inner])
-    #     wall_thickness = float(h_corpus.mean())
-    # else:
-    #     wall_thickness = 0.007
-    wall_thickness = float(cfg.get("wall_thickness", 0.007))
-    R_fc_inner = R_fc - wall_thickness
-
-    # ── Handle body primitives ────────────────────────────────────────────────
-    # Use config values if provided (right/left selectable), else fall back to
-    # hardcoded right-controller defaults (keeps existing callers working).
-    prim_cfg = cfg.get("handle_primitives")
-    if prim_cfg is not None:
-        boxes, cylinders = _primitives_from_cfg(prim_cfg)
-    else:
-        boxes = [
-            Box3D(
-                name="box_vertical",
-                center=np.array([-0.009, -0.012, -0.015]),
-                half_dims=np.array([0.021, 0.0028, 0.013]),
-                color=[220, 130, 60],
-            ),
-            Box3D(
-                name="box_horizontal",
-                center=np.array([-0.009, -0.029, -0.0048]),
-                half_dims=np.array([0.021, 0.0032, 0.015]),
-                axes=np.column_stack([[1, 0, 0], [0, 0, -1], [0, 1, 0]]).astype(float),
-                color=[130, 60, 220],
-            ),
-        ]
-        cylinders = [
-            Cylinder3D(
-                name="control_panel",
-                center=np.array([-0.008, 0.0, -0.05]),
-                axis=np.array([0.0, 1.0, 0.0]),
-                radius=0.031,
-                radius_v=0.033,
-                half_length=0.017,
-                angle=np.pi / 10,
-                color=[100, 180, 255],
-            ),
-            Cylinder3D(
-                name="handle",
-                center=np.array([0.001, 0.022, -0.098]),
-                axis=np.array([0.0, 1.0, -1.5]),
-                radius=0.021,
-                half_length=0.037,
-                color=[255, 55, 55],
-            ),
-        ]
-
-    return ControllerGeometry(
-        ring_axis=big_ring_axis,
-        is_inner=is_inner,
-        radial_out=radial_out,
-        ring_centroid=centroid,
-        R_fc=R_fc,
-        R_fc_inner=R_fc_inner,
-        frustum_slope=frustum_slope,
-        z_frustum_top=z_frustum_top,
-        z_frustum_bot=z_frustum_bot,
-        z_rel=z_rel,
-        ring_center_ax=ring_center_ax,
-        boxes=boxes,
-        cylinders=cylinders,
-    )
-
-
 # =========================================================
 # 3. TRACKER (per camera + controller)
 # =========================================================
 
-class SingleViewTracker:
+class CameraTracker:
     def __init__(self, camera: Camera, model: ControllerModel, matching_cfg: dict = None, geometry_cfg: dict = None):
         self.camera = camera
         self.model = model
@@ -234,36 +98,13 @@ class SingleViewTracker:
         # Lazy cache (e.g. KD-tree later)
         self.kd_tree_cache = None
 
-        # Pre-compute body geometry and LED quad cache once from the fixed model.
-        from src._led_graph import (
-            _build_led_neighbor_lists,
-            _build_led_neighbor_lists_edge,
-            _precompute_led_quads,
-        )
-        positions = model.positions.astype("float32")
-        normals   = model.normals.astype("float32")
+        from src.pose_search import PoseSearcher
+        self._pose_searcher = PoseSearcher(camera, model, geometry_cfg, matching_cfg)
+        self._geometry = self._pose_searcher._geometry
 
-        self._geometry: ControllerGeometry = _compute_geometry(positions, normals, geometry_cfg)
-
-        self._led_nbr = _build_led_neighbor_lists(positions, normals)
-        self._led_triple_idx, self._led_triple_depth, self._led_triple_gates = _precompute_led_quads(
-            positions, self._led_nbr,
-        )
-        self._led_nbr_edge = _build_led_neighbor_lists_edge(
-            positions, normals, self._geometry.is_inner, self._geometry.z_rel
-        )
-        self._led_triple_idx_edge, self._led_triple_depth_edge, self._led_triple_gates_edge = (
-            _precompute_led_quads(positions, self._led_nbr_edge)
-        )
-
-        # Bind strategies
-        from src._matching import (
-            proximity_match, brute_match, prior_constrained_match,
-        )
-
-        self.proximity_match          = proximity_match.__get__(self)
-        self.brute_match              = brute_match.__get__(self)
-        self.prior_constrained_match  = prior_constrained_match.__get__(self)
+        self.proximity_match         = self._pose_searcher.proximity_search
+        self.brute_match             = self._pose_searcher.brute_search
+        self.prior_constrained_match = self._pose_searcher.constrained_search
 
     # # -----------------------------------------------------
     # # Custom projection
@@ -462,27 +303,15 @@ class SingleViewTracker:
     # -----------------------------------------------------
     # Tracking
     # -----------------------------------------------------
-    def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
-              blob_brightnesses: Optional[np.ndarray] = None,
-              other_cameras_blobs: Optional[List] = None,
-              blob_mask: Optional[np.ndarray] = None,
-              occluders_per_cam: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        State machine:
+    def search(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+               blob_brightnesses: Optional[np.ndarray] = None,
+               other_cameras_blobs: Optional[List] = None,
+               blob_mask: Optional[np.ndarray] = None,
+               occluders_per_cam: Optional[Dict] = None) -> Optional[Dict]:
+        """Pure pose solve — reads self state, does not commit results.
 
-        Have prev_pose?
-          Yes → proximity_match (fast locked path); brute fallback only if proximity returns None
-          Prediction via constant-velocity extrapolation (prev_pose + prev_prev_pose).
-          No  → brute_match (cold start or re-acquisition)
-
-        After any candidate solution:
-          1. Pose-jump check against prev_pose (tight: 15 cm / 25°).
-             If jump is too large → try brute_match; reject if still jumping.
-          2. Error threshold (< 5 px accepted).
-
-        On success: update prev_pose AND last_good_pose.
-        On failure: clear prev_pose (trigger brute next frame)
-                    but KEEP last_good_pose for re-acquisition plausibility check.
+        Returns a validated solution dict (error below threshold, T_world_ctrl populated)
+        or None.  Call apply() with the returned value to commit state changes.
         """
         blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
@@ -516,7 +345,7 @@ class SingleViewTracker:
         if _rot_ax is not None:
             _jump_kw['rot_thresh_xyz_deg'] = tuple(_rot_ax)
 
-        # Normalise prev_pose shapes
+        # Normalise prev_pose shapes (idempotent — canonicalises (3,1) rvec and (3,) tvec)
         if self.prev_pose is not None:
             rvec, tvec = self.prev_pose
             self.prev_pose = (
@@ -675,42 +504,309 @@ class SingleViewTracker:
                 f"[{ctrl_name} | cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
             )
+            # World-frame controller pose: T_world_ctrl = T_world_cam ∘ T_cam_ctrl
+            R_ctrl, _ = cv2.Rodrigues(solution["rvec"])
+            T_cam_ctrl = Transform(R_ctrl, solution["tvec"].reshape(3))
+            solution["T_world_ctrl"] = self.T_world_cam.compose(T_cam_ctrl)
+            return solution
+
+        if solution is not None:
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds {_accept_err_px:.1f}px threshold")
+        else:
+            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
+        return None
+
+    def apply(self, result: Optional[Dict]) -> None:
+        """Commit a search() result to tracker state.
+
+        On success: update prev_pose, pose_history, vel_ema, assignment caches.
+        On failure: clear transient state so the next frame starts a cold brute search.
+        last_good_pose is preserved across failures for re-acquisition plausibility checks.
+        """
+        if result is not None:
             if self.prev_pose is not None:
-                _step = (np.asarray(solution["tvec"], np.float64).reshape(3)
+                _step = (np.asarray(result["tvec"], np.float64).reshape(3)
                          - np.asarray(self.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
                 _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
                 self.vel_ema = (_beta * _step + (1.0 - _beta) * self.vel_ema
                                if self.vel_ema is not None else _step)
             self.prev_prev_pose  = self.prev_pose
-            self.prev_pose       = (solution["rvec"], solution["tvec"])
+            self.prev_pose       = (result["rvec"], result["tvec"])
             self.pose_history.appendleft((
-                np.asarray(solution["rvec"], np.float32).reshape(3, 1),
-                np.asarray(solution["tvec"], np.float32).reshape(3),
+                np.asarray(result["rvec"], np.float32).reshape(3, 1),
+                np.asarray(result["tvec"], np.float32).reshape(3),
             ))
-            self.prev_assignment = solution["assignment"]
+            self.prev_assignment      = result["assignment"]
             self.last_good_pose       = self.prev_pose
             self.last_good_assignment = self.prev_assignment
             self.consecutive_failures = 0
-
-            # World-frame controller pose: T_world_ctrl = T_world_cam ∘ T_cam_ctrl
-            R_ctrl, _ = cv2.Rodrigues(solution["rvec"])
-            T_cam_ctrl = Transform(R_ctrl, solution["tvec"].reshape(3))
-            solution["T_world_ctrl"] = self.T_world_cam.compose(T_cam_ctrl)
-
-            return solution
-
-        # Tracking lost — clear velocity history and blob ID state so re-acquisition starts fresh
-        if solution is not None:
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds {_accept_err_px:.1f}px threshold")
         else:
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
-        self.consecutive_failures += 1
-        self.prev_pose       = None
-        self.prev_prev_pose  = None
-        self.prev_assignment = None
-        self.vel_ema         = None
-        self.pose_history.clear()
-        return None
+            self.consecutive_failures += 1
+            self.prev_pose       = None
+            self.prev_prev_pose  = None
+            self.prev_assignment = None
+            self.vel_ema         = None
+            self.pose_history.clear()
+
+    def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+              blob_brightnesses: Optional[np.ndarray] = None,
+              other_cameras_blobs: Optional[List] = None,
+              blob_mask: Optional[np.ndarray] = None,
+              occluders_per_cam: Optional[Dict] = None) -> Optional[Dict]:
+        """Thin wrapper: search() then apply(). Preserves backward compatibility."""
+        result = self.search(blobs, blob_radii, blob_brightnesses,
+                             other_cameras_blobs, blob_mask, occluders_per_cam)
+        self.apply(result)
+        return result
+
+
+# =========================================================
+# 2.5 PER-CONTROLLER TRACKER
+# =========================================================
+
+class ControllerTracker:
+    """Manages all camera-trackers for a single controller.
+
+    Owns primary-camera selection, camera fallback, handoff heuristics, state
+    propagation to non-primary CameraTrackers, and claimed-blob registration.
+    Cross-controller concerns (Voronoi reservation, ordering) remain in TrackingSystem.
+    """
+
+    def __init__(self, ctrl_name: str, cameras: Dict[int, "Camera"],
+                 trackers: Dict[int, CameraTracker],
+                 matching_cfg: Optional[dict] = None):
+        self.ctrl_name        = ctrl_name
+        self.cameras          = cameras
+        self.trackers         = trackers           # {cam_id: CameraTracker}
+        self._matching_cfg    = matching_cfg or {}
+        self._designated_primary: Optional[int]  = None
+        self._prev_primary:       Optional[int]  = None
+        self._handoff_counter:    Dict[int, int] = {}
+
+    def update(
+        self,
+        avail:         Dict[int, tuple],        # cam_id → (blobs, radii, brts, orig_idx)
+        obs_src:       Dict[int, np.ndarray],   # full observations per camera
+        rad_src:       Dict,
+        brt_src:       Dict,
+        claimed_blobs: Dict[int, Set[int]],     # mutated in place
+        fixed_primary_cam: Optional[int] = None,
+        occluders_per_cam: Optional[Dict] = None,
+        self_cal=None,
+    ) -> Optional[Dict]:
+        if not avail:
+            return None
+
+        _cfg = self._matching_cfg
+
+        # ── Primary camera selection ───────────────────────────────────────────
+        if fixed_primary_cam is not None and fixed_primary_cam in avail:
+            primary_cam_id = fixed_primary_cam
+        else:
+            _designated  = self._designated_primary
+            _des_tracker = self.trackers.get(_designated)
+            _min_inliers = int(_cfg.get('min_inliers', 4))
+            _des_ok = (
+                _des_tracker is not None
+                and _designated in avail
+                and len(avail[_designated][0]) >= _min_inliers
+            )
+            if _des_ok:
+                primary_cam_id = _designated
+            else:
+                _with_prior = [
+                    cid for cid in avail
+                    if self.trackers[cid].prev_pose is not None
+                ]
+                if _with_prior:
+                    primary_cam_id = max(_with_prior, key=lambda cid: len(avail[cid][0]))
+                else:
+                    _cold_eligible = [
+                        cid for cid in avail if len(avail[cid][0]) >= _min_inliers
+                    ]
+                    if _cold_eligible:
+                        primary_cam_id = min(_cold_eligible, key=lambda cid: len(avail[cid][0]))
+                    else:
+                        primary_cam_id = max(avail, key=lambda cid: len(avail[cid][0]))
+
+        primary_tracker = self.trackers[primary_cam_id]
+        _, _, _, primary_orig = avail[primary_cam_id]
+
+        other_cameras_blobs = [
+            (self.cameras[cid], av[0], av[1])
+            for cid, av in avail.items()
+            if cid != primary_cam_id
+        ]
+        aux_orig: Dict[int, List[int]] = {
+            cid: av[3] for cid, av in avail.items() if cid != primary_cam_id
+        }
+
+        _prim_obs_full = obs_src[primary_cam_id]
+        _prim_rad_full = rad_src.get(primary_cam_id) if rad_src else None
+        _prim_brt_full = brt_src.get(primary_cam_id) if brt_src else None
+        _prim_mask = np.zeros(len(_prim_obs_full), dtype=bool)
+        _prim_mask[primary_orig] = True
+
+        # ── Primary camera track ───────────────────────────────────────────────
+        solution = primary_tracker.track(
+            _prim_obs_full,
+            blob_radii=_prim_rad_full,
+            blob_brightnesses=_prim_brt_full,
+            other_cameras_blobs=other_cameras_blobs,
+            blob_mask=_prim_mask,
+            occluders_per_cam=occluders_per_cam,
+        )
+
+        # ── Fallback cameras ───────────────────────────────────────────────────
+        _cold_start = primary_tracker.prev_pose is None
+        if solution is None and len(avail) > 1:
+            _fallback_order = sorted(
+                [cid for cid in avail if cid != primary_cam_id],
+                key=lambda cid: (
+                    0 if self.trackers[cid].prev_pose is not None else 1,
+                    len(avail[cid][0]) if _cold_start else -len(avail[cid][0]),
+                ),
+            )
+            for _fb_cid in _fallback_order:
+                _fb_blobs, _fb_radii, _fb_brts, _fb_orig = avail[_fb_cid]
+                if len(_fb_blobs) < 3:
+                    continue
+                _fb_tracker = self.trackers[_fb_cid]
+                _fb_other = [
+                    (self.cameras[cid], av[0], av[1])
+                    for cid, av in avail.items() if cid != _fb_cid
+                ]
+                _fb_obs_full = obs_src[_fb_cid]
+                _fb_rad_full = rad_src.get(_fb_cid) if rad_src else None
+                _fb_brt_full = brt_src.get(_fb_cid) if brt_src else None
+                _fb_mask = np.zeros(len(_fb_obs_full), dtype=bool)
+                _fb_mask[_fb_orig] = True
+                solution = _fb_tracker.track(
+                    _fb_obs_full,
+                    blob_radii=_fb_rad_full,
+                    blob_brightnesses=_fb_brt_full,
+                    other_cameras_blobs=_fb_other,
+                    blob_mask=_fb_mask,
+                    occluders_per_cam=occluders_per_cam,
+                )
+                if solution is not None:
+                    primary_cam_id  = _fb_cid
+                    primary_tracker = _fb_tracker
+                    primary_orig    = _fb_orig
+                    aux_orig = {
+                        cid: av[3] for cid, av in avail.items() if cid != _fb_cid
+                    }
+                    break
+
+        if solution is None:
+            return None
+
+        solution["primary_cam"] = primary_cam_id
+
+        # ── Primary switch logging ─────────────────────────────────────────────
+        if self._prev_primary is not None and primary_cam_id != self._prev_primary:
+            logger.info(
+                f"[{self.ctrl_name}] Primary camera switched "
+                f"cam{self._prev_primary} → cam{primary_cam_id}"
+            )
+        self._prev_primary = primary_cam_id
+        if fixed_primary_cam is None:
+            self._designated_primary = primary_cam_id
+
+        # ── Index remapping ────────────────────────────────────────────────────
+        if not solution.get('_orig_idx', False):
+            solution["assignment"] = [
+                (primary_orig[b], lid) for b, lid in solution["assignment"]
+            ]
+        _raw_aux = solution.get("aux_assignments") or {}
+        if _raw_aux:
+            solution["aux_assignments"] = {
+                cid: [(aux_orig[cid][b], lid) for b, lid in pairs]
+                for cid, pairs in _raw_aux.items()
+                if cid in aux_orig
+            }
+
+        # ── Register claimed blobs ─────────────────────────────────────────────
+        for b, _ in solution["assignment"]:
+            claimed_blobs.setdefault(primary_cam_id, set()).add(b)
+        for cid, pairs in (solution.get("aux_assignments") or {}).items():
+            for b, _ in pairs:
+                claimed_blobs.setdefault(cid, set()).add(b)
+
+        # ── Self-calibration feed ──────────────────────────────────────────────
+        if (self_cal is not None
+                and primary_cam_id == self_cal.primary_camera.camera_idx):
+            _R_prim, _ = cv2.Rodrigues(solution["rvec"].reshape(3, 1).astype(np.float32))
+            _t_prim = solution["tvec"].reshape(3).astype(np.float32)
+            _sc_aux_obs: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+            for _aux_cid, _aux_pairs in (solution.get("aux_assignments") or {}).items():
+                if len(_aux_pairs) < 3:
+                    continue
+                _led_ids   = np.array([lid for _, lid in _aux_pairs], dtype=np.int32)
+                _blob_idxs = np.array([b   for b, _  in _aux_pairs], dtype=np.int32)
+                _led_pos   = primary_tracker.model.positions[_led_ids]
+                _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim
+                _blobs_aux = obs_src[_aux_cid][_blob_idxs]
+                _sc_aux_obs[_aux_cid] = (_pts_prim, _blobs_aux)
+            if _sc_aux_obs:
+                self_cal.add_frame(
+                    solution["rvec"], solution["tvec"],
+                    primary_error=solution["error"],
+                    primary_inliers=len(solution["assignment"]),
+                    aux_observations=_sc_aux_obs,
+                )
+
+        # ── State propagation to non-primary cameras ───────────────────────────
+        T_world_ctrl = solution["T_world_ctrl"]
+        aux_asgns    = solution.get("aux_assignments") or {}
+        for _cid, _tracker in self.trackers.items():
+            if _cid == primary_cam_id:
+                continue
+            _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
+            _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
+            _tv_np = _T_cam_ctrl.t.astype(np.float32)
+            if _tracker.prev_pose is not None:
+                _step = (_tv_np.reshape(3).astype(np.float64)
+                         - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
+                _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
+                _tracker.vel_ema = (_beta * _step + (1.0 - _beta) * _tracker.vel_ema
+                                   if _tracker.vel_ema is not None else _step)
+            _tracker.prev_prev_pose = _tracker.prev_pose
+            _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
+            _tracker.last_good_pose = _tracker.prev_pose
+            _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np))
+            _aux_asgn = aux_asgns.get(_cid)
+            if _aux_asgn is not None:
+                _tracker.prev_assignment      = _aux_asgn
+                _tracker.last_good_assignment = _aux_asgn
+            elif _tracker.prev_assignment is None:
+                _tracker.last_good_assignment = None
+            _tracker.consecutive_failures = 0
+
+        # ── Camera handoff check ───────────────────────────────────────────────
+        if bool(_cfg.get('camera_handoff', True)) and fixed_primary_cam is None:
+            _ratio_thr  = float(_cfg.get('handoff_coverage_ratio',   1.5))
+            _min_adv    = int(  _cfg.get('handoff_min_advantage',     3))
+            _hysteresis = int(  _cfg.get('handoff_hysteresis_frames', 3))
+            _n_primary  = len(solution["assignment"])
+            for _aux_cid, _aux_pairs in aux_asgns.items():
+                _aux_n = len(_aux_pairs)
+                if (_aux_n >= _ratio_thr * _n_primary
+                        and _aux_n - _n_primary >= _min_adv):
+                    self._handoff_counter[_aux_cid] = self._handoff_counter.get(_aux_cid, 0) + 1
+                    if self._handoff_counter[_aux_cid] >= _hysteresis:
+                        logger.info(
+                            f"[{self.ctrl_name}] Camera handoff: "
+                            f"cam{primary_cam_id}({_n_primary} LEDs)"
+                            f" → cam{_aux_cid}({_aux_n} LEDs)"
+                            f" — warm start from propagated pose"
+                        )
+                        self._designated_primary = _aux_cid
+                        self._handoff_counter.clear()
+                else:
+                    self._handoff_counter[_aux_cid] = 0
+
+        return solution
 
 
 # =========================================================
@@ -743,18 +839,7 @@ class TrackingSystem:
             if _primary_cam and _aux_cams:
                 self._self_cal = SelfCalibrator(_primary_cam, _aux_cams, sc_cfg)
 
-        self.trackers: Dict[Tuple[str, int], SingleViewTracker] = {}
-
-        for ctrl in controllers:
-            for cam in cameras:
-                key = (ctrl.name, cam.camera_idx)
-                geo = (geometry_cfg_per_ctrl or {}).get(ctrl.name) or geometry_cfg
-                self.trackers[key] = SingleViewTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geo)
-
-        self._matching_cfg:       dict                       = matching_cfg or {}
-        self._designated_primary: Dict[str, Optional[int]]  = {}
-        self._handoff_counter:    Dict[str, Dict[int, int]] = {}
-        self._prev_primary:       Dict[str, Optional[int]]  = {}
+        self._matching_cfg: dict = matching_cfg or {}
 
         # Resolve fixed primary camera: matching cfg wins, then self-cal lock_primary.
         _fpc = self._matching_cfg.get("fixed_primary_camera")
@@ -762,9 +847,24 @@ class TrackingSystem:
             _fpc = _sc_primary_idx
         self._fixed_primary_cam: Optional[int] = int(_fpc) if _fpc is not None else None
 
+        self.trackers: Dict[Tuple[str, int], CameraTracker] = {}
+        self.ctrl_trackers: Dict[str, ControllerTracker]    = {}
+
+        for ctrl in controllers:
+            ctrl_cam_trackers: Dict[int, CameraTracker] = {}
+            for cam in cameras:
+                key = (ctrl.name, cam.camera_idx)
+                geo = (geometry_cfg_per_ctrl or {}).get(ctrl.name) or geometry_cfg
+                cam_tracker = CameraTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geo)
+                self.trackers[key]           = cam_tracker
+                ctrl_cam_trackers[cam.camera_idx] = cam_tracker
+            self.ctrl_trackers[ctrl.name] = ControllerTracker(
+                ctrl.name, self.cameras, ctrl_cam_trackers, matching_cfg=matching_cfg,
+            )
+
         if self._fixed_primary_cam is not None:
             for ctrl in controllers:
-                self._designated_primary[ctrl.name] = self._fixed_primary_cam
+                self.ctrl_trackers[ctrl.name]._designated_primary = self._fixed_primary_cam
 
 
 
@@ -775,8 +875,7 @@ class TrackingSystem:
         None means no designation exists yet (cold start); callers should treat all
         cameras as equally primary in that case.
         """
-        ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
-        return {name: self._designated_primary.get(name) for name in ctrl_names}
+        return {name: ct._designated_primary for name, ct in self.ctrl_trackers.items()}
 
     def get_predicted_led_projections_per_camera(
         self,
@@ -802,7 +901,7 @@ class TrackingSystem:
             vel_per_ctrl:  Dict[str, float]                = {}
             for ctrl_name in ctrl_names:
                 tracker = self.trackers.get((ctrl_name, cam_id))
-                pred = SingleViewTracker._predict_pose(tracker.pose_history) if tracker else None
+                pred = CameraTracker._predict_pose(tracker.pose_history) if tracker else None
                 if pred is None:
                     proj_per_ctrl[ctrl_name] = None
                     vel_per_ctrl[ctrl_name]  = 0.0
@@ -896,7 +995,7 @@ class TrackingSystem:
         Blob ownership model: observations_per_camera is never mutated. Instead,
         claimed_blobs tracks which original blob indices have been consumed by
         earlier controllers. Each controller receives a pre-filtered view of
-        unclaimed blobs; assignments returned are remapped to original indices.
+        unclaimed blobs; assignments are remapped to original indices by ControllerTracker.
 
         Controllers with a prior pose run first so their high-confidence claims
         are registered before cold-starting controllers search.
@@ -906,41 +1005,21 @@ class TrackingSystem:
         """
         results: Dict[str, Optional[Dict]] = {}
 
-        ctrl_names: List[str] = sorted({ctrl for ctrl, _ in self.trackers})
-
-        # Controllers with a prior pose run first — their claims reduce the search
-        # space for cold-starting controllers.
-        # first_controller config breaks ties when both controllers have equal status.
-        def _has_prior(name: str) -> bool:
-            return any(
-                t.prev_pose is not None
-                for (cname, _), t in self.trackers.items()
-                if cname == name
-            )
-        _first = self._matching_cfg.get('first_controller', None)
-
-        def _order_key(name: str):
-            has_prior_rank = 0 if _has_prior(name) else 1
-            preferred_rank = (0 if name == f"{_first}_controller" else 1) if _first else 0
-            return (has_prior_rank, preferred_rank, name)
-
-        ordered = sorted(ctrl_names, key=_order_key)
+        ordered = self.get_ctrl_processing_order()
         if ctrl_name_filter is not None:
             ordered = [n for n in ordered if n == ctrl_name_filter]
 
-        # Blob ownership: original observation indices claimed by controllers so far.
+        # Blob ownership: original observation indices claimed by earlier controllers.
         claimed_blobs: Dict[int, Set[int]] = {}
 
         def _filter_cam(cam_id: int, obs_map: dict, rad_map: dict, brt_map: dict,
                         extra_excluded: Optional[Set[int]] = None):
             """Return (filtered_blobs, filtered_radii, filtered_brts, orig_indices)
-            for camera cam_id, excluding already-claimed blobs and any extra_excluded
-            original indices (Phase 3 reservations for later controllers).
-            Returns (None, None, None, []) when no unclaimed blobs remain."""
+            excluding claimed and reserved blobs. Returns (None,None,None,[]) if empty."""
             obs = obs_map.get(cam_id)
             if obs is None or len(obs) == 0:
                 return None, None, None, []
-            claimed = claimed_blobs.get(cam_id, set())
+            claimed  = claimed_blobs.get(cam_id, set())
             excluded = claimed if not extra_excluded else claimed | extra_excluded
             keep = [i for i in range(len(obs)) if i not in excluded]
             if not keep:
@@ -950,31 +1029,21 @@ class TrackingSystem:
             _r = rad_map.get(cam_id) if rad_map else None
             f_radii = _r[k] if _r is not None else None
             _b = brt_map.get(cam_id) if brt_map else None
-            f_brts = _b[k] if _b is not None else None
+            f_brts  = _b[k] if _b is not None else None
             return f_blobs, f_radii, f_brts, keep
 
         _cfg = self._matching_cfg
 
-        # Reservation sets: _reservations[ctrl_i][cam_id] = blob indices ctrl_i must not use.
-        # Populated by the Voronoi block below when sharing a blob pool; empty when each
-        # controller has its own per-ctrl blob set (per_ctrl_observations provided).
+        # Reservation sets: blobs that later controllers must not use (cross-controller Voronoi).
         _reservations: Dict[str, Dict[int, Set[int]]] = {_cn: {} for _cn in ordered}
 
-        # ── Phase 3: Proximity mutual exclusion ───────────────────────────────
-        # Skipped when per_ctrl_observations is provided: each controller already has
-        # its own independent blob set, so cross-controller reservation is unnecessary.
+        # ── Phase 3 / 4: Proximity mutual exclusion ───────────────────────────
         if per_ctrl_observations is None and len(ordered) >= 2:
-            # Phase 3 radius: used when only one controller has a projection on a camera.
             _reserve_px = float(_cfg.get(
-                'proximity_mutual_exclusion_px',
-                _cfg.get('aux_snap_px', 15.0),
+                'proximity_mutual_exclusion_px', _cfg.get('aux_snap_px', 15.0),
             ))
-            # Phase 4 radius: when both controllers have projections, extend the Voronoi
-            # partition to cover the full controller body region (ring + handle area).
             _voronoi_px = float(_cfg.get('voronoi_max_dist_px', 100.0))
 
-            # Cache per-controller, per-camera projected LED positions.
-            # {ctrl_name → {cam_id → (N,2) float32 or None}}
             _ctrl_proj: Dict[str, Dict[int, Optional[np.ndarray]]] = {}
             for _cn in ordered:
                 _ctrl_proj[_cn] = {}
@@ -987,7 +1056,7 @@ class TrackingSystem:
                     _R, _ = cv2.Rodrigues(np.asarray(_rv, dtype=np.float32).reshape(3))
                     _tv_np = np.asarray(_tv, dtype=np.float32).reshape(3)
                     _pts_cam = (_R @ _trk.model.positions.T).T + _tv_np
-                    _vis = _pts_cam[:, 2] > 0.01  # LED must be in front of camera
+                    _vis = _pts_cam[:, 2] > 0.01
                     if not _vis.any():
                         _ctrl_proj[_cn][_cid] = None
                         continue
@@ -1006,13 +1075,12 @@ class TrackingSystem:
                             continue
                         _pj = _proj_j.get(_cid)
                         if _pj is None or len(_pj) == 0:
-                            continue  # j has no projection on this camera — nothing to reserve
+                            continue
                         _d_j = np.linalg.norm(
                             _obs[:, None, :] - _pj[None, :, :], axis=2
                         ).min(axis=1)
                         _pi = _proj_i.get(_cid)
                         if _pi is not None and len(_pi) > 0:
-                            # Phase 4 — Full Voronoi: both controllers have projections.
                             _d_i = np.linalg.norm(
                                 _obs[:, None, :] - _pi[None, :, :], axis=2
                             ).min(axis=1)
@@ -1021,7 +1089,6 @@ class TrackingSystem:
                                 continue
                             _reserve_mask = _near_either & (_d_j < _d_i)
                         else:
-                            # Phase 3 — only j has projection: radius-bounded reservation.
                             _near_j = _d_j < _reserve_px
                             if not _near_j.any():
                                 continue
@@ -1031,14 +1098,8 @@ class TrackingSystem:
                         _res_set = _reservations[_cn_i].setdefault(_cid, set())
                         _res_set.update(int(k) for k in np.where(_reserve_mask)[0])
 
+        # ── Per-controller tracking ────────────────────────────────────────────
         for ctrl_name in ordered:
-            ctrl_pairs: List[Tuple[int, "SingleViewTracker"]] = [
-                (cam_id, tracker)
-                for (cname, cam_id), tracker in self.trackers.items()
-                if cname == ctrl_name
-            ]
-
-            # Select obs source: per-controller blobs if provided, else shared pool.
             if per_ctrl_observations is not None and ctrl_name in per_ctrl_observations:
                 _obs_src = per_ctrl_observations[ctrl_name]
                 _rad_src = (per_ctrl_radii or {}).get(ctrl_name) or {}
@@ -1048,87 +1109,16 @@ class TrackingSystem:
                 _rad_src = radii_per_camera or {}
                 _brt_src = brightnesses_per_camera or {}
 
-            # Build per-camera filtered views for this controller.
-            # Exclude already-claimed blobs (Phase 1) and Voronoi-reserved blobs (Phase 3).
-            # Phase 3 reservations are empty when per_ctrl_observations is active.
-            # Key: cam_id → (filtered_blobs, filtered_radii, filtered_brts, orig_idx_list)
             _ctrl_reservations = _reservations.get(ctrl_name, {})
             avail: Dict[int, tuple] = {}
-            for cam_id, _ in ctrl_pairs:
+            for cam_id in self.ctrl_trackers[ctrl_name].trackers:
                 _extra = _ctrl_reservations.get(cam_id) or None
                 fb, fr, fbt, keep = _filter_cam(cam_id, _obs_src, _rad_src, _brt_src,
                                                  extra_excluded=_extra)
                 if fb is not None:
                     avail[cam_id] = (fb, fr, fbt, keep)
 
-            if not avail:
-                results[ctrl_name] = None
-                continue
-
-            tracker_map = {cam_id: t for cam_id, t in ctrl_pairs}
-
-            # --- Select primary camera ---
-            # Fixed primary always wins when it has unclaimed blobs.
-            if (self._fixed_primary_cam is not None
-                    and self._fixed_primary_cam in avail):
-                primary_cam_id = self._fixed_primary_cam
-            else:
-                _designated = self._designated_primary.get(ctrl_name)
-                _des_tracker = tracker_map.get(_designated)
-                _min_inliers = int(_cfg.get('min_inliers', 4))
-                # Require enough unclaimed blobs; do NOT require prev_pose — a
-                # just-promoted camera starts cold (brute) and that is fine.
-                _des_ok = (
-                    _des_tracker is not None
-                    and _designated in avail
-                    and len(avail[_designated][0]) >= _min_inliers
-                )
-                if _des_ok:
-                    primary_cam_id = _designated
-                else:
-                    # Pick camera with prev_pose that has the most unclaimed blobs.
-                    # Cold-start (no prev_pose anywhere): prefer the camera with the
-                    # fewest blobs — it is less likely to be contaminated by another
-                    # controller's LEDs, giving a more reliable brute-match anchor.
-                    # Require ≥ min_inliers blobs so brute_match can actually run.
-                    _with_prior = [
-                        cid for cid in avail
-                        if tracker_map[cid].prev_pose is not None
-                    ]
-                    if _with_prior:
-                        primary_cam_id = max(_with_prior, key=lambda cid: len(avail[cid][0]))
-                    else:
-                        _cold_eligible = [
-                            cid for cid in avail if len(avail[cid][0]) >= _min_inliers
-                        ]
-                        if _cold_eligible:
-                            primary_cam_id = min(_cold_eligible, key=lambda cid: len(avail[cid][0]))
-                        else:
-                            primary_cam_id = max(avail, key=lambda cid: len(avail[cid][0]))
-
-            primary_tracker = tracker_map[primary_cam_id]
-            primary_blobs, primary_radii, primary_brightnesses, primary_orig = avail[primary_cam_id]
-
-            other_cameras_blobs = [
-                (self.cameras[cid], av[0], av[1])
-                for cid, av in avail.items()
-                if cid != primary_cam_id
-            ]
-            # orig-index maps for aux cameras — needed to remap solution indices.
-            aux_orig: Dict[int, List[int]] = {
-                cid: av[3] for cid, av in avail.items() if cid != primary_cam_id
-            }
-
-            # Phase 5: pass the full camera observation array + availability mask so
-            # brute_match can search across all blobs (not just the pre-filtered subset).
-            _prim_obs_full = _obs_src[primary_cam_id]
-            _prim_rad_full = _rad_src.get(primary_cam_id) if _rad_src else None
-            _prim_brt_full = _brt_src.get(primary_cam_id) if _brt_src else None
-            _prim_mask = np.zeros(len(_prim_obs_full), dtype=bool)
-            _prim_mask[primary_orig] = True
-
-            # ── Cross-controller occlusion: build occluder dict from any
-            # controller already matched this frame (guard: current-frame only).
+            # Build cross-controller occluder dict from controllers matched this frame.
             _occluders_per_cam = None
             if bool(_cfg.get('cross_controller_occlusion', False)) and len(ordered) > 1:
                 for _occ_ctrl in ordered:
@@ -1139,8 +1129,7 @@ class TrackingSystem:
                         continue
                     _occ_T_world = _occ_result['T_world_ctrl']
                     _occ_tracker = next(
-                        (t for (cn, _), t in self.trackers.items() if cn == _occ_ctrl),
-                        None,
+                        (t for (cn, _), t in self.trackers.items() if cn == _occ_ctrl), None,
                     )
                     if _occ_tracker is None:
                         continue
@@ -1154,182 +1143,15 @@ class TrackingSystem:
                             _T_cam_occ.t.astype(np.float32),
                             _occ_tracker._geometry,
                         )
-                    break  # first valid preceding controller is the occluder
+                    break
 
-            solution = primary_tracker.track(
-                _prim_obs_full,
-                blob_radii=_prim_rad_full,
-                blob_brightnesses=_prim_brt_full,
-                other_cameras_blobs=other_cameras_blobs,
-                blob_mask=_prim_mask,
+            results[ctrl_name] = self.ctrl_trackers[ctrl_name].update(
+                avail, _obs_src, _rad_src, _brt_src,
+                claimed_blobs,
+                fixed_primary_cam=self._fixed_primary_cam,
                 occluders_per_cam=_occluders_per_cam,
+                self_cal=self._self_cal,
             )
-
-            # Primary failed — try other cameras before giving up.
-            # Warm: prev_pose cameras first, then most blobs (best proximity coverage).
-            # Cold: prev_pose cameras first, then fewest blobs (least contamination).
-            _cold_start = primary_tracker.prev_pose is None
-            if solution is None and len(avail) > 1:
-                _fallback_order = sorted(
-                    [cid for cid in avail if cid != primary_cam_id],
-                    key=lambda cid: (
-                        0 if tracker_map[cid].prev_pose is not None else 1,
-                        len(avail[cid][0]) if _cold_start else -len(avail[cid][0]),
-                    ),
-                )
-                for _fb_cid in _fallback_order:
-                    _fb_blobs, _fb_radii, _fb_brts, _fb_orig = avail[_fb_cid]
-                    if len(_fb_blobs) < 3:
-                        continue
-                    _fb_tracker = tracker_map[_fb_cid]
-                    _fb_other = [
-                        (self.cameras[cid], av[0], av[1])
-                        for cid, av in avail.items() if cid != _fb_cid
-                    ]
-                    _fb_obs_full = _obs_src[_fb_cid]
-                    _fb_rad_full = _rad_src.get(_fb_cid) if _rad_src else None
-                    _fb_brt_full = _brt_src.get(_fb_cid) if _brt_src else None
-                    _fb_mask = np.zeros(len(_fb_obs_full), dtype=bool)
-                    _fb_mask[_fb_orig] = True
-                    solution = _fb_tracker.track(
-                        _fb_obs_full,
-                        blob_radii=_fb_rad_full,
-                        blob_brightnesses=_fb_brt_full,
-                        other_cameras_blobs=_fb_other,
-                        blob_mask=_fb_mask,
-                        occluders_per_cam=_occluders_per_cam,
-                    )
-                    if solution is not None:
-                        primary_cam_id  = _fb_cid
-                        primary_tracker = _fb_tracker
-                        primary_orig    = _fb_orig
-                        aux_orig = {
-                            cid: av[3] for cid, av in avail.items() if cid != _fb_cid
-                        }
-                        break
-
-            if solution is not None:
-                solution["primary_cam"] = primary_cam_id
-
-                # Track primary camera changes for logging and the fallback-brute rule.
-                # We no longer clear prev_pose here: by the time this guard fires,
-                # track() has already stored a fresh solution as prev_pose, so there
-                # is nothing biased to clear.  Clearing it caused an oscillation:
-                # the newly-designated primary became ineligible (_des_ok requires
-                # prev_pose) on the very next frame, handing control back to the old
-                # camera, which triggered a new handoff, repeating indefinitely.
-                _prev_prim = self._prev_primary.get(ctrl_name)
-                if _prev_prim is not None and primary_cam_id != _prev_prim:
-                    logger.info(
-                        f"[{ctrl_name}] Primary camera switched "
-                        f"cam{_prev_prim} → cam{primary_cam_id}"
-                    )
-                self._prev_primary[ctrl_name] = primary_cam_id
-
-                # Persist winning camera so next frame's selection prefers it.
-                if self._fixed_primary_cam is None:
-                    self._designated_primary[ctrl_name] = primary_cam_id
-
-                # Remap filtered indices → original observation indices.
-                # When _orig_idx is set, track() already mapped indices to original space.
-                if not solution.get('_orig_idx', False):
-                    solution["assignment"] = [
-                        (primary_orig[b], lid) for b, lid in solution["assignment"]
-                    ]
-                _raw_aux = solution.get("aux_assignments") or {}
-                if _raw_aux:
-                    solution["aux_assignments"] = {
-                        cid: [(aux_orig[cid][b], lid) for b, lid in pairs]
-                        for cid, pairs in _raw_aux.items()
-                        if cid in aux_orig
-                    }
-
-                # Register claimed blobs (original indices) so subsequent controllers
-                # receive pre-filtered views that exclude these.
-                for b, _ in solution["assignment"]:
-                    claimed_blobs.setdefault(primary_cam_id, set()).add(b)
-                for cid, pairs in (solution.get("aux_assignments") or {}).items():
-                    for b, _ in pairs:
-                        claimed_blobs.setdefault(cid, set()).add(b)
-
-                # Self-calibration: feed observations when primary cam matches anchor.
-                if (self._self_cal is not None
-                        and primary_cam_id == self._self_cal.primary_camera.camera_idx):
-                    _R_prim, _ = cv2.Rodrigues(solution["rvec"].reshape(3, 1).astype(np.float32))
-                    _t_prim = solution["tvec"].reshape(3).astype(np.float32)
-                    _sc_aux_obs: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-                    for _aux_cid, _aux_pairs in (solution.get("aux_assignments") or {}).items():
-                        if len(_aux_pairs) < 3:
-                            continue
-                        _led_ids   = np.array([lid for _, lid in _aux_pairs], dtype=np.int32)
-                        _blob_idxs = np.array([b   for b, _  in _aux_pairs], dtype=np.int32)
-                        _led_pos   = primary_tracker.model.positions[_led_ids]
-                        _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim
-                        _blobs_aux = _obs_src[_aux_cid][_blob_idxs]
-                        _sc_aux_obs[_aux_cid] = (_pts_prim, _blobs_aux)
-                    if _sc_aux_obs:
-                        self._self_cal.add_frame(
-                            solution["rvec"], solution["tvec"],
-                            primary_error=solution["error"],
-                            primary_inliers=len(solution["assignment"]),
-                            aux_observations=_sc_aux_obs,
-                        )
-
-                # State propagation: push T_world_ctrl into every non-primary tracker
-                # so any camera can be promoted to primary without cold-start brute search.
-                T_world_ctrl = solution["T_world_ctrl"]
-                aux_asgns = solution.get("aux_assignments") or {}
-                for _cid, _tracker in tracker_map.items():
-                    if _cid == primary_cam_id:
-                        continue
-                    _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
-                    _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
-                    _tv_np = _T_cam_ctrl.t.astype(np.float32)
-                    if _tracker.prev_pose is not None:
-                        _step = (_tv_np.reshape(3).astype(np.float64)
-                                 - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
-                        _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
-                        _tracker.vel_ema = (_beta * _step + (1.0 - _beta) * _tracker.vel_ema
-                                           if _tracker.vel_ema is not None else _step)
-                    _tracker.prev_prev_pose = _tracker.prev_pose
-                    _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
-                    _tracker.last_good_pose = _tracker.prev_pose
-                    _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np))
-                    _aux_asgn = aux_asgns.get(_cid)
-                    if _aux_asgn is not None:
-                        _tracker.prev_assignment      = _aux_asgn
-                        _tracker.last_good_assignment = _aux_asgn
-                    elif _tracker.prev_assignment is None:
-                        _tracker.last_good_assignment = None
-                    _tracker.consecutive_failures = 0
-
-                # Handoff check: promote an aux camera that consistently dominates.
-                # Uses full aux_assignments (snap + expansion) rather than aux_cameras
-                # (which only counts LEDs in the primary's RANSAC inlier set).
-                if bool(_cfg.get('camera_handoff', True)) and self._fixed_primary_cam is None:
-                    _ratio_thr  = float(_cfg.get('handoff_coverage_ratio',   1.5))
-                    _min_adv    = int(  _cfg.get('handoff_min_advantage',     3))
-                    _hysteresis = int(  _cfg.get('handoff_hysteresis_frames', 3))
-                    _n_primary  = len(solution["assignment"])
-                    _hctr = self._handoff_counter.setdefault(ctrl_name, {})
-                    for _aux_cid, _aux_pairs in aux_asgns.items():
-                        _aux_n = len(_aux_pairs)
-                        if (_aux_n >= _ratio_thr * _n_primary
-                                and _aux_n - _n_primary >= _min_adv):
-                            _hctr[_aux_cid] = _hctr.get(_aux_cid, 0) + 1
-                            if _hctr[_aux_cid] >= _hysteresis:
-                                logger.info(
-                                    f"[{ctrl_name}] Camera handoff: "
-                                    f"cam{primary_cam_id}({_n_primary} LEDs)"
-                                    f" → cam{_aux_cid}({_aux_n} LEDs)"
-                                    f" — warm start from propagated pose"
-                                )
-                                self._designated_primary[ctrl_name] = _aux_cid
-                                _hctr.clear()
-                        else:
-                            _hctr[_aux_cid] = 0
-
-            results[ctrl_name] = solution
 
         return results
 

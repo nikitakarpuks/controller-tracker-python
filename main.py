@@ -11,7 +11,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from src import debug_config
-from src.blobs_detection import get_centroids, get_pass2_params
+from src.blob_detector import BlobDetector, BlobResult
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.debug_config import DebugMode
@@ -67,6 +67,8 @@ def main():
     calib_cfg = load_json_config(config["cameras"]["intrinsics_path"])
     cameras   = {idx: Camera(calib_cfg, camera_idx=idx)
                  for idx in config["data"]["selected_cameras"]}
+    blob_detectors = {idx: BlobDetector(idx, config["blob_detection"])
+                      for idx in cameras}
 
     # Load all enabled controllers; build per-controller geometry configs.
     enabled_ctrls    = {}   # {ctrl_name: ControllerModel}
@@ -142,47 +144,37 @@ def main():
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
 
-        per_ctrl_blobs    = {}
-        per_ctrl_radii    = {}
-        per_ctrl_brts     = {}
-        per_ctrl_contours = {}
+        # per_ctrl_blobs: {ctrl_name: {cam_idx: BlobResult}}
+        per_ctrl_blobs: dict = {}
 
         # ── Phase 1: detect blobs for every controller on the original images ──
+        _match_cfg = config["matching"]
+        _blob_cfg  = config["blob_detection"]
         for ctrl_name in ctrl_names_ordered:
-            per_ctrl_blobs[ctrl_name]    = {}
-            per_ctrl_radii[ctrl_name]    = {}
-            per_ctrl_brts[ctrl_name]     = {}
-            per_ctrl_contours[ctrl_name] = {}
+            per_ctrl_blobs[ctrl_name] = {}
 
             for cam_idx in cameras:
                 if cam_idx not in cam_images:
                     continue
                 predicted_leds = proj_hints.get(cam_idx, {}).get(ctrl_name)
-                _match_cfg     = config["matching"]
-                _base_r        = float(_match_cfg.get("proximity_expansion_px", 8.0))
-                _vel_k         = float(_match_cfg.get("proximity_expansion_velocity_k", 0.0))
-                _v_px          = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
-                _local_r_px    = _base_r + _vel_k * _v_px
-                _blob_cfg      = config["blob_detection"]
-                _thr_k         = float(_blob_cfg.get("velocity_threshold_k", 0.0))
-                _thr_min       = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
-                _thr_scale     = max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0
+                _base_r     = float(_match_cfg.get("proximity_expansion_px", 8.0))
+                _vel_k      = float(_match_cfg.get("proximity_expansion_velocity_k", 0.0))
+                _v_px       = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
+                _local_r_px = _base_r + _vel_k * _v_px
+                _thr_k      = float(_blob_cfg.get("velocity_threshold_k", 0.0))
+                _thr_min    = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
+                _thr_scale  = max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0
                 t0 = time()
-                blob_centroids, blob_contours, blob_radii, blob_brightnesses, _, _, _ = get_centroids(
-                    cam_images[cam_idx], _blob_cfg,
-                    visualize=_blob_cfg["visualize"],
-                    img_path=img_path, cam_idx=cam_idx,
+                per_ctrl_blobs[ctrl_name][cam_idx] = blob_detectors[cam_idx].detect(
+                    cam_images[cam_idx],
                     ctrl_label=ctrl_name.replace("_controller", ""),
                     predicted_leds=predicted_leds,
                     local_search_radius_px=_local_r_px,
                     threshold_scale=_thr_scale,
+                    visualize=_blob_cfg["visualize"],
+                    img_path=img_path,
                 )
                 logger.info(f"blob detection took {time() - t0} seconds")
-
-                per_ctrl_blobs[ctrl_name][cam_idx]    = blob_centroids
-                per_ctrl_radii[ctrl_name][cam_idx]    = blob_radii
-                per_ctrl_brts[ctrl_name][cam_idx]     = blob_brightnesses
-                per_ctrl_contours[ctrl_name][cam_idx] = blob_contours
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
         # centroid level (no image copy / pixel drawing needed) ─────────────────
@@ -193,10 +185,10 @@ def main():
             # Remove blobs from preceding controllers' LED-matched positions.
             if ctrl_idx > 0:
                 for cam_idx in list(per_ctrl_blobs[ctrl_name]):
-                    _blobs = per_ctrl_blobs[ctrl_name][cam_idx]
-                    if len(_blobs) == 0:
+                    curr = per_ctrl_blobs[ctrl_name][cam_idx]
+                    if len(curr) == 0:
                         continue
-                    keep = np.ones(len(_blobs), dtype=bool)
+                    keep = np.ones(len(curr), dtype=bool)
                     for prev_ctrl in ctrl_names_ordered[:ctrl_idx]:
                         sol = results.get(prev_ctrl)
                         if sol is None:
@@ -204,50 +196,42 @@ def main():
                         primary_cam = sol["primary_cam"]
                         if cam_idx == primary_cam:
                             matched_pairs = sol["assignment"]
-                            src_blobs = per_ctrl_blobs[prev_ctrl].get(cam_idx)
-                            src_radii = per_ctrl_radii[prev_ctrl].get(cam_idx)
                         elif cam_idx in (sol.get("aux_assignments") or {}):
                             matched_pairs = sol["aux_assignments"][cam_idx]
-                            src_blobs = per_ctrl_blobs[prev_ctrl].get(cam_idx)
-                            src_radii = per_ctrl_radii[prev_ctrl].get(cam_idx)
                         else:
                             continue
-                        if not matched_pairs or src_blobs is None or src_radii is None:
+                        src = per_ctrl_blobs[prev_ctrl].get(cam_idx)
+                        if not matched_pairs or src is None:
                             continue
                         m_idx = [b for b, _ in matched_pairs]
-                        m_pos = src_blobs[m_idx]
-                        m_rad = src_radii[m_idx]
                         dists = np.linalg.norm(
-                            _blobs[:, None, :] - m_pos[None, :, :], axis=2
-                        )  # (N_curr, N_matched)
-                        too_close = (dists < (m_rad + _mask_margin)[None, :]).any(axis=1)
+                            curr.centroids[:, None, :] - src.centroids[m_idx][None, :, :], axis=2
+                        )
+                        too_close = (dists < (src.radii[m_idx] + _mask_margin)[None, :]).any(axis=1)
                         keep &= ~too_close
-                    per_ctrl_blobs[ctrl_name][cam_idx] = _blobs[keep]
-                    per_ctrl_radii[ctrl_name][cam_idx] = per_ctrl_radii[ctrl_name][cam_idx][keep]
-                    per_ctrl_brts[ctrl_name][cam_idx]  = per_ctrl_brts[ctrl_name][cam_idx][keep]
-                    kept_idx = np.where(keep)[0]
-                    per_ctrl_contours[ctrl_name][cam_idx] = [
-                        per_ctrl_contours[ctrl_name][cam_idx][i] for i in kept_idx
-                    ]
+                    per_ctrl_blobs[ctrl_name][cam_idx] = curr.filter(keep)
 
             t0 = time()
+            _ctrl_blobs = per_ctrl_blobs[ctrl_name]
             sol_map = tracking_system.update(
                 {},
-                per_ctrl_observations={ctrl_name: per_ctrl_blobs[ctrl_name]},
-                per_ctrl_radii={ctrl_name: per_ctrl_radii[ctrl_name]},
-                per_ctrl_brightnesses={ctrl_name: per_ctrl_brts[ctrl_name]},
+                per_ctrl_observations={ctrl_name: {c: r.centroids    for c, r in _ctrl_blobs.items()}},
+                per_ctrl_radii=        {ctrl_name: {c: r.radii        for c, r in _ctrl_blobs.items()}},
+                per_ctrl_brightnesses= {ctrl_name: {c: r.brightnesses for c, r in _ctrl_blobs.items()}},
                 ctrl_name_filter=ctrl_name,
             )
             elapsed_per_ctrl[ctrl_name] = time() - t0
             results[ctrl_name] = sol_map.get(ctrl_name)
 
-        blobs.append({c: dict(cb) for c, cb in per_ctrl_blobs.items()})
-        contours_all.append({c: dict(cc) for c, cc in per_ctrl_contours.items()})
+        blobs.append({ctrl: {cam: r.centroids for cam, r in cb.items()}
+                      for ctrl, cb in per_ctrl_blobs.items()})
+        contours_all.append({ctrl: {cam: r.contours for cam, r in cb.items()}
+                             for ctrl, cb in per_ctrl_blobs.items()})
 
         total_blobs = sum(
-            len(blobs_arr)
+            len(r)
             for ctrl_blobs in per_ctrl_blobs.values()
-            for blobs_arr in ctrl_blobs.values()
+            for r in ctrl_blobs.values()
         )
 
         for ctrl_name in enabled_ctrls:
@@ -284,8 +268,9 @@ def main():
                             int(row[4]): (float(row[2]), float(row[3]))
                             for row in _proj
                         }
-                        _brts  = per_ctrl_brts[ctrl_name].get(primary_cam_idx)
-                        _radii = per_ctrl_radii[ctrl_name].get(primary_cam_idx)
+                        _cam_result = per_ctrl_blobs[ctrl_name].get(primary_cam_idx)
+                        _brts  = _cam_result.brightnesses if _cam_result is not None else None
+                        _radii = _cam_result.radii        if _cam_result is not None else None
                         if _brts is not None and _radii is not None:
                             for blob_idx, led_id in sol["assignment"]:
                                 if led_id not in led_lookup:

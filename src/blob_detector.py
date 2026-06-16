@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
-_pass2_memory: dict = {}  # {cam_key: {...}}  — persists per-camera pass-2 state across frames
+from typing import List, Optional
 
 
 _NEIGHBOR_DY = np.array([-1, -1, -1,  0,  0,  1,  1,  1], dtype=np.int32)
@@ -734,129 +735,181 @@ def _detect_blobs_local(image, led_projections, cfg,
     )
 
 
-def get_pass2_params(cam_idx) -> dict | None:
-    """Return the pass-2 thresholds last used for cam_idx, or None if pass-2 did not run."""
-    mem = _pass2_memory.get(cam_idx if cam_idx is not None else 0)
-    if not mem or "pixel_threshold" not in mem:
-        return None
-    return {
-        "pixel_threshold":    mem["pixel_threshold"],
-        "required_threshold": mem.get("required_threshold"),
-        "max_area":           mem.get("max_area"),
-    }
+@dataclass
+class BlobResult:
+    """Detection output for one (camera, controller, frame) triplet."""
+    centroids:    np.ndarray   # (N, 2) float32
+    radii:        np.ndarray   # (N,)   float32
+    brightnesses: np.ndarray   # (N,)   float32
+    contours:     List         # N × (M, 2) float32 contour arrays
+
+    def __len__(self) -> int:
+        return len(self.centroids)
+
+    def filter(self, mask: np.ndarray) -> "BlobResult":
+        """Return a new BlobResult containing only blobs where mask is True."""
+        idx = np.where(mask)[0]
+        return BlobResult(
+            centroids=self.centroids[idx],
+            radii=self.radii[idx],
+            brightnesses=self.brightnesses[idx],
+            contours=[self.contours[i] for i in idx],
+        )
+
+    @staticmethod
+    def empty() -> "BlobResult":
+        return BlobResult(
+            centroids=np.empty((0, 2), dtype=np.float32),
+            radii=np.empty(0, dtype=np.float32),
+            brightnesses=np.empty(0, dtype=np.float32),
+            contours=[],
+        )
 
 
-def get_centroids(image, cfg, visualize=False, img_path=None, cam_idx=None,
-                  ctrl_label="", predicted_leds=None,
-                  local_search_radius_px=None, threshold_scale: float = 1.0):
-    pixel_threshold    = max(int(cfg["min_threshold"] * threshold_scale), 1)
-    _req_factor        = float(cfg.get("required_threshold_factor", 1.5))
-    required_threshold = min(int(pixel_threshold * _req_factor), 255)
+class BlobDetector:
+    """
+    Per-camera blob detector. Holds per-camera EMA pass-2 state as instance
+    state, replacing the module-level _pass2_memory global in blobs_detection.py.
+    One instance per camera — instances are independent and safe to use from
+    separate threads (different cameras).
+    """
 
-    cam_str  = f"_cam{cam_idx}" if cam_idx is not None else ""
-    ctrl_str = f"_{ctrl_label}" if ctrl_label else ""
+    def __init__(self, camera_idx: int, cfg: dict):
+        self.camera_idx = camera_idx
+        self._cfg = cfg
+        self._memory: dict = {}
 
-    # ── Per-LED local search (active when a predicted pose is available) ─────
-    if predicted_leds is not None and len(predicted_leds) > 0:
-        return _detect_blobs_local(image, predicted_leds, cfg,
-                                   visualize, img_path,
-                                   f"{cam_str}{ctrl_str}",
-                                   search_radius_px=local_search_radius_px,
-                                   threshold_scale=threshold_scale)
+    @property
+    def pass2_params(self) -> Optional[dict]:
+        """Return the pass-2 thresholds last used, or None if pass-2 has not run."""
+        if not self._memory or "pixel_threshold" not in self._memory:
+            return None
+        return {
+            "pixel_threshold":    self._memory["pixel_threshold"],
+            "required_threshold": self._memory.get("required_threshold"),
+            "max_area":           self._memory.get("max_area"),
+        }
 
-    pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
-    pass2_required_factor       = float(cfg.get("pass2_required_factor", 0.7))
-    pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
-    ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
-    count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
+    def detect(
+        self,
+        image: np.ndarray,
+        ctrl_label: str = "",
+        predicted_leds: Optional[np.ndarray] = None,
+        local_search_radius_px: float = 0.0,
+        threshold_scale: float = 1.0,
+        visualize: bool = False,
+        img_path=None,
+    ) -> BlobResult:
+        cfg     = self._cfg
+        cam_idx = self.camera_idx
 
-    # Per-camera EMA memory — keyed by cam_idx so cameras don't bleed into each other.
-    _cam_key = cam_idx if cam_idx is not None else 0
-    _mem = _pass2_memory.setdefault(_cam_key, {})
+        pixel_threshold    = max(int(cfg["min_threshold"] * threshold_scale), 1)
+        _req_factor        = float(cfg.get("required_threshold_factor", 1.5))
+        required_threshold = min(int(pixel_threshold * _req_factor), 255)
 
-    vis_suffix_1 = f"{cam_str}{ctrl_str}_pass1" if pass2_factor > 0 else f"{cam_str}{ctrl_str}"
-    result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
-                            visualize, img_path, vis_suffix_1)
-    large_blobs_pass1 = result[6]
+        cam_str  = f"_cam{cam_idx}"
+        ctrl_str = f"_{ctrl_label}" if ctrl_label else ""
 
-    min_area_pass2 = cfg.get("pass2_min_area")
-    min_area_pass2 = float(min_area_pass2) if min_area_pass2 is not None else None
+        # ── Warm path: per-LED local search (no EMA state access) ────────────
+        if predicted_leds is not None and len(predicted_leds) > 0:
+            raw = _detect_blobs_local(
+                image, predicted_leds, cfg,
+                visualize, img_path, f"{cam_str}{ctrl_str}",
+                search_radius_px=local_search_radius_px,
+                threshold_scale=threshold_scale,
+            )
+            return BlobResult(centroids=raw[0], contours=raw[1],
+                              radii=raw[2], brightnesses=raw[3])
 
-    if pass2_factor > 0 and len(result[0]) >= 2:
-        # Normal path: derive pass-2 params from pass-1 blob stats.
-        mean_vals = []
-        area_vals = []
-        for cnt in result[1]:
-            cnt_int = cnt.reshape(-1, 1, 2).astype(np.int32)
-            xb, yb, wb, hb = cv2.boundingRect(cnt_int)
-            roi_m = np.zeros((hb, wb), dtype=np.uint8)
-            cnt_r = cnt.reshape(-1, 2).copy()
-            cnt_r[:, 0] -= xb
-            cnt_r[:, 1] -= yb
-            cv2.drawContours(roi_m, [cnt_r.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
-            px = image[yb:yb+hb, xb:xb+wb][roi_m > 0]
-            if px.size > 0:
-                mean_vals.append(float(np.mean(px)))
-            area_vals.append(float(cv2.contourArea(cnt_int)))
-        if mean_vals:
-            ref_brightness   = float(np.percentile(mean_vals, pass2_brightness_percentile))
-            raw_pixel_thr    = int(ref_brightness * pass2_factor)
-            raw_required_thr = int(ref_brightness * pass2_required_factor)
-            if raw_pixel_thr > pixel_threshold:
-                cur_count  = len(mean_vals)
-                prev_count = _mem.get("blob_count", cur_count)
-                count_stable = (max(cur_count, prev_count) / max(min(cur_count, prev_count), 1)
-                                <= count_gate_max_factor)
+        # ── Cold path: global search with optional pass-2 EMA ────────────────
+        pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
+        pass2_required_factor       = float(cfg.get("pass2_required_factor", 0.7))
+        pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
+        ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
+        count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
+        _mem = self._memory
 
-                if count_stable or not _mem:
-                    if _mem:
-                        pixel_threshold_2    = int(ema_alpha * raw_pixel_thr
-                                                   + (1 - ema_alpha) * _mem.get("pixel_threshold", raw_pixel_thr))
-                        required_threshold_2 = int(ema_alpha * raw_required_thr
-                                                   + (1 - ema_alpha) * _mem.get("required_threshold", raw_required_thr))
+        vis_suffix_1 = f"{cam_str}{ctrl_str}_pass1" if pass2_factor > 0 else f"{cam_str}{ctrl_str}"
+        result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
+                               visualize, img_path, vis_suffix_1)
+        large_blobs_pass1 = result[6]
+
+        min_area_pass2 = cfg.get("pass2_min_area")
+        min_area_pass2 = float(min_area_pass2) if min_area_pass2 is not None else None
+
+        if pass2_factor > 0 and len(result[0]) >= 2:
+            mean_vals = []
+            area_vals = []
+            for cnt in result[1]:
+                cnt_int = cnt.reshape(-1, 1, 2).astype(np.int32)
+                xb, yb, wb, hb = cv2.boundingRect(cnt_int)
+                roi_m = np.zeros((hb, wb), dtype=np.uint8)
+                cnt_r = cnt.reshape(-1, 2).copy()
+                cnt_r[:, 0] -= xb
+                cnt_r[:, 1] -= yb
+                cv2.drawContours(roi_m, [cnt_r.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
+                px = image[yb:yb + hb, xb:xb + wb][roi_m > 0]
+                if px.size > 0:
+                    mean_vals.append(float(np.mean(px)))
+                area_vals.append(float(cv2.contourArea(cnt_int)))
+            if mean_vals:
+                ref_brightness   = float(np.percentile(mean_vals, pass2_brightness_percentile))
+                raw_pixel_thr    = int(ref_brightness * pass2_factor)
+                raw_required_thr = int(ref_brightness * pass2_required_factor)
+                if raw_pixel_thr > pixel_threshold:
+                    cur_count    = len(mean_vals)
+                    prev_count   = _mem.get("blob_count", cur_count)
+                    count_stable = (max(cur_count, prev_count) /
+                                    max(min(cur_count, prev_count), 1) <= count_gate_max_factor)
+                    if count_stable or not _mem:
+                        if _mem:
+                            pixel_threshold_2    = int(ema_alpha * raw_pixel_thr
+                                                       + (1 - ema_alpha) * _mem.get("pixel_threshold", raw_pixel_thr))
+                            required_threshold_2 = int(ema_alpha * raw_required_thr
+                                                       + (1 - ema_alpha) * _mem.get("required_threshold", raw_required_thr))
+                        else:
+                            pixel_threshold_2    = raw_pixel_thr
+                            required_threshold_2 = raw_required_thr
+                        update_memory = True
                     else:
-                        pixel_threshold_2    = raw_pixel_thr
-                        required_threshold_2 = raw_required_thr
-                    update_memory = True
-                else:
-                    # Blob count jumped — hold previous stable thresholds, don't update memory.
-                    pixel_threshold_2    = _mem["pixel_threshold"]
-                    required_threshold_2 = _mem.get("required_threshold", required_threshold)
-                    update_memory = False
+                        pixel_threshold_2    = _mem["pixel_threshold"]
+                        required_threshold_2 = _mem.get("required_threshold", required_threshold)
+                        update_memory        = False
+                    max_area_pass2 = float(max(area_vals)) if area_vals else None
+                    result2 = _detect_blobs(
+                        image, pixel_threshold_2, required_threshold_2, cfg,
+                        visualize, img_path, f"{cam_str}{ctrl_str}_pass2",
+                        max_area_override=max_area_pass2,
+                        min_area_override=min_area_pass2,
+                        interior_exclude_blobs=large_blobs_pass1,
+                    )
+                    if len(result2[0]) >= 1:
+                        if update_memory:
+                            _mem["pixel_threshold"]    = pixel_threshold_2
+                            _mem["required_threshold"] = required_threshold_2
+                            _mem["max_area"]           = max_area_pass2
+                            _mem["large_blobs"]        = large_blobs_pass1
+                            _mem["blob_count"]         = cur_count
+                        corrected_radii = _correct_radii_for_threshold(
+                            result2[2], result2[3], pixel_threshold, pixel_threshold_2)
+                        return BlobResult(centroids=result2[0], contours=result2[1],
+                                          radii=corrected_radii, brightnesses=result2[3])
 
-                max_area_pass2 = float(max(area_vals)) if area_vals else None
-                result2 = _detect_blobs(image, pixel_threshold_2, required_threshold_2, cfg,
-                                         visualize, img_path, f"{cam_str}{ctrl_str}_pass2",
-                                         max_area_override=max_area_pass2,
-                                         min_area_override=min_area_pass2,
-                                         interior_exclude_blobs=large_blobs_pass1)
-                if len(result2[0]) >= 1:
-                    if update_memory:
-                        _mem["pixel_threshold"]    = pixel_threshold_2
-                        _mem["required_threshold"] = required_threshold_2
-                        _mem["max_area"]           = max_area_pass2
-                        _mem["large_blobs"]        = large_blobs_pass1
-                        _mem["blob_count"]         = cur_count
-                    corrected = list(result2)
-                    corrected[2] = _correct_radii_for_threshold(
-                        result2[2], result2[3], pixel_threshold, pixel_threshold_2)
-                    return tuple(corrected)
+        elif pass2_factor > 0 and _mem:
+            result2 = _detect_blobs(
+                image, _mem["pixel_threshold"],
+                _mem.get("required_threshold", required_threshold), cfg,
+                visualize, img_path, f"{cam_str}{ctrl_str}_pass2",
+                max_area_override=_mem["max_area"],
+                min_area_override=min_area_pass2,
+                interior_exclude_blobs=large_blobs_pass1,
+            )
+            if len(result2[0]) >= 1:
+                corrected_radii = _correct_radii_for_threshold(
+                    result2[2], result2[3], pixel_threshold, _mem["pixel_threshold"])
+                return BlobResult(centroids=result2[0], contours=result2[1],
+                                  radii=corrected_radii, brightnesses=result2[3])
+            _mem.clear()
 
-    elif pass2_factor > 0 and _mem:
-        # Fallback: pass 1 didn't yield enough blobs — reuse params from last
-        # successful pass 2.  Use large blobs from the current frame (not stored
-        # ones) since they represent the actual exclusion zones this frame.
-        result2 = _detect_blobs(image, _mem["pixel_threshold"],
-                                 _mem.get("required_threshold", required_threshold), cfg,
-                                 visualize, img_path, f"{cam_str}{ctrl_str}_pass2",
-                                 max_area_override=_mem["max_area"],
-                                 min_area_override=min_area_pass2,
-                                 interior_exclude_blobs=large_blobs_pass1)
-        if len(result2[0]) >= 1:
-            corrected = list(result2)
-            corrected[2] = _correct_radii_for_threshold(
-                result2[2], result2[3], pixel_threshold, _mem["pixel_threshold"])
-            return tuple(corrected)
-        _mem.clear()
-
-    return result
+        return BlobResult(centroids=result[0], contours=result[1],
+                          radii=result[2], brightnesses=result[3])
