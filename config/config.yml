@@ -1,9 +1,9 @@
 data:
-  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
+  root: "./data/datasets/single_ctrl/2_r_ctrl_edge_handle_occlusion/a"
   img_width: 2560
   img_height: 481
   total_cameras_number: 4
-  selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1] #, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -58,7 +58,7 @@ controllers:
 blob_detection:
 
   # ── Common (both warm and cold paths) ────────────────────────────────────
-  visualize: true
+  visualize: false
   min_threshold: 6                  # pixels >= this are included in a blob
   min_area: 2
   max_area: 250

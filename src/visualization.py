@@ -6,7 +6,7 @@ import rerun.blueprint as rrb
 
 from src.transformations import Transform
 from src._visibility import _visible_mask, _cross_occluded_mask
-from src.controller import _compute_geometry
+from src.geometry import _compute_geometry
 
 
 # =========================================================
