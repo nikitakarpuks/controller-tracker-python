@@ -77,10 +77,13 @@ class SelfCalibrator:
             blobs_aux       : (N, 2) matched 2D detections in aux camera
         """
         if primary_error > self.min_primary_error:
+            logger.debug(f"[SelfCal] frame rejected: primary_error={primary_error:.3f} > {self.min_primary_error}")
             return False
         if primary_inliers < self.min_primary_inliers:
+            logger.debug(f"[SelfCal] frame rejected: inliers={primary_inliers} < {self.min_primary_inliers}")
             return False
         if not aux_observations:
+            logger.debug("[SelfCal] frame rejected: no aux observations")
             return False
 
         accepted = False
@@ -99,6 +102,9 @@ class SelfCalibrator:
     # ------------------------------------------------------------------
     def run(self) -> Dict[int, dict]:
         """Optimise intrinsics on all accumulated observations, print and plot results."""
+        logger.info(f"[SelfCal] run(): {self._n_accepted} frames accepted across session")
+        for cid, obs in self._obs.items():
+            logger.info(f"[SelfCal]   cam{cid}: {len(obs)} observations")
         new_results = {}
         plot_data: Dict[int, dict] = {}
 
@@ -135,7 +141,7 @@ class SelfCalibrator:
             updated[name] = float(x[i])
         K = np.array([[updated["fx"], 0,            updated["cx"]],
                       [0,            updated["fy"], updated["cy"]],
-                      [0,            0,             1           ]], dtype=np.float32)
+                      [0,            0,             1           ]], dtype=np.float64)
         if self.is_fisheye:
             dc = np.array([[updated["k1"]], [updated["k2"]],
                            [updated["k3"]], [updated["k4"]]], dtype=np.float64)
@@ -169,7 +175,7 @@ class SelfCalibrator:
                     proj, _ = cv2.fisheye.projectPoints(
                         pts.astype(np.float64).reshape(-1, 1, 3),
                         rvec_fixed.astype(np.float64), tvec_fixed.astype(np.float64),
-                        K.astype(np.float64), dc,
+                        K, dc,
                     )
                 else:
                     proj, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K, dc)
@@ -215,12 +221,12 @@ class SelfCalibrator:
                 pb, _ = cv2.fisheye.projectPoints(
                     pts.astype(np.float64).reshape(-1, 1, 3),
                     rvec_fixed.astype(np.float64), tvec_fixed.astype(np.float64),
-                    K0.astype(np.float64), dc0,
+                    K0, dc0,
                 )
                 pa, _ = cv2.fisheye.projectPoints(
                     pts.astype(np.float64).reshape(-1, 1, 3),
                     rvec_fixed.astype(np.float64), tvec_fixed.astype(np.float64),
-                    K1.astype(np.float64), dc1,
+                    K1, dc1,
                 )
             else:
                 pb, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K0, dc0)
@@ -263,6 +269,20 @@ class SelfCalibrator:
                 cam.dist_coeffs = np.array(
                     [[cam.k1], [cam.k2], [cam.k3], [cam.k4]], dtype=np.float64
                 )
+                # Recompute rpmax in case k1-k4 changed.
+                def _drho(t, c=cam):
+                    return (1 + 3*c.k1*t**2 + 5*c.k2*t**4
+                              + 7*c.k3*t**6 + 9*c.k4*t**8)
+                if _drho(np.pi / 2) >= 0:
+                    _theta_max = np.pi / 2
+                else:
+                    _lo, _hi = 0.0, np.pi / 2
+                    for _ in range(60):
+                        _mid = (_lo + _hi) / 2
+                        if _drho(_mid) > 0: _lo = _mid
+                        else:               _hi = _mid
+                    _theta_max = _lo
+                cam.rpmax = float(_theta_max * 0.99 * (cam.fx + cam.fy) / 2)
             else:
                 cam.dist_coeffs = np.array(
                     [cam.k1, cam.k2, cam.p1, cam.p2, cam.k3, cam.k4, cam.k5, cam.k6],

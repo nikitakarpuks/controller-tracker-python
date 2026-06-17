@@ -21,7 +21,7 @@ VIS_CONFIG = {
     "show_blobs":       True,
     "show_projected":   True,
     "show_errors":      True,
-    "show_image_plane": True,
+    "show_image_plane":  True,
     "show_camera_frame": False, # unit vector lines
     "show_led_ids":       True,   # LED index labels next to projected disks
     "show_blob_ids":      True,   # blob index labels next to blob contours
@@ -137,8 +137,19 @@ def compute_frustum_boundary(cam, z: float, edge_samples: int = 20):
     Sampling the edges (not just corners) captures the curvature introduced by
     lens distortion: with barrel distortion the edges bow inward, with pincushion
     they bow outward — straight-line corner interpolation misses this.
+
+    SPECIAL HANDLING FOR KB4 FISHEYE CAMERAS:
+    For KB4, undistorted points can blow up near image edges. We need to:
+    1. Use more edge samples to capture the true boundary
+    2. Filter out invalid (NaN/infinite) points
+    3. Clip extreme values to prevent visualization breakage
     """
     w, h = float(cam.width), float(cam.height)
+
+    # For KB4, use more samples to capture the distortion curve better
+    if hasattr(cam, 'is_fisheye') and cam.is_fisheye:
+        edge_samples = max(edge_samples, 50)  # More samples for fisheye
+
     t = np.linspace(0.0, 1.0, edge_samples, endpoint=False, dtype=np.float32)
     edges_px = np.concatenate([
         np.column_stack([t * w,            np.zeros_like(t)]),   # top
@@ -147,8 +158,15 @@ def compute_frustum_boundary(cam, z: float, edge_samples: int = 20):
         np.column_stack([np.zeros_like(t), (1.0 - t) * h]),     # left
     ], axis=0)
 
-    norm = cam.undistort_points(edges_px)
+    if getattr(cam, 'is_fisheye', False) and getattr(cam, 'rpmax', 0) > 0:
+        # Only keep pixels within the valid fisheye radius so the outline stays convex.
+        r_px = np.sqrt((edges_px[:, 0] - cam.cx)**2 + (edges_px[:, 1] - cam.cy)**2)
+        edges_px = edges_px[r_px <= cam.rpmax]
 
+    if len(edges_px) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    norm = cam.undistort_points(edges_px)
     pts = np.column_stack([norm[:, 0] * z, norm[:, 1] * z, np.full(len(norm), z)])
     return pts.astype(np.float32)
 
