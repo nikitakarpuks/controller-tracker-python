@@ -1,19 +1,20 @@
 data:
-  root: "./data/datasets/single_ctrl/2_r_ctrl_edge_handle_occlusion/a"
+  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
+#  root: "./data/cameras/cam2/cam2_calib_small"
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
-  selected_cameras: [0, 1] #, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
 #  intrinsics_path: "./data/cameras/mateo_fresh_calib.json"
-#  intrinsics_path: "./data/cameras/my_calibration.json"
+#  intrinsics_path: "./data/cameras/backup/my_calibration.json"
 
-  intrinsics_path: "./data/cameras/new/calibration_kleinen_c.json"
+  intrinsics_path: "./data/cameras/custom_june_calib.json"
 
-  extrinsics_convention: "T_imu_cam"   # "T_imu_cam" or "T_cam0_camN"
+  extrinsics_convention: "T_cam0_camN"   # "T_imu_cam" or "T_cam0_camN"
 
 controllers:
   right_controller:
@@ -63,7 +64,7 @@ controllers:
 blob_detection:
 
   # ── Common (both warm and cold paths) ────────────────────────────────────
-  visualize: false
+  visualize: true
   min_threshold: 6                  # pixels >= this are included in a blob
   min_area: 2
   max_area: 250
@@ -207,10 +208,10 @@ matching:
 
 self_calibration:
   enabled: false                  # set to true to enable online intrinsic calibration
-  primary_camera: 1               # camera used as 3D reference (its T_imu_cam is the anchor)
+  primary_camera: 0               # camera used as 3D reference (its T_imu_cam is the anchor)
   lock_primary: false             # prevent handoff away from primary_camera
-  aux_cameras: [3]                # cameras to calibrate; null = all non-primary cameras
-  optimize_params: [fx, fy, cx, cy, p1, p2]  # subset of: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6
+  aux_cameras: [2]                # cameras to calibrate; null = all non-primary cameras
+  optimize_params: [fx, fy, cx, cy]  # subset of: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6
   min_primary_error_px: 0.5       # only accept frames with primary PnP error below this
   min_primary_inliers: 4          # minimum PnP inliers for a frame to be accepted
   plots_dir: "./data/cameras/"    # directory where self_cal_cam{N}.png plots are saved
