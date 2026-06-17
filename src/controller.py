@@ -927,6 +927,7 @@ class TrackingSystem:
                     R_pred, tvec_pred, positions, normals, tracker._geometry,
                     cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
                     cam_w=camera.width, cam_h=camera.height, cam_rpmax=camera.rpmax,
+                    cam_is_fisheye=camera.is_fisheye,
                     facing_threshold_deg=_facing_deg,
                 )
                 vis_ids = np.where(vis_mask)[0]
@@ -938,6 +939,7 @@ class TrackingSystem:
                 proj_pts = _project_points(
                     rvec_pred, tvec_pred, positions[vis_ids],
                     camera.camera_matrix, camera.dist_coeffs,
+                    is_fisheye=camera.is_fisheye,
                 )  # (M, 2)
 
                 led_cam     = (R_pred @ positions[vis_ids].T).T + tvec_pred  # (M, 3)
@@ -1063,6 +1065,7 @@ class TrackingSystem:
                     _ctrl_proj[_cn][_cid] = _project_points(
                         _rv, _tv, _trk.model.positions[_vis],
                         _cam.camera_matrix, _cam.dist_coeffs,
+                        is_fisheye=_cam.is_fisheye,
                     )
 
             for _i, _cn_i in enumerate(ordered[:-1]):
@@ -1154,9 +1157,3 @@ class TrackingSystem:
             )
 
         return results
-
-
-# class MultiViewFusion:
-#     def fuse(self, poses_from_cameras):
-#         # average / optimize / triangulate
-#         return fused_pose

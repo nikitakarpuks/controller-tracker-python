@@ -2,13 +2,18 @@ data:
   root: "./data/datasets/single_ctrl/2_r_ctrl_edge_handle_occlusion/a"
   img_width: 2560
   img_height: 481
+  has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
   selected_cameras: [0, 1] #, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
 #  intrinsics_path: "./data/cameras/mateo_fresh_calib.json"
-  intrinsics_path: "./data/cameras/my_calibration.json"
+#  intrinsics_path: "./data/cameras/my_calibration.json"
+
+  intrinsics_path: "./data/cameras/new/calibration_kleinen_c.json"
+
+  extrinsics_convention: "T_imu_cam"   # "T_imu_cam" or "T_cam0_camN"
 
 controllers:
   right_controller:

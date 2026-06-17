@@ -147,28 +147,11 @@ def compute_frustum_boundary(cam, z: float, edge_samples: int = 20):
         np.column_stack([np.zeros_like(t), (1.0 - t) * h]),     # left
     ], axis=0)
 
-    norm = cv2.undistortPoints(
-        edges_px.reshape(-1, 1, 2),
-        cam.camera_matrix, cam.dist_coeffs,
-    ).reshape(-1, 2)
+    norm = cam.undistort_points(edges_px)
 
     pts = np.column_stack([norm[:, 0] * z, norm[:, 1] * z, np.full(len(norm), z)])
     return pts.astype(np.float32)
 
-
-def backproject_to_plane(blobs: np.ndarray, cam, z: float = 0.2) -> np.ndarray:
-    """
-    Convert 2D pixel blob positions to 3D points on the visualization plane.
-
-    Uses normalized image coordinates so the result is independent of z
-    (changing z just scales the whole plane uniformly, ratios preserved).
-    """
-    pts = []
-    for u, v in blobs:
-        x = (u - cam.cx) / cam.fx * z
-        y = (v - cam.cy) / cam.fy * z
-        pts.append([x, y, z])
-    return np.array(pts, dtype=np.float32)
 
 
 def make_disk_mesh(positions: np.ndarray, normals: np.ndarray,
@@ -233,16 +216,18 @@ def make_contour_mesh_3d(contours_px: list, cam, frustum_z: float,
         if n < 3:
             continue
         if undistort:
-            cnt = cv2.undistortPoints(
-                cnt.reshape(-1, 1, 2).astype(np.float32),
-                cam.camera_matrix, cam.dist_coeffs,
-                P=cam.camera_matrix,
-            ).reshape(-1, 2)
-        pts = np.column_stack([
-            (cnt[:, 0] - cam.cx) / cam.fx * frustum_z,
-            (cnt[:, 1] - cam.cy) / cam.fy * frustum_z,
-            np.full(n, frustum_z, dtype=np.float32),
-        ]).astype(np.float32)
+            cnt_n = cam.undistort_points(cnt)   # normalized (X/Z, Y/Z)
+            pts = np.column_stack([
+                cnt_n[:, 0] * frustum_z,
+                cnt_n[:, 1] * frustum_z,
+                np.full(n, frustum_z, dtype=np.float32),
+            ]).astype(np.float32)
+        else:
+            pts = np.column_stack([
+                (cnt[:, 0] - cam.cx) / cam.fx * frustum_z,
+                (cnt[:, 1] - cam.cy) / cam.fy * frustum_z,
+                np.full(n, frustum_z, dtype=np.float32),
+            ]).astype(np.float32)
 
         center = pts.mean(axis=0)
         all_verts.append(center)
@@ -260,25 +245,6 @@ def make_contour_mesh_3d(contours_px: list, cam, frustum_z: float,
             np.array(all_colors, dtype=np.uint8))
 
 
-def project_to_plane(pts_cam: np.ndarray, z: float = 0.2) -> np.ndarray:
-    """
-    Project 3D camera-space LED positions onto the visualization plane at depth z.
-
-    Divides by Z to get normalized coords, then scales by z — same formula
-    as backproject_to_plane, so blobs and projected LEDs are comparable.
-    Filters points behind the camera.
-    """
-    out = []
-    indices = []
-    for i, (X, Y, Z) in enumerate(pts_cam):
-        if Z <= 1e-6:
-            continue
-        x_n = X / Z   # normalized image coords
-        y_n = Y / Z
-        out.append([x_n * z, y_n * z, z])
-        indices.append(i)
-
-    return np.array(out, dtype=np.float32), indices
 
 # =========================================================
 # Static one-shot visualization (frame 0 equivalent)
@@ -514,6 +480,7 @@ class ControllerAnimatorRerun:
                 "ctrl_positions":  ctrl_pos,
                 "ctrl_normals":    ctrl_nrm,
                 "T_model_ctrl":    T_model_ctrl,
+                "T_ctrl_model":    T_ctrl_model,
                 "geom":            _compute_geometry(ctrl_pos, ctrl_nrm, cv.get("geometry_cfg")),
             }
 
@@ -538,28 +505,23 @@ class ControllerAnimatorRerun:
         for idx in range(n_frames):
             rr.set_time("frame", sequence=idx)
 
-            # Build per-controller T_cam_model for this frame.
-            T_cam_model_per_ctrl: dict = {}
+            # Build per-controller T_world_ctrl for this frame.
+            T_world_ctrl_per_ctrl: dict = {}
             for ctrl_name, poses in poses_per_ctrl.items():
                 pose = poses[idx] if idx < len(poses) else None
                 if pose is None:
                     continue
-                rvec, tvec = pose
-                R, _ = cv2.Rodrigues(rvec)
-                T_cam_ctrl   = Transform(R, tvec.reshape(3))
-                T_ctrl_model = self._ctrl_state[ctrl_name]["T_model_ctrl"].inverse()
-                T_cam_model_per_ctrl[ctrl_name] = T_cam_ctrl.compose(T_ctrl_model)
+                T_world_ctrl_per_ctrl[ctrl_name] = pose  # T_world_ctrl stored directly
 
             # Build ghost world-frame transforms for case-3 lost frames.
-            # T_world_ctrl → T_world_model (camera-independent display transform).
             ghost_T_world_model_per_ctrl: dict = {}
             for ctrl_name in self._controllers_vis:
-                if ctrl_name in T_cam_model_per_ctrl:
+                if ctrl_name in T_world_ctrl_per_ctrl:
                     continue
                 frozen_list = (frozen_poses_all or {}).get(ctrl_name, [])
                 T_world_ctrl = frozen_list[idx] if idx < len(frozen_list) else None
                 if T_world_ctrl is not None:
-                    T_ctrl_model = self._ctrl_state[ctrl_name]["T_model_ctrl"].inverse()
+                    T_ctrl_model = self._ctrl_state[ctrl_name]["T_ctrl_model"]
                     ghost_T_world_model_per_ctrl[ctrl_name] = T_world_ctrl.compose(T_ctrl_model)
 
             blobs    = blobs_all[idx]    if blobs_all    is not None and idx < len(blobs_all)    else None
@@ -586,7 +548,7 @@ class ControllerAnimatorRerun:
                 for n in self._controllers_vis
             }
 
-            self._log_frame(idx, T_cam_model_per_ctrl, assignments_frame,
+            self._log_frame(idx, T_world_ctrl_per_ctrl, assignments_frame,
                             blobs_per_ctrl=blobs, contours_per_ctrl=contours,
                             primary_cam_per_ctrl=primary_cams_frame,
                             aux_assignments_per_ctrl=aux_assignments_frame,
@@ -707,12 +669,13 @@ class ControllerAnimatorRerun:
                 rr.log(f"{ctrl_path}/blobs", rr.Clear(recursive=False))
 
             if blobs is not None and len(blobs) > 0 and self.vis_cfg.get("show_blob_ids", True):
-                blobs_ud = cv2.undistortPoints(
-                    blobs.reshape(-1, 1, 2).astype(np.float32),
-                    cam.camera_matrix, cam.dist_coeffs, P=cam.camera_matrix,
-                ).reshape(-1, 2)
+                _norm = cam.undistort_points(blobs)   # normalized (X/Z, Y/Z)
+                label_pts = np.column_stack([
+                    _norm[:, 0] * ctrl_z,
+                    _norm[:, 1] * ctrl_z,
+                    np.full(len(_norm), ctrl_z, dtype=np.float32),
+                ]).copy()
                 bdx, bdy = self.vis_cfg.get("blob_id_label_offset", [-0.0013, 0.0008])
-                label_pts = backproject_to_plane(blobs_ud, cam, z=ctrl_z).copy()
                 label_pts[:, 0] += bdx
                 label_pts[:, 1] += bdy
                 rr.log(f"{ctrl_path}/blob_ids", rr.Points3D(
@@ -728,7 +691,7 @@ class ControllerAnimatorRerun:
     # Per-frame logging
     # ------------------------------------------------------------------
 
-    def _log_frame(self, idx: int, T_cam_model_per_ctrl: dict,
+    def _log_frame(self, idx: int, T_world_ctrl_per_ctrl: dict,
                    assignments_per_ctrl: dict, blobs_per_ctrl: dict,
                    contours_per_ctrl: dict = None,
                    primary_cam_per_ctrl: dict = None,
@@ -775,7 +738,7 @@ class ControllerAnimatorRerun:
         # ── Hide or ghost controllers with no valid pose this frame ─────────
         ghost_led_color = self.vis_cfg.get("ghost_led_color", [110, 110, 130])
         for ctrl_name in self._controllers_vis:
-            if ctrl_name in T_cam_model_per_ctrl:
+            if ctrl_name in T_world_ctrl_per_ctrl:
                 continue
             ghost_T_world_model = (ghost_T_world_model_per_ctrl or {}).get(ctrl_name)
             if ghost_T_world_model is not None:
@@ -818,8 +781,9 @@ class ControllerAnimatorRerun:
                         rr.log(f"world/{ctrl_name}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))
 
         # ── Per-controller loop ─────────────────────────────────────────────
-        for ctrl_name, T_cam_model in T_cam_model_per_ctrl.items():
+        for ctrl_name, T_world_ctrl in T_world_ctrl_per_ctrl.items():
             cs          = self._ctrl_state[ctrl_name]
+            T_ctrl_model = cs["T_ctrl_model"]
             model_positions = cs["model_positions"]
             model_normals   = cs["model_normals"]
             ctrl_path   = f"world/{ctrl_name}"
@@ -829,26 +793,24 @@ class ControllerAnimatorRerun:
                 primary_cam_idx = next(iter(self._cameras))
             cam_path  = f"{ctrl_path}/camera_{primary_cam_idx}"
 
-            camera      = self._cameras[primary_cam_idx]
-            T_world_cam = camera.T_world_cam
+            camera = self._cameras[primary_cam_idx]
 
+            # Primary camera frame pose (for projection and visibility)
+            T_cam_ctrl  = camera.T_world_cam.inverse().compose(T_world_ctrl)
+            T_cam_model = T_cam_ctrl.compose(T_ctrl_model)
             R_cam = T_cam_model.R
             t_cam = T_cam_model.t
 
-            if T_world_cam is not None:
-                T_disp_model = T_world_cam.compose(T_cam_model)
-            else:
-                T_disp_model = T_cam_model
-            R_disp = T_disp_model.R
-            t_disp = T_disp_model.t
+            # World frame model pose (for 3D display)
+            T_world_model = T_world_ctrl.compose(T_ctrl_model)
+            R_disp = T_world_model.R
+            t_disp = T_world_model.t
 
-            def _w(pts, _Twc=T_world_cam):
-                if _Twc is None:
-                    return pts
+            def _w(pts, _cam=camera):
                 pts_arr = np.asarray(pts, dtype=np.float64)
                 if pts_arr.ndim == 1:
-                    return _Twc.apply(pts_arr.reshape(1, 3))[0]
-                return _Twc.apply(pts_arr)
+                    return _cam.T_world_cam.apply(pts_arr.reshape(1, 3))[0]
+                return _cam.T_world_cam.apply(pts_arr)
 
             # LED positions in camera frame and display frame.
             pts_cam_real  = (R_cam  @ model_positions.T).T + t_cam
@@ -867,7 +829,6 @@ class ControllerAnimatorRerun:
             normals_disp = (R_disp @ model_normals.T).T
 
             # ── Visibility mask ─────────────────────────────────────────────
-            T_cam_ctrl = T_cam_model.compose(cs["T_model_ctrl"])
             vis_mask = _visible_mask(
                 T_cam_ctrl.R, T_cam_ctrl.t,
                 cs["ctrl_positions"], cs["ctrl_normals"],
@@ -875,27 +836,19 @@ class ControllerAnimatorRerun:
                 cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
                 cam_w=camera.width, cam_h=camera.height,
                 cam_rpmax=camera.rpmax,
+                cam_is_fisheye=camera.is_fisheye,
                 facing_threshold_deg=float(self._matching_cfg.get('led_facing_angle_deg', 86.0)),
             )
-            if (bool(self._matching_cfg.get('cross_controller_occlusion', False))
-                    and T_world_cam is not None):
+            if bool(self._matching_cfg.get('cross_controller_occlusion', False)):
                 _br          = float(self._matching_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
                 _gate_margin = float(self._matching_cfg.get('cross_occlusion_gate_margin_px', 20.0))
                 _focal_px    = float(max(camera.camera_matrix[0, 0], camera.camera_matrix[1, 1]))
-                for _occ_name, _T_cam_model_occ in T_cam_model_per_ctrl.items():
+                for _occ_name, _T_world_ctrl_occ in T_world_ctrl_per_ctrl.items():
                     if _occ_name == ctrl_name:
                         continue
-                    _occ_cs  = self._ctrl_state[_occ_name]
-                    _occ_pci = (primary_cam_per_ctrl or {}).get(_occ_name, next(iter(self._cameras)))
-                    if _occ_pci not in self._cameras:
-                        _occ_pci = next(iter(self._cameras))
-                    _T_world_cam_occ = self._cameras[_occ_pci].T_world_cam
-                    if _T_world_cam_occ is None:
-                        continue
-                    # Express occluder pose in the primary camera frame of the current controller.
-                    _T_world_model_occ     = _T_world_cam_occ.compose(_T_cam_model_occ)
-                    _T_cam_model_occ_local = T_world_cam.inverse().compose(_T_world_model_occ)
-                    _T_cam_ctrl_occ        = _T_cam_model_occ_local.compose(_occ_cs["T_model_ctrl"])
+                    _occ_cs = self._ctrl_state[_occ_name]
+                    # Occluder pose in the primary camera frame of the current controller.
+                    _T_cam_ctrl_occ = camera.T_world_cam.inverse().compose(_T_world_ctrl_occ)
                     vis_mask &= ~_cross_occluded_mask(
                         T_cam_ctrl.R.astype(np.float32), T_cam_ctrl.t.astype(np.float32),
                         cs["ctrl_positions"],
@@ -933,12 +886,12 @@ class ControllerAnimatorRerun:
             # ── blob positions on the error plane (used by error lines below) ─
             blobs = (blobs_per_ctrl or {}).get(ctrl_name, {}).get(primary_cam_idx)
             if blobs is not None and len(blobs) > 0:
-                blobs_undist_disp = cv2.undistortPoints(
-                    blobs.reshape(-1, 1, 2).astype(np.float32),
-                    camera.camera_matrix, camera.dist_coeffs,
-                    P=camera.camera_matrix,
-                ).reshape(-1, 2)
-                pts_plane_cam  = backproject_to_plane(blobs_undist_disp, camera, z=error_z)
+                blobs_norm = camera.undistort_points(blobs)   # (N,2) normalized (X/Z, Y/Z)
+                pts_plane_cam = np.column_stack([
+                    blobs_norm[:, 0] * error_z,
+                    blobs_norm[:, 1] * error_z,
+                    np.full(len(blobs_norm), error_z, dtype=np.float32),
+                ])
                 pts_plane_disp = _w(pts_plane_cam)
             else:
                 pts_plane_disp = None
@@ -968,8 +921,7 @@ class ControllerAnimatorRerun:
                         [[70, 130, 255] if lid in matched_lids else [230, 80, 50]
                          for lid in all_proj_lids], dtype=np.uint8)
                     proj_normal_cam  = np.array([0.0, 0.0, -1.0])
-                    proj_normal_disp = (T_world_cam.R @ proj_normal_cam
-                                        if T_world_cam is not None else proj_normal_cam)
+                    proj_normal_disp = camera.T_world_cam.R @ proj_normal_cam
                     proj_normals = np.tile(proj_normal_disp, (len(all_proj_pts), 1)).astype(np.float32)
                     pv, pf, pc = make_disk_mesh(np.array(all_proj_pts, dtype=np.float32),
                                                 proj_normals, proj_colors,
@@ -1010,11 +962,8 @@ class ControllerAnimatorRerun:
             ctrl_positions = cs["ctrl_positions"]
             if assignment and pts_plane_disp is not None:
                 matched_lids_ord = [lid for _, lid in assignment]
-                proj_matched, _ = cv2.projectPoints(
-                    ctrl_positions[matched_lids_ord].astype(np.float32),
-                    rvec_ctrl,
-                    tvec_ctrl.reshape(3, 1),
-                    camera.camera_matrix, camera.dist_coeffs,
+                proj_matched, _ = camera.project_points(
+                    ctrl_positions[matched_lids_ord], rvec_ctrl, tvec_ctrl,
                 )
                 proj_matched = proj_matched.reshape(-1, 2)
 
@@ -1076,17 +1025,14 @@ class ControllerAnimatorRerun:
                         rr.log(f"{_acp}/{_sub}", rr.Clear(recursive=False))
                     continue
 
-                _T_world_aux = _aux_cam.T_world_cam
-                _T_aux_model = (_T_world_aux.inverse().compose(T_disp_model)
-                                if _T_world_aux is not None else T_disp_model)
-                _pts_aux_cam = (_T_aux_model.R @ model_positions.T).T + _T_aux_model.t
+                # Uniform formula for any camera: pose in aux camera frame
+                _T_aux_ctrl  = _aux_cam.T_world_cam.inverse().compose(T_world_ctrl)
+                _T_aux_model = _T_aux_ctrl.compose(T_ctrl_model)
+                _pts_aux_cam = _T_aux_model.apply(model_positions)
                 _aux_color   = _camera_color(_aux_ci)
                 _aux_blobs_raw = (blobs_per_ctrl or {}).get(ctrl_name, {}).get(_aux_ci)
                 _aux_blobs_arr = (np.asarray(_aux_blobs_raw, dtype=np.float32)
                                   if _aux_blobs_raw is not None and len(_aux_blobs_raw) > 0 else None)
-
-                _R_aw = _T_world_aux.R if _T_world_aux is not None else np.eye(3)
-                _t_aw = _T_world_aux.t if _T_world_aux is not None else np.zeros(3)
 
                 _aux_matched_lids = {_lid for _, _lid in _aux_pairs}
 
@@ -1095,17 +1041,17 @@ class ControllerAnimatorRerun:
                 _aux_lid_to_proj = {}
                 for _i, (_ipx, _ipy, _ipz) in enumerate(_pts_aux_cam):
                     if _ipz > 1e-6 and _i in _aux_matched_lids:
-                        _pp  = np.array([_ipx / _ipz * matched_proj_z,
-                                         _ipy / _ipz * matched_proj_z,
-                                         matched_proj_z])
-                        _pw  = _R_aw @ _pp + _t_aw
+                        _pp = np.array([_ipx / _ipz * matched_proj_z,
+                                        _ipy / _ipz * matched_proj_z,
+                                        matched_proj_z])
+                        _pw = _aux_cam.T_world_cam.apply(_pp.reshape(1, 3))[0]
                         _aux_proj_pts.append(_pw)
                         _aux_proj_lids.append(_i)
                         _aux_lid_to_proj[_i] = _pw
 
                 if self.vis_cfg.get("show_projected", True):
                     if _aux_proj_pts:
-                        _pn_world = _R_aw @ np.array([0.0, 0.0, -1.0])
+                        _pn_world = _aux_cam.T_world_cam.R @ np.array([0.0, 0.0, -1.0])
                         _pnormals = np.tile(_pn_world, (len(_aux_proj_pts), 1)).astype(np.float32)
                         _apv, _apf, _apc = make_disk_mesh(
                             np.array(_aux_proj_pts, dtype=np.float32), _pnormals,
@@ -1126,7 +1072,7 @@ class ControllerAnimatorRerun:
                              frustum_z]
                             for _lid in _aux_proj_lids
                         ], dtype=np.float32)
-                        _lbl_pts_world = (_R_aw @ _lbl_pts_cam.T).T + _t_aw
+                        _lbl_pts_world = _aux_cam.T_world_cam.apply(_lbl_pts_cam)
                         rr.log(f"{_acp}/led_ids", rr.Points3D(
                             positions=_lbl_pts_world,
                             labels=[str(_lid) for _lid in _aux_proj_lids],
@@ -1144,16 +1090,11 @@ class ControllerAnimatorRerun:
                 _aux_error_z     = frustum_z - error_z_offset
 
                 if _aux_blobs_arr is not None:
-                    # _T_aux_model.R may have det=-1 (improper rotation for left controller).
-                    # Recover proper-rotation T_aux_ctrl by composing with T_model_ctrl.
-                    _T_aux_ctrl   = _T_aux_model.compose(cs["T_model_ctrl"])
-                    _rv_aux, _    = cv2.Rodrigues(_T_aux_ctrl.R.astype(np.float32))
-                    _tv_aux       = _T_aux_ctrl.t.astype(np.float32).reshape(3, 1)
+                    _rv_aux, _ = cv2.Rodrigues(_T_aux_ctrl.R.astype(np.float32))
+                    _tv_aux    = _T_aux_ctrl.t.astype(np.float32).reshape(3, 1)
                     _aux_lids_ord = [_lid for _, _lid in _aux_pairs]
-                    _proj_px_aux, _ = cv2.projectPoints(
-                        ctrl_positions[_aux_lids_ord].astype(np.float32),
-                        _rv_aux, _tv_aux,
-                        _aux_cam.camera_matrix, _aux_cam.dist_coeffs,
+                    _proj_px_aux, _ = _aux_cam.project_points(
+                        ctrl_positions[_aux_lids_ord], _rv_aux, _tv_aux,
                     )
                     _proj_px_aux = _proj_px_aux.reshape(-1, 2)
 
@@ -1166,17 +1107,15 @@ class ControllerAnimatorRerun:
                         _lp = _pts_aux_cam[_lid]
                         if _lp[2] > 1e-6 and self.vis_cfg.get("show_errors", True):
                             _bu, _bv = float(_aux_blobs_arr[_blob_j, 0]), float(_aux_blobs_arr[_blob_j, 1])
-                            _b_ud = cv2.undistortPoints(
-                                np.array([[_bu, _bv]], dtype=np.float32).reshape(1, 1, 2),
-                                _aux_cam.camera_matrix, _aux_cam.dist_coeffs,
-                                P=_aux_cam.camera_matrix,
+                            _b_norm = _aux_cam.undistort_points(
+                                np.array([[_bu, _bv]], dtype=np.float32),
                             ).reshape(2)
-                            _blob_plane_w = _R_aw @ backproject_to_plane(
-                                _b_ud.reshape(1, 2), _aux_cam, z=_aux_error_z)[0] + _t_aw
-                            _proj_flat_w  = _R_aw @ np.array([
-                                _lp[0] / _lp[2] * _aux_error_z,
-                                _lp[1] / _lp[2] * _aux_error_z,
-                                _aux_error_z]) + _t_aw
+                            _blob_plane_cam = np.array([_b_norm[0] * _aux_error_z,
+                                                        _b_norm[1] * _aux_error_z, _aux_error_z])
+                            _blob_plane_w = _aux_cam.T_world_cam.apply(_blob_plane_cam.reshape(1, 3))[0]
+                            _proj_flat_cam = np.array([_lp[0] / _lp[2] * _aux_error_z,
+                                                       _lp[1] / _lp[2] * _aux_error_z, _aux_error_z])
+                            _proj_flat_w = _aux_cam.T_world_cam.apply(_proj_flat_cam.reshape(1, 3))[0]
                             _aux_err_strips.append([_proj_flat_w.tolist(), _blob_plane_w.tolist()])
                             _pu, _pv_val = float(_proj_px_aux[_pi, 0]), float(_proj_px_aux[_pi, 1])
                             _aux_err_vals.append(float(np.sqrt((_bu - _pu)**2 + (_bv - _pv_val)**2)))

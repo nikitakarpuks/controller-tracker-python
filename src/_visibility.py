@@ -175,6 +175,7 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   cam_w: int = 0,
                   cam_h: int = 0,
                   cam_rpmax: float = 0.0,
+                  cam_is_fisheye: bool = False,
                   facing_threshold_deg: float = 86.0,
                   debug: bool = False) -> np.ndarray:
     """
@@ -197,7 +198,7 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                 of the full model (e.g. positions[il]).  If None, geom.is_inner
                 is used (assumes positions == full model).
     cam_K     : 3×3 camera intrinsic matrix; if None, the in-frame check is skipped.
-    cam_dc    : distortion coefficients (radtan8: k1,k2,p1,p2,k3,k4,k5,k6).
+    cam_dc    : distortion coefficients (radtan8: k1,k2,p1,p2,k3,k4,k5,k6; kb4: (4,1) array).
     cam_w, cam_h : image dimensions in pixels.
     cam_rpmax : maximum valid normalised radius for the distortion model;
                 LEDs beyond this are culled.  0 disables the check.
@@ -220,12 +221,19 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
         active = np.where(mask)[0]
         if len(active) > 0:
             dc = cam_dc if cam_dc is not None else np.zeros(4, dtype=np.float32)
-            pts, _ = cv2.projectPoints(
-                positions[active].astype(np.float32).reshape(-1, 1, 3),
-                _to_rvec(R),
-                tvec.astype(np.float32).reshape(3, 1),
-                cam_K, dc,
-            )
+            rv = _to_rvec(R)
+            tv = tvec.astype(np.float32).reshape(3, 1)
+            if cam_is_fisheye:
+                pts, _ = cv2.fisheye.projectPoints(
+                    positions[active].astype(np.float64).reshape(-1, 1, 3),
+                    rv.astype(np.float64), tv.astype(np.float64),
+                    cam_K.astype(np.float64), dc,
+                )
+            else:
+                pts, _ = cv2.projectPoints(
+                    positions[active].astype(np.float32).reshape(-1, 1, 3),
+                    rv, tv, cam_K, dc,
+                )
             pts      = pts.reshape(-1, 2)
             in_frame = (pts[:, 0] >= 0) & (pts[:, 0] < cam_w) & \
                        (pts[:, 1] >= 0) & (pts[:, 1] < cam_h)

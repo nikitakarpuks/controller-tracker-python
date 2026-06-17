@@ -558,3 +558,118 @@
 
   Recommendation: your current optimize_params: [fx, fy, cx, cy] is exactly right. The distortion coefficients shouldn't be added unless reprojection error stays high after cx/cy/fx/fy
   are tuned — and with sparse LED data you won't have enough coverage near image edges to reliably recover k1/k2 anyway.
+
+
+
+  good, now let's think about how can we parallelize matching for multiple cameras at once inside pose_search, and do the changes in the current code that would make it easy to implement
+  this. First, tell me about the brute match. Do we search the pose for the all cameras in the cold start scenario?
+  regarding proximity and constrained, I would still propose that we need to keep joint optimization, but the Hungarian search itself, is it easy to parallelize between cameras?
+  Prepare a detailed report
+
+● Let me read the key sections to give you an accurate picture before answering.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now I have a thorough picture. Let me write the full report.
+
+  ---
+  Multi-camera parallelization analysis
+
+  Brute search — cold start
+
+  Each PoseSearcher is bound to one camera (self.camera, self._cam). In cold start, brute_search is called once per camera, each working purely on its own blobs. other_cameras_blobs is
+  passed in but is never used to generate hypotheses — only to validate a primary-camera P3P solution (step 6.7) and then refine it (joint LM at the end). This means:
+
+  - Cross-camera parallelization is already structurally possible. Each camera's PoseSearcher.brute_search is independent. The caller just needs to run them concurrently. No changes
+  needed in pose_search.py for this level.
+  - Within a single brute_search call, the hot inner triple/blob/P3P loop has shared mutable state (best_solution, best_inliers, strong_found, tier_p3p_calls) that makes the triple loop
+  non-trivially parallelizable. This is the hard part — the early-exit on strong_found is the main optimization lever and it's inherently sequential.
+  - Step 6.7 aux-camera validation runs inside the inner loop, once per winning P3P hypothesis (~4–7 times per call typically). The loop over other_cameras_blobs there is sequential, but
+  each camera is independent. This is a real parallelization target, but only if P3P hypotheses themselves become cheap enough to batch. For now, it's not a bottleneck because it only
+  runs for hypotheses that pass Hungarian.
+
+  ---
+  Proximity search — aux Hungarian
+
+  The flow is:
+  1. Primary Hungarian + RANSAC    ← must be sequential (produces rvec/tvec)
+  2. per-aux-cam: _aux_cam_vis + cdist + linear_sum_assignment   ← fully independent
+  3. _apply_joint_lm               ← must wait for all aux results
+
+  Step 2 is already extracted (_aux_cam_vis) but the loop body still does several more things: project LEDs, build cost matrix, Hungarian solve, size filter. Each camera in the loop is
+  completely independent — no shared state between cameras, no ordering dependency. This is the easiest parallelization in the whole file.
+
+  What's needed to make it parallel-ready:
+
+  The loop body needs to be extracted into a method so it can be submitted to an executor. Right now it looks like:
+  for _ocam, _oblobs, _oradii in other_cameras_blobs:
+      _oblobs = np.asarray(...)
+      _pairs_i = []
+      if len(_oblobs) > 0:
+          _R_i_r, _t_i_r, _rv_i_r, _focal_i_r, _vis_i_r = self._aux_cam_vis(...)
+          # ... project, cdist, Hungarian, size filter ...
+      aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
+
+  Extract to _match_aux_hungarian(ocam, oblobs, oradii, T_world, expansion_px, log_size_filter) → returns (cam_idx, pairs_list).
+
+  Then the call site becomes:
+  results = [self._match_aux_hungarian(...) for ...]  # or map to executor
+  aux_snapped_per_cam = dict(results)
+
+  ---
+  Constrained search — aux snaps
+
+  The flow is:
+  1. Primary snap                  ← sequential
+  2. Aux pre-snap (per camera)     ← fully independent → already _snap_led_pairs
+  3. Translation solve             ← sequential (consumes pre-snap results)
+  4. Validation                    ← sequential
+  5. Aux post-solve snap (per cam) ← fully independent → already _snap_led_pairs
+
+  Steps 2 and 5 are each a loop of _snap_led_pairs calls per camera. Because of our earlier refactor, each call is already isolated and returns its result cleanly. No new extraction is
+  needed — you can submit each call to an executor directly:
+
+  # step 2
+  with executor.map(...):
+      _aux_pre = {idx: (ocam, obl, self._snap_led_pairs(...)) for ...}
+
+  # step 5
+  aux_snapped = {idx: self._snap_led_pairs(...) for ocam, obl, oradii in ...}
+
+  For 2–3 aux cameras _snap_led_pairs is already fast (it's a tiny CPU loop). Parallelization here only pays off with 4+ cameras.
+
+  ---
+  Summary table
+
+  ┌───────────────────────────────────────────────┬───────────────────────────────────────┬──────────────────────────────────────┬─────────────────────────────────────────────────────┐
+  │                     Site                      │             Independent?              │          Extraction needed?          │               Parallelization payoff                │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Cross-camera brute (cold start)               │ Yes — separate PoseSearcher instances │ No, caller-side only                 │ High — full P3P searches on separate cameras        │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Step 6.7 aux validation (in brute inner loop) │ Yes per camera                        │ Small: extract loop body             │ Medium — only runs for accepted hypotheses          │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Proximity aux Hungarian loop                  │ Yes per camera                        │ Yes: extract to _match_aux_hungarian │ High — cdist + linear_sum_assignment is non-trivial │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Constrained pre-snap loop                     │ Yes per camera                        │ No — already _snap_led_pairs         │ Low (tiny workload)                                 │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Constrained post-snap loop                    │ Yes per camera                        │ No — already _snap_led_pairs         │ Low (tiny workload)                                 │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Joint LM (_apply_joint_lm)                    │ No — must run after all aux           │ Already extracted                    │ Sequential, not parallelizable                      │
+  └───────────────────────────────────────────────┴───────────────────────────────────────┴──────────────────────────────────────┴─────────────────────────────────────────────────────┘
+
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Constrained post-snap loop                    │ Yes per camera                        │ No — already _snap_led_pairs         │ Low (tiny workload)                                 │
+  ├───────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Joint LM (_apply_joint_lm)                    │ No — must run after all aux           │ Already extracted                    │ Sequential, not parallelizable                      │
+  └───────────────────────────────────────────────┴───────────────────────────────────────┴──────────────────────────────────────┴─────────────────────────────────────────────────────┘
+
+  ---
+  Recommended structural changes now
+
+  Only one extraction is non-trivial and needed before parallelization can be wired in:
+  Extract _match_aux_hungarian from proximity_search — the per-camera body after _aux_cam_vis (project LEDs → cost matrix → size filter → Hungarian solve). This method would take (ocam,
+  oblobs, oradii, T_world_ref, expansion_px, log_size_filter) and return (cam_idx, pairs_list). The rest of the parallelization is either caller-level (brute cold start) or already clean
+  enough to map() directly.
+
+  Want me to do that extraction?

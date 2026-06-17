@@ -16,6 +16,7 @@ def _ransac_pnp(
     reprojection_px: float = 2.0,
     iterations: int = 100,
     confidence: float = 0.99,
+    is_fisheye: bool = False,
 ) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     RANSAC PnP using undistorted normalised image coordinates.
@@ -44,9 +45,13 @@ def _ransac_pnp(
     fx = float(K[0, 0])
 
     # Undistort image points → normalised camera coordinates (K removed, distortion removed).
-    pts_norm = cv2.undistortPoints(
-        img_pts.astype(np.float32).reshape(-1, 1, 2), K, dc,
-    ).reshape(-1, 2)
+    inp = img_pts.astype(np.float32).reshape(-1, 1, 2)
+    if is_fisheye:
+        pts_norm = cv2.fisheye.undistortPoints(
+            inp.astype(np.float64), K.astype(np.float64), dc,
+        ).reshape(-1, 2)
+    else:
+        pts_norm = cv2.undistortPoints(inp, K, dc).reshape(-1, 2)
 
     use_guess = rvec_init is not None and tvec_init is not None
     r0 = np.asarray(rvec_init, dtype=np.float64).reshape(3, 1) if use_guess else None
@@ -79,14 +84,18 @@ def _to_rvec(R_or_rvec: np.ndarray) -> np.ndarray:
     return R_or_rvec.astype(np.float32).reshape(3, 1)
 
 
-def _project_points(rvec, tvec, points: np.ndarray, K, dc) -> np.ndarray:
+def _project_points(rvec, tvec, points: np.ndarray, K, dc, is_fisheye: bool = False) -> np.ndarray:
     """Project (N,3) world points → (N,2) image points."""
-    pts, _ = cv2.projectPoints(
-        points.astype(np.float32),
-        _to_rvec(rvec),
-        np.asarray(tvec, dtype=np.float32).reshape(3, 1),
-        K, dc,
-    )
+    r = _to_rvec(rvec)
+    t = np.asarray(tvec, dtype=np.float32).reshape(3, 1)
+    if is_fisheye:
+        pts, _ = cv2.fisheye.projectPoints(
+            points.astype(np.float64).reshape(-1, 1, 3),
+            r.astype(np.float64), t.astype(np.float64),
+            K.astype(np.float64), dc,
+        )
+    else:
+        pts, _ = cv2.projectPoints(points.astype(np.float32), r, t, K, dc)
     return pts.reshape(-1, 2)
 
 
