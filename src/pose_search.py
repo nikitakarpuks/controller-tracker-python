@@ -107,17 +107,6 @@ def _build_led_neighbor_lists_edge(
         nbrs = np.array(nbrs, dtype=int)
         result.append(nbrs)
 
-        if is_deep():
-            kind = "inner" if is_inner[i] else "outer"
-            lines = [f"LED {i:2d} ({kind}, z_rel={z_rel[i]:+.5f})  →  neighbours:"]
-            for rank, j in enumerate(nbrs):
-                jkind = "inner" if is_inner[j] else "outer"
-                src   = "same " if is_inner[j] == is_inner[i] else "cross"
-                lines.append(f"  rank {rank}: LED {j:2d} ({jkind}/{src}, "
-                              f"z_rel={z_rel[j]:+.5f}, dot={dots[i,j]:.4f}, "
-                              f"dist={dists[i,j]*1000:.1f} mm)")
-            # logger.debug("\n".join(lines))
-
     return result
 
 
@@ -194,17 +183,17 @@ def _gate_any_point(
     gate_img: np.ndarray,
     fx: float, fy: float, cx: float, cy: float,
     thresh_sq: float,
+    track_dist: bool = False,
 ) -> Tuple[bool, float]:
     """
     Return True if ANY gate LED projects within sqrt(thresh_sq) pixels of ANY gate blob.
     If either pool is empty, returns True (no gate to fail).
-    Returns (passed, min_dist_px); min_dist is only tracked in deep-debug mode.
+    Returns (passed, min_dist_px); min_dist is only tracked when track_dist=True.
     """
     if len(gate_obj) == 0 or len(gate_img) == 0:
         return True, 0.0
 
-    track_dist = is_deep()
-    min_dist   = np.inf if track_dist else 0.0
+    min_dist = np.inf if track_dist else 0.0
     for obj in gate_obj:
         p = R_h @ obj + tvec_h
         if p[2] <= 0:
@@ -273,7 +262,8 @@ def _filter_aux_by_reprojection(
         _led_ids   = [led_id for _, led_id in _pairs]
         _blob_idxs = [b_idx  for b_idx, _  in _pairs]
         _pts3d = positions[_led_ids].astype(np.float32)
-        _proj  = _project_points(_rv_ci, _tv_ci, _pts3d, _ocam.camera_matrix, _ocam.dist_coeffs)
+        _proj  = _project_points(_rv_ci, _tv_ci, _pts3d, _ocam.camera_matrix, _ocam.dist_coeffs,
+                                 is_fisheye=_ocam.is_fisheye)
         _errs  = np.linalg.norm(_proj - _oblobs[_blob_idxs], axis=1)
         _kept  = [_pairs[i] for i in range(len(_pairs)) if _errs[i] < threshold_px]
         if _kept:
@@ -325,6 +315,7 @@ def _joint_refine_pose(
             cam.dist_coeffs,
             model_positions[l_idx].astype(np.float32),
             blobs_c[b_idx].astype(np.float32),
+            getattr(cam, "is_fisheye", False),
         ))
 
     if sum(len(e[4]) for e in cam_data) < 4:
@@ -352,13 +343,20 @@ def _joint_refine_pose(
         tv = x[3:].astype(np.float64)
         R_wc = cv2.Rodrigues(rv)[0].astype(np.float64)
         parts = []
-        for (R_cw, t_cw, K_c, dc_c, leds, blobs_ref), w in zip(cam_data, cam_weights):
+        for (R_cw, t_cw, K_c, dc_c, leds, blobs_ref, is_fe), w in zip(cam_data, cam_weights):
             R_ci = (R_cw @ R_wc).astype(np.float32)
             t_ci = (R_cw @ tv + t_cw).astype(np.float32)
             rv_ci = cv2.Rodrigues(R_ci)[0]
-            proj, _ = cv2.projectPoints(
-                leds.reshape(-1, 1, 3), rv_ci, t_ci.reshape(3, 1), K_c, dc_c,
-            )
+            if is_fe:
+                proj, _ = cv2.fisheye.projectPoints(
+                    leds.astype(np.float64).reshape(-1, 1, 3),
+                    rv_ci.astype(np.float64), t_ci.astype(np.float64).reshape(3, 1),
+                    K_c.astype(np.float64), dc_c,
+                )
+            else:
+                proj, _ = cv2.projectPoints(
+                    leds.reshape(-1, 1, 3), rv_ci, t_ci.reshape(3, 1), K_c, dc_c,
+                )
             parts.append(((proj.reshape(-1, 2) - blobs_ref) * w).ravel())
         return np.concatenate(parts).astype(np.float64)
 
@@ -403,6 +401,51 @@ class PoseSearcher:
         self.T_world_cam   = camera.T_world_cam
         self._matching_cfg = matching_cfg or {}
 
+        self._cam  = camera.camera_idx
+        self._ctrl = model.name.replace("_controller", "")
+
+        _cfg = matching_cfg or {}
+        # ── cached config (static for the lifetime of this searcher) ────────────
+        # shared
+        self._c_facing_deg          = float(_cfg.get('led_facing_angle_deg',             86.0))
+        self._c_led_radius_mm       = float(_cfg.get('self._c_led_radius_mm',                     2.5))
+        self._c_blob_size_min       = float(_cfg.get('self._c_blob_size_min',              0.2))
+        self._c_blob_size_max       = float(_cfg.get('self._c_blob_size_max',              4.0))
+        self._c_blob_size_score_w   = float(_cfg.get('self._c_blob_size_score_w',            0.5))
+        self._c_blob_bright_score_w = float(_cfg.get('self._c_blob_bright_score_w',      0.3))
+        self._c_occ_radius          = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+        self._c_occ_margin_px       = float(_cfg.get('cross_occlusionself._c_occ_margin_px',   20.0))
+        self._c_log_size_filter     = bool( _cfg.get('log_size_filter',                  False))
+        # joint optimisation
+        self._c_joint_opt           = bool( _cfg.get('joint_optimization',               True))
+        self._c_joint_prefilter_px  = float(_cfg.get('joint_aux_prefilter_px',            8.0))
+        self._c_joint_primary_w     = float(_cfg.get('joint_primary_weight',              2.0))
+        self._c_joint_huber_scale   = float(_cfg.get('joint_huber_scale',                1.5))
+        # proximity
+        self._c_prox_reproj_px      = float(_cfg.get('proximity_reprojection_threshold',  2.0))
+        self._c_prox_min_inliers    = int(  _cfg.get('proximity_min_inliers',
+                                                      _cfg.get('min_inliers',            4)))
+        self._c_prox_expansion_px   = float(_cfg.get('proximity_expansion_px',            8.0))
+        # constrained
+        self._c_cs_reproj_px        = float(_cfg.get('reprojection_threshold',            2.0))
+        self._c_cs_snap_factor      = float(_cfg.get('proximity_self._c_cs_snap_factor',             4.0))
+        # brute-force
+        _brute_reproj               = float(_cfg.get('reprojection_threshold',            1.5))
+        self._c_brute_depth_tiers   = tuple(tuple(t) for t in _cfg.get('depth_tiers',
+                                        ((2, 3), (2, 4), (2, 4, 'edge'),
+                                         (3, 5), (3, 5, 'edge'), (4, 6))))
+        self._c_brute_p4_px         = float(_cfg.get('p4_threshold_px',                  2.0))
+        self._c_brute_hungarian_px  = float(_cfg.get('hungarian_threshold_px',            5.0))
+        self._c_brute_reproj_px     = _brute_reproj
+        self._c_brute_min_inliers   = int(  _cfg.get('min_inliers',                      4))
+        self._c_brute_min_frac      = _cfg.get('min_inlier_fraction',               None) or None
+        self._c_brute_strong_in     = int(  _cfg.get('strong_match_inliers',             7))
+        self._c_brute_strong_err    = float(_cfg.get('strong_match_error_px',            1.5))
+        self._c_brute_min_vis_cov   = float(_cfg.get('min_vis_coverage',                 0.75))
+        self._c_brute_rng_seed      = _cfg.get('rng_seed',                              42)
+        self._c_brute_aux_reproj_px = float(_cfg.get('joint_aux_prefilter_px',
+                                                      _brute_reproj * 2.0))
+
         positions = model.positions.astype("float32")
         normals   = model.normals.astype("float32")
 
@@ -418,6 +461,150 @@ class PoseSearcher:
         self._led_triple_idx_edge, self._led_triple_depth_edge, self._led_triple_gates_edge = (
             _precompute_led_quads(positions, self._led_nbr_edge)
         )
+
+    @staticmethod
+    def _dbg(active: bool, msg: str) -> None:
+        if active:
+            logger.debug(msg)
+
+    def _aux_cam_vis(
+        self,
+        ocam,
+        T_world_ctrl,
+        occluders_per_cam: Optional[Dict],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
+        """Return (R, t, rv, focal_px, vis_mask) for an aux camera given a world-frame controller pose."""
+        _T_ci = ocam.T_world_cam.inverse().compose(T_world_ctrl)
+        R     = _T_ci.R.astype(np.float32)
+        t     = _T_ci.t.astype(np.float32)
+        rv    = cv2.Rodrigues(R)[0]
+        focal = float(max(ocam.camera_matrix[0, 0], ocam.camera_matrix[1, 1]))
+        vis   = _visible_mask(
+            R, t, self.model.positions, self.model.normals, self._geometry,
+            cam_K=ocam.camera_matrix, cam_dc=ocam.dist_coeffs,
+            cam_w=ocam.width, cam_h=ocam.height, cam_rpmax=ocam.rpmax,
+            cam_is_fisheye=ocam.is_fisheye,
+            facing_threshold_deg=self._c_facing_deg,
+        )
+        if occluders_per_cam:
+            occ = occluders_per_cam.get(ocam.camera_idx)
+            if occ is not None:
+                R_occ, t_occ, geom_occ = occ
+                vis &= ~_cross_occluded_mask(
+                    R, t, self.model.positions,
+                    R_occ, t_occ, geom_occ,
+                    self._c_occ_radius, self._c_occ_radius, focal, self._c_occ_margin_px,
+                    log_tag=f"[{self._ctrl} | cam {self._cam} aux_cam {ocam.camera_idx}]",
+                    vis_mask=vis,
+                )
+        return R, t, rv, focal, vis
+
+    def _snap_led_pairs(
+        self,
+        lids: List[int],
+        proj: np.ndarray,
+        led_cam_pts: np.ndarray,
+        blobs: np.ndarray,
+        blob_radii: Optional[np.ndarray],
+        focal_px: float,
+    ) -> List[Tuple[int, int]]:
+        """
+        Snap each LED (by id in lids) to the nearest eligible blob.
+        Returns (blob_idx, led_id) pairs with no blob used twice.
+        """
+        pairs: List[Tuple[int, int]] = []
+        used: set = set()
+        for ii, lid in enumerate(lids):
+            depth       = float(max(led_cam_pts[ii, 2], 0.01))
+            expected_px = focal_px * (self._c_led_radius_mm / 1000.0) / depth
+            snap_px     = expected_px * self._c_cs_snap_factor
+            dists       = np.linalg.norm(blobs - proj[ii], axis=1)
+            if blob_radii is not None:
+                elig = ((blob_radii >= expected_px * self._c_blob_size_min) &
+                        (blob_radii <= expected_px * self._c_blob_size_max))
+                if elig.any():
+                    cand   = np.where(elig)[0]
+                    scores = dists[cand] + self._c_blob_size_score_w * np.abs(blob_radii[cand] - expected_px)
+                    j      = int(cand[np.argmin(scores)])
+                else:
+                    j = int(np.argmin(dists))
+            else:
+                j = int(np.argmin(dists))
+            if dists[j] < snap_px and j not in used:
+                pairs.append((j, lid))
+                used.add(j)
+        return pairs
+
+    def _apply_joint_lm(
+        self,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        primary_pairs: List[Tuple[int, int]],
+        blobs: np.ndarray,
+        aux_assignments: Dict[int, List],
+        other_cameras_blobs: List,
+        K: np.ndarray,
+        dc: np.ndarray,
+        label: str,
+        prior_error: float,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+        """
+        Joint multi-camera LM refinement over all cameras simultaneously.
+        Returns (rvec_refined, tvec_refined, error_refined) or None if skipped/failed.
+        """
+        if not self._c_joint_opt or not aux_assignments or not other_cameras_blobs:
+            return None
+        _aux = [
+            (ocam, np.asarray(oblobs, dtype=np.float32), aux_assignments.get(ocam.camera_idx, []))
+            for ocam, oblobs, _ in other_cameras_blobs
+            if aux_assignments.get(ocam.camera_idx)
+        ]
+        if not _aux:
+            return None
+        _R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
+        _T_wc = self.T_world_cam.compose(
+            Transform(_R.astype(np.float64), np.asarray(tvec, dtype=np.float64).reshape(3))
+        )
+        _aux = _filter_aux_by_reprojection(_T_wc, _aux, self.model.positions, self._c_joint_prefilter_px)
+        if not _aux:
+            return None
+        _T_joint, _joint_err = _joint_refine_pose(
+            _T_wc, self.camera, primary_pairs, blobs, _aux, self.model.positions,
+            primary_weight=self._c_joint_primary_w,
+            huber_scale=self._c_joint_huber_scale,
+        )
+        if _T_joint is None:
+            return None
+        _T_prim = self.T_world_cam.inverse().compose(_T_joint)
+        _rv_j   = cv2.Rodrigues(_T_prim.R.astype(np.float32))[0]
+        _tv_j   = _T_prim.t.astype(np.float32)
+        _lo     = self.model.positions[[l for _, l in primary_pairs]].astype(np.float32)
+        _li     = blobs[[b for b, _ in primary_pairs]].astype(np.float32)
+        _err_j  = float(np.mean(np.linalg.norm(_project_points(_rv_j, _tv_j, _lo, K, dc,
+                                                                is_fisheye=self.camera.is_fisheye) - _li, axis=1)))
+        logger.debug(
+            f"[{self._ctrl} | cam {self._cam}] {label} joint LM: "
+            f"primary err {prior_error:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
+        )
+        for _aux_cam_j, _aux_blobs_j, _aux_pr_j in _aux:
+            if not _aux_pr_j:
+                continue
+            _T_aux_j  = _aux_cam_j.T_world_cam.inverse().compose(_T_joint)
+            _rv_aux_j = cv2.Rodrigues(_T_aux_j.R.astype(np.float32))[0]
+            _tv_aux_j = _T_aux_j.t.astype(np.float32)
+            _leds_j   = self.model.positions[[l for _, l in _aux_pr_j]].astype(np.float32)
+            _blobs_j  = _aux_blobs_j[[b for b, _ in _aux_pr_j]].astype(np.float32)
+            _err_ax   = float(np.mean(np.linalg.norm(
+                _project_points(_rv_aux_j, _tv_aux_j, _leds_j,
+                                _aux_cam_j.camera_matrix, _aux_cam_j.dist_coeffs,
+                                is_fisheye=_aux_cam_j.is_fisheye) - _blobs_j,
+                axis=1,
+            )))
+            logger.debug(
+                f"[{self._ctrl} | cam {self._cam}] {label} joint LM cam{_aux_cam_j.camera_idx}: "
+                f"err={_err_ax:.2f}px  ({len(_aux_pr_j)} pairs)"
+            )
+        return _rv_j, _tv_j, _err_j
 
     def proximity_search(
         self,
@@ -445,23 +632,8 @@ class PoseSearcher:
         dc = self.camera.dist_coeffs
 
         geom = self._geometry
-        _cfg = getattr(self, '_matching_cfg', None) or {}
-        _cam = self.camera.camera_idx
-        _ctrl = self.model.name.replace("_controller", "")
-        facing_threshold_deg         = float(_cfg.get('led_facing_angle_deg',              86.0))
-        reprojection_threshold       = float(_cfg.get('proximity_reprojection_threshold',   2.0))
-        min_inliers                  = int(  _cfg.get('proximity_min_inliers',
-                                                   _cfg.get('min_inliers', 4)))
-        led_radius_mm                = float(_cfg.get('led_radius_mm',                      2.5))
-        blob_size_max_factor         = float(_cfg.get('blob_size_max_factor',               4.0))
-        blob_size_min_factor         = float(_cfg.get('blob_size_min_factor',               0.2))
-        _log_size_filter             = is_deep() and bool(_cfg.get('log_size_filter', False))
-        _br                          = float(_cfg.get('cross_occlusion_bounding_radius_m',  0.18))
-        _gate_margin_px              = float(_cfg.get('cross_occlusion_gate_margin_px',    20.0))
-        blob_size_score_weight       = float(_cfg.get('blob_size_score_weight',             0.5))
-        blob_brightness_score_weight = float(_cfg.get('blob_brightness_score_weight',       0.3))
-        proximity_expansion_px = expansion_px if expansion_px is not None \
-                                 else float(_cfg.get('proximity_expansion_px', 8.0))
+        _log_size_filter   = is_deep() and self._c_log_size_filter
+        proximity_expansion_px = expansion_px if expansion_px is not None else self._c_prox_expansion_px
 
         R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
         focal_px = float(max(K[0, 0], K[1, 1]))
@@ -471,8 +643,8 @@ class PoseSearcher:
             self.model.positions, self.model.normals,
             geom,
             cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-            cam_rpmax=self.camera.rpmax,
-            facing_threshold_deg=facing_threshold_deg,
+            cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
+            facing_threshold_deg=self._c_facing_deg,
         )
         if occluders_per_cam:
             _occ = occluders_per_cam.get(self.camera.camera_idx)
@@ -481,8 +653,8 @@ class PoseSearcher:
                 vis_mask_pred &= ~_cross_occluded_mask(
                     R_pred_arr, tvec_pred, self.model.positions,
                     _R_occ, _t_occ, _geom_occ,
-                    _br, _br, focal_px, _gate_margin_px,
-                    log_tag=f"[{_ctrl} | cam {_cam}]",
+                    self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
+                    log_tag=f"[{self._ctrl} | cam {self._cam}]",
                     vis_mask=vis_mask_pred,
                 )
         n_model_visible = int(vis_mask_pred.sum())
@@ -501,7 +673,8 @@ class PoseSearcher:
         if n_model_visible > 0 and len(blobs) > 0:
             vis_ids     = np.where(vis_mask_pred)[0]
             vis_pos     = self.model.positions[vis_ids].astype(np.float32)
-            proj_vis    = _project_points(rvec_pred, tvec_pred, vis_pos, K, dc)
+            proj_vis    = _project_points(rvec_pred, tvec_pred, vis_pos, K, dc,
+                                          is_fisheye=self.camera.is_fisheye)
             led_cam_vis = (R_pred_arr @ vis_pos.T).T + tvec_pred
 
             cost = cdist(proj_vis, blobs)
@@ -509,10 +682,10 @@ class PoseSearcher:
             if blob_radii is not None:
                 for k in range(len(vis_ids)):
                     depth       = float(max(led_cam_vis[k, 2], 0.01))
-                    expected_px = focal_px * (led_radius_mm / 1000.0) / depth
+                    expected_px = focal_px * (self._c_led_radius_mm / 1000.0) / depth
                     ineligible  = (
-                        (blob_radii < expected_px * blob_size_min_factor) |
-                        (blob_radii > expected_px * blob_size_max_factor)
+                        (blob_radii < expected_px * self._c_blob_size_min) |
+                        (blob_radii > expected_px * self._c_blob_size_max)
                     )
                     cost[k, ineligible] = 1e9
                     if _log_size_filter:
@@ -520,13 +693,13 @@ class PoseSearcher:
                             logger.debug(
                                 f"  LED {int(vis_ids[k])}: blob {_c} size-filtered"
                                 f"  r={blob_radii[_c]:.2f}  expected"
-                                f" {expected_px*blob_size_min_factor:.2f}–{expected_px*blob_size_max_factor:.2f}px"
+                                f" {expected_px*self._c_blob_size_min:.2f}–{expected_px*self._c_blob_size_max:.2f}px"
                             )
 
             if _brightness_norm is not None:
                 normals_cam = (R_pred_arr @ self.model.normals[vis_ids].T).T
                 facing      = np.maximum(0.0, normals_cam[:, 2])
-                cost += blob_brightness_score_weight * np.abs(facing[:, None] - _brightness_norm[None, :])
+                cost += self._c_blob_bright_score_w * np.abs(facing[:, None] - _brightness_norm[None, :])
 
             n_vis    = len(vis_ids)
             cost_aug = np.hstack([cost, np.full((n_vis, n_vis), proximity_expansion_px - 1e-6)])
@@ -539,12 +712,12 @@ class PoseSearcher:
                     locked_img.append(blobs[c])
 
         logger.debug(
-            f"[{_ctrl} | cam {_cam}] Proximity Hungarian: {len(pairs)}/{len(blobs)} blobs matched "
+            f"[{self._ctrl} | cam {self._cam}] Proximity Hungarian: {len(pairs)}/{len(blobs)} blobs matched "
             f"of {n_model_visible} visible LEDs"
         )
 
-        if len(pairs) < min_inliers:
-            logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: too few pairs ({len(pairs)} < {min_inliers}) → None")
+        if len(pairs) < self._c_prox_min_inliers:
+            logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: too few pairs ({len(pairs)} < {self._c_prox_min_inliers}) → None")
             return None
 
         lo = np.array(locked_obj, dtype=np.float32)
@@ -552,21 +725,23 @@ class PoseSearcher:
 
         ok, rvec, tvec, ransac_idx = _ransac_pnp(
             lo, li, K, dc, rvec_pred, tvec_pred,
-            reprojection_px=reprojection_threshold,
+            reprojection_px=self._c_prox_reproj_px,
+            is_fisheye=self.camera.is_fisheye,
         )
 
         if not ok or ransac_idx is None:
-            logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC failed → None")
+            logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: RANSAC failed → None")
             return None
 
         final_pairs = [pairs[k] for k in ransac_idx]
-        if len(final_pairs) < min_inliers:
-            logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: RANSAC too few inliers ({len(final_pairs)}) → None")
+        if len(final_pairs) < self._c_prox_min_inliers:
+            logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: RANSAC too few inliers ({len(final_pairs)}) → None")
             return None
 
         lo_f = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
         li_f = blobs[[b for b, _ in final_pairs]].astype(np.float32)
-        pe   = np.linalg.norm(_project_points(rvec, tvec, lo_f, K, dc) - li_f, axis=1)
+        pe   = np.linalg.norm(_project_points(rvec, tvec, lo_f, K, dc,
+                                               is_fisheye=self.camera.is_fisheye) - li_f, axis=1)
         error     = float(pe.mean())
         max_error = float(pe.max())
 
@@ -586,44 +761,25 @@ class PoseSearcher:
                 _oblobs = np.asarray(_oblobs, dtype=np.float32)
                 _pairs_i: List = []
                 if len(_oblobs) > 0:
-                    _T_ci_r    = _ocam.T_world_cam.inverse().compose(_T_world_ref)
-                    _R_i_r     = _T_ci_r.R.astype(np.float32)
-                    _t_i_r     = _T_ci_r.t.astype(np.float32)
-                    _rv_i_r, _ = cv2.Rodrigues(_R_i_r)
-                    _focal_i_r = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
-
-                    _vis_i_r = _visible_mask(
-                        _R_i_r, _t_i_r, self.model.positions, self.model.normals, geom,
-                        cam_K=_ocam.camera_matrix, cam_dc=_ocam.dist_coeffs,
-                        cam_w=_ocam.width, cam_h=_ocam.height, cam_rpmax=_ocam.rpmax,
-                        facing_threshold_deg=facing_threshold_deg,
+                    _R_i_r, _t_i_r, _rv_i_r, _focal_i_r, _vis_i_r = self._aux_cam_vis(
+                        _ocam, _T_world_ref, occluders_per_cam
                     )
-                    if occluders_per_cam:
-                        _occ_i_r = occluders_per_cam.get(_ocam.camera_idx)
-                        if _occ_i_r is not None:
-                            _R_occ_i_r, _t_occ_i_r, _geom_occ_i_r = _occ_i_r
-                            _vis_i_r &= ~_cross_occluded_mask(
-                                _R_i_r, _t_i_r, self.model.positions,
-                                _R_occ_i_r, _t_occ_i_r, _geom_occ_i_r,
-                                _br, _br, _focal_i_r, _gate_margin_px,
-                                log_tag=f"[{_ctrl} | cam {_cam} aux_cam {_ocam.camera_idx}]",
-                                vis_mask=_vis_i_r,
-                            )
 
                     _vis_ids_i  = np.where(_vis_i_r)[0]
                     if len(_vis_ids_i) > 0:
                         _vis_pos_i  = self.model.positions[_vis_ids_i].astype(np.float32)
                         _proj_i_r   = _project_points(_rv_i_r, _t_i_r, _vis_pos_i,
-                                                      _ocam.camera_matrix, _ocam.dist_coeffs)
+                                                      _ocam.camera_matrix, _ocam.dist_coeffs,
+                                                      is_fisheye=_ocam.is_fisheye)
                         _led_ci_r   = (_R_i_r @ _vis_pos_i.T).T + _t_i_r
-                        _exp_px_i_r = _focal_i_r * (led_radius_mm / 1000.0) / np.maximum(_led_ci_r[:, 2], 0.01)
+                        _exp_px_i_r = _focal_i_r * (self._c_led_radius_mm / 1000.0) / np.maximum(_led_ci_r[:, 2], 0.01)
 
                         _cost_i_r = cdist(_proj_i_r, _oblobs)
 
                         if _oradii is not None:
                             for _k in range(len(_vis_ids_i)):
-                                _inelig_r = ((_oradii < _exp_px_i_r[_k] * blob_size_min_factor) |
-                                             (_oradii > _exp_px_i_r[_k] * blob_size_max_factor))
+                                _inelig_r = ((_oradii < _exp_px_i_r[_k] * self._c_blob_size_min) |
+                                             (_oradii > _exp_px_i_r[_k] * self._c_blob_size_max))
                                 _cost_i_r[_k, _inelig_r] = 1e9
                                 if _log_size_filter:
                                     for _c in np.where(_inelig_r)[0]:
@@ -631,7 +787,7 @@ class PoseSearcher:
                                             f"  LED {int(_vis_ids_i[_k])}: blob {_c}"
                                             f" size-filtered (aux cam{_ocam.camera_idx})"
                                             f"  r={_oradii[_c]:.2f}  expected"
-                                            f" {_exp_px_i_r[_k]*blob_size_min_factor:.2f}–{_exp_px_i_r[_k]*blob_size_max_factor:.2f}px"
+                                            f" {_exp_px_i_r[_k]*self._c_blob_size_min:.2f}–{_exp_px_i_r[_k]*self._c_blob_size_max:.2f}px"
                                         )
 
                         _n_vis_i   = len(_vis_ids_i)
@@ -645,7 +801,7 @@ class PoseSearcher:
                 aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
                 if is_deep() and _pairs_i:
                     logger.debug(
-                        f"[{_ctrl} | cam {_cam}] Proximity aux snap cam{_ocam.camera_idx}: "
+                        f"[{self._ctrl} | cam {self._cam}] Proximity aux snap cam{_ocam.camera_idx}: "
                         f"{len(_pairs_i)} pairs (refined pose)"
                         + ("  [size filter active]" if _oradii is not None else "")
                     )
@@ -658,61 +814,18 @@ class PoseSearcher:
             aux_cameras_result.append((_aux_cam_idx, _n_aux))
 
         # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
-        if bool(_cfg.get('joint_optimization', True)) and aux_snapped_per_cam:
-            _aux_joint = [
-                (_ocam, np.asarray(_oblobs, dtype=np.float32),
-                 aux_snapped_per_cam.get(_ocam.camera_idx, []))
-                for _ocam, _oblobs, _ in (other_cameras_blobs or [])
-                if aux_snapped_per_cam.get(_ocam.camera_idx)
-            ]
-            if _aux_joint:
-                _R_pr, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
-                _T_wc_pr = self.T_world_cam.compose(
-                    Transform(_R_pr.astype(np.float64),
-                              np.asarray(tvec, dtype=np.float64).reshape(3))
-                )
-                _aux_prefilter_px = float(_cfg.get('joint_aux_prefilter_px', 8.0))
-                _aux_joint = _filter_aux_by_reprojection(
-                    _T_wc_pr, _aux_joint, self.model.positions, _aux_prefilter_px
-                )
-                _T_joint = _joint_err = None
-                if _aux_joint:
-                    _T_joint, _joint_err = _joint_refine_pose(
-                        _T_wc_pr, self.camera, final_pairs, blobs, _aux_joint, self.model.positions,
-                        primary_weight=float(_cfg.get('joint_primary_weight', 2.0)),
-                        huber_scale=float(_cfg.get('joint_huber_scale', 1.5)),
-                    )
-                if _T_joint is not None:
-                    _T_prim = self.T_world_cam.inverse().compose(_T_joint)
-                    _rv_j = cv2.Rodrigues(_T_prim.R.astype(np.float32))[0]
-                    _tv_j = _T_prim.t.astype(np.float32)
-                    _proj_j = _project_points(_rv_j, _tv_j, lo_f, K, dc)
-                    _err_j = float(np.mean(np.linalg.norm(_proj_j - li_f, axis=1)))
-                    logger.debug(
-                        f"[{_ctrl} | cam {_cam}] Proximity joint LM: "
-                        f"primary err {error:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
-                    )
-                    for _aux_cam_j, _aux_blobs_j, _aux_pr_j in _aux_joint:
-                        if not _aux_pr_j:
-                            continue
-                        _T_aux_j = _aux_cam_j.T_world_cam.inverse().compose(_T_joint)
-                        _rv_aux_j = cv2.Rodrigues(_T_aux_j.R.astype(np.float32))[0]
-                        _tv_aux_j = _T_aux_j.t.astype(np.float32)
-                        _leds_aux_j  = self.model.positions[[l for _, l in _aux_pr_j]].astype(np.float32)
-                        _blobs_aux_j = _aux_blobs_j[[b for b, _ in _aux_pr_j]].astype(np.float32)
-                        _proj_aux_j  = _project_points(_rv_aux_j, _tv_aux_j, _leds_aux_j,
-                                                       _aux_cam_j.camera_matrix, _aux_cam_j.dist_coeffs)
-                        _err_aux_j   = float(np.mean(np.linalg.norm(_proj_aux_j - _blobs_aux_j, axis=1)))
-                        logger.debug(
-                            f"[{_ctrl} | cam {_cam}] Proximity joint LM cam{_aux_cam_j.camera_idx}: "
-                            f"err={_err_aux_j:.2f}px  ({len(_aux_pr_j)} pairs)"
-                        )
-                    rvec, tvec, error = _rv_j, _tv_j, _err_j
+        _joint_result = self._apply_joint_lm(
+            rvec, tvec, final_pairs, blobs,
+            aux_snapped_per_cam, other_cameras_blobs or [],
+            K, dc, "Proximity", error,
+        )
+        if _joint_result is not None:
+            rvec, tvec, error = _joint_result
 
         _aux_log = ""
         if aux_cameras_result:
             _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result if n > 0) + "]"
-        logger.debug(f"[{_ctrl} | cam {_cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}")
+        logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}")
         return {
             "rvec":       rvec,
             "tvec":       tvec,
@@ -782,16 +895,6 @@ class PoseSearcher:
 
         K  = self.camera.camera_matrix
         dc = self.camera.dist_coeffs
-        _cam = self.camera.camera_idx
-        _ctrl = self.model.name.replace("_controller", "")
-
-        _cfg = getattr(self, '_matching_cfg', None) or {}
-        reprojection_threshold = float(_cfg.get('reprojection_threshold', 2.0))
-        led_radius_mm          = float(_cfg.get('led_radius_mm',          2.5))
-        snap_factor            = float(_cfg.get('proximity_snap_factor',  4.0))
-        blob_size_max_factor   = float(_cfg.get('blob_size_max_factor',   4.0))
-        blob_size_min_factor   = float(_cfg.get('blob_size_min_factor',   0.2))
-        blob_size_score_weight = float(_cfg.get('blob_size_score_weight', 0.5))
 
         mode       = 'p2p' if n_blobs >= 3 else 'p1p'
         n_required = 3     if mode == 'p2p' else 2
@@ -799,7 +902,8 @@ class PoseSearcher:
         # ── Primary snap ──────────────────────────────────────────────────────────
         prior_lids = [lid for _, lid in prior_assignment]
         prior_obj  = self.model.positions[prior_lids].astype(np.float32)
-        proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc)
+        proj_prior = _project_points(rvec_pred, tvec_pred, prior_obj, K, dc,
+                                     is_fisheye=self.camera.is_fisheye)
         led_cam    = (R_prior @ prior_obj.T).T + tvec_pred
         focal_px   = float(max(K[0, 0], K[1, 1]))
 
@@ -811,13 +915,13 @@ class PoseSearcher:
                 break
 
             depth       = float(max(led_cam[i, 2], 0.01))
-            expected_px = focal_px * (led_radius_mm / 1000.0) / depth
-            snap_px     = expected_px * snap_factor
+            expected_px = focal_px * (self._c_led_radius_mm / 1000.0) / depth
+            snap_px     = expected_px * self._c_cs_snap_factor
 
             if blob_radii is not None:
                 eligible = (
-                    (blob_radii >= expected_px * blob_size_min_factor) &
-                    (blob_radii <= expected_px * blob_size_max_factor)
+                    (blob_radii >= expected_px * self._c_blob_size_min) &
+                    (blob_radii <= expected_px * self._c_blob_size_max)
                 )
             else:
                 eligible = None
@@ -828,7 +932,7 @@ class PoseSearcher:
                 cand_idx   = np.where(eligible)[0]
                 dists_cand = dists[cand_idx]
                 size_err   = np.abs(blob_radii[cand_idx] - expected_px)
-                scores     = dists_cand + blob_size_score_weight * size_err
+                scores     = dists_cand + self._c_blob_size_score_w * size_err
                 j          = int(cand_idx[np.argmin(scores)])
             else:
                 j = int(np.argmin(dists))
@@ -863,40 +967,20 @@ class PoseSearcher:
                 _t_ci_p     = _T_ci_p.t.astype(np.float32)
                 _rv_ci_p, _ = cv2.Rodrigues(_R_ci_p)
                 _proj_ci_p  = _project_points(_rv_ci_p, _t_ci_p, prior_obj,
-                                               _ocam.camera_matrix, _ocam.dist_coeffs)
+                                               _ocam.camera_matrix, _ocam.dist_coeffs,
+                                               is_fisheye=_ocam.is_fisheye)
                 _led_ci_p   = (_R_ci_p @ prior_obj.T).T + _t_ci_p
                 _focal_ci   = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
-                _pairs_ci: List = []
-                _used_ci: set   = set()
-                for _ii, _lid in enumerate(prior_lids):
-                    _depth_ci = float(max(_led_ci_p[_ii, 2], 0.01))
-                    _exp_ci   = _focal_ci * (led_radius_mm / 1000.0) / _depth_ci
-                    _snap_ci  = _exp_ci * snap_factor
-                    if _oradii is not None:
-                        _elig_ci = ((_oradii >= _exp_ci * blob_size_min_factor) &
-                                    (_oradii <= _exp_ci * blob_size_max_factor))
-                    else:
-                        _elig_ci = None
-                    _dists_ci = np.linalg.norm(_obl - _proj_ci_p[_ii], axis=1)
-                    if _elig_ci is not None and _elig_ci.any():
-                        _cand_ci   = np.where(_elig_ci)[0]
-                        _scores_ci = (_dists_ci[_cand_ci]
-                                      + blob_size_score_weight * np.abs(_oradii[_cand_ci] - _exp_ci))
-                        _jj        = int(_cand_ci[np.argmin(_scores_ci)])
-                    else:
-                        _jj = int(np.argmin(_dists_ci))
-                    if _dists_ci[_jj] < _snap_ci and _jj not in _used_ci:
-                        _pairs_ci.append((_jj, _lid))
-                        _used_ci.add(_jj)
+                _pairs_ci = self._snap_led_pairs(
+                    prior_lids, _proj_ci_p, _led_ci_p, _obl, _oradii, _focal_ci
+                )
                 _aux_pre[_ocam.camera_idx] = (_ocam, _obl, _pairs_ci)
 
         n_aux_pre = sum(len(v[2]) for v in _aux_pre.values())
 
         # ── Undistort primary hypothesis blob positions ───────────────────────────
         hyp_blobs  = np.array([blobs[b] for b, _ in pairs_hyp], dtype=np.float32)
-        pts_undist = cv2.undistortPoints(
-            hyp_blobs.reshape(-1, 1, 2), K, dc,
-        ).reshape(-1, 2)
+        pts_undist = self.camera.undistort_points(hyp_blobs)
 
         # ── Translation solve ─────────────────────────────────────────────────────
         # General linear equation per pair in a camera with relative transform
@@ -925,9 +1009,7 @@ class PoseSearcher:
                 _A     = _T_ap.R.astype(np.float64)
                 _c     = _T_ap.t.astype(np.float64)
                 _aux_hyp = np.array([_obl[b_idx] for b_idx, _ in _pairs_ci], dtype=np.float32)
-                _und_aux = cv2.undistortPoints(
-                    _aux_hyp.reshape(-1, 1, 2), _ocam.camera_matrix, _ocam.dist_coeffs,
-                ).reshape(-1, 2)
+                _und_aux = _ocam.undistort_points(_aux_hyp)
                 for _k, (_, _lid) in enumerate(_pairs_ci):
                     _Pi = self.model.positions[_lid].astype(np.float64)
                     _q  = _A @ (R_prior.astype(np.float64) @ _Pi) + _c
@@ -968,13 +1050,14 @@ class PoseSearcher:
         all_primary = pairs_hyp + [pair_val]
         all_obj     = self.model.positions[[l for _, l in all_primary]].astype(np.float32)
         all_img     = blobs[[b for b, _ in all_primary]].astype(np.float32)
-        proj_all    = _project_points(rvec_pred, t_solved.astype(np.float32), all_obj, K, dc)
+        proj_all    = _project_points(rvec_pred, t_solved.astype(np.float32), all_obj, K, dc,
+                                      is_fisheye=self.camera.is_fisheye)
         errors      = np.linalg.norm(proj_all - all_img, axis=1)
 
-        if np.any(errors > reprojection_threshold):
+        if np.any(errors > self._c_cs_reproj_px):
             logger.debug(
                 f"prior_constrained ({mode}): validation failed "
-                f"errors={errors.round(2)} thresh={reprojection_threshold} → None"
+                f"errors={errors.round(2)} thresh={self._c_cs_reproj_px} → None"
             )
             return None
 
@@ -996,32 +1079,13 @@ class PoseSearcher:
                 _t_ci_s     = _T_ci_s.t.astype(np.float32)
                 _rv_ci_s, _ = cv2.Rodrigues(_R_ci_s)
                 _proj_ci_s  = _project_points(_rv_ci_s, _t_ci_s, prior_obj,
-                                               _ocam.camera_matrix, _ocam.dist_coeffs)
+                                               _ocam.camera_matrix, _ocam.dist_coeffs,
+                                               is_fisheye=_ocam.is_fisheye)
                 _led_ci_s   = (_R_ci_s @ prior_obj.T).T + _t_ci_s
                 _focal_ci   = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
-                _pairs_s: List = []
-                _used_s: set   = set()
-                for _ii, _lid in enumerate(prior_lids):
-                    _depth_s = float(max(_led_ci_s[_ii, 2], 0.01))
-                    _exp_s   = _focal_ci * (led_radius_mm / 1000.0) / _depth_s
-                    _snap_s  = _exp_s * snap_factor
-                    if _oradii is not None:
-                        _elig_s = ((_oradii >= _exp_s * blob_size_min_factor) &
-                                   (_oradii <= _exp_s * blob_size_max_factor))
-                    else:
-                        _elig_s = None
-                    _dists_s = np.linalg.norm(_obl - _proj_ci_s[_ii], axis=1)
-                    if _elig_s is not None and _elig_s.any():
-                        _cand_s   = np.where(_elig_s)[0]
-                        _scores_s = (_dists_s[_cand_s]
-                                     + blob_size_score_weight * np.abs(_oradii[_cand_s] - _exp_s))
-                        _jj_s     = int(_cand_s[np.argmin(_scores_s)])
-                    else:
-                        _jj_s = int(np.argmin(_dists_s))
-                    if _dists_s[_jj_s] < _snap_s and _jj_s not in _used_s:
-                        _pairs_s.append((_jj_s, _lid))
-                        _used_s.add(_jj_s)
-                aux_snapped_per_cam[_ocam.camera_idx] = _pairs_s
+                aux_snapped_per_cam[_ocam.camera_idx] = self._snap_led_pairs(
+                    prior_lids, _proj_ci_s, _led_ci_s, _obl, _oradii, _focal_ci
+                )
 
         aux_inlier_count   = sum(len(v) for v in aux_snapped_per_cam.values())
         aux_cameras_result = [(idx, len(pairs))
@@ -1031,7 +1095,7 @@ class PoseSearcher:
         if aux_cameras_result:
             _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result) + "]"
         logger.debug(
-            f"[{_ctrl} | cam {_cam}] prior_constrained ({mode}): OK  pairs={len(all_primary)}  err={error:.2f}px"
+            f"[{self._ctrl} | cam {self._cam}] prior_constrained ({mode}): OK  pairs={len(all_primary)}  err={error:.2f}px"
             + (f"  n_aux_solve={n_aux_pre}" if n_aux_pre > 0 else "")
             + _aux_log
         )
@@ -1082,29 +1146,7 @@ class PoseSearcher:
           - Blob pairs newly eligible because i2 ≥ prev blob_max for already-eligible triples
         Exits on strong match at the end of any tier's LED triple.
         """
-        _cfg = getattr(self, '_matching_cfg', None) or {}
-        _cam = self.camera.camera_idx
-        _ctrl = self.model.name.replace("_controller", "")
-        if _cfg:
-            depth_tiers            = tuple(tuple(t) for t in _cfg.get('depth_tiers', depth_tiers))
-            p4_threshold_px        = float(_cfg.get('p4_threshold_px',        p4_threshold_px))
-            hungarian_threshold_px = float(_cfg.get('hungarian_threshold_px', hungarian_threshold_px))
-            reprojection_threshold = float(_cfg.get('reprojection_threshold', reprojection_threshold))
-            min_inliers            = int(  _cfg.get('min_inliers',            min_inliers))
-            min_inlier_fraction    = _cfg.get('min_inlier_fraction', min_inlier_fraction) or None
-            strong_match_inliers   = int(  _cfg.get('strong_match_inliers',   strong_match_inliers))
-            strong_match_error_px  = float(_cfg.get('strong_match_error_px',  strong_match_error_px))
-            min_vis_coverage       = float(_cfg.get('min_vis_coverage',       min_vis_coverage))
-            rng_seed               = _cfg.get('rng_seed', rng_seed)
-        facing_threshold_deg  = float(_cfg.get('led_facing_angle_deg', 86.0))
-        blob_size_min_factor  = float(_cfg.get('blob_size_min_factor', 0.2))
-        blob_size_max_factor  = float(_cfg.get('blob_size_max_factor', 4.0))
-        _log_size_filter      = is_deep() and bool(_cfg.get('log_size_filter', False))
-        _br                   = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
-        _gate_margin_px       = float(_cfg.get('cross_occlusion_gate_margin_px',   20.0))
-        led_radius_mm         = float(_cfg.get('led_radius_mm',        2.5))
-        # Aux-camera inlier threshold for step 6.7: looser than primary RANSAC threshold.
-        brute_aux_reproj_px   = float(_cfg.get('joint_aux_prefilter_px', reprojection_threshold * 2.0))
+        _log_size_filter = is_deep() and self._c_log_size_filter
 
         blobs   = np.asarray(blobs, dtype=np.float32)
         n_blobs = len(blobs)
@@ -1113,13 +1155,13 @@ class PoseSearcher:
         if n_available < 4:
             return None
 
-        if min_inlier_fraction is not None:
-            fraction_floor     = int(np.ceil(min_inlier_fraction * n_available))
-            min_inliers_eff    = max(min_inliers, fraction_floor)
-            strong_inliers_eff = min(strong_match_inliers, fraction_floor)
+        if self._c_brute_min_frac is not None:
+            fraction_floor     = int(np.ceil(self._c_brute_min_frac * n_available))
+            min_inliers_eff    = max(self._c_brute_min_inliers, fraction_floor)
+            strong_inliers_eff = min(self._c_brute_strong_in, fraction_floor)
         else:
-            min_inliers_eff    = min_inliers
-            strong_inliers_eff = strong_match_inliers
+            min_inliers_eff    = self._c_brute_min_inliers
+            strong_inliers_eff = self._c_brute_strong_in
 
         positions = self.model.positions.astype(np.float32)
         normals   = self.model.normals.astype(np.float32)
@@ -1137,16 +1179,14 @@ class PoseSearcher:
 
         geom = self._geometry
 
-        max_blob_depth = max(t[1] for t in depth_tiers)
+        max_blob_depth = max(t[1] for t in self._c_brute_depth_tiers)
         blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
 
         # Undistort blobs once (mirrors OpenHMD's correspondence_search_set_blobs).
         # Gate check uses pinhole projection which is valid in undistorted space.
-        blobs_undist = cv2.undistortPoints(
-            blobs.reshape(-1, 1, 2), K, dc, P=K
-        ).reshape(-1, 2).astype(np.float32)
+        blobs_undist = self.camera.undistort_points(blobs, P=K).astype(np.float32)
 
-        p4_thresh_sq = p4_threshold_px ** 2
+        p4_thresh_sq = self._c_brute_p4_px ** 2
         fx, fy       = float(K[0, 0]), float(K[1, 1])
         cx, cy       = float(K[0, 2]), float(K[1, 2])
 
@@ -1172,11 +1212,13 @@ class PoseSearcher:
         prev_blob_max_per_triple      = np.zeros(len(led_triple_idx),      dtype=np.int32)
         prev_blob_max_per_triple_edge = np.zeros(len(led_triple_idx_edge), dtype=np.int32)
 
-        rng = np.random.default_rng(rng_seed)
+        rng = np.random.default_rng(self._c_brute_rng_seed)
 
-        tier_p3p_calls = [0] * len(depth_tiers)
-        tier_lq_tried  = [0] * len(depth_tiers)
-        tier_lq_total  = [0] * len(depth_tiers)
+        _track_gate_dist = is_deep()
+
+        tier_p3p_calls = [0] * len(self._c_brute_depth_tiers)
+        tier_lq_tried  = [0] * len(self._c_brute_depth_tiers)
+        tier_lq_total  = [0] * len(self._c_brute_depth_tiers)
 
         _dbg_leds, _dbg_blobs = get_debug_triple()
         debug_active      = _dbg_leds is not None or _dbg_blobs is not None
@@ -1188,7 +1230,7 @@ class PoseSearcher:
         seen_bijections:  set                  = set()
         bijection_counts: Dict[frozenset, int] = {} if is_deep() else None
 
-        for tier_idx, tier_spec in enumerate(depth_tiers):
+        for tier_idx, tier_spec in enumerate(self._c_brute_depth_tiers):
             if strong_found:
                 break
 
@@ -1297,14 +1339,18 @@ class PoseSearcher:
                             # ── 1. P3P → up to 4 pose hypotheses ─────────────────
                             tier_p3p_calls[tier_idx] += 1
                             did_p3p = True
+                            # solveP3P only supports standard polynomial distortion
+                            # internally. Pre-undistort to normalised coords and pass
+                            # identity K so both radtan8 and kb4 work correctly.
+                            p3p_img_norm = self.camera.undistort_points(p3p_img_pts)
                             n_sols, rvecs, tvecs = cv2.solveP3P(
                                 p3p_world_pts.reshape(3, 1, 3),
-                                p3p_img_pts.reshape(3, 1, 2),
-                                K, dc,
+                                p3p_img_norm.reshape(3, 1, 2).astype(np.float32),
+                                np.eye(3, dtype=np.float32),
+                                np.zeros(4, dtype=np.float32),
                                 flags=cv2.SOLVEPNP_P3P,
                             )
-                            if dbg:
-                                logger.debug(f"  P3P returned {n_sols} solutions")
+                            self._dbg(dbg, f"  P3P returned {n_sols} solutions")
                             if not n_sols or rvecs is None:
                                 continue
 
@@ -1327,17 +1373,15 @@ class PoseSearcher:
 
                                 # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
                                 z_ok = _check_z_range(tvec_h)
-                                if dbg:
-                                    logger.debug(f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
+                                self._dbg(dbg, f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
                                 if not z_ok:
                                     continue
 
                                 R_h, _ = cv2.Rodrigues(rvec_h)
 
                                 # ── 3. Gate check (any gate LED near any gate blob) ─
-                                gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_led_world_pts, gate_blob_img_pts, fx, fy, cx, cy, p4_thresh_sq)
-                                if dbg:
-                                    logger.debug(f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
+                                gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_led_world_pts, gate_blob_img_pts, fx, fy, cx, cy, p4_thresh_sq, _track_gate_dist)
+                                self._dbg(dbg, f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
                                 if not gate_ok:
                                     continue
 
@@ -1346,16 +1390,16 @@ class PoseSearcher:
                                     R_h, tvec_h, positions, normals,
                                     geom,
                                     cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-                                    cam_rpmax=self.camera.rpmax,
-                                    facing_threshold_deg=facing_threshold_deg,
+                                    cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
+                                    facing_threshold_deg=self._c_facing_deg,
                                 )
                                 vis_ids = np.where(vis_mask_h)[0]
-                                if dbg:
-                                    logger.debug(f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
-                                if len(vis_ids) < min_inliers:
+                                self._dbg(dbg, f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
+                                if len(vis_ids) < self._c_brute_min_inliers:
                                     continue
 
-                                proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc)
+                                proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc,
+                                                           is_fisheye=self.camera.is_fisheye)
                                 cost     = cdist(blobs, proj_all)
                                 if blob_mask is not None:
                                     _cost_sub = cost[_avail_idx]
@@ -1364,12 +1408,12 @@ class PoseSearcher:
                                 else:
                                     hungarian_blob_rows, hungarian_led_cols = linear_sum_assignment(cost)
 
-                                inlier_mask    = cost[hungarian_blob_rows, hungarian_led_cols] < hungarian_threshold_px
+                                inlier_mask    = cost[hungarian_blob_rows, hungarian_led_cols] < self._c_brute_hungarian_px
                                 inlier_blobs   = hungarian_blob_rows[inlier_mask]
                                 inlier_leds    = vis_ids[hungarian_led_cols[inlier_mask]]
 
                                 if dbg:
-                                    outlier_mask     = cost[hungarian_blob_rows, hungarian_led_cols] >= hungarian_threshold_px
+                                    outlier_mask     = cost[hungarian_blob_rows, hungarian_led_cols] >= self._c_brute_hungarian_px
                                     outlier_blob_rows = hungarian_blob_rows[outlier_mask]
                                     outlier_led_cols  = vis_ids[hungarian_led_cols[outlier_mask]]
                                     logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after Hungarian "
@@ -1381,11 +1425,11 @@ class PoseSearcher:
                                 ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
                                     positions[inlier_leds], blobs[inlier_blobs], K, dc,
                                     rvec_h, tvec_h.reshape(3, 1),
-                                    reprojection_px=reprojection_threshold,
+                                    reprojection_px=self._c_brute_reproj_px,
+                                    is_fisheye=self.camera.is_fisheye,
                                 )
-                                if dbg:
-                                    logger.debug(f"  sol {sol_i}: RANSAC ok={ok_r}, "
-                                                 f"inliers={len(ransac_inliers) if ok_r else 0}")
+                                self._dbg(dbg, f"  sol {sol_i}: RANSAC ok={ok_r}, "
+                                               f"inliers={len(ransac_inliers) if ok_r else 0}")
                                 if not ok_r:
                                     continue
 
@@ -1405,8 +1449,8 @@ class PoseSearcher:
                                     R_r, tvec_r_flat, positions, normals,
                                     geom,
                                     cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-                                    cam_rpmax=self.camera.rpmax,
-                                    facing_threshold_deg=facing_threshold_deg,
+                                    cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
+                                    facing_threshold_deg=self._c_facing_deg,
                                 )
                                 if occluders_per_cam:
                                     _occ_r = occluders_per_cam.get(self.camera.camera_idx)
@@ -1415,16 +1459,15 @@ class PoseSearcher:
                                         vis_mask_r &= ~_cross_occluded_mask(
                                             R_r, tvec_r_flat, positions,
                                             _R_occ_r, _t_occ_r, _geom_occ_r,
-                                            _br, _br, focal_px, _gate_margin_px,
-                                            log_tag=f"[{_ctrl} | cam {_cam}]",
+                                            self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
+                                            log_tag=f"[{self._ctrl} | cam {self._cam}]",
                                             vis_mask=vis_mask_r,
                                         )
                                 # Drop inliers that became occluded under the refined pose.
                                 inlier_still_visible = vis_mask_r[inlier_leds]
                                 inlier_leds  = inlier_leds[inlier_still_visible]
                                 inlier_blobs = inlier_blobs[inlier_still_visible]
-                                if dbg:
-                                    logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after vis recheck")
+                                self._dbg(dbg, f"  sol {sol_i}: {len(inlier_blobs)} inliers after vis recheck")
                                 if len(inlier_blobs) < min_inliers_eff:
                                     continue
 
@@ -1441,7 +1484,8 @@ class PoseSearcher:
                                 unmatched_col_idx = np.array([j for j, lid in enumerate(vis_ids_r) if int(lid) not in matched_led_set], dtype=np.int32)
 
                                 if len(unmatched_blobs) > 0 and len(unmatched_col_idx) > 0:
-                                    proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc)
+                                    proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc,
+                                                                  is_fisheye=self.camera.is_fisheye)
                                     cost_r     = cdist(blobs, proj_vis_r)
                                     sub_min    = cost_r[np.ix_(unmatched_blobs, unmatched_col_idx)].min(axis=0)
                                     _led_cam_r = ((R_r @ positions[vis_ids_r].T).T + tvec_r_flat
@@ -1449,29 +1493,29 @@ class PoseSearcher:
                                     extra_blobs: List[int] = []
                                     extra_leds:  List[int] = []
                                     for order_j in np.argsort(sub_min):
-                                        if sub_min[order_j] >= reprojection_threshold:
+                                        if sub_min[order_j] >= self._c_brute_reproj_px:
                                             break
                                         col    = int(unmatched_col_idx[order_j])
                                         led_id = int(vis_ids_r[col])
-                                        _exp_px_rc = (focal_px * (led_radius_mm / 1000.0) /
+                                        _exp_px_rc = (focal_px * (self._c_led_radius_mm / 1000.0) /
                                                       float(max(_led_cam_r[col, 2], 0.01))
                                                       if _led_cam_r is not None else None)
                                         for row_i in np.argsort(cost_r[unmatched_blobs, col]):
                                             b = int(unmatched_blobs[row_i])
                                             if b in matched_blob_set:
                                                 continue
-                                            if cost_r[b, col] >= reprojection_threshold:
+                                            if cost_r[b, col] >= self._c_brute_reproj_px:
                                                 break
                                             if (_exp_px_rc is not None and not (
-                                                    _exp_px_rc * blob_size_min_factor
+                                                    _exp_px_rc * self._c_blob_size_min
                                                     <= float(blob_radii[b])
-                                                    <= _exp_px_rc * blob_size_max_factor)):
+                                                    <= _exp_px_rc * self._c_blob_size_max)):
                                                 if _log_size_filter:
                                                     logger.debug(
                                                         f"  LED {led_id}: blob {b}"
                                                         f" size-filtered (brute extra-blob)"
                                                         f"  r={float(blob_radii[b]):.2f}  expected"
-                                                        f" {_exp_px_rc*blob_size_min_factor:.2f}–{_exp_px_rc*blob_size_max_factor:.2f}px"
+                                                        f" {_exp_px_rc*self._c_blob_size_min:.2f}–{_exp_px_rc*self._c_blob_size_max:.2f}px"
                                                     )
                                                 continue
                                             matched_blob_set.add(b)
@@ -1481,8 +1525,7 @@ class PoseSearcher:
                                     if extra_blobs:
                                         inlier_blobs = np.concatenate([inlier_blobs, np.array(extra_blobs, dtype=inlier_blobs.dtype)])
                                         inlier_leds  = np.concatenate([inlier_leds,  np.array(extra_leds,  dtype=inlier_leds.dtype)])
-                                        if dbg:
-                                            logger.debug(f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
+                                        self._dbg(dbg, f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
 
                                 # ── 6.7. Aux-camera validation ────────────────────
                                 # Lift refined pose to world frame and score against
@@ -1504,33 +1547,9 @@ class PoseSearcher:
                                         _oblobs = np.asarray(_oblobs, dtype=np.float32)
                                         if len(_oblobs) == 0:
                                             continue
-                                        _T_ci_ctrl = _ocam.T_world_cam.inverse().compose(T_world_ctrl)
-                                        _R_i  = _T_ci_ctrl.R.astype(np.float32)
-                                        _t_i  = _T_ci_ctrl.t.astype(np.float32)
-                                        _rv_i = cv2.Rodrigues(_R_i)[0]
-
-                                        _vis_i = _visible_mask(
-                                            _R_i, _t_i, positions, normals, geom,
-                                            cam_K=_ocam.camera_matrix,
-                                            cam_dc=_ocam.dist_coeffs,
-                                            cam_w=_ocam.width,
-                                            cam_h=_ocam.height,
-                                            cam_rpmax=_ocam.rpmax,
-                                            facing_threshold_deg=facing_threshold_deg,
+                                        _R_i, _t_i, _rv_i, _focal_i, _vis_i = self._aux_cam_vis(
+                                            _ocam, T_world_ctrl, occluders_per_cam
                                         )
-                                        if occluders_per_cam:
-                                            _occ_i = occluders_per_cam.get(_ocam.camera_idx)
-                                            if _occ_i is not None:
-                                                _R_occ_i, _t_occ_i, _geom_occ_i = _occ_i
-                                                _focal_i_b = float(max(_ocam.camera_matrix[0, 0],
-                                                                        _ocam.camera_matrix[1, 1]))
-                                                _vis_i &= ~_cross_occluded_mask(
-                                                    _R_i, _t_i, positions,
-                                                    _R_occ_i, _t_occ_i, _geom_occ_i,
-                                                    _br, _br, _focal_i_b, _gate_margin_px,
-                                                    log_tag=f"[{_ctrl} | cam {_cam} aux_cam {_ocam.camera_idx}]",
-                                                    vis_mask=_vis_i,
-                                                )
                                         _vis_ids_i = np.where(_vis_i)[0]
                                         if len(_vis_ids_i) == 0:
                                             continue
@@ -1538,27 +1557,27 @@ class PoseSearcher:
                                         _proj_i = _project_points(
                                             _rv_i, _t_i, positions[_vis_ids_i],
                                             _ocam.camera_matrix, _ocam.dist_coeffs,
+                                            is_fisheye=_ocam.is_fisheye,
                                         )
                                         _cost_i = cdist(_oblobs, _proj_i)
                                         _rows_i, _cols_i = linear_sum_assignment(_cost_i)
-                                        _inlier_i = _cost_i[_rows_i, _cols_i] < brute_aux_reproj_px
+                                        _inlier_i = _cost_i[_rows_i, _cols_i] < self._c_brute_aux_reproj_px
                                         _led_cam_i = (_R_i @ positions[_vis_ids_i].T).T + _t_i
                                         if _oradii is not None:
-                                            _focal_i = float(max(_ocam.camera_matrix[0, 0], _ocam.camera_matrix[1, 1]))
                                             for _k in range(len(_rows_i)):
                                                 if not _inlier_i[_k]:
                                                     continue
                                                 _depth_k = float(max(_led_cam_i[_cols_i[_k], 2], 0.01))
-                                                _exp_px_k = _focal_i * (led_radius_mm / 1000.0) / _depth_k
-                                                if not (_exp_px_k * blob_size_min_factor
+                                                _exp_px_k = _focal_i * (self._c_led_radius_mm / 1000.0) / _depth_k
+                                                if not (_exp_px_k * self._c_blob_size_min
                                                         <= float(_oradii[_rows_i[_k]])
-                                                        <= _exp_px_k * blob_size_max_factor):
+                                                        <= _exp_px_k * self._c_blob_size_max):
                                                     if _log_size_filter:
                                                         logger.debug(
                                                             f"  LED {int(_vis_ids_i[_cols_i[_k]])}: blob {int(_rows_i[_k])}"
                                                             f" size-filtered (brute aux-inlier cam{_ocam.camera_idx})"
                                                             f"  r={float(_oradii[_rows_i[_k]]):.2f}  expected"
-                                                            f" {_exp_px_k*blob_size_min_factor:.2f}–{_exp_px_k*blob_size_max_factor:.2f}px"
+                                                            f" {_exp_px_k*self._c_blob_size_min:.2f}–{_exp_px_k*self._c_blob_size_max:.2f}px"
                                                         )
                                                     _inlier_i[_k] = False
                                         _n_aux = int(_inlier_i.sum())
@@ -1568,7 +1587,7 @@ class PoseSearcher:
                                                 f"  sol {sol_i}: aux cam{_ocam.camera_idx} "
                                                 f"vis={len(_vis_ids_i)} blobs={len(_oblobs)} "
                                                 f"matched_dists={_matched_dists.round(1).tolist()} "
-                                                f"thresh={brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
+                                                f"thresh={self._c_brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
                                             )
                                         extra_inlier_count += _n_aux
                                         aux_blob_denom     += min(len(_oblobs), len(_vis_ids_i))
@@ -1625,10 +1644,10 @@ class PoseSearcher:
                                             if _blob_denom > 0 else 1.0)
                                 balanced_coverage = (2.0 * led_cov * blob_cov / (led_cov + blob_cov)
                                                      if led_cov + blob_cov > 0.0 else 0.0)
-                                if balanced_coverage < min_vis_coverage:
+                                if balanced_coverage < self._c_brute_min_vis_cov:
                                     if dbg:
                                         logger.debug(
-                                            f"  sol {sol_i}: balanced coverage {balanced_coverage:.2f} < {min_vis_coverage:.2f}"
+                                            f"  sol {sol_i}: balanced coverage {balanced_coverage:.2f} < {self._c_brute_min_vis_cov:.2f}"
                                             f"  led_cov={led_cov:.2f}  blob_cov={blob_cov:.2f}"
                                             f"  (primary {n_inlier_blobs}/{n_visible_leds} leds,"
                                             f" {n_inlier_blobs}/{min(n_available, n_visible_leds)} blobs"
@@ -1636,7 +1655,8 @@ class PoseSearcher:
                                         )
                                     continue
 
-                                proj_r = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc)
+                                proj_r = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc,
+                                                         is_fisheye=self.camera.is_fisheye)
                                 err    = float(np.mean(np.linalg.norm(proj_r - blobs[inlier_blobs], axis=1)))
 
                                 orient_err = np.inf
@@ -1665,10 +1685,9 @@ class PoseSearcher:
                                      tvec_err < best_tvec_err)
                                 )
 
-                                if dbg:
-                                    logger.debug(f"  sol {sol_i}: err={err:.3f} px  "
-                                                 f"inliers={n_inlier_blobs}+{extra_inlier_count}aux={n_inlier_total}  "
-                                                 f"is_better={is_better}")
+                                self._dbg(dbg, f"  sol {sol_i}: err={err:.3f} px  "
+                                               f"inliers={n_inlier_blobs}+{extra_inlier_count}aux={n_inlier_total}  "
+                                               f"is_better={is_better}")
 
                                 if is_better:
                                     best_solution = {
@@ -1696,7 +1715,7 @@ class PoseSearcher:
                                                 f"cam{c}:{n}" for c, n in aux_cameras_current
                                             ) + "]"
                                         logger.debug(
-                                            f"  ★ [{_ctrl} | cam {_cam}] new best — tier={tier_idx} "
+                                            f"  ★ [{self._ctrl} | cam {self._cam}] new best — tier={tier_idx} "
                                             f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
                                             f"sol={sol_i}  inliers={n_inlier_blobs}+{extra_inlier_count}aux  err={err:.3f}px  "
                                             f"cov={balanced_coverage:.2f} (led={led_cov:.2f} blob={blob_cov:.2f})"
@@ -1704,7 +1723,7 @@ class PoseSearcher:
                                             + _aux_dbg
                                         )
 
-                                    if best_error <= strong_match_error_px and balanced_coverage >= min_vis_coverage:
+                                    if best_error <= self._c_brute_strong_err and balanced_coverage >= self._c_brute_min_vis_cov:
                                         strong_found = True
 
                 cur_prev_blob[triple_i] = blob_max
@@ -1714,73 +1733,27 @@ class PoseSearcher:
                     break
 
         # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
-        if (best_solution is not None
-                and other_cameras_blobs
-                and bool(_cfg.get('joint_optimization', True))
-                and best_solution.get('aux_assignments')):
-            _aux_joint = [
-                (_ocam, np.asarray(_oblobs, dtype=np.float32),
-                 best_solution['aux_assignments'].get(_ocam.camera_idx, []))
-                for _ocam, _oblobs, _ in other_cameras_blobs
-                if best_solution['aux_assignments'].get(_ocam.camera_idx)
-            ]
-            if _aux_joint:
-                _R_b, _ = cv2.Rodrigues(best_solution['rvec'].reshape(3, 1).astype(np.float32))
-                _T_wc_b = self.T_world_cam.compose(
-                    Transform(_R_b.astype(np.float64),
-                              best_solution['tvec'].reshape(3).astype(np.float64))
-                )
-                _aux_prefilter_px = float(_cfg.get('joint_aux_prefilter_px', 8.0))
-                _aux_joint = _filter_aux_by_reprojection(
-                    _T_wc_b, _aux_joint, positions, _aux_prefilter_px
-                )
-                _T_joint, _joint_err = _joint_refine_pose(
-                    _T_wc_b,
-                    self.camera,
-                    best_solution['assignment'],
-                    blobs,
-                    _aux_joint,
-                    positions,
-                    primary_weight=float(_cfg.get('joint_primary_weight', 2.0)),
-                    huber_scale=float(_cfg.get('joint_huber_scale', 1.5)),
-                ) if _aux_joint else (None, None)
-                if _T_joint is not None:
-                    _T_prim = self.T_world_cam.inverse().compose(_T_joint)
-                    _rv_j = cv2.Rodrigues(_T_prim.R.astype(np.float32))[0]
-                    _tv_j = _T_prim.t.astype(np.float32)
-                    _lo_b = positions[np.array([l for _, l in best_solution['assignment']], dtype=np.int32)]
-                    _li_b = blobs[np.array([b for b, _ in best_solution['assignment']], dtype=np.int32)]
-                    _err_j = float(np.mean(np.linalg.norm(
-                        _project_points(_rv_j, _tv_j, _lo_b, K, dc) - _li_b, axis=1,
-                    )))
-                    logger.debug(
-                        f"[{_ctrl} | cam {_cam}] Brute joint LM: "
-                        f"primary err {best_solution['error']:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
-                    )
-                    for _aux_cam_j, _aux_blobs_j, _aux_pr_j in _aux_joint:
-                        if not _aux_pr_j:
-                            continue
-                        _T_aux_j = _aux_cam_j.T_world_cam.inverse().compose(_T_joint)
-                        _rv_aux_j = cv2.Rodrigues(_T_aux_j.R.astype(np.float32))[0]
-                        _tv_aux_j = _T_aux_j.t.astype(np.float32)
-                        _leds_aux_j  = positions[[l for _, l in _aux_pr_j]].astype(np.float32)
-                        _blobs_aux_j_ref = _aux_blobs_j[[b for b, _ in _aux_pr_j]].astype(np.float32)
-                        _proj_aux_j  = _project_points(_rv_aux_j, _tv_aux_j, _leds_aux_j,
-                                                       _aux_cam_j.camera_matrix, _aux_cam_j.dist_coeffs)
-                        _err_aux_j   = float(np.mean(np.linalg.norm(_proj_aux_j - _blobs_aux_j_ref, axis=1)))
-                        logger.debug(
-                            f"[{_ctrl} | cam {_cam}] Brute joint LM cam{_aux_cam_j.camera_idx}: "
-                            f"err={_err_aux_j:.2f}px  ({len(_aux_pr_j)} pairs)"
-                        )
-                    best_solution['rvec']   = _rv_j
-                    best_solution['tvec']   = _tv_j.reshape(3, 1)
-                    best_solution['error']  = _err_j
-                    best_solution['method'] = best_solution['method'] + '_mc'
+        if best_solution is not None:
+            _joint_result = self._apply_joint_lm(
+                best_solution['rvec'].reshape(3, 1),
+                best_solution['tvec'].reshape(3),
+                best_solution['assignment'],
+                blobs,
+                best_solution.get('aux_assignments') or {},
+                other_cameras_blobs or [],
+                K, dc, "Brute", best_solution['error'],
+            )
+            if _joint_result is not None:
+                _rv_j, _tv_j, _err_j = _joint_result
+                best_solution['rvec']   = _rv_j
+                best_solution['tvec']   = _tv_j.reshape(3, 1)
+                best_solution['error']  = _err_j
+                best_solution['method'] = best_solution['method'] + '_mc'
 
         total_p3p_tried = sum(tier_p3p_calls)
 
         result_str = (
-            f"found in tier_{solution_tier} ({_tier_label(depth_tiers[solution_tier])})  "
+            f"found in tier_{solution_tier} ({_tier_label(self._c_brute_depth_tiers[solution_tier])})  "
             f"({best_inliers} inliers, {best_error:.2f} px)"
             if best_solution is not None else "not found"
         )
@@ -1794,25 +1767,17 @@ class PoseSearcher:
                 f"({n_dup} duplicate calls, max {max_dup}× same bijection)"
             )
         tier_lines = "\n".join(
-            f"  tier_{i} ({_tier_label(depth_tiers[i])}) — "
+            f"  tier_{i} ({_tier_label(self._c_brute_depth_tiers[i])}) — "
             f"{tier_p3p_calls[i]:>7} P3P calls  "
             f"({tier_lq_tried[i]}/{tier_lq_total[i]} LED triples reached inner loop)"
-            for i in range(len(depth_tiers))
+            for i in range(len(self._c_brute_depth_tiers))
         )
         logger.debug(
-            f"[{_ctrl} | cam {_cam}] Brute-force: {result_str}\n"
+            f"[{self._ctrl} | cam {self._cam}] Brute-force: {result_str}\n"
             f"{tier_lines}\n"
             f"  total — {total_p3p_tried:>7} P3P calls"
             f"{dup_line}"
         )
-
-        # if best_solution is not None:
-        #     R_best, _ = cv2.Rodrigues(best_solution["rvec"])
-        #     tvec_best = best_solution["tvec"].reshape(3)
-        #     cam_dbg = -(R_best.T @ tvec_best)
-        #     print(f"[vis check] cam_world = {cam_dbg.round(4)}")
-        #     print("[frustum debug] inner LED occlusion check for best solution:")
-        #     _visible_mask(R_best, tvec_best, positions, normals, geom, debug=True)
 
         if best_solution is not None and blob_mask is not None:
             best_solution['_orig_idx'] = True

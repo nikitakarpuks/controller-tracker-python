@@ -47,7 +47,7 @@ def get_data(cfg):
 def get_crop_coordinates(cfg) -> dict:
     """Returns {cam_idx: (left, top, right, bottom)} for each selected camera."""
     part_width = cfg["img_width"] // cfg["total_cameras_number"]
-    top = 1  # top pixel row has exposure/gain values encoded, skip it
+    top = 1 if cfg.get("has_technical_row", True) else 0
     bottom = cfg["img_height"]
     return {
         cam_idx: (cam_idx * part_width, top, (cam_idx + 1) * part_width, bottom)

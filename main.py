@@ -4,7 +4,6 @@ from pathlib import Path
 from shutil import copy
 from time import time
 
-import cv2
 import numpy as np
 
 from loguru import logger
@@ -64,8 +63,10 @@ def main():
         out_tracking_lost.mkdir(parents=True, exist_ok=True)
 
     # ── Camera & controller setup ──────────────────────────────────────────
-    calib_cfg = load_json_config(config["cameras"]["intrinsics_path"])
-    cameras   = {idx: Camera(calib_cfg, camera_idx=idx)
+    calib_cfg              = load_json_config(config["cameras"]["intrinsics_path"])
+    extrinsics_convention  = config["cameras"].get("extrinsics_convention", "T_imu_cam")
+    cameras   = {idx: Camera(calib_cfg, camera_idx=idx,
+                             extrinsics_convention=extrinsics_convention)
                  for idx in config["data"]["selected_cameras"]}
     blob_detectors = {idx: BlobDetector(idx, config["blob_detection"])
                       for idx in cameras}
@@ -239,10 +240,7 @@ def main():
             if sol:
                 T_world_ctrl    = sol["T_world_ctrl"]
                 primary_cam_idx = sol.get("primary_cam", 0)
-                primary_camera  = cameras[primary_cam_idx]
-                T_primary_ctrl  = primary_camera.T_world_cam.inverse().compose(T_world_ctrl)
-                rvec_primary, _ = cv2.Rodrigues(T_primary_ctrl.R.astype(np.float32))
-                poses_all[ctrl_name].append((rvec_primary.reshape(3), T_primary_ctrl.t.astype(np.float32)))
+                poses_all[ctrl_name].append(T_world_ctrl)
                 assignments_all[ctrl_name].append(sol["assignment"].copy())
                 primary_cams_all[ctrl_name].append(primary_cam_idx)
                 aux_assignments_all[ctrl_name].append(sol.get("aux_assignments"))

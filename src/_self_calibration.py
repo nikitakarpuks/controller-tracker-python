@@ -28,7 +28,8 @@ from loguru import logger
 from scipy.optimize import least_squares
 
 
-_ALL_PARAMS = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]
+_RADTAN8_PARAMS = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]
+_KB4_PARAMS     = ["fx", "fy", "cx", "cy", "k1", "k2", "k3", "k4"]
 
 
 class SelfCalibrator:
@@ -41,10 +42,14 @@ class SelfCalibrator:
         self.primary_camera = primary_camera
         self.aux_cameras: Dict[int, object] = {c.camera_idx: c for c in aux_cameras}
 
+        first_aux = next(iter(aux_cameras), None)
+        self.is_fisheye: bool = bool(first_aux and getattr(first_aux, "is_fisheye", False))
+        _valid_params = _KB4_PARAMS if self.is_fisheye else _RADTAN8_PARAMS
+
         self.optimize_params: List[str] = list(cfg.get("optimize_params", ["fx", "fy", "cx", "cy"]))
-        unknown = set(self.optimize_params) - set(_ALL_PARAMS)
+        unknown = set(self.optimize_params) - set(_valid_params)
         if unknown:
-            raise ValueError(f"[SelfCal] Unknown optimize_params: {unknown}. Valid: {_ALL_PARAMS}")
+            raise ValueError(f"[SelfCal] Unknown optimize_params: {unknown}. Valid: {_valid_params}")
 
         self.min_primary_error   = float(cfg.get("min_primary_error_px",  0.5))
         self.min_primary_inliers = int(  cfg.get("min_primary_inliers",   6))
@@ -115,14 +120,14 @@ class SelfCalibrator:
 
     # ------------------------------------------------------------------
     def _cam_intrinsics_dict(self, cam) -> dict:
-        return {
-            "fx": float(cam.fx), "fy": float(cam.fy),
-            "cx": float(cam.cx), "cy": float(cam.cy),
-            "k1": float(cam.k1), "k2": float(cam.k2),
-            "p1": float(cam.p1), "p2": float(cam.p2),
-            "k3": float(cam.k3), "k4": float(cam.k4),
-            "k5": float(cam.k5), "k6": float(cam.k6),
-        }
+        d = {"fx": float(cam.fx), "fy": float(cam.fy),
+             "cx": float(cam.cx), "cy": float(cam.cy),
+             "k1": float(cam.k1), "k2": float(cam.k2),
+             "k3": float(cam.k3), "k4": float(cam.k4)}
+        if not getattr(cam, "is_fisheye", False):
+            d.update({"p1": float(cam.p1), "p2": float(cam.p2),
+                      "k5": float(cam.k5), "k6": float(cam.k6)})
+        return d
 
     def _params_to_K_dc(self, x: np.ndarray, base: dict) -> Tuple:
         updated = dict(base)
@@ -131,8 +136,12 @@ class SelfCalibrator:
         K = np.array([[updated["fx"], 0,            updated["cx"]],
                       [0,            updated["fy"], updated["cy"]],
                       [0,            0,             1           ]], dtype=np.float32)
-        dc = np.array([updated[k] for k in ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]],
-                      dtype=np.float32)
+        if self.is_fisheye:
+            dc = np.array([[updated["k1"]], [updated["k2"]],
+                           [updated["k3"]], [updated["k4"]]], dtype=np.float64)
+        else:
+            dc = np.array([updated[k] for k in ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]],
+                          dtype=np.float32)
         return K, dc, updated
 
     # ------------------------------------------------------------------
@@ -150,11 +159,20 @@ class SelfCalibrator:
         pts_list   = [o[0] for o in obs]
         blobs_list = [o[1] for o in obs]
 
+        _is_fe = getattr(aux_cam, "is_fisheye", False)
+
         def _residuals(x):
             K, dc, _ = self._params_to_K_dc(x, base)
             parts = []
             for pts, blobs in zip(pts_list, blobs_list):
-                proj, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K, dc)
+                if _is_fe:
+                    proj, _ = cv2.fisheye.projectPoints(
+                        pts.astype(np.float64).reshape(-1, 1, 3),
+                        rvec_fixed.astype(np.float64), tvec_fixed.astype(np.float64),
+                        K.astype(np.float64), dc,
+                    )
+                else:
+                    proj, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K, dc)
                 parts.append((proj.reshape(-1, 2) - blobs).ravel())
             return np.concatenate(parts)
 
@@ -193,8 +211,20 @@ class SelfCalibrator:
         K1, dc1, _ = self._params_to_K_dc(result.x,  base)
         proj_before, proj_after, observed = [], [], []
         for pts, blobs in zip(pts_list, blobs_list):
-            pb, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K0, dc0)
-            pa, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K1, dc1)
+            if _is_fe:
+                pb, _ = cv2.fisheye.projectPoints(
+                    pts.astype(np.float64).reshape(-1, 1, 3),
+                    rvec_fixed.astype(np.float64), tvec_fixed.astype(np.float64),
+                    K0.astype(np.float64), dc0,
+                )
+                pa, _ = cv2.fisheye.projectPoints(
+                    pts.astype(np.float64).reshape(-1, 1, 3),
+                    rvec_fixed.astype(np.float64), tvec_fixed.astype(np.float64),
+                    K1.astype(np.float64), dc1,
+                )
+            else:
+                pb, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K0, dc0)
+                pa, _ = cv2.projectPoints(pts.reshape(-1, 1, 3), rvec_fixed, tvec_fixed, K1, dc1)
             proj_before.append(pb.reshape(-1, 2))
             proj_after.append(pa.reshape(-1, 2))
             observed.append(blobs)
@@ -222,16 +252,22 @@ class SelfCalibrator:
             cam.fx = intr["fx"]; cam.fy = intr["fy"]
             cam.cx = intr["cx"]; cam.cy = intr["cy"]
             cam.k1 = intr["k1"]; cam.k2 = intr["k2"]
-            cam.p1 = intr["p1"]; cam.p2 = intr["p2"]
             cam.k3 = intr["k3"]; cam.k4 = intr["k4"]
-            cam.k5 = intr["k5"]; cam.k6 = intr["k6"]
+            if not getattr(cam, "is_fisheye", False):
+                cam.p1 = intr["p1"]; cam.p2 = intr["p2"]
+                cam.k5 = intr["k5"]; cam.k6 = intr["k6"]
             cam.camera_matrix = np.array(
                 [[cam.fx, 0, cam.cx], [0, cam.fy, cam.cy], [0, 0, 1]], dtype=np.float32
             )
-            cam.dist_coeffs = np.array(
-                [cam.k1, cam.k2, cam.p1, cam.p2, cam.k3, cam.k4, cam.k5, cam.k6],
-                dtype=np.float32,
-            )
+            if getattr(cam, "is_fisheye", False):
+                cam.dist_coeffs = np.array(
+                    [[cam.k1], [cam.k2], [cam.k3], [cam.k4]], dtype=np.float64
+                )
+            else:
+                cam.dist_coeffs = np.array(
+                    [cam.k1, cam.k2, cam.p1, cam.p2, cam.k3, cam.k4, cam.k5, cam.k6],
+                    dtype=np.float32,
+                )
             logger.info(f"[SelfCal] Applied updated intrinsics to cam{cid}")
 
     # ------------------------------------------------------------------
@@ -239,8 +275,10 @@ class SelfCalibrator:
         for cid, res in new_results.items():
             cam_idx = self.aux_cameras[cid].camera_idx
             intr    = res["optimized_intrinsics"]
-            block   = {k: intr[k] for k in _ALL_PARAMS}
-            block["rpmax"] = float(getattr(self.aux_cameras[cid], "rpmax", 0.0))
+            _params = _KB4_PARAMS if self.is_fisheye else _RADTAN8_PARAMS
+            block   = {k: intr[k] for k in _params}
+            if not self.is_fisheye:
+                block["rpmax"] = float(getattr(self.aux_cameras[cid], "rpmax", 0.0))
             print(
                 f"\n[SelfCal] cam{cam_idx} — paste into calibration file "
                 f"at value0.intrinsics[{cam_idx}].intrinsics:\n"
