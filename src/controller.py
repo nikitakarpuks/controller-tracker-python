@@ -386,7 +386,6 @@ class CameraTracker:
             if _use_proximity and n_available >= 3:
                 solution = self.proximity_match(
                     blobs_prox, predicted_pose,
-                    blob_radii=radii_prox,
                     blob_brightnesses=brts_prox,
                     other_cameras_blobs=other_cameras_blobs,
                     occluders_per_cam=occluders_per_cam,
