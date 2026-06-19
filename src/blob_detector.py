@@ -375,7 +375,10 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
 
     # ── 4. Visualization ──────────────────────────────────────────────────────
     if visualize:
-        vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        # Warm-mode uses a black background so only colored annotation pixels are
+        # non-zero; the compositor then blends only those pixels onto the canvas.
+        vis = (np.zeros((*image.shape[:2], 3), dtype=np.uint8)
+               if warm_mode else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))
 
         C_AREA_SM  = (255, 0, 255)    # pink        — pixels < min_area or 1×1
         C_AREA_LG  = (0, 140, 255)   # dark orange — area > max_area (hard limit)
@@ -673,12 +676,7 @@ def _detect_blobs_local(image, led_projections, cfg,
 
         canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-        # Blit per-LED annotated patches
-        for patch, x1, y1, led_idx, pix_thr, req_thr in vis_patches:
-            ph, pw = patch.shape[:2]
-            canvas[y1:y1 + ph, x1:x1 + pw] = patch
-
-        # Search circles + LED ID labels on top
+        # Search circles + LED ID labels first (so blob pixels are drawn on top)
         for i in range(n_leds):
             proj_x, proj_y = float(led_projections[i, 0]), float(led_projections[i, 1])
             led_id_vis     = int(led_projections[i, 4])
@@ -689,6 +687,13 @@ def _detect_blobs_local(image, led_projections, cfg,
             label_pos = (cx_draw + sr + 2, cy_draw - sr // 2 if cy_draw - sr // 2 > 10 else cy_draw + sr + 10)
             cv2.putText(canvas, str(led_id_vis), label_pos,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, C_ROI, 1, cv2.LINE_AA)
+
+        # Paint only colored annotation pixels from each patch (background is black)
+        for patch, x1, y1, led_idx, pix_thr, req_thr in vis_patches:
+            ph, pw = patch.shape[:2]
+            dst  = canvas[y1:y1 + ph, x1:x1 + pw]
+            mask = patch.any(axis=2)
+            dst[mask] = patch[mask]
 
         # Warm-mode legend strip
         strip_entries = [

@@ -5,7 +5,7 @@ import numpy as np
 from loguru import logger
 from scipy.optimize import linear_sum_assignment, least_squares
 from scipy.spatial.distance import cdist
-from itertools import combinations
+from itertools import combinations, product
 from typing import Dict, List, Optional, Tuple
 
 from scipy.spatial import KDTree
@@ -426,6 +426,8 @@ class PoseSearcher:
         self._c_prox_min_inliers    = int(  _cfg.get('proximity_min_inliers',
                                                       _cfg.get('min_inliers',            4)))
         self._c_prox_expansion_px   = float(_cfg.get('proximity_expansion_px',            8.0))
+        self._c_prox_max_hyp        = int(  _cfg.get('proximity_max_hypotheses',          256))
+        self._c_prox_none_penalty   = float(_cfg.get('proximity_none_penalty_px',        0.3))
         # constrained
         self._c_cs_reproj_px        = float(_cfg.get('reprojection_threshold',            2.0))
         self._c_cs_snap_factor      = float(_cfg.get('proximity_self._c_cs_snap_factor',             4.0))
@@ -610,18 +612,17 @@ class PoseSearcher:
         self,
         blobs: np.ndarray,
         predicted_pose: Tuple[np.ndarray, np.ndarray],
-        blob_radii: Optional[np.ndarray] = None,
         blob_brightnesses: Optional[np.ndarray] = None,
         other_cameras_blobs: Optional[List] = None,
         occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = None,
         expansion_px: Optional[float] = None,
     ) -> Optional[Dict]:
         """
-        Refine a predicted pose via global Hungarian matching over all model-visible LEDs.
+        Refine a predicted pose via Hungarian matching over model-visible LEDs.
 
-        Projects every visible LED with the predicted pose, builds a cost matrix
-        (distance + size + brightness penalties) against detected blobs, and solves
-        globally via linear_sum_assignment. RANSAC filters inliers.
+        Projects visible LEDs with the predicted pose, identifies locked pairs (exactly
+        one blob candidate per LED), refines the pose with a quick PnP on those pairs,
+        then runs Hungarian on the refined projections. RANSAC filters inliers.
         Returns None when too few pairs survive; caller falls back to brute_match.
         """
         rvec_pred, tvec_pred = predicted_pose
@@ -632,7 +633,6 @@ class PoseSearcher:
         dc = self.camera.dist_coeffs
 
         geom = self._geometry
-        _log_size_filter   = is_deep() and self._c_log_size_filter
         proximity_expansion_px = expansion_px if expansion_px is not None else self._c_prox_expansion_px
 
         R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
@@ -665,54 +665,185 @@ class PoseSearcher:
             if _bmax > 0:
                 _brightness_norm = blob_brightnesses / _bmax
 
-        # Hungarian: project all model-visible LEDs and match to detected blobs globally.
+        # Hypothesis testing: per-LED candidate sets, enumerate valid assignments,
+        # score each by solvePnP reprojection error, pick the best.
         pairs      = []
         locked_obj = []
         locked_img = []
 
         if n_model_visible > 0 and len(blobs) > 0:
-            vis_ids     = np.where(vis_mask_pred)[0]
-            vis_pos     = self.model.positions[vis_ids].astype(np.float32)
-            proj_vis    = _project_points(rvec_pred, tvec_pred, vis_pos, K, dc,
-                                          is_fisheye=self.camera.is_fisheye)
-            led_cam_vis = (R_pred_arr @ vis_pos.T).T + tvec_pred
+            vis_ids  = np.where(vis_mask_pred)[0]
+            vis_pos  = self.model.positions[vis_ids].astype(np.float32)
+            proj_vis = _project_points(rvec_pred, tvec_pred, vis_pos, K, dc,
+                                       is_fisheye=self.camera.is_fisheye)
 
-            cost = cdist(proj_vis, blobs)
+            # Step 1: per-LED candidate blobs within expansion_px, sorted by distance.
+            dist_pred  = cdist(proj_vis, blobs)
+            candidates = []
+            for k in range(len(vis_ids)):
+                in_neigh = np.where(dist_pred[k] < proximity_expansion_px)[0]
+                if len(in_neigh) > 0:
+                    candidates.append(in_neigh[np.argsort(dist_pred[k, in_neigh])].tolist())
+                else:
+                    candidates.append([])
 
-            if blob_radii is not None:
-                for k in range(len(vis_ids)):
-                    depth       = float(max(led_cam_vis[k, 2], 0.01))
-                    expected_px = focal_px * (self._c_led_radius_mm / 1000.0) / depth
-                    ineligible  = (
-                        (blob_radii < expected_px * self._c_blob_size_min) |
-                        (blob_radii > expected_px * self._c_blob_size_max)
-                    )
-                    cost[k, ineligible] = 1e9
-                    if _log_size_filter:
-                        for _c in np.where(ineligible)[0]:
-                            logger.debug(
-                                f"  LED {int(vis_ids[k])}: blob {_c} size-filtered"
-                                f"  r={blob_radii[_c]:.2f}  expected"
-                                f" {expected_px*self._c_blob_size_min:.2f}–{expected_px*self._c_blob_size_max:.2f}px"
+            # Step 2: compute how many LED neighbourhoods each blob appears in.
+            blob_led_count: Dict[int, int] = {}
+            for cands in candidates:
+                for b in cands:
+                    blob_led_count[b] = blob_led_count.get(b, 0) + 1
+
+            # Step 3: partition.
+            # truly_locked_k : 1 candidate AND that blob is unique to this LED's neighbourhood.
+            # hyp_k          : 2+ candidates OR 1 candidate shared with another LED's neighbourhood.
+            # Empty LEDs (0 candidates) are skipped entirely.
+            truly_locked_k: List[int] = []
+            hyp_k:          List[int] = []
+            for k, cands in enumerate(candidates):
+                if len(cands) == 0:
+                    continue
+                elif len(cands) == 1:
+                    if blob_led_count[int(cands[0])] == 1:
+                        truly_locked_k.append(k)
+                    else:
+                        hyp_k.append(k)   # shared blob — must compete via hypothesis
+                else:
+                    hyp_k.append(k)
+
+            truly_locked_blobs = set(int(candidates[k][0]) for k in truly_locked_k)
+            n_empty   = sum(1 for c in candidates if len(c) == 0)
+            n_shared1 = sum(1 for k in hyp_k if len(candidates[k]) == 1)
+            n_ambig   = len(hyp_k) - n_shared1
+
+            locked_led_ids = [int(vis_ids[k]) for k in truly_locked_k]
+            logger.debug(
+                f"[{self._ctrl} | cam {self._cam}] Proximity candidates: "
+                f"locked={len(truly_locked_k)}  shared1={n_shared1}  ambiguous={n_ambig}  empty={n_empty}"
+                f"  expansion={proximity_expansion_px:.1f}px"
+                f"  locked_ids={locked_led_ids}"
+                + (f"  hyp_sizes={[len(candidates[k]) for k in hyp_k]}" if hyp_k else "")
+            )
+
+            def _score_hyp(hyp_blob_indices: list) -> float:
+                """solvePnP on truly-locked + matched hypothesis pairs; returns max reprojection
+                error. None entries mean 'no blob for this LED' and are skipped.
+                Falls back to pixel distance from predicted projection if PnP fails."""
+                matched_hyp = [(k, int(b)) for k, b in zip(hyp_k, hyp_blob_indices) if b is not None]
+                all_led_k   = truly_locked_k + [k for k, _ in matched_hyp]
+                all_blob_c  = [int(candidates[k][0]) for k in truly_locked_k] + [b for _, b in matched_hyp]
+
+                if not all_led_k:
+                    return float('inf')
+
+                all_obj = vis_pos[all_led_k]
+                all_img = blobs[np.array(all_blob_c, dtype=np.int32)]
+
+                if len(all_led_k) >= 4:
+                    inp = all_img.astype(np.float32).reshape(-1, 1, 2)
+                    if self.camera.is_fisheye:
+                        pts_norm = cv2.fisheye.undistortPoints(
+                            inp.astype(np.float64), K.astype(np.float64), dc,
+                        ).reshape(-1, 2)
+                    else:
+                        pts_norm = cv2.undistortPoints(inp, K, dc).reshape(-1, 2)
+                    try:
+                        ok_h, rvec_h, tvec_h = cv2.solvePnP(
+                            all_obj.astype(np.float64).reshape(-1, 1, 3),
+                            pts_norm.astype(np.float64).reshape(-1, 1, 2),
+                            np.eye(3, dtype=np.float64), np.zeros(4, dtype=np.float64),
+                            rvec_pred.astype(np.float64).copy(),
+                            tvec_pred.astype(np.float64).reshape(3, 1).copy(),
+                            useExtrinsicGuess=True,
+                            flags=cv2.SOLVEPNP_ITERATIVE,
+                        )
+                        if ok_h:
+                            proj_h = _project_points(
+                                np.asarray(rvec_h, dtype=np.float32).reshape(3, 1),
+                                np.asarray(tvec_h, dtype=np.float32).reshape(3),
+                                all_obj, K, dc, is_fisheye=self.camera.is_fisheye,
                             )
+                            return float(np.linalg.norm(proj_h - all_img, axis=1).max())
+                    except Exception:
+                        pass
 
-            if _brightness_norm is not None:
-                normals_cam = (R_pred_arr @ self.model.normals[vis_ids].T).T
-                facing      = np.maximum(0.0, normals_cam[:, 2])
-                cost += self._c_blob_bright_score_w * np.abs(facing[:, None] - _brightness_norm[None, :])
+                # PnP unavailable or failed: pixel distance from predicted projection.
+                return float(np.linalg.norm(proj_vis[all_led_k] - all_img, axis=1).max())
 
-            n_vis    = len(vis_ids)
-            cost_aug = np.hstack([cost, np.full((n_vis, n_vis), proximity_expansion_px - 1e-6)])
-            row_ind, col_ind = linear_sum_assignment(cost_aug)
-            for r, c in zip(row_ind, col_ind):
-                if c < len(blobs) and cost[r, c] < proximity_expansion_px:
-                    led_id = int(vis_ids[r])
-                    pairs.append((c, led_id))
-                    locked_obj.append(self.model.positions[led_id])
-                    locked_img.append(blobs[c])
+            # Step 4: enumerate hypotheses and pick the best.
+            # None is appended to each hyp LED's candidate list as a valid "no match" option.
+            if not hyp_k:
+                best_hyp_blobs = []
+                logger.debug(
+                    f"[{self._ctrl} | cam {self._cam}] Proximity: no hypothesis LEDs, "
+                    f"direct assignment of {len(truly_locked_k)} locked pairs"
+                )
+            else:
+                # Score: error + none_penalty_px * n_none — a match is preferred only if
+                # it reduces reprojection error by more than the per-None penalty.
+                best_key       = float('inf')
+                best_none      = 0
+                best_hyp_blobs = None
+                n_tried        = 0
+                n_collisions   = 0
+
+                for combo in product(*[candidates[k] + [None] for k in hyp_k]):
+                    combo_blobs  = list(combo)
+                    matched_only = [b for b in combo_blobs if b is not None]
+                    matched_set  = set(matched_only)
+                    # Reject only true conflicts: duplicate blob or stealing a truly-locked blob.
+                    if len(matched_set) < len(matched_only) or matched_set & truly_locked_blobs:
+                        n_collisions += 1
+                        continue
+
+                    n_none = len(combo_blobs) - len(matched_only)
+                    score  = _score_hyp(combo_blobs)
+                    key    = score + self._c_prox_none_penalty * n_none
+                    if is_deep():
+                        logger.debug(
+                            f"[{self._ctrl} | cam {self._cam}] Proximity hyp {n_tried}: "
+                            f"blobs={combo_blobs}  max_err={score:.2f}px  none={n_none}"
+                            + ("  ← best" if key < best_key else "")
+                        )
+                    if key < best_key:
+                        best_key       = key
+                        best_none      = n_none
+                        best_hyp_blobs = combo_blobs
+                    n_tried += 1
+
+                    if n_tried >= self._c_prox_max_hyp:
+                        logger.debug(
+                            f"[{self._ctrl} | cam {self._cam}] Proximity: hypothesis cap "
+                            f"({self._c_prox_max_hyp}) reached  ({n_collisions} collisions skipped)"
+                        )
+                        break
+
+                if best_hyp_blobs is None:
+                    best_hyp_blobs = []
+                    logger.debug(
+                        f"[{self._ctrl} | cam {self._cam}] Proximity: all {n_tried + n_collisions} combos invalid"
+                        f"  ({n_collisions} collisions), using truly-locked pairs only"
+                    )
+                else:
+                    best_err  = best_key - self._c_prox_none_penalty * best_none
+                    n_matched = len(hyp_k) - best_none
+                    logger.debug(
+                        f"[{self._ctrl} | cam {self._cam}] Proximity: {n_tried} hypotheses evaluated"
+                        f"  {n_collisions} skipped (collision)"
+                        f"  best_max_err={best_err:.2f}px  matched={n_matched}/{len(hyp_k)} hyp LEDs"
+                        f"  best_hyp_blobs={best_hyp_blobs}"
+                    )
+
+            # Step 5: build pairs from truly-locked + best hypothesis assignment (skip None).
+            locked_assignment = [(int(candidates[k][0]), int(vis_ids[k])) for k in truly_locked_k]
+            hyp_assignment    = [(int(best_hyp_blobs[i]), int(vis_ids[hyp_k[i]]))
+                                 for i in range(len(best_hyp_blobs)) if best_hyp_blobs[i] is not None]
+            for blob_c, led_id in locked_assignment + hyp_assignment:
+                pairs.append((blob_c, led_id))
+                locked_obj.append(self.model.positions[led_id])
+                locked_img.append(blobs[blob_c])
 
         logger.debug(
-            f"[{self._ctrl} | cam {self._cam}] Proximity Hungarian: {len(pairs)}/{len(blobs)} blobs matched "
+            f"[{self._ctrl} | cam {self._cam}] Proximity: {len(pairs)}/{len(blobs)} blobs matched "
             f"of {n_model_visible} visible LEDs"
         )
 
@@ -733,7 +864,15 @@ class PoseSearcher:
             logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: RANSAC failed → None")
             return None
 
-        final_pairs = [pairs[k] for k in ransac_idx]
+        final_pairs   = [pairs[k] for k in ransac_idx]
+        inlier_set    = set(ransac_idx)
+        dropped_pairs = [pairs[k] for k in range(len(pairs)) if k not in inlier_set]
+        if dropped_pairs:
+            logger.debug(
+                f"[{self._ctrl} | cam {self._cam}] Proximity RANSAC dropped "
+                f"{len(dropped_pairs)} pair(s): "
+                + "  ".join(f"led={lid} blob={bid}" for bid, lid in dropped_pairs)
+            )
         if len(final_pairs) < self._c_prox_min_inliers:
             logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: RANSAC too few inliers ({len(final_pairs)}) → None")
             return None
@@ -757,7 +896,7 @@ class PoseSearcher:
         if other_cameras_blobs:
             _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
             _T_world_ref = self.T_world_cam.compose(Transform(_R_ref, np.asarray(tvec, dtype=np.float32).reshape(3)))
-            for _ocam, _oblobs, _oradii in other_cameras_blobs:
+            for _ocam, _oblobs, _ in other_cameras_blobs:
                 _oblobs = np.asarray(_oblobs, dtype=np.float32)
                 _pairs_i: List = []
                 if len(_oblobs) > 0:
@@ -771,24 +910,8 @@ class PoseSearcher:
                         _proj_i_r   = _project_points(_rv_i_r, _t_i_r, _vis_pos_i,
                                                       _ocam.camera_matrix, _ocam.dist_coeffs,
                                                       is_fisheye=_ocam.is_fisheye)
-                        _led_ci_r   = (_R_i_r @ _vis_pos_i.T).T + _t_i_r
-                        _exp_px_i_r = _focal_i_r * (self._c_led_radius_mm / 1000.0) / np.maximum(_led_ci_r[:, 2], 0.01)
 
                         _cost_i_r = cdist(_proj_i_r, _oblobs)
-
-                        if _oradii is not None:
-                            for _k in range(len(_vis_ids_i)):
-                                _inelig_r = ((_oradii < _exp_px_i_r[_k] * self._c_blob_size_min) |
-                                             (_oradii > _exp_px_i_r[_k] * self._c_blob_size_max))
-                                _cost_i_r[_k, _inelig_r] = 1e9
-                                if _log_size_filter:
-                                    for _c in np.where(_inelig_r)[0]:
-                                        logger.debug(
-                                            f"  LED {int(_vis_ids_i[_k])}: blob {_c}"
-                                            f" size-filtered (aux cam{_ocam.camera_idx})"
-                                            f"  r={_oradii[_c]:.2f}  expected"
-                                            f" {_exp_px_i_r[_k]*self._c_blob_size_min:.2f}–{_exp_px_i_r[_k]*self._c_blob_size_max:.2f}px"
-                                        )
 
                         _n_vis_i   = len(_vis_ids_i)
                         _cost_i_aug = np.hstack([_cost_i_r,
@@ -803,7 +926,6 @@ class PoseSearcher:
                     logger.debug(
                         f"[{self._ctrl} | cam {self._cam}] Proximity aux snap cam{_ocam.camera_idx}: "
                         f"{len(_pairs_i)} pairs (refined pose)"
-                        + ("  [size filter active]" if _oradii is not None else "")
                     )
 
         aux_inlier_count = 0
