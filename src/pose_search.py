@@ -428,6 +428,8 @@ class PoseSearcher:
         self._c_prox_expansion_px   = float(_cfg.get('proximity_expansion_px',            8.0))
         self._c_prox_max_hyp        = int(  _cfg.get('proximity_max_hypotheses',          256))
         self._c_prox_none_penalty   = float(_cfg.get('proximity_none_penalty_px',        0.3))
+        self._c_prox_none_factor    = float(_cfg.get('proximity_none_penalty_factor',    1.0))
+        self._c_prox_score_metric   = str(  _cfg.get('proximity_score_metric',           'max'))
         # constrained
         self._c_cs_reproj_px        = float(_cfg.get('reprojection_threshold',            2.0))
         self._c_cs_snap_factor      = float(_cfg.get('proximity_self._c_cs_snap_factor',             4.0))
@@ -725,9 +727,11 @@ class PoseSearcher:
             )
 
             def _score_hyp(hyp_blob_indices: list) -> float:
-                """solvePnP on truly-locked + matched hypothesis pairs; returns max reprojection
-                error. None entries mean 'no blob for this LED' and are skipped.
-                Falls back to pixel distance from predicted projection if PnP fails."""
+                """solvePnP on truly-locked + matched hypothesis pairs; returns reprojection
+                error (mean or max per proximity_score_metric). None entries mean 'no blob
+                for this LED' and are skipped. Falls back to pixel distance from predicted
+                projection if PnP fails."""
+                _agg = np.max if self._c_prox_score_metric == 'max' else np.mean
                 matched_hyp = [(k, int(b)) for k, b in zip(hyp_k, hyp_blob_indices) if b is not None]
                 all_led_k   = truly_locked_k + [k for k, _ in matched_hyp]
                 all_blob_c  = [int(candidates[k][0]) for k in truly_locked_k] + [b for _, b in matched_hyp]
@@ -762,12 +766,12 @@ class PoseSearcher:
                                 np.asarray(tvec_h, dtype=np.float32).reshape(3),
                                 all_obj, K, dc, is_fisheye=self.camera.is_fisheye,
                             )
-                            return float(np.linalg.norm(proj_h - all_img, axis=1).max())
+                            return float(_agg(np.linalg.norm(proj_h - all_img, axis=1)))
                     except Exception:
                         pass
 
                 # PnP unavailable or failed: pixel distance from predicted projection.
-                return float(np.linalg.norm(proj_vis[all_led_k] - all_img, axis=1).max())
+                return float(_agg(np.linalg.norm(proj_vis[all_led_k] - all_img, axis=1)))
 
             # Step 4: enumerate hypotheses and pick the best.
             # None is appended to each hyp LED's candidate list as a valid "no match" option.
@@ -786,8 +790,22 @@ class PoseSearcher:
                 n_tried        = 0
                 n_collisions   = 0
 
-                for combo in product(*[candidates[k] + [None] for k in hyp_k]):
-                    combo_blobs  = list(combo)
+                def _hyp_combos_by_none_count():
+                    """Yield all assignment combos ordered by ascending None count.
+                    Zero-None (all LEDs matched) combos come first; the all-None combo last."""
+                    n = len(hyp_k)
+                    for n_none in range(n + 1):
+                        for none_positions in combinations(range(n), n_none):
+                            none_set      = set(none_positions)
+                            non_none_pos  = [i for i in range(n) if i not in none_set]
+                            non_none_cands = [candidates[hyp_k[i]] for i in non_none_pos]
+                            for vals in (product(*non_none_cands) if non_none_cands else [()]):
+                                combo = [None] * n
+                                for pos, val in zip(non_none_pos, vals):
+                                    combo[pos] = val
+                                yield combo
+
+                for combo_blobs in _hyp_combos_by_none_count():
                     matched_only = [b for b in combo_blobs if b is not None]
                     matched_set  = set(matched_only)
                     # Reject only true conflicts: duplicate blob or stealing a truly-locked blob.
@@ -795,13 +813,17 @@ class PoseSearcher:
                         n_collisions += 1
                         continue
 
-                    n_none = len(combo_blobs) - len(matched_only)
-                    score  = _score_hyp(combo_blobs)
-                    key    = score + self._c_prox_none_penalty * n_none
+                    n_none    = combo_blobs.count(None)
+                    score     = _score_hyp(combo_blobs)
+                    none_cost = self._c_prox_none_penalty * sum(
+                        self._c_prox_none_factor ** k for k in range(n_none)
+                    )
+                    key = score + none_cost
                     if is_deep():
+                        _err_label = f"{self._c_prox_score_metric}_err"
                         logger.debug(
                             f"[{self._ctrl} | cam {self._cam}] Proximity hyp {n_tried}: "
-                            f"blobs={combo_blobs}  max_err={score:.2f}px  none={n_none}"
+                            f"blobs={combo_blobs}  {_err_label}={score:.2f}px  none={n_none}"
                             + ("  ← best" if key < best_key else "")
                         )
                     if key < best_key:
@@ -824,12 +846,16 @@ class PoseSearcher:
                         f"  ({n_collisions} collisions), using truly-locked pairs only"
                     )
                 else:
-                    best_err  = best_key - self._c_prox_none_penalty * best_none
+                    best_none_cost = self._c_prox_none_penalty * sum(
+                        self._c_prox_none_factor ** k for k in range(best_none)
+                    )
+                    best_err  = best_key - best_none_cost
                     n_matched = len(hyp_k) - best_none
+                    _err_label = f"best_{self._c_prox_score_metric}_err"
                     logger.debug(
                         f"[{self._ctrl} | cam {self._cam}] Proximity: {n_tried} hypotheses evaluated"
                         f"  {n_collisions} skipped (collision)"
-                        f"  best_max_err={best_err:.2f}px  matched={n_matched}/{len(hyp_k)} hyp LEDs"
+                        f"  {_err_label}={best_err:.2f}px  matched={n_matched}/{len(hyp_k)} hyp LEDs"
                         f"  best_hyp_blobs={best_hyp_blobs}"
                     )
 
