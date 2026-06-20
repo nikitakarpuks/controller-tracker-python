@@ -1,5 +1,5 @@
 data:
-  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
+  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a/a"
 #  root: "./data/cameras/cam2/cam2_calib_small"
   img_width: 2560
   img_height: 481
@@ -144,8 +144,10 @@ matching:
                                           # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.0  # RANSAC threshold (tighter than brute — prior is already close)
   proximity_expansion_px: 15.0           # neighbourhood radius (px) per LED; velocity-scaled: gate = base + k * v_px
-  proximity_max_hypotheses: 256          # cap on valid hypothesis evaluations before best-so-far is accepted
-  proximity_none_penalty_px: 0.3        # px of reprojection error cost per unmatched LED; a match is only preferred if it reduces error by more than this
+  proximity_max_hypotheses: 64          # cap on valid hypothesis evaluations before best-so-far is accepted
+  proximity_none_penalty_px: 0.4        # px cost for the first unmatched LED
+  proximity_none_penalty_factor: 1.5    # geometric growth per None level: k-th None costs penalty * factor^(k-1); 1.0 = flat (linear)
+  proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_expansion_velocity_k: 0.7   # extra px per px/frame of estimated velocity
   proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
