@@ -5,6 +5,7 @@ from shutil import copy
 from time import time
 
 import numpy as np
+import rerun as rr
 
 from loguru import logger
 from tqdm import tqdm
@@ -23,6 +24,11 @@ SLOW_MATCH_THRESHOLD_S = 1.5
 
 
 def main():
+    # Initialise rerun before any other native libraries (numpy BLAS/LAPACK,
+    # cv2, scipy) are loaded to prevent a Windows DLL heap-state conflict that
+    # causes rrb.EyeControls3D() to crash with 0xC0000005 ACCESS_VIOLATION.
+    rr.init("controller_animator", spawn=False)
+
     config = load_yaml_config('./config/config.yml')
 
     # ── Debug mode: auto-detect from the data path ─────────────────────────

@@ -11,7 +11,7 @@ trimesh==4.11.4  # visualization
 fast-simplification==0.1.13
 cascadio==0.0.17
 rtree==1.4.1
-rerun-sdk==0.31.1
+rerun-sdk==0.33.1
 
 tqdm==4.67.3
 loguru==0.7.3
