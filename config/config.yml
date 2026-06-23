@@ -148,6 +148,7 @@ matching:
   proximity_none_penalty_px: 0.4        # px cost for the first unmatched LED
   proximity_none_penalty_factor: 1.5    # geometric growth per None level: k-th None costs penalty * factor^(k-1); 1.0 = flat (linear)
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
+  proximity_top_k_ransac: 3
   proximity_expansion_velocity_k: 0.7   # extra px per px/frame of estimated velocity
   proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose

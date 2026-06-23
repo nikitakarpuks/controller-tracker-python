@@ -673,3 +673,14 @@
   enough to map() directly.
 
   Want me to do that extraction?
+
+
+● main.py exits with code 0 and produces a 4.8 MB recording file.
+
+  Root cause: On Windows, np.linalg.lstsq (called during PoseSearcher.__init__ via _compute_geometry) initializes BLAS/LAPACK native DLLs that corrupt heap state in a way that
+  makes rerun's Rust-backed rrb.EyeControls3D() crash with 0xC0000005 ACCESS_VIOLATION. Initializing rerun with rr.init() before any of those libraries activates their native code
+  is enough to prevent the corruption.
+
+  Changes made:
+  1. main.py: added import rerun as rr and rr.init("controller_animator", spawn=False) at the very top of main(), before camera/tracking setup.
+  2. src/visualization.py: removed all [DBG] debug print statements from both start() and _build_blueprint().

@@ -477,8 +477,8 @@ class ControllerAnimatorRerun:
             import os
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
             rr.save(save_path)
-            print(f"[rerun] Saving recording to: {save_path}  (no live viewer)")
-            print(f"[rerun] Replay later with:   rerun {save_path}")
+            print(f"[rerun] Saving recording to: {save_path}  (no live viewer)", flush=True)
+            print(f"[rerun] Replay later with:   rerun {save_path}", flush=True)
 
         blueprint = self._build_blueprint(cameras, frustum_z=self.vis_cfg.get("frustum_z", 0.05))
         rr.send_blueprint(blueprint)

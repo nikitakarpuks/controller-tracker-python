@@ -430,6 +430,7 @@ class PoseSearcher:
         self._c_prox_none_penalty   = float(_cfg.get('proximity_none_penalty_px',        0.3))
         self._c_prox_none_factor    = float(_cfg.get('proximity_none_penalty_factor',    1.0))
         self._c_prox_score_metric   = str(  _cfg.get('proximity_score_metric',           'max'))
+        self._c_prox_top_k_ransac   = int(  _cfg.get('proximity_top_k_ransac',           3))
         # constrained
         self._c_cs_reproj_px        = float(_cfg.get('reprojection_threshold',            2.0))
         self._c_cs_snap_factor      = float(_cfg.get('proximity_self._c_cs_snap_factor',             4.0))
@@ -789,6 +790,8 @@ class PoseSearcher:
                 best_hyp_blobs = None
                 n_tried        = 0
                 n_collisions   = 0
+                # Top-K candidates for stage-2 RANSAC rescoring (sorted ascending by key).
+                top_candidates: list = []
 
                 def _hyp_combos_by_none_count():
                     """Yield all assignment combos ordered by ascending None count.
@@ -830,6 +833,15 @@ class PoseSearcher:
                         best_key       = key
                         best_none      = n_none
                         best_hyp_blobs = combo_blobs
+                    # Maintain sorted top-K list for stage-2 RANSAC rescoring.
+                    _tk = self._c_prox_top_k_ransac
+                    if _tk >= 2:
+                        if len(top_candidates) < _tk:
+                            top_candidates.append((key, n_none, list(combo_blobs)))
+                            top_candidates.sort(key=lambda x: x[0])
+                        elif key < top_candidates[-1][0]:
+                            top_candidates[-1] = (key, n_none, list(combo_blobs))
+                            top_candidates.sort(key=lambda x: x[0])
                     n_tried += 1
 
                     if n_tried >= self._c_prox_max_hyp:
@@ -858,6 +870,92 @@ class PoseSearcher:
                         f"  {_err_label}={best_err:.2f}px  matched={n_matched}/{len(hyp_k)} hyp LEDs"
                         f"  best_hyp_blobs={best_hyp_blobs}"
                     )
+
+                    # Stage-2: RANSAC rescore the top-K hypotheses.
+                    # ITERATIVE solvePnP inflates the error when one pair is a noisy
+                    # blob that is still a valid inlier; RANSAC recovers the true
+                    # quality by ignoring that pair during scoring.  We run RANSAC only
+                    # on the K cheapest ITERATIVE hypotheses (default K=3) — not all 64.
+                    #
+                    # Scoring mirrors the ITERATIVE key:
+                    #   ransac_key = mean_inlier_error
+                    #              + none_penalty * Σ none_factor^k  (k=0..n_missing-1)
+                    # where n_missing = hyp_Nones + RANSAC_drops.
+                    # Both sources of "missing LED" carry the same geometric penalty:
+                    # a None that was never tried and a pair that RANSAC rejected are
+                    # equivalent evidence that this LED is not confirmed in this frame.
+                    # Including hyp_Nones prevents choosing a hypothesis with fewer
+                    # matched LEDs just because its smaller inlier set has lower error.
+                    if self._c_prox_top_k_ransac >= 2 and len(top_candidates) >= 2:
+                        _s2_best_key   = float('inf')
+                        _s2_best_blobs = best_hyp_blobs
+                        _s2_best_none  = best_none
+
+                        for _rk, (_rkey, _rn_none, _rblobs) in enumerate(top_candidates):
+                            _locked_r = [(int(candidates[k][0]), int(vis_ids[k]))
+                                         for k in truly_locked_k]
+                            _hyp_r    = [(int(_rblobs[i]), int(vis_ids[hyp_k[i]]))
+                                         for i in range(len(_rblobs))
+                                         if _rblobs[i] is not None]
+                            _pairs_r  = _locked_r + _hyp_r
+                            if len(_pairs_r) < self._c_prox_min_inliers:
+                                logger.debug(
+                                    f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 rank-{_rk+1}: "
+                                    f"iter_key={_rkey:.2f}  blobs={_rblobs}  SKIP (too few pairs)"
+                                )
+                                continue
+                            _o_r = self.model.positions[[l for _, l in _pairs_r]].astype(np.float32)
+                            _i_r = blobs[[b for b, _ in _pairs_r]].astype(np.float32)
+                            _ok_r, _rv_r, _tv_r, _idx_r = _ransac_pnp(
+                                _o_r, _i_r, K, dc, rvec_pred, tvec_pred,
+                                reprojection_px=self._c_prox_reproj_px,
+                                is_fisheye=self.camera.is_fisheye,
+                            )
+                            if not _ok_r or _idx_r is None:
+                                logger.debug(
+                                    f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 rank-{_rk+1}: "
+                                    f"iter_key={_rkey:.2f}  blobs={_rblobs}  RANSAC failed"
+                                )
+                                continue
+                            _n_r        = len(_idx_r)
+                            _n_drop_r   = len(_pairs_r) - _n_r
+                            _n_missing_r = _rn_none + _n_drop_r   # hyp Nones + RANSAC drops
+                            _proj_r     = _project_points(_rv_r, _tv_r, _o_r[_idx_r], K, dc,
+                                                          is_fisheye=self.camera.is_fisheye)
+                            _err_r      = float(np.linalg.norm(_proj_r - _i_r[_idx_r], axis=1).mean())
+                            _miss_cost_r = self._c_prox_none_penalty * sum(
+                                self._c_prox_none_factor ** _dk for _dk in range(_n_missing_r)
+                            )
+                            _s2_key_r = _err_r + _miss_cost_r
+                            _marker   = "  <- best" if _s2_key_r < _s2_best_key else ""
+                            logger.debug(
+                                f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 rank-{_rk+1}: "
+                                f"iter_key={_rkey:.2f}  blobs={_rblobs}  "
+                                f"inliers={_n_r}/{len(_pairs_r)}  "
+                                f"err={_err_r:.2f}px  "
+                                f"missing={_n_missing_r}(none={_rn_none}+drop={_n_drop_r})  "
+                                f"miss_cost={_miss_cost_r:.2f}  "
+                                f"ransac_key={_s2_key_r:.2f}{_marker}"
+                            )
+                            if _s2_key_r < _s2_best_key:
+                                _s2_best_key   = _s2_key_r
+                                _s2_best_blobs = list(_rblobs)
+                                _s2_best_none  = _rn_none
+
+                        if _s2_best_blobs != best_hyp_blobs:
+                            logger.debug(
+                                f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 RANSAC: "
+                                f"switched rank-1 -> rank-{next((i+1 for i,c in enumerate(top_candidates) if list(c[2])==_s2_best_blobs), '?')}  "
+                                f"ransac_key={_s2_best_key:.2f}  "
+                                f"old={best_hyp_blobs}  new={_s2_best_blobs}"
+                            )
+                            best_hyp_blobs = _s2_best_blobs
+                            best_none      = _s2_best_none
+                        else:
+                            logger.debug(
+                                f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 RANSAC: "
+                                f"rank-1 confirmed  ransac_key={_s2_best_key:.2f}"
+                            )
 
             # Step 5: build pairs from truly-locked + best hypothesis assignment (skip None).
             locked_assignment = [(int(candidates[k][0]), int(vis_ids[k])) for k in truly_locked_k]
