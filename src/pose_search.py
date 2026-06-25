@@ -1039,10 +1039,10 @@ class PoseSearcher:
 
                         _n_vis_i   = len(_vis_ids_i)
                         _cost_i_aug = np.hstack([_cost_i_r,
-                                                 np.full((_n_vis_i, _n_vis_i), proximity_expansion_px - 1e-6)])
+                                                 np.full((_n_vis_i, _n_vis_i), self._c_joint_prefilter_px - 1e-6)])
                         _row_r, _col_r = linear_sum_assignment(_cost_i_aug)
                         for _rr, _cc in zip(_row_r, _col_r):
-                            if _cc < len(_oblobs) and _cost_i_r[_rr, _cc] < proximity_expansion_px:
+                            if _cc < len(_oblobs) and _cost_i_r[_rr, _cc] < self._c_joint_prefilter_px:
                                 _pairs_i.append((int(_cc), int(_vis_ids_i[_rr])))
 
                 aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i

@@ -684,3 +684,20 @@
   Changes made:
   1. main.py: added import rerun as rr and rr.init("controller_animator", spawn=False) at the very top of main(), before camera/tracking setup.
   2. src/visualization.py: removed all [DBG] debug print statements from both start() and _build_blueprint().
+
+
+
+
+
+
+
+
+
+
+
+Phase 1 — Parallel race
+  All cameras that have enough predicted-visible LEDs run proximity search independently. "Winner" shouldn't just be speed — it should be the first
+  to cross a strong match threshold (e.g., inliers ≥ strong_ Jump to bottom (ctrl+End) ↓ ong_match_error_px, which already exist in the config). You
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 

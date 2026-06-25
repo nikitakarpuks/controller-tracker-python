@@ -375,6 +375,16 @@ class CameraTracker:
         _base_expansion = float(_cfg.get('proximity_expansion_px', 8.0))
         _prox_vel_k     = float(_cfg.get('proximity_expansion_velocity_k', 0.0))
         _eff_expansion  = _base_expansion + _prox_vel_k * _v_px
+        # Uncertainty term: larger neighbourhood when prediction history is short.
+        # Decays as 1/n — full boost at n=1 (constant-position), half at n=2, etc.
+        _uncertainty_k = float(_cfg.get('proximity_expansion_uncertainty_k', 0.0))
+        if _uncertainty_k > 0.0:
+            _eff_expansion += _uncertainty_k / max(len(self.pose_history), 1)
+        # Depth term: closer controller → larger pixel-space uncertainty → bigger neighbourhood.
+        _depth_k = float(_cfg.get('proximity_expansion_depth_k', 0.0))
+        if _depth_k > 0.0 and predicted_pose is not None:
+            _ctrl_depth = max(float(predicted_pose[1].reshape(3)[2]), 0.01)
+            _eff_expansion += _depth_k / _ctrl_depth
 
         # ------------------------------------------------------------------
         # Candidate search
