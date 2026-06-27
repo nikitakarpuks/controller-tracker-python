@@ -128,6 +128,7 @@ def main():
     last_good_T_world    = {n: None for n in enabled_ctrls}
     blobs        = []
     contours_all = []
+    blob_vis_all = []
 
     _csv_path = debug_cfg.get("calibration_csv")
     _csv_file = _csv_writer = None
@@ -146,17 +147,19 @@ def main():
         #     pass
         # cam_images: {cam_idx: numpy array}
 
-        proj_hints, vel_hints = tracking_system.get_predicted_led_projections_per_camera()
+        proj_hints, vel_hints, radius_hints = tracking_system.get_predicted_led_projections_per_camera()
         primary_cams       = tracking_system.get_designated_primary_cameras()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
 
         # per_ctrl_blobs: {ctrl_name: {cam_idx: BlobResult}}
         per_ctrl_blobs: dict = {}
+        frame_blob_vis: dict = {}
 
         # ── Phase 1: detect blobs for every controller on the original images ──
         _match_cfg = config["matching"]
         _blob_cfg  = config["blob_detection"]
+        _base_r    = float(_match_cfg.get("proximity_expansion_px", 8.0))
         for ctrl_name in ctrl_names_ordered:
             per_ctrl_blobs[ctrl_name] = {}
 
@@ -164,23 +167,24 @@ def main():
                 if cam_idx not in cam_images:
                     continue
                 predicted_leds = proj_hints.get(cam_idx, {}).get(ctrl_name)
-                _base_r     = float(_match_cfg.get("proximity_expansion_px", 8.0))
-                _vel_k      = float(_match_cfg.get("proximity_expansion_velocity_k", 0.0))
                 _v_px       = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
-                _local_r_px = _base_r + _vel_k * _v_px
+                _local_r_px = radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r)
                 _thr_k      = float(_blob_cfg.get("velocity_threshold_k", 0.0))
                 _thr_min    = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
                 _thr_scale  = max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0
                 t0 = time()
-                per_ctrl_blobs[ctrl_name][cam_idx] = blob_detectors[cam_idx].detect(
+                _det_result = blob_detectors[cam_idx].detect(
                     cam_images[cam_idx],
                     ctrl_label=ctrl_name.replace("_controller", ""),
                     predicted_leds=predicted_leds,
                     local_search_radius_px=_local_r_px,
                     threshold_scale=_thr_scale,
-                    visualize=_blob_cfg["visualize"],
-                    img_path=img_path,
+                    visualize=True,
+                    img_path=img_path if _blob_cfg["visualize"] else None,
                 )
+                per_ctrl_blobs[ctrl_name][cam_idx] = _det_result[0]
+                if _det_result[1]:
+                    frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _det_result[1]
                 logger.info(f"blob detection took {time() - t0} seconds")
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
@@ -234,6 +238,7 @@ def main():
                       for ctrl, cb in per_ctrl_blobs.items()})
         contours_all.append({ctrl: {cam: r.contours for cam, r in cb.items()}
                              for ctrl, cb in per_ctrl_blobs.items()})
+        blob_vis_all.append(frame_blob_vis)
 
         total_blobs = sum(
             len(r)
@@ -348,6 +353,7 @@ def main():
             primary_cams_all=primary_cams_all,
             aux_assignments_all=aux_assignments_all,
             frozen_poses_all=frozen_poses_all,
+            blob_vis_all=blob_vis_all,
         )
 
 

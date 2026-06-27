@@ -902,18 +902,27 @@ class TrackingSystem:
         """
         ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
         _facing_deg  = float(self._matching_cfg.get('led_facing_angle_deg', 86.0))
-        result:    Dict[int, Dict[str, Optional[np.ndarray]]] = {}
-        vel_hints: Dict[int, Dict[str, float]]                = {}
+        result:       Dict[int, Dict[str, Optional[np.ndarray]]] = {}
+        vel_hints:    Dict[int, Dict[str, float]]                = {}
+        radius_hints: Dict[int, Dict[str, float]]                = {}
+
+        # Pre-read all four expansion terms once — same values used in track()
+        _base_r = float(self._matching_cfg.get('proximity_expansion_px', 8.0))
+        _vel_k  = float(self._matching_cfg.get('proximity_expansion_velocity_k', 0.0))
+        _unc_k  = float(self._matching_cfg.get('proximity_expansion_uncertainty_k', 0.0))
+        _dpt_k  = float(self._matching_cfg.get('proximity_expansion_depth_k', 0.0))
 
         for cam_id, camera in self.cameras.items():
-            proj_per_ctrl: Dict[str, Optional[np.ndarray]] = {}
-            vel_per_ctrl:  Dict[str, float]                = {}
+            proj_per_ctrl:   Dict[str, Optional[np.ndarray]] = {}
+            vel_per_ctrl:    Dict[str, float]                = {}
+            radius_per_ctrl: Dict[str, float]               = {}
             for ctrl_name in ctrl_names:
                 tracker = self.trackers.get((ctrl_name, cam_id))
                 pred = CameraTracker._predict_pose(tracker.pose_history) if tracker else None
                 if pred is None:
-                    proj_per_ctrl[ctrl_name] = None
-                    vel_per_ctrl[ctrl_name]  = 0.0
+                    proj_per_ctrl[ctrl_name]   = None
+                    vel_per_ctrl[ctrl_name]    = 0.0
+                    radius_per_ctrl[ctrl_name] = _base_r
                     continue
                 rvec_pred, tvec_pred = pred
                 _ph = tracker.pose_history
@@ -941,8 +950,9 @@ class TrackingSystem:
                 )
                 vis_ids = np.where(vis_mask)[0]
                 if len(vis_ids) == 0:
-                    proj_per_ctrl[ctrl_name] = None
-                    vel_per_ctrl[ctrl_name]  = 0.0
+                    proj_per_ctrl[ctrl_name]   = None
+                    vel_per_ctrl[ctrl_name]    = 0.0
+                    radius_per_ctrl[ctrl_name] = _base_r
                     continue
 
                 proj_pts = _project_points(
@@ -965,11 +975,21 @@ class TrackingSystem:
                 ])  # (M, 5): proj_x, proj_y, depth_m, facing_cos, led_id
 
                 _depth_pred = max(float(tvec_pred[2]), 0.1)
-                vel_per_ctrl[ctrl_name] = float(np.linalg.norm(vel_3d)) * camera.fx / _depth_pred
+                _v_px       = float(np.linalg.norm(vel_3d)) * camera.fx / _depth_pred
+                vel_per_ctrl[ctrl_name] = _v_px
 
-            result[cam_id]    = proj_per_ctrl
-            vel_hints[cam_id] = vel_per_ctrl
-        return result, vel_hints
+                # Full effective blob-detection search radius — mirrors track() expansion logic
+                _r = _base_r + _vel_k * _v_px
+                if _unc_k > 0.0:
+                    _r += _unc_k / max(len(tracker.pose_history), 1)
+                if _dpt_k > 0.0:
+                    _r += _dpt_k / _depth_pred
+                radius_per_ctrl[ctrl_name] = _r
+
+            result[cam_id]        = proj_per_ctrl
+            vel_hints[cam_id]     = vel_per_ctrl
+            radius_hints[cam_id]  = radius_per_ctrl
+        return result, vel_hints, radius_hints
 
     def get_ctrl_processing_order(self) -> List[str]:
         """Return controller names in the same priority order used by update()."""
