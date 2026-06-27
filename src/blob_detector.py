@@ -374,6 +374,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     ) if len(filtered_contours) > 0 else np.empty(0, dtype=np.float32)
 
     # ── 4. Visualization ──────────────────────────────────────────────────────
+    vis_out = None
     if visualize:
         # Warm-mode uses a black background so only colored annotation pixels are
         # non-zero; the compositor then blends only those pixels onto the canvas.
@@ -458,10 +459,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / pass_type
                 out_dir.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), vis)
+            vis_out = vis
 
     return (filtered_centroids, filtered_contours, filtered_radii,
             filtered_brightnesses,
-            rejected_centroids, rejected_contours, large_rejected_contours)
+            rejected_centroids, rejected_contours, large_rejected_contours,
+            vis_out)
 
 
 def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
@@ -622,7 +625,7 @@ def _detect_blobs_local(image, led_projections, cfg,
             vis_patches.append((patch_out[0], x1, y1, i, pixel_thr_i, req_thr_i))
 
         centroids_crop, contours_crop, radii, brightnesses, \
-            rej_centroids_crop, rej_contours_crop, large_rejected = result
+            rej_centroids_crop, rej_contours_crop, large_rejected, _ = result
 
         # Remap centroids and contours to full-image coordinates
         if len(centroids_crop) > 0:
@@ -665,7 +668,8 @@ def _detect_blobs_local(image, led_projections, cfg,
         filtered_brightnesses = np.empty(0, dtype=np.float32)
 
     # ── Composite visualization ───────────────────────────────────────────────
-    if visualize and img_path is not None:
+    canvas_out = None
+    if visualize:
         C_ROI  = (0, 180, 0)    # green — search circle
         C_KEPT = (255, 255, 255)
         C_AREA_SM = (255, 0, 255)
@@ -720,14 +724,16 @@ def _detect_blobs_local(image, led_projections, cfg,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
                 (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
                 x += tw + 10
-        cv2.putText(strip, f"warm: {n_leds} LEDs  NMS min_dist={min_split_dist:.1f}px",
+        cv2.putText(strip, f"warm: {n_leds} LEDs  base_r={base_px:.1f}px  NMS min_dist={min_split_dist:.1f}px",
                     (6, row_h * 2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
         canvas = np.vstack([canvas, strip])
 
-        suffix_stripped = vis_suffix.lstrip("_")
-        out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / "local"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), canvas)
+        if img_path is not None:
+            suffix_stripped = vis_suffix.lstrip("_")
+            out_dir = Path("./visualization/blobs") / (suffix_stripped or "default") / "local"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out_dir / f"{Path(img_path).stem}.png"), canvas)
+        canvas_out = canvas
 
     return (
         filtered_centroids,
@@ -737,6 +743,7 @@ def _detect_blobs_local(image, led_projections, cfg,
         np.empty((0, 2), dtype=np.float32),  # rejected centroids (pre-NMS rejects are in patches)
         [],                                   # rejected contours
         all_large_rejected,
+        canvas_out,
     )
 
 
@@ -823,8 +830,9 @@ class BlobDetector:
                 search_radius_px=local_search_radius_px,
                 threshold_scale=threshold_scale,
             )
-            return BlobResult(centroids=raw[0], contours=raw[1],
-                              radii=raw[2], brightnesses=raw[3])
+            canvases = {"local": raw[7]} if raw[7] is not None else {}
+            return (BlobResult(centroids=raw[0], contours=raw[1],
+                               radii=raw[2], brightnesses=raw[3]), canvases)
 
         # ── Cold path: global search with optional pass-2 EMA ────────────────
         pass2_factor                = float(cfg.get("pass2_threshold_factor", 0.0))
@@ -838,6 +846,9 @@ class BlobDetector:
         result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                                visualize, img_path, vis_suffix_1)
         large_blobs_pass1 = result[6]
+        canvases = {}
+        if result[7] is not None:
+            canvases["pass1"] = result[7]
 
         min_area_pass2 = cfg.get("pass2_min_area")
         min_area_pass2 = float(min_area_pass2) if min_area_pass2 is not None else None
@@ -888,6 +899,8 @@ class BlobDetector:
                         min_area_override=min_area_pass2,
                         interior_exclude_blobs=large_blobs_pass1,
                     )
+                    if result2[7] is not None:
+                        canvases["pass2"] = result2[7]
                     if len(result2[0]) >= 1:
                         if update_memory:
                             _mem["pixel_threshold"]    = pixel_threshold_2
@@ -897,8 +910,9 @@ class BlobDetector:
                             _mem["blob_count"]         = cur_count
                         corrected_radii = _correct_radii_for_threshold(
                             result2[2], result2[3], pixel_threshold, pixel_threshold_2)
-                        return BlobResult(centroids=result2[0], contours=result2[1],
-                                          radii=corrected_radii, brightnesses=result2[3])
+                        return (BlobResult(centroids=result2[0], contours=result2[1],
+                                           radii=corrected_radii, brightnesses=result2[3]),
+                                canvases)
 
         elif pass2_factor > 0 and _mem:
             result2 = _detect_blobs(
@@ -909,12 +923,16 @@ class BlobDetector:
                 min_area_override=min_area_pass2,
                 interior_exclude_blobs=large_blobs_pass1,
             )
+            if result2[7] is not None:
+                canvases["pass2"] = result2[7]
             if len(result2[0]) >= 1:
                 corrected_radii = _correct_radii_for_threshold(
                     result2[2], result2[3], pixel_threshold, _mem["pixel_threshold"])
-                return BlobResult(centroids=result2[0], contours=result2[1],
-                                  radii=corrected_radii, brightnesses=result2[3])
+                return (BlobResult(centroids=result2[0], contours=result2[1],
+                                   radii=corrected_radii, brightnesses=result2[3]),
+                        canvases)
             _mem.clear()
 
-        return BlobResult(centroids=result[0], contours=result[1],
-                          radii=result[2], brightnesses=result[3])
+        return (BlobResult(centroids=result[0], contours=result[1],
+                           radii=result[2], brightnesses=result[3]),
+                canvases)

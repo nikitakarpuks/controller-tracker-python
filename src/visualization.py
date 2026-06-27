@@ -392,11 +392,9 @@ class ControllerAnimatorRerun:
 
     def _build_blueprint(self, cameras: dict, frustum_z: float) -> rrb.Blueprint:
         """
-        Build a tabbed blueprint with one global "World" view and one
-        per-camera view.  Each camera tab:
-          - positions the 3-D eye at that camera's centre, looking along its
-            optical axis toward the projection surface at frustum_z depth;
-          - hides every other camera's frustum, blobs, and markers.
+        Build a tabbed blueprint with one global "World" view, one per-camera
+        view, and a "Blob Debug" tab showing blob detection canvases per
+        camera × controller combination.
         """
         all_cam_indices = sorted(cameras.keys())
         views: list = [rrb.Spatial3DView(name="World", origin="/world")]
@@ -440,6 +438,22 @@ class ControllerAnimatorRerun:
                 ),
             ))
 
+        # ── Blob Debug tab ─────────────────────────────────────────────────
+        ctrl_labels = [cn.replace("_controller", "") for cn in self._controllers_vis]
+        image_views: list = []
+        for ci in all_cam_indices:
+            for cl in ctrl_labels:
+                image_views.append(rrb.Spatial2DView(
+                    name=f"cam{ci} / {cl}",
+                    origin=f"blob_debug/cam{ci}/{cl}",
+                ))
+        views.append(rrb.Vertical(
+            rrb.Grid(*image_views, grid_columns=len(ctrl_labels)),
+            rrb.TextLogView(name="Detection modes", origin="blob_debug/modes"),
+            name="Blob Debug",
+            row_shares=[10, 1],
+        ))
+
         return rrb.Blueprint(
             rrb.Tabs(*views),
             collapse_panels=False,
@@ -451,7 +465,8 @@ class ControllerAnimatorRerun:
               save_path: str = None,
               primary_cams_all: dict = None,
               aux_assignments_all: dict = None,
-              frozen_poses_all: dict = None):
+              frozen_poses_all: dict = None,
+              blob_vis_all: list = None):
         """
         Log all frames to rerun.
         Opens the viewer automatically (spawn=True).
@@ -523,6 +538,9 @@ class ControllerAnimatorRerun:
         for idx in range(n_frames):
             rr.set_time("frame", sequence=idx)
 
+            if blob_vis_all is not None and idx < len(blob_vis_all):
+                self._log_blob_debug(blob_vis_all[idx])
+
             # Build per-controller T_world_ctrl for this frame.
             T_world_ctrl_per_ctrl: dict = {}
             for ctrl_name, poses in poses_per_ctrl.items():
@@ -577,6 +595,61 @@ class ControllerAnimatorRerun:
             msg += f" Recording saved to: {save_path}"
             msg += f"\n[rerun] Replay with:  rerun {save_path}"
         print(msg)
+
+    # ------------------------------------------------------------------
+    # Blob debug images (logged per frame under blob_debug/ subtree)
+    # ------------------------------------------------------------------
+
+    def _log_blob_debug(self, frame_vis: dict) -> None:
+        """Log blob detection canvases and a mode summary for the current frame.
+
+        frame_vis: {ctrl_name: {cam_idx: {mode_key: canvas_bgr}}}
+        mode_key is "local", "pass1", or "pass2".
+
+        For 2-pass frames (pass1 + pass2 present) the two canvases are placed
+        side-by-side in a single image so both are visible in one panel.
+        The composite image is logged directly at the panel origin path so that
+        Rerun updates it reliably when scrubbing the timeline.
+        """
+        mode_lines = []
+        for ctrl_name, cam_dict in frame_vis.items():
+            ctrl_label = ctrl_name.replace("_controller", "")
+            for cam_idx, canvases in cam_dict.items():
+                if not canvases:
+                    continue
+
+                if "pass1" in canvases and "pass2" in canvases:
+                    p1 = canvases["pass1"]
+                    p2 = canvases["pass2"]
+                    if p1.shape[0] != p2.shape[0]:
+                        # Pad shorter canvas to match height
+                        h = max(p1.shape[0], p2.shape[0])
+                        def _pad(img, h):
+                            if img.shape[0] < h:
+                                pad = np.zeros((h - img.shape[0], img.shape[1], 3), dtype=np.uint8)
+                                return np.vstack([img, pad])
+                            return img
+                        p1, p2 = _pad(p1, h), _pad(p2, h)
+                    # Thin separator between the two passes
+                    sep = np.full((p1.shape[0], 3, 3), 80, dtype=np.uint8)
+                    composite = np.hstack([p1, sep, p2])
+                    mode_str = "pass1|pass2"
+                elif "local" in canvases:
+                    composite = canvases["local"]
+                    mode_str = "local"
+                else:
+                    # pass1 only (cold start, pass2 skipped)
+                    composite = next(iter(canvases.values()))
+                    mode_str = next(iter(canvases))
+
+                rr.log(
+                    f"blob_debug/cam{cam_idx}/{ctrl_label}",
+                    rr.Image(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)),
+                )
+                mode_lines.append(f"cam{cam_idx}/{ctrl_label}: {mode_str}")
+
+        if mode_lines:
+            rr.log("blob_debug/modes", rr.TextLog("  |  ".join(mode_lines)))
 
     # ------------------------------------------------------------------
     # Static geometry (logged once, no timeline)
