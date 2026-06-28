@@ -29,6 +29,8 @@ VIS_CONFIG = {
     "frustum_z":        0.05,      # depth of the virtual projection screen (metres).
                                    # Must be less than the closest expected controller depth.
                                    # Pure display parameter — has no effect on matching.
+    "frustum_edge_samples": 100,   # samples per image edge for the frustum outline polygon.
+                                   # Higher = smoother curve, fewer blobs appearing outside.
     "ray_radius":       0.0002,    # thickness of all rays and normals (metres)
     "led_disk_radius":  0.0015,     # radius of LED disks on the controller body (metres)
     "proj_disk_radius": 0.0004,    # radius of projection disks on the frustum plane (metres)
@@ -658,7 +660,7 @@ class ControllerAnimatorRerun:
     def _log_static_cameras(self, cameras: dict):
         """Frustum image planes and camera markers — logged once."""
         frustum_z    = self.vis_cfg.get("frustum_z", 0.05)
-        edge_samples = 20
+        edge_samples = self.vis_cfg.get("frustum_edge_samples", 100)
         cam_r        = self.vis_cfg.get("camera_center_radius", 0.004)
 
         for cam_idx, cam in cameras.items():
@@ -998,7 +1000,7 @@ class ControllerAnimatorRerun:
             all_proj_lids  = []
             lid_to_proj_pt = {}
             for i, (px, py, pz) in enumerate(pts_cam_real):
-                if pz > 1e-6 and (i in matched_lids or i in vis_set):
+                if pz >= frustum_z and (i in matched_lids or i in vis_set):
                     z_val        = matched_proj_z if i in matched_lids else frustum_z
                     proj_pt_cam  = np.array([px / pz * z_val, py / pz * z_val, z_val])
                     proj_pt_disp = _w(proj_pt_cam)
@@ -1131,7 +1133,7 @@ class ControllerAnimatorRerun:
                 _aux_proj_lids   = []
                 _aux_lid_to_proj = {}
                 for _i, (_ipx, _ipy, _ipz) in enumerate(_pts_aux_cam):
-                    if _ipz > 1e-6 and _i in _aux_matched_lids:
+                    if _ipz >= frustum_z and _i in _aux_matched_lids:
                         _pp = np.array([_ipx / _ipz * matched_proj_z,
                                         _ipy / _ipz * matched_proj_z,
                                         matched_proj_z])

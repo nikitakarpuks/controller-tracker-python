@@ -98,6 +98,7 @@ def _split_blob_at_seeds(image, intensities, ys, xs, seed_a, seed_b):
 def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    visualize=False, img_path=None, vis_suffix="",
                    max_area_override=None, min_area_override=None,
+                   min_circularity_override=None,
                    interior_exclude_blobs=None,
                    warm_mode=False,
                    vis_patch_out=None):
@@ -180,7 +181,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     outlier_factor     = float(cfg.get("outlier_factor", 3.0))
     min_split_dist     = float(cfg.get("min_split_dist", 4.0))
     split_valley_ratio = float(cfg.get("split_valley_ratio", 0.6))
-    min_circularity    = float(cfg.get("min_circularity", 0.5))
+    min_circularity    = (float(min_circularity_override)
+                          if min_circularity_override is not None
+                          else float(cfg.get("min_circularity", 0.5)))
 
     # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
     interior_edge_margin_px = float(cfg.get("interior_edge_margin_px", 10.0))
@@ -576,6 +579,19 @@ def _detect_blobs_local(image, led_projections, cfg,
         pixel_thrs = np.maximum((pixel_thrs * threshold_scale).astype(int), 1)
     req_thrs = np.clip((pixel_thrs * req_factor).astype(int), 0, 255)
 
+    # Per-LED min_circularity: relax for LEDs seen at a steep angle.
+    # A circle projected at cos θ is an ellipse with theoretical circularity
+    # 2·c/(1+c²).  We blend between no-adapt (angle_factor=0) and full-physics
+    # (angle_factor=1) so that noisy blobs still have sufficient headroom.
+    #   scale_i = 1 − angle_factor × (1 − 2c/(1+c²))
+    min_circ_base  = float(cfg.get("min_circularity", 0.5))
+    min_circ_floor = float(cfg.get("min_circularity_floor", 0.0))
+    angle_factor   = float(cfg.get("min_circularity_angle_factor", 0.5))
+    cos_clamped    = np.clip(cos_vals, 0.0, 1.0)
+    theoretical    = 2.0 * cos_clamped / (1.0 + cos_clamped ** 2)
+    scale          = 1.0 - angle_factor * (1.0 - theoretical)
+    min_circ_per_led = np.maximum(min_circ_base * scale, min_circ_floor)
+
     # Per-LED search radii
     search_rs = np.round(base_px + depth_k / safe_d).astype(int)
 
@@ -617,6 +633,7 @@ def _detect_blobs_local(image, led_projections, cfg,
             visualize=visualize, img_path=None, vis_suffix="",
             max_area_override=max_area_i,
             min_area_override=min_area_i,
+            min_circularity_override=float(min_circ_per_led[i]),
             warm_mode=True,
             vis_patch_out=patch_out,
         )
@@ -676,8 +693,6 @@ def _detect_blobs_local(image, led_projections, cfg,
         C_AREA_LG = (0, 140, 255)
         C_THRESH  = (180, 0, 0)
         C_CIRC    = (0, 255, 255)
-        min_circularity = float(cfg.get("min_circularity", 0.5))
-
         canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
         # Search circles + LED ID labels first (so blob pixels are drawn on top)
@@ -703,7 +718,7 @@ def _detect_blobs_local(image, led_projections, cfg,
         strip_entries = [
             (C_KEPT,     "kept"),
             ((0, 255, 128), "split"),
-            (C_CIRC,     f"not circular (< {min_circularity})"),
+            (C_CIRC,     f"not circular (< {min_circ_base:.2f}·angle_scale)"),
             (C_THRESH,   f"too dim (< req_thr)"),
             (C_AREA_LG,  f"area > max_area"),
             (C_AREA_SM,  "pixels < min_area"),
