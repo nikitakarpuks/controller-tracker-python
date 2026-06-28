@@ -539,6 +539,12 @@ class CameraTracker:
                 _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
                 self.vel_ema = (_beta * _step + (1.0 - _beta) * self.vel_ema
                                if self.vel_ema is not None else _step)
+            elif self.consecutive_failures > 0 and self.last_good_pose is not None:
+                _warmstart_max = int(self._matching_cfg.get('pose_gap_velocity_warmstart_frames', 3))
+                if self.consecutive_failures <= _warmstart_max:
+                    _lg_tvec  = np.asarray(self.last_good_pose[1], np.float64).reshape(3)
+                    _new_tvec = np.asarray(result["tvec"],          np.float64).reshape(3)
+                    self.vel_ema = ((_new_tvec - _lg_tvec) / self.consecutive_failures).astype(np.float32)
             self.prev_prev_pose  = self.prev_pose
             self.prev_pose       = (result["rvec"], result["tvec"])
             self.pose_history.appendleft((

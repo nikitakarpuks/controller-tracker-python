@@ -727,6 +727,13 @@ class PoseSearcher:
                 + (f"  hyp_sizes={[len(candidates[k]) for k in hyp_k]}" if hyp_k else "")
             )
 
+            # Pre-undistort all blob positions once — reused across all hypothesis evaluations.
+            _blobs_inp = blobs.astype(np.float64).reshape(-1, 1, 2)
+            if self.camera.is_fisheye:
+                _blobs_norm = cv2.fisheye.undistortPoints(_blobs_inp, K.astype(np.float64), dc).reshape(-1, 2)
+            else:
+                _blobs_norm = cv2.undistortPoints(_blobs_inp.astype(np.float32), K, dc).reshape(-1, 2)
+
             def _score_hyp(hyp_blob_indices: list) -> float:
                 """solvePnP on truly-locked + matched hypothesis pairs; returns reprojection
                 error (mean or max per proximity_score_metric). None entries mean 'no blob
@@ -744,13 +751,7 @@ class PoseSearcher:
                 all_img = blobs[np.array(all_blob_c, dtype=np.int32)]
 
                 if len(all_led_k) >= 4:
-                    inp = all_img.astype(np.float32).reshape(-1, 1, 2)
-                    if self.camera.is_fisheye:
-                        pts_norm = cv2.fisheye.undistortPoints(
-                            inp.astype(np.float64), K.astype(np.float64), dc,
-                        ).reshape(-1, 2)
-                    else:
-                        pts_norm = cv2.undistortPoints(inp, K, dc).reshape(-1, 2)
+                    pts_norm = _blobs_norm[np.array(all_blob_c, dtype=np.int32)]
                     try:
                         ok_h, rvec_h, tvec_h = cv2.solvePnP(
                             all_obj.astype(np.float64).reshape(-1, 1, 3),
@@ -773,6 +774,12 @@ class PoseSearcher:
 
                 # PnP unavailable or failed: pixel distance from predicted projection.
                 return float(_agg(np.linalg.norm(proj_vis[all_led_k] - all_img, axis=1)))
+
+            def _fmt_leds(blobs_list):
+                return "[" + ", ".join(
+                    f"{int(vis_ids[hyp_k[i]])}:{'✓' if blobs_list[i] is not None else 'None'}"
+                    for i in range(len(hyp_k))
+                ) + "]"
 
             # Step 4: enumerate hypotheses and pick the best.
             # None is appended to each hyp LED's candidate list as a valid "no match" option.
@@ -824,9 +831,13 @@ class PoseSearcher:
                     key = score + none_cost
                     if is_deep():
                         _err_label = f"{self._c_prox_score_metric}_err"
+                        _leds_fmt = "[" + ", ".join(
+                            f"{int(vis_ids[hyp_k[i]])}:{'✓' if combo_blobs[i] is not None else 'None'}"
+                            for i in range(len(hyp_k))
+                        ) + "]"
                         logger.debug(
                             f"[{self._ctrl} | cam {self._cam}] Proximity hyp {n_tried}: "
-                            f"blobs={combo_blobs}  {_err_label}={score:.2f}px  none={n_none}"
+                            f"leds={_leds_fmt}  {_err_label}={score:.2f}px"
                             + ("  ← best" if key < best_key else "")
                         )
                     if key < best_key:
@@ -868,7 +879,7 @@ class PoseSearcher:
                         f"[{self._ctrl} | cam {self._cam}] Proximity: {n_tried} hypotheses evaluated"
                         f"  {n_collisions} skipped (collision)"
                         f"  {_err_label}={best_err:.2f}px  matched={n_matched}/{len(hyp_k)} hyp LEDs"
-                        f"  best_hyp_blobs={best_hyp_blobs}"
+                        f"  best_hyp_leds={_fmt_leds(best_hyp_blobs)}"
                     )
 
                     # Stage-2: RANSAC rescore the top-K hypotheses.
@@ -901,7 +912,7 @@ class PoseSearcher:
                             if len(_pairs_r) < self._c_prox_min_inliers:
                                 logger.debug(
                                     f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 rank-{_rk+1}: "
-                                    f"iter_key={_rkey:.2f}  blobs={_rblobs}  SKIP (too few pairs)"
+                                    f"iter_key={_rkey:.2f}  leds={_fmt_leds(_rblobs)}  SKIP (too few pairs)"
                                 )
                                 continue
                             _o_r = self.model.positions[[l for _, l in _pairs_r]].astype(np.float32)
@@ -914,7 +925,7 @@ class PoseSearcher:
                             if not _ok_r or _idx_r is None:
                                 logger.debug(
                                     f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 rank-{_rk+1}: "
-                                    f"iter_key={_rkey:.2f}  blobs={_rblobs}  RANSAC failed"
+                                    f"iter_key={_rkey:.2f}  leds={_fmt_leds(_rblobs)}  RANSAC failed"
                                 )
                                 continue
                             _n_r        = len(_idx_r)
@@ -927,17 +938,17 @@ class PoseSearcher:
                                 self._c_prox_none_factor ** _dk for _dk in range(_n_missing_r)
                             )
                             _s2_key_r = _err_r + _miss_cost_r
-                            _marker   = "  <- best" if _s2_key_r < _s2_best_key else ""
+                            _marker   = "  <- best" if (_s2_key_r, _rn_none) < (_s2_best_key, _s2_best_none) else ""
                             logger.debug(
                                 f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 rank-{_rk+1}: "
-                                f"iter_key={_rkey:.2f}  blobs={_rblobs}  "
+                                f"iter_key={_rkey:.2f}  leds={_fmt_leds(_rblobs)}  "
                                 f"inliers={_n_r}/{len(_pairs_r)}  "
                                 f"err={_err_r:.2f}px  "
                                 f"missing={_n_missing_r}(none={_rn_none}+drop={_n_drop_r})  "
                                 f"miss_cost={_miss_cost_r:.2f}  "
                                 f"ransac_key={_s2_key_r:.2f}{_marker}"
                             )
-                            if _s2_key_r < _s2_best_key:
+                            if (_s2_key_r, _rn_none) < (_s2_best_key, _s2_best_none):
                                 _s2_best_key   = _s2_key_r
                                 _s2_best_blobs = list(_rblobs)
                                 _s2_best_none  = _rn_none
@@ -947,7 +958,7 @@ class PoseSearcher:
                                 f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 RANSAC: "
                                 f"switched rank-1 -> rank-{next((i+1 for i,c in enumerate(top_candidates) if list(c[2])==_s2_best_blobs), '?')}  "
                                 f"ransac_key={_s2_best_key:.2f}  "
-                                f"old={best_hyp_blobs}  new={_s2_best_blobs}"
+                                f"old={_fmt_leds(best_hyp_blobs)}  new={_fmt_leds(_s2_best_blobs)}"
                             )
                             best_hyp_blobs = _s2_best_blobs
                             best_none      = _s2_best_none
