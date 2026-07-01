@@ -1,6 +1,6 @@
 data:
   root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a/a"
-#  root: "./data/cameras/cam2/cam2_calib_small"
+#  root: "./data/datasets/first_ds"
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
@@ -86,8 +86,8 @@ blob_detection:
       a: 0.1
       b: 6.0
     max_area:
-      a: 2.0
-      b: 25.0
+      a: 3.0
+      b: 35.0
     min_area:
       a: 0.05
       b: -20.0
@@ -146,15 +146,20 @@ matching:
                                           # because the pose prior is already close; null = use min_inliers)
   proximity_reprojection_threshold: 2.5  # RANSAC threshold (tighter than brute — prior is already close)
   proximity_expansion_px: 5.0           # neighbourhood radius (px) per LED; velocity-scaled: gate = base + k * v_px
-  proximity_max_hypotheses: 64          # cap on valid hypothesis evaluations before best-so-far is accepted
+  proximity_max_hypotheses: 128          # cap on valid hypothesis evaluations before best-so-far is accepted
   proximity_none_penalty_px: 0.4        # px cost for the first unmatched LED
   proximity_none_penalty_factor: 1.5    # geometric growth per None level: k-th None costs penalty * factor^(k-1); 1.0 = flat (linear)
+  proximity_strong_match_px: 0.5        # 0-None hypothesis below this error triggers early termination
+  proximity_branch_k: 2                 # top-K hypotheses per None level to branch from at the next level
+  proximity_none_branch_width: 5
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_top_k_ransac: 3
+  visibility_occlusion_margin_m: 0.01   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
+  proximity_vis_score_threshold: 0.98   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
 
-  proximity_expansion_velocity_k: 0.5   # extra px per px/frame of estimated velocity
-  proximity_expansion_uncertainty_k: 15.0  # extra px / n_history; ~20 recommended — largest at n=1 (2nd frame), decays as 1/n
-  proximity_expansion_depth_k: 1.0        # extra px * m of depth; same pattern as local_search_depth_k — closer controller → bigger neigh
+  proximity_expansion_velocity_k: 0.3   # extra px per px/frame of estimated velocity
+  proximity_expansion_uncertainty_k: 1.0  # extra px / n_history; largest at n=1 (2nd frame), decays as 1/n
+  proximity_expansion_depth_k: 2.0        # extra px * m of depth; same pattern as local_search_depth_k — closer controller → bigger neigh
   proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
                                         # LEDs (and closer to it) are reserved when only one controller has a pose
   voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs

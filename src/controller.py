@@ -947,14 +947,13 @@ class TrackingSystem:
                 positions = tracker.model.positions
                 normals   = tracker.model.normals
 
-                vis_mask = _visible_mask(
+                vis_ids = np.where(_visible_mask(
                     R_pred, tvec_pred, positions, normals, tracker._geometry,
                     cam_K=camera.camera_matrix, cam_dc=camera.dist_coeffs,
                     cam_w=camera.width, cam_h=camera.height, cam_rpmax=camera.rpmax,
                     cam_is_fisheye=camera.is_fisheye,
                     facing_threshold_deg=_facing_deg,
-                )
-                vis_ids = np.where(vis_mask)[0]
+                ) >= 1.0)[0]
                 if len(vis_ids) == 0:
                     proj_per_ctrl[ctrl_name]   = None
                     vel_per_ctrl[ctrl_name]    = 0.0

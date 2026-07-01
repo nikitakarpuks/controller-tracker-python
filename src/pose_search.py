@@ -1,4 +1,5 @@
 import math
+import time
 
 import cv2
 import numpy as np
@@ -427,10 +428,16 @@ class PoseSearcher:
                                                       _cfg.get('min_inliers',            4)))
         self._c_prox_expansion_px   = float(_cfg.get('proximity_expansion_px',            8.0))
         self._c_prox_max_hyp        = int(  _cfg.get('proximity_max_hypotheses',          256))
-        self._c_prox_none_penalty   = float(_cfg.get('proximity_none_penalty_px',        0.3))
-        self._c_prox_none_factor    = float(_cfg.get('proximity_none_penalty_factor',    1.0))
+        self._c_prox_none_penalty    = float(_cfg.get('proximity_none_penalty_px',        0.3))
+        self._c_prox_none_factor     = float(_cfg.get('proximity_none_penalty_factor',    1.0))
+        self._c_prox_strong_match_px = float(_cfg.get('proximity_strong_match_px',        0.2))
+        self._c_prox_branch_k       = int(  _cfg.get('proximity_branch_k',                3))
+        self._c_prox_level0_max_hyp = int(  _cfg.get('proximity_level0_max_hyp',          16))
+        self._c_prox_none_branch_w  = int(  _cfg.get('proximity_none_branch_width',        5))
         self._c_prox_score_metric   = str(  _cfg.get('proximity_score_metric',           'max'))
-        self._c_prox_top_k_ransac   = int(  _cfg.get('proximity_top_k_ransac',           3))
+        self._c_prox_top_k_ransac        = int(  _cfg.get('proximity_top_k_ransac',           3))
+        self._c_vis_occlusion_margin_m   = float(_cfg.get('visibility_occlusion_margin_m',  0.0))
+        self._c_prox_vis_score_threshold = float(_cfg.get('proximity_vis_score_threshold',  0.95))
         # constrained
         self._c_cs_reproj_px        = float(_cfg.get('reprojection_threshold',            2.0))
         self._c_cs_snap_factor      = float(_cfg.get('proximity_self._c_cs_snap_factor',             4.0))
@@ -484,7 +491,7 @@ class PoseSearcher:
         t     = _T_ci.t.astype(np.float32)
         rv    = cv2.Rodrigues(R)[0]
         focal = float(max(ocam.camera_matrix[0, 0], ocam.camera_matrix[1, 1]))
-        vis   = _visible_mask(
+        vis_scores = _visible_mask(
             R, t, self.model.positions, self.model.normals, self._geometry,
             cam_K=ocam.camera_matrix, cam_dc=ocam.dist_coeffs,
             cam_w=ocam.width, cam_h=ocam.height, cam_rpmax=ocam.rpmax,
@@ -495,14 +502,15 @@ class PoseSearcher:
             occ = occluders_per_cam.get(ocam.camera_idx)
             if occ is not None:
                 R_occ, t_occ, geom_occ = occ
-                vis &= ~_cross_occluded_mask(
+                _cross_occ = _cross_occluded_mask(
                     R, t, self.model.positions,
                     R_occ, t_occ, geom_occ,
                     self._c_occ_radius, self._c_occ_radius, focal, self._c_occ_margin_px,
                     log_tag=f"[{self._ctrl} | cam {self._cam} aux_cam {ocam.camera_idx}]",
-                    vis_mask=vis,
+                    vis_mask=vis_scores > 0.0,
                 )
-        return R, t, rv, focal, vis
+                vis_scores[_cross_occ] = 0.0
+        return R, t, rv, focal, vis_scores >= 1.0
 
     def _snap_led_pairs(
         self,
@@ -632,6 +640,8 @@ class PoseSearcher:
         rvec_pred = np.asarray(rvec_pred, dtype=np.float32).reshape(3, 1)
         tvec_pred = np.asarray(tvec_pred, dtype=np.float32).reshape(3)
 
+        _t_collisions = _t_scoring = _t_stage2 = _t_aux = _t_lm = 0.0
+
         K  = self.camera.camera_matrix
         dc = self.camera.dist_coeffs
 
@@ -641,25 +651,28 @@ class PoseSearcher:
         R_pred_arr, _ = cv2.Rodrigues(rvec_pred)
         focal_px = float(max(K[0, 0], K[1, 1]))
 
-        vis_mask_pred = _visible_mask(
+        vis_scores_pred = _visible_mask(
             R_pred_arr, tvec_pred,
             self.model.positions, self.model.normals,
             geom,
             cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
             cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
             facing_threshold_deg=self._c_facing_deg,
+            occlusion_margin_m=self._c_vis_occlusion_margin_m,
         )
         if occluders_per_cam:
             _occ = occluders_per_cam.get(self.camera.camera_idx)
             if _occ is not None:
                 _R_occ, _t_occ, _geom_occ = _occ
-                vis_mask_pred &= ~_cross_occluded_mask(
+                _cross_occ = _cross_occluded_mask(
                     R_pred_arr, tvec_pred, self.model.positions,
                     _R_occ, _t_occ, _geom_occ,
                     self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
                     log_tag=f"[{self._ctrl} | cam {self._cam}]",
-                    vis_mask=vis_mask_pred,
+                    vis_mask=vis_scores_pred > 0.0,
                 )
+                vis_scores_pred[_cross_occ] = 0.0
+        vis_mask_pred   = vis_scores_pred >= self._c_prox_vis_score_threshold
         n_model_visible = int(vis_mask_pred.sum())
 
         _brightness_norm = None
@@ -673,6 +686,7 @@ class PoseSearcher:
         pairs      = []
         locked_obj = []
         locked_img = []
+        _locked_pose_dbg = None   # DEBUG: (rvec, tvec) from PnP on truly-locked pairs only
 
         if n_model_visible > 0 and len(blobs) > 0:
             vis_ids  = np.where(vis_mask_pred)[0]
@@ -734,18 +748,43 @@ class PoseSearcher:
             else:
                 _blobs_norm = cv2.undistortPoints(_blobs_inp.astype(np.float32), K, dc).reshape(-1, 2)
 
-            def _score_hyp(hyp_blob_indices: list) -> float:
-                """solvePnP on truly-locked + matched hypothesis pairs; returns reprojection
-                error (mean or max per proximity_score_metric). None entries mean 'no blob
-                for this LED' and are skipped. Falls back to pixel distance from predicted
-                projection if PnP fails."""
+            # DEBUG: PnP on truly-locked pairs only, for pose-comparison logging below.
+            # Not used for any downstream processing.
+            if len(truly_locked_k) >= 3:
+                _lk_obj  = vis_pos[truly_locked_k]
+                _lk_bidx = np.array([int(candidates[k][0]) for k in truly_locked_k], dtype=np.int32)
+                _lk_norm = _blobs_norm[_lk_bidx]
+                try:
+                    _lk_ok, _lk_rv, _lk_tv = cv2.solvePnP(
+                        _lk_obj.astype(np.float64).reshape(-1, 1, 3),
+                        _lk_norm.astype(np.float64).reshape(-1, 1, 2),
+                        np.eye(3, dtype=np.float64), np.zeros(4, dtype=np.float64),
+                        rvec_pred.astype(np.float64).copy(),
+                        tvec_pred.astype(np.float64).reshape(3, 1).copy(),
+                        useExtrinsicGuess=True,
+                        flags=cv2.SOLVEPNP_ITERATIVE,
+                    )
+                except Exception:
+                    _lk_ok = False
+                if _lk_ok:
+                    _locked_pose_dbg = (np.asarray(_lk_rv).ravel(), np.asarray(_lk_tv).ravel())
+
+            def _score_hyp(hyp_blob_indices: list) -> Tuple[float, Dict[int, float]]:
+                """solvePnP on truly-locked + matched hypothesis pairs; returns
+                (aggregate reprojection error per proximity_score_metric,
+                {hyp_position: residual_px}). The residual map lets callers rank
+                which non-None hyp position fits worst, without a second solve.
+                None entries mean 'no blob for this LED' and are skipped. Falls
+                back to pixel distance from predicted projection if PnP fails."""
                 _agg = np.max if self._c_prox_score_metric == 'max' else np.mean
-                matched_hyp = [(k, int(b)) for k, b in zip(hyp_k, hyp_blob_indices) if b is not None]
+                matched_pos = [i for i in range(len(hyp_k)) if hyp_blob_indices[i] is not None]
+                matched_hyp = [(hyp_k[i], int(hyp_blob_indices[i])) for i in matched_pos]
                 all_led_k   = truly_locked_k + [k for k, _ in matched_hyp]
                 all_blob_c  = [int(candidates[k][0]) for k in truly_locked_k] + [b for _, b in matched_hyp]
+                n_locked    = len(truly_locked_k)
 
                 if not all_led_k:
-                    return float('inf')
+                    return float('inf'), {}
 
                 all_obj = vis_pos[all_led_k]
                 all_img = blobs[np.array(all_blob_c, dtype=np.int32)]
@@ -768,12 +807,16 @@ class PoseSearcher:
                                 np.asarray(tvec_h, dtype=np.float32).reshape(3),
                                 all_obj, K, dc, is_fisheye=self.camera.is_fisheye,
                             )
-                            return float(_agg(np.linalg.norm(proj_h - all_img, axis=1)))
+                            resid = np.linalg.norm(proj_h - all_img, axis=1)
+                            resid_map = {p: float(resid[n_locked + j]) for j, p in enumerate(matched_pos)}
+                            return float(_agg(resid)), resid_map
                     except Exception:
                         pass
 
                 # PnP unavailable or failed: pixel distance from predicted projection.
-                return float(_agg(np.linalg.norm(proj_vis[all_led_k] - all_img, axis=1)))
+                resid = np.linalg.norm(proj_vis[all_led_k] - all_img, axis=1)
+                resid_map = {p: float(resid[n_locked + j]) for j, p in enumerate(matched_pos)}
+                return float(_agg(resid)), resid_map
 
             def _fmt_leds(blobs_list):
                 return "[" + ", ".join(
@@ -800,35 +843,76 @@ class PoseSearcher:
                 # Top-K candidates for stage-2 RANSAC rescoring (sorted ascending by key).
                 top_candidates: list = []
 
-                def _hyp_combos_by_none_count():
-                    """Yield all assignment combos ordered by ascending None count.
-                    Zero-None (all LEDs matched) combos come first; the all-None combo last."""
-                    n = len(hyp_k)
-                    for n_none in range(n + 1):
-                        for none_positions in combinations(range(n), n_none):
-                            none_set      = set(none_positions)
-                            non_none_pos  = [i for i in range(n) if i not in none_set]
-                            non_none_cands = [candidates[hyp_k[i]] for i in non_none_pos]
-                            for vals in (product(*non_none_cands) if non_none_cands else [()]):
-                                combo = [None] * n
-                                for pos, val in zip(non_none_pos, vals):
-                                    combo[pos] = val
-                                yield combo
+                def _bt_combos(n_none_target: int):
+                    """Backtracking generator: collision-free combos with exactly n_none_target Nones.
+                    Prunes duplicate-blob branches immediately — no post-filter needed."""
+                    _n    = len(hyp_k)
+                    _used = set(truly_locked_blobs)
+                    _co   = [None] * _n
 
-                for combo_blobs in _hyp_combos_by_none_count():
-                    matched_only = [b for b in combo_blobs if b is not None]
-                    matched_set  = set(matched_only)
-                    # Reject only true conflicts: duplicate blob or stealing a truly-locked blob.
-                    if len(matched_set) < len(matched_only) or matched_set & truly_locked_blobs:
-                        n_collisions += 1
-                        continue
+                    def _bt(i: int, nones_left: int):
+                        if i == _n:
+                            yield list(_co)
+                            return
+                        remaining = _n - i
+                        # Assign a blob — skip if all remaining slots must be None
+                        if nones_left < remaining:
+                            for _b in candidates[hyp_k[i]]:
+                                if _b not in _used:
+                                    _co[i] = _b; _used.add(_b)
+                                    yield from _bt(i + 1, nones_left)
+                                    _used.discard(_b); _co[i] = None
+                        # Assign None — skip if no Nones left to spend
+                        if nones_left > 0:
+                            _co[i] = None
+                            yield from _bt(i + 1, nones_left - 1)
 
-                    n_none    = combo_blobs.count(None)
-                    score     = _score_hyp(combo_blobs)
-                    none_cost = self._c_prox_none_penalty * sum(
-                        self._c_prox_none_factor ** k for k in range(n_none)
-                    )
-                    key = score + none_cost
+                    yield from _bt(0, n_none_target)
+
+                # Minimum None count forced by blob scarcity: if fewer distinct blobs
+                # are available than hyp LEDs, a full (0-None) assignment is impossible.
+                # Skip all levels below this minimum to avoid iterating only collisions.
+                _avail_blobs = (
+                    set(b for k in hyp_k for b in candidates[k]) - truly_locked_blobs
+                )
+                _min_none_forced = max(0, len(hyp_k) - len(_avail_blobs))
+
+                # Pre-collect 0-None combos and sort by total raw pixel distance so the
+                # best-by-individual-distance combo is tried first, enabling earlier
+                # best_key establishment and faster None-cost pruning.
+                _zero_none_combos: list = []
+                if _min_none_forced == 0:
+                    _t0 = time.perf_counter()
+                    for _vals in product(*[candidates[hyp_k[i]] for i in range(len(hyp_k))]):
+                        _combo = list(_vals)
+                        _ms = set(_combo)
+                        if len(_ms) < len(_combo) or _ms & truly_locked_blobs:
+                            n_collisions += 1
+                            continue
+                        _raw = sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k)))
+                        _zero_none_combos.append((_raw, _combo))
+                    _t_collisions += time.perf_counter() - _t0
+                    _zero_none_combos.sort(key=lambda x: x[0])
+                    _zero_none_total = len(_zero_none_combos)
+                    if self._c_prox_level0_max_hyp > 0 and _zero_none_total > self._c_prox_level0_max_hyp:
+                        logger.debug(
+                            f"[{self._ctrl} | cam {self._cam}] Proximity: level-0 cap "
+                            f"kept {self._c_prox_level0_max_hyp}/{_zero_none_total} combos by raw distance"
+                        )
+                        _zero_none_combos = _zero_none_combos[:self._c_prox_level0_max_hyp]
+                _had_zero_none_candidates = len(_zero_none_combos) > 0
+                # Nones at the base level are unavoidable and carry no penalty;
+                # only extras above it are penalised.
+                n_none_base = (
+                    0 if _had_zero_none_candidates
+                    else (_min_none_forced if _min_none_forced > 0 else None)
+                )
+
+                _stopped_early = False
+                _first_valid_level_seen = _had_zero_none_candidates
+                _level_parents: list = []  # (key, combo, resid_map) — top-K from the previous None level
+
+                def _log_hyp(n_tried, combo_blobs, score, key, best_key):
                     if is_deep():
                         _err_label = f"{self._c_prox_score_metric}_err"
                         _leds_fmt = "[" + ", ".join(
@@ -840,11 +924,8 @@ class PoseSearcher:
                             f"leds={_leds_fmt}  {_err_label}={score:.2f}px"
                             + ("  ← best" if key < best_key else "")
                         )
-                    if key < best_key:
-                        best_key       = key
-                        best_none      = n_none
-                        best_hyp_blobs = combo_blobs
-                    # Maintain sorted top-K list for stage-2 RANSAC rescoring.
+
+                def _update_top_k(key, n_none, combo_blobs):
                     _tk = self._c_prox_top_k_ransac
                     if _tk >= 2:
                         if len(top_candidates) < _tk:
@@ -853,6 +934,16 @@ class PoseSearcher:
                         elif key < top_candidates[-1][0]:
                             top_candidates[-1] = (key, n_none, list(combo_blobs))
                             top_candidates.sort(key=lambda x: x[0])
+
+                # --- Level 0: process pre-sorted 0-None combos ---
+                for _raw, combo_blobs in _zero_none_combos:
+                    _t0 = time.perf_counter(); score, resid_map = _score_hyp(combo_blobs); _t_scoring += time.perf_counter() - _t0
+                    key   = score  # none_cost == 0
+                    _log_hyp(n_tried, combo_blobs, score, key, best_key)
+                    if key < best_key:
+                        best_key = key; best_none = 0; best_hyp_blobs = combo_blobs
+                    _update_top_k(key, 0, combo_blobs)
+                    _level_parents.append((key, list(combo_blobs), resid_map))
                     n_tried += 1
 
                     if n_tried >= self._c_prox_max_hyp:
@@ -862,6 +953,100 @@ class PoseSearcher:
                         )
                         break
 
+                    if score <= self._c_prox_strong_match_px:
+                        _stopped_early = True
+                        logger.debug(
+                            f"[{self._ctrl} | cam {self._cam}] Proximity: early stop "
+                            f"(0-None score {score:.2f}px <= {self._c_prox_strong_match_px:.2f}px)"
+                        )
+                        break
+
+                _level_parents.sort(key=lambda x: x[0])
+                _level_parents = _level_parents[:self._c_prox_branch_k]
+
+                # --- Levels 1+ : branch from top-K parents of the previous level ---
+                if not _stopped_early and n_tried < self._c_prox_max_hyp:
+                    for n_none in range(max(1, _min_none_forced), len(hyp_k) + 1):
+                        if n_none_base is not None:
+                            _n_extra = n_none - n_none_base
+                            none_cost = self._c_prox_none_penalty * sum(
+                                self._c_prox_none_factor ** _k for _k in range(_n_extra)
+                            )
+                            if none_cost >= best_key:
+                                break
+                        else:
+                            none_cost = 0.0  # base not yet known; no pruning
+
+                        _used_fallback = not bool(_level_parents)
+                        if _level_parents:
+                            # Each parent spawns children only for its weakest-fit matched
+                            # positions (by the parent's own per-point PnP residual), not
+                            # every matched position — narrows branching to the LED(s)
+                            # actually likely to be a bad assignment.
+                            _seen_ck: set = set()
+                            _this_level: list = []
+                            _bw = self._c_prox_none_branch_w
+                            for _, _par, _resid in _level_parents:
+                                _matched = [_i for _i in range(len(_par)) if _par[_i] is not None]
+                                _matched.sort(key=lambda _i: _resid.get(_i, 0.0), reverse=True)
+                                for _i in _matched[:_bw]:
+                                    _child = list(_par); _child[_i] = None
+                                    _ck = tuple(_child)
+                                    if _ck not in _seen_ck:
+                                        _seen_ck.add(_ck); _this_level.append(_child)
+                        else:
+                            # Fallback: no parents — backtracking enumerates only collision-free
+                            # combos, so no post-filter is needed.
+                            _this_level = []
+                            _t0 = time.perf_counter()
+                            for _combo in _bt_combos(n_none):
+                                _this_level.append(_combo)
+                            _t_collisions += time.perf_counter() - _t0
+
+                        if not _this_level:
+                            if _used_fallback:
+                                continue  # this n_none has no valid combos; try next level
+                            break         # branching: empty children → no grandchildren either
+
+                        _is_first_available = not _first_valid_level_seen
+                        _first_valid_level_seen = True
+                        if n_none_base is None:
+                            n_none_base = n_none
+
+                        _next_parents: list = []
+                        _cap_hit = False
+                        for combo_blobs in _this_level:
+                            _t0 = time.perf_counter(); score, resid_map = _score_hyp(combo_blobs); _t_scoring += time.perf_counter() - _t0
+                            key   = score + none_cost
+                            _log_hyp(n_tried, combo_blobs, score, key, best_key)
+                            if key < best_key:
+                                best_key = key; best_none = n_none; best_hyp_blobs = combo_blobs
+                            _update_top_k(key, n_none, combo_blobs)
+                            _next_parents.append((key, list(combo_blobs), resid_map))
+                            n_tried += 1
+
+                            if n_tried >= self._c_prox_max_hyp:
+                                logger.debug(
+                                    f"[{self._ctrl} | cam {self._cam}] Proximity: hypothesis cap "
+                                    f"({self._c_prox_max_hyp}) reached  ({n_collisions} collisions skipped)"
+                                )
+                                _cap_hit = True
+                                break
+
+                            if _is_first_available and score <= self._c_prox_strong_match_px:
+                                _stopped_early = True
+                                logger.debug(
+                                    f"[{self._ctrl} | cam {self._cam}] Proximity: early stop "
+                                    f"({n_none}-None score {score:.2f}px <= {self._c_prox_strong_match_px:.2f}px)"
+                                )
+                                _cap_hit = True
+                                break
+
+                        _next_parents.sort(key=lambda x: x[0])
+                        _level_parents = _next_parents[:self._c_prox_branch_k]
+                        if _cap_hit:
+                            break
+
                 if best_hyp_blobs is None:
                     best_hyp_blobs = []
                     logger.debug(
@@ -870,7 +1055,7 @@ class PoseSearcher:
                     )
                 else:
                     best_none_cost = self._c_prox_none_penalty * sum(
-                        self._c_prox_none_factor ** k for k in range(best_none)
+                        self._c_prox_none_factor ** k for k in range(best_none - n_none_base)
                     )
                     best_err  = best_key - best_none_cost
                     n_matched = len(hyp_k) - best_none
@@ -890,14 +1075,14 @@ class PoseSearcher:
                     #
                     # Scoring mirrors the ITERATIVE key:
                     #   ransac_key = mean_inlier_error
-                    #              + none_penalty * Σ none_factor^k  (k=0..n_missing-1)
-                    # where n_missing = hyp_Nones + RANSAC_drops.
-                    # Both sources of "missing LED" carry the same geometric penalty:
-                    # a None that was never tried and a pair that RANSAC rejected are
-                    # equivalent evidence that this LED is not confirmed in this frame.
-                    # Including hyp_Nones prevents choosing a hypothesis with fewer
-                    # matched LEDs just because its smaller inlier set has lower error.
+                    #              + none_penalty * Σ none_factor^k  (k=0..n_extra-1)
+                    # where n_extra = (hyp_Nones + RANSAC_drops) - n_none_base.
+                    # n_none_base is the minimum None count forced by blob scarcity;
+                    # those Nones are unavoidable and carry no penalty.  Only Nones
+                    # above the base — whether from the hypothesis or RANSAC drops —
+                    # are penalised, using the same geometric series as the main loop.
                     if self._c_prox_top_k_ransac >= 2 and len(top_candidates) >= 2:
+                        _t_stage2_start = time.perf_counter()
                         _s2_best_key   = float('inf')
                         _s2_best_blobs = best_hyp_blobs
                         _s2_best_none  = best_none
@@ -935,7 +1120,7 @@ class PoseSearcher:
                                                           is_fisheye=self.camera.is_fisheye)
                             _err_r      = float(np.linalg.norm(_proj_r - _i_r[_idx_r], axis=1).mean())
                             _miss_cost_r = self._c_prox_none_penalty * sum(
-                                self._c_prox_none_factor ** _dk for _dk in range(_n_missing_r)
+                                self._c_prox_none_factor ** _dk for _dk in range(_n_missing_r - n_none_base)
                             )
                             _s2_key_r = _err_r + _miss_cost_r
                             _marker   = "  <- best" if (_s2_key_r, _rn_none) < (_s2_best_key, _s2_best_none) else ""
@@ -967,6 +1152,7 @@ class PoseSearcher:
                                 f"[{self._ctrl} | cam {self._cam}] Proximity stage-2 RANSAC: "
                                 f"rank-1 confirmed  ransac_key={_s2_best_key:.2f}"
                             )
+                        _t_stage2 += time.perf_counter() - _t_stage2_start
 
             # Step 5: build pairs from truly-locked + best hypothesis assignment (skip None).
             locked_assignment = [(int(candidates[k][0]), int(vis_ids[k])) for k in truly_locked_k]
@@ -999,6 +1185,18 @@ class PoseSearcher:
             logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: RANSAC failed → None")
             return None
 
+        # DEBUG: compare predicted / locked-only / final poses to gauge whether
+        # refining the predicted pose from locked pairs (for candidate tightening)
+        # would meaningfully change the result.
+        _lk_str = (f"rvec={_locked_pose_dbg[0]} tvec={_locked_pose_dbg[1]}"
+                   if _locked_pose_dbg is not None else "n/a")
+        # logger.debug(
+        #     f"[{self._ctrl} | cam {self._cam}] Pose compare — "
+        #     f"\npred: rvec={rvec_pred.ravel()} tvec={tvec_pred.ravel()}  |  "
+        #     f"\nlocked-PnP: {_lk_str}  |  "
+        #     f"\nfinal: rvec={np.asarray(rvec).ravel()} tvec={np.asarray(tvec).ravel()}"
+        # )
+
         final_pairs   = [pairs[k] for k in ransac_idx]
         inlier_set    = set(ransac_idx)
         dropped_pairs = [pairs[k] for k in range(len(pairs)) if k not in inlier_set]
@@ -1011,6 +1209,43 @@ class PoseSearcher:
         if len(final_pairs) < self._c_prox_min_inliers:
             logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: RANSAC too few inliers ({len(final_pairs)}) → None")
             return None
+
+        # Strict visibility re-check with the RANSAC-refined pose (no occlusion margin).
+        # Removes LEDs that were included via the permissive predicted-pose check but are
+        # actually occluded under the now-accurate pose.
+        _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
+        _tvec_ref  = np.asarray(tvec, dtype=np.float32).reshape(3)
+        _vis_ref = _visible_mask(
+            _R_ref, _tvec_ref,
+            self.model.positions, self.model.normals, geom,
+            cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+            cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
+            facing_threshold_deg=self._c_facing_deg,
+            occlusion_margin_m=0.0,
+        )
+        if occluders_per_cam:
+            _occ_ref = occluders_per_cam.get(self.camera.camera_idx)
+            if _occ_ref is not None:
+                _R_occ_ref, _t_occ_ref, _geom_occ_ref = _occ_ref
+                _cross_occ_ref = _cross_occluded_mask(
+                    _R_ref, _tvec_ref, self.model.positions,
+                    _R_occ_ref, _t_occ_ref, _geom_occ_ref,
+                    self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
+                    log_tag=f"[{self._ctrl} | cam {self._cam}]",
+                    vis_mask=_vis_ref > 0.0,
+                )
+                _vis_ref[_cross_occ_ref] = 0.0
+        _dropped_vis = [(b, l) for b, l in final_pairs if _vis_ref[l] < 1.0]
+        if _dropped_vis:
+            logger.debug(
+                f"[{self._ctrl} | cam {self._cam}] Proximity post-RANSAC vis-drop "
+                f"{len(_dropped_vis)} pair(s): " +
+                "  ".join(f"led={l} blob={b}" for b, l in _dropped_vis)
+            )
+            final_pairs = [(b, l) for b, l in final_pairs if _vis_ref[l] >= 1.0]
+            if len(final_pairs) < self._c_prox_min_inliers:
+                logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: post-vis-drop too few pairs → None")
+                return None
 
         lo_f = self.model.positions[[l for _, l in final_pairs]].astype(np.float32)
         li_f = blobs[[b for b, _ in final_pairs]].astype(np.float32)
@@ -1028,6 +1263,7 @@ class PoseSearcher:
         # Aux cameras: Hungarian over all model-visible LEDs × all aux blobs.
         # Same dummy-column pattern as the primary path prevents LEDs without a
         # nearby blob from stealing real blobs from LEDs that have one.
+        _t_aux_start = time.perf_counter()
         if other_cameras_blobs:
             _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
             _T_world_ref = self.T_world_cam.compose(Transform(_R_ref, np.asarray(tvec, dtype=np.float32).reshape(3)))
@@ -1070,7 +1306,10 @@ class PoseSearcher:
             aux_inlier_count += _n_aux
             aux_cameras_result.append((_aux_cam_idx, _n_aux))
 
+        _t_aux = time.perf_counter() - _t_aux_start
+
         # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
+        _t_lm_start = time.perf_counter()
         _joint_result = self._apply_joint_lm(
             rvec, tvec, final_pairs, blobs,
             aux_snapped_per_cam, other_cameras_blobs or [],
@@ -1078,11 +1317,15 @@ class PoseSearcher:
         )
         if _joint_result is not None:
             rvec, tvec, error = _joint_result
+        _t_lm = time.perf_counter() - _t_lm_start
 
         _aux_log = ""
         if aux_cameras_result:
             _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result if n > 0) + "]"
-        logger.debug(f"[{self._ctrl} | cam {self._cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}")
+        logger.debug(
+            f"[{self._ctrl} | cam {self._cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}"
+            f"  bench: coll={_t_collisions*1000:.1f}ms  score={_t_scoring*1000:.1f}ms  s2={_t_stage2*1000:.1f}ms  aux={_t_aux*1000:.1f}ms  lm={_t_lm*1000:.1f}ms"
+        )
         return {
             "rvec":       rvec,
             "tvec":       tvec,
@@ -1649,7 +1892,7 @@ class PoseSearcher:
                                     cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
                                     cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
                                     facing_threshold_deg=self._c_facing_deg,
-                                )
+                                ) >= 1.0
                                 vis_ids = np.where(vis_mask_h)[0]
                                 self._dbg(dbg, f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
                                 if len(vis_ids) < self._c_brute_min_inliers:
@@ -1702,7 +1945,7 @@ class PoseSearcher:
                                 #   (b) inliers occluded under the refined pose are dropped.
                                 R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
                                 tvec_r_flat = tvec_r.reshape(3)
-                                vis_mask_r = _visible_mask(
+                                vis_scores_r = _visible_mask(
                                     R_r, tvec_r_flat, positions, normals,
                                     geom,
                                     cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
@@ -1713,13 +1956,15 @@ class PoseSearcher:
                                     _occ_r = occluders_per_cam.get(self.camera.camera_idx)
                                     if _occ_r is not None:
                                         _R_occ_r, _t_occ_r, _geom_occ_r = _occ_r
-                                        vis_mask_r &= ~_cross_occluded_mask(
+                                        _cross_occ_r = _cross_occluded_mask(
                                             R_r, tvec_r_flat, positions,
                                             _R_occ_r, _t_occ_r, _geom_occ_r,
                                             self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
                                             log_tag=f"[{self._ctrl} | cam {self._cam}]",
-                                            vis_mask=vis_mask_r,
+                                            vis_mask=vis_scores_r > 0.0,
                                         )
+                                        vis_scores_r[_cross_occ_r] = 0.0
+                                vis_mask_r = vis_scores_r >= 1.0
                                 # Drop inliers that became occluded under the refined pose.
                                 inlier_still_visible = vis_mask_r[inlier_leds]
                                 inlier_leds  = inlier_leds[inlier_still_visible]

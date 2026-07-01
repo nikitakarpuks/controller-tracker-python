@@ -922,7 +922,7 @@ class ControllerAnimatorRerun:
             normals_disp = (R_disp @ model_normals.T).T
 
             # ── Visibility mask ─────────────────────────────────────────────
-            vis_mask = _visible_mask(
+            vis_scores = _visible_mask(
                 T_cam_ctrl.R, T_cam_ctrl.t,
                 cs["ctrl_positions"], cs["ctrl_normals"],
                 cs["geom"],
@@ -940,16 +940,16 @@ class ControllerAnimatorRerun:
                     if _occ_name == ctrl_name:
                         continue
                     _occ_cs = self._ctrl_state[_occ_name]
-                    # Occluder pose in the primary camera frame of the current controller.
                     _T_cam_ctrl_occ = camera.T_world_cam.inverse().compose(_T_world_ctrl_occ)
-                    vis_mask &= ~_cross_occluded_mask(
+                    _cross_occ_vis = _cross_occluded_mask(
                         T_cam_ctrl.R.astype(np.float32), T_cam_ctrl.t.astype(np.float32),
                         cs["ctrl_positions"],
                         _T_cam_ctrl_occ.R.astype(np.float32), _T_cam_ctrl_occ.t.astype(np.float32),
                         _occ_cs["geom"],
                         _br, _br, _focal_px, _gate_margin,
                     )
-            vis_set = set(np.where(vis_mask)[0].tolist())
+                    vis_scores[_cross_occ_vis] = 0.0
+            vis_set = set(np.where(vis_scores >= 1.0)[0].tolist())
 
             # ── LED disks ───────────────────────────────────────────────────
             if self.vis_cfg.get("show_leds", True):
