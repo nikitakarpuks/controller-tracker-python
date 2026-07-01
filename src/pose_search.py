@@ -995,13 +995,30 @@ class PoseSearcher:
                                     if _ck not in _seen_ck:
                                         _seen_ck.add(_ck); _this_level.append(_child)
                         else:
-                            # Fallback: no parents — backtracking enumerates only collision-free
-                            # combos, so no post-filter is needed.
-                            _this_level = []
+                            # Fallback: no parents (no prior level produced any scored
+                            # combo, e.g. blob scarcity forces Nones from the start) —
+                            # backtracking enumerates only collision-free combos, so no
+                            # collision post-filter is needed. Still cap like level 0:
+                            # sort by raw pixel distance and keep only the best-by-distance
+                            # combos before paying for solvePnP on any of them.
                             _t0 = time.perf_counter()
-                            for _combo in _bt_combos(n_none):
-                                _this_level.append(_combo)
+                            _fallback_combos = [
+                                (sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k))
+                                     if _combo[i] is not None), _combo)
+                                for _combo in _bt_combos(n_none)
+                            ]
                             _t_collisions += time.perf_counter() - _t0
+                            _fallback_combos.sort(key=lambda x: x[0])
+                            _fallback_total = len(_fallback_combos)
+                            if (self._c_prox_level0_max_hyp > 0 and
+                                    _fallback_total > self._c_prox_level0_max_hyp):
+                                logger.debug(
+                                    f"[{self._ctrl} | cam {self._cam}] Proximity: fallback "
+                                    f"{n_none}-None cap kept {self._c_prox_level0_max_hyp}/{_fallback_total} "
+                                    f"combos by raw distance"
+                                )
+                                _fallback_combos = _fallback_combos[:self._c_prox_level0_max_hyp]
+                            _this_level = [_combo for _, _combo in _fallback_combos]
 
                         if not _this_level:
                             if _used_fallback:
