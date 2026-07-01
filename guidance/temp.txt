@@ -701,3 +701,132 @@ Phase 1 — Parallel race
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ 
+
+
+
+
+
+
+
+
+
+
+
+
+ ▐▛███▜▌   Claude Code v2.1.196
+▝▜█████▛▘  Sonnet 4.6 · Claude Pro
+  ▘▘ ▝▝    ~\PyCharmProjects\controller-tracker-python\visualization
+
+
+❯ Hi, read how we test hyps in brute and proximity match in src/pose_search.py
+
+● Reading the file now.
+
+  Read 1 file (ctrl+o to expand)
+
+❯ good. The issue is that currently in a good case brute match can even
+  outperform hyps check in proximity match which is a little absurd.
+  In brute match we use neighborhood notion and check p3p hypothesis with 4th
+  gate blob. However in proximity we we try different led-blob assginments from
+  same neighborhood, and use some expensive checks for all of them like
+  visibility check;
+  I would really like to speed hyps testing in proximity as much as possible.
+  Can't we use neighbour and gate blob idea from brute match to make it cheap?
+
+● Let me read the file to understand both approaches before suggesting anything.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now let me read the brute match section.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now I have a clear picture. Here's the analysis:
+
+  Brute match gate (cheap): After P3P gives a full pose from 3 correspondences,
+  it checks _gate_any_point — just a few fast inline projections (no PnP). Only
+  hypotheses passing this gate reach Hungarian + RANSAC.
+
+  Proximity hypothesis scoring (expensive): For every combo in _score_hyp (line
+  ~748), it calls cv2.solvePnP (ITERATIVE) on all locked + hyp pairs. That's the
+  hot path. The 0-None combos are pre-sorted by _raw (sum of predicted
+  distances), which helps ordering but every combo still pays full solvePnP
+  cost.
+
+  The gate analog for proximity:
+
+  The direct equivalent is possible because you already have dist_pred
+  (distances from each hyp LED's predicted projection to each candidate blob)
+  precomputed. Before calling _score_hyp, gate on:
+
+  max(dist_pred[hyp_k[i], combo[i]] for i in range(len(hyp_k))) >
+  gate_threshold_px
+
+  This is O(n_hyp_leds) with no projections — just array lookups on
+  already-computed distances — and would reject combos where any single
+  assignment is inconsistent with the predicted pose. It's exactly
+  _gate_fourth_point applied repeatedly, using the predicted pose instead of a
+  P3P pose.
+
+  A second-tier gate, if you have ≥4 truly locked pairs: run one cheap solvePnP
+  on locked pairs only (once, not per combo), then use that refined pose to
+  project each hyp LED and gate combos tighter than the predicted pose allows.
+  This is the "neighbor + gate blob" structure from brute almost exactly.
+
+  The first approach (pure dist_pred max gate) requires zero new projections and
+  could eliminate the majority of _score_hyp calls. Would you like to implement
+  that, and optionally layer on the locked-pairs refined gate on top?
+
+✻ Sautéed for 1m 29s
+
+❯ the issue with 1st approach is that by design we have a neigh for each led
+  predicted pose where we expect our blob to be; 2nd idea sounds more
+  interesting. Indeed, if we have many locked pairs, we can refine our
+  predicted pose with it by solving pnp with locked pairs and have a new
+  predicted pose.And then we will have better starting position in which we can
+  tighten neigh radii or our winning prediction will be closer to start of hyp
+  check loop;
+  What do you think about it?
+
+● The idea is solid. Here's how I think about it:
+
+  What you gain from locked-pair PnP:
+
+  The locked pairs are unambiguous and already known — running solvePnP on them
+  costs one call but gives you a pose that's strictly tighter than rvec_pred.
+  Since proximity is only called when tracking is healthy, you'll typically have
+  4-8 locked pairs, and that PnP will converge fast from the predicted pose as
+  initial guess.
+
+  Two downstream effects, in order of impact:
+
+  1. Candidate tightening (high leverage). Re-project hyp_k LEDs with the
+  refined pose and rebuild their candidate blobs using a tighter radius — say
+  the prox_reproj_px threshold rather than expansion_px. If a hyp LED currently
+  has 3 candidates and tightening drops it to 1, that LED becomes locked too,
+  eliminating it from the combo enumeration entirely. The combo count is
+  multiplicative, so even halving candidates per LED can cut the total by orders
+  of magnitude.
+  2. Better initial guess in _score_hyp (lower leverage). Using the refined pose
+  as useExtrinsicGuess means ITERATIVE PnP converges in fewer iterations per
+  combo. Helpful but secondary — if the candidate tightening already collapsed
+  hyp_k from 5 LEDs to 2, this doesn't matter much.
+
+  One risk to be aware of:
+
+  If the predicted pose has enough drift that some locked pairs are actually
+  mis-assigned (wrong unique blob), the locked-pair PnP will produce a slightly
+  wrong refined pose. The safeguard here is checking the reprojection error on
+  the locked pairs after solving — if it's unexpectedly large (say >
+  prox_reproj_px * 2), fall back to rvec_pred and skip candidate tightening.
+  This keeps the existing logic as the safe fallback.
+
+  Verdict: The candidate tightening is where the real speedup lives and it
+  directly addresses the "brute can outperform proximity" problem. The current
+  code's sorting of 0-None combos by _raw distance already exploits the
+  predicted pose ordering, but if you start the hyp enumeration with fewer
+  candidates to begin with, you never generate the bad combos at all. Worth
+  implementing.
+
+✻ Baked for 43s
+
