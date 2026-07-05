@@ -356,6 +356,8 @@ def main():
             blob_vis_all=blob_vis_all,
         )
 
+    tracking_system.shutdown()
+
 
 if __name__ == "__main__":
     main()

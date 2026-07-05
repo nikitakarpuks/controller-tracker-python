@@ -45,3 +45,16 @@ def log_best() -> bool:
 def get_debug_triple() -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Return (debug_led_ids, debug_blob_ids) for targeted triple logging in brute_match."""
     return _debug_led_ids, _debug_blob_ids
+
+
+def get_config() -> dict:
+    """Return the current configuration as kwargs for configure() — used to propagate
+    this process's debug_config state into a spawned worker process, which starts
+    with fresh (default) module globals otherwise."""
+    return {
+        'mode':           _mode,
+        'debug_led_ids':  _debug_led_ids,
+        'debug_blob_ids': _debug_blob_ids,
+        'verbose_all':    _verbose_all,
+        'log_best':       _log_best,
+    }
