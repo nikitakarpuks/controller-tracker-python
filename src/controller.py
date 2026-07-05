@@ -307,11 +307,21 @@ class CameraTracker:
                blob_brightnesses: Optional[np.ndarray] = None,
                other_cameras_blobs: Optional[List] = None,
                blob_mask: Optional[np.ndarray] = None,
-               occluders_per_cam: Optional[Dict] = None) -> Optional[Dict]:
+               occluders_per_cam: Optional[Dict] = None,
+               allow_expensive_fallback: bool = True) -> Optional[Dict]:
         """Pure pose solve — reads self state, does not commit results.
 
         Returns a validated solution dict (error below threshold, T_world_ctrl populated)
         or None.  Call apply() with the returned value to commit state changes.
+
+        allow_expensive_fallback: gates the brute-force retries that fire when this
+        camera HAS a prior but proximity still comes up short (failed outright, a
+        pose-jump, or error too high) — brute-force can cost hundreds of ms for no
+        result. Cold-start brute-force (no prior at all) is unconditional regardless
+        of this flag, since it's the only way to ever acquire a track. Callers with
+        other cameras available this frame should pass False on a first pass and only
+        retry with True if the whole controller came up empty — a struggling camera
+        can otherwise be warm-started next frame from a fused pose at zero cost.
         """
         blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
@@ -407,7 +417,7 @@ class CameraTracker:
                     solution['_orig_idx']  = True
 
             # --- Fallback: brute only when proximity found no solution ---
-            if solution is None and n_available >= 4:
+            if solution is None and allow_expensive_fallback and n_available >= 4:
                 logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity → None, running brute fallback")
                 brute = self.brute_match(blobs, pose_prior=predicted_pose,
                                          other_cameras_blobs=other_cameras_blobs,
@@ -476,7 +486,7 @@ class CameraTracker:
                       f"err={solution['error']:.2f} px) — "
                       f"attempting brute recovery.")
                 solution = None
-                if n_available >= 4:
+                if allow_expensive_fallback and n_available >= 4:
                     _jump_prior = predicted_pose if predicted_pose is not None else self.prev_pose
                     brute = self.brute_match(blobs, pose_prior=_jump_prior,
                                              other_cameras_blobs=other_cameras_blobs,
@@ -498,7 +508,8 @@ class CameraTracker:
         # ------------------------------------------------------------------
 
         # Proximity found a solution but error is too high — try brute before giving up
-        if solution is not None and solution["error"] >= _accept_err_px and n_available >= 4:
+        if (solution is not None and solution["error"] >= _accept_err_px
+                and allow_expensive_fallback and n_available >= 4):
             logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity err={solution['error']:.2f}px exceeds threshold, attempting brute recovery")
             brute = self.brute_match(blobs, pose_prior=self.prev_pose,
                                      other_cameras_blobs=other_cameras_blobs,
@@ -563,17 +574,6 @@ class CameraTracker:
             self.vel_ema         = None
             self.pose_history.clear()
 
-    def track(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
-              blob_brightnesses: Optional[np.ndarray] = None,
-              other_cameras_blobs: Optional[List] = None,
-              blob_mask: Optional[np.ndarray] = None,
-              occluders_per_cam: Optional[Dict] = None) -> Optional[Dict]:
-        """Thin wrapper: search() then apply(). Preserves backward compatibility."""
-        result = self.search(blobs, blob_radii, blob_brightnesses,
-                             other_cameras_blobs, blob_mask, occluders_per_cam)
-        self.apply(result)
-        return result
-
 
 # =========================================================
 # 2.5 PER-CONTROLLER TRACKER
@@ -582,8 +582,10 @@ class CameraTracker:
 class ControllerTracker:
     """Manages all camera-trackers for a single controller.
 
-    Owns primary-camera selection, camera fallback, handoff heuristics, state
-    propagation to non-primary CameraTrackers, and claimed-blob registration.
+    Every available camera searches independently (its own blobs only, no
+    aux-camera folding), then all resolved per-camera solutions are fused into
+    one pose via fuse_camera_poses(). Owns state propagation to every
+    CameraTracker from that fused pose and claimed-blob registration.
     Cross-controller concerns (Voronoi reservation, ordering) remain in TrackingSystem.
     """
 
@@ -594,9 +596,10 @@ class ControllerTracker:
         self.cameras          = cameras
         self.trackers         = trackers           # {cam_id: CameraTracker}
         self._matching_cfg    = matching_cfg or {}
+        # Informational only (reporting/self-cal anchor from the last successful frame) —
+        # every camera searches independently every frame, so this no longer gates work.
         self._designated_primary: Optional[int]  = None
         self._prev_primary:       Optional[int]  = None
-        self._handoff_counter:    Dict[int, int] = {}
 
     def update(
         self,
@@ -612,214 +615,190 @@ class ControllerTracker:
         if not avail:
             return None
 
-        _cfg = self._matching_cfg
+        from src.pose_search import fuse_camera_poses
 
-        # ── Primary camera selection ───────────────────────────────────────────
-        if fixed_primary_cam is not None and fixed_primary_cam in avail:
-            primary_cam_id = fixed_primary_cam
-        else:
-            _designated  = self._designated_primary
-            _des_tracker = self.trackers.get(_designated)
-            _min_inliers = int(_cfg.get('min_inliers', 4))
-            _des_ok = (
-                _des_tracker is not None
-                and _designated in avail
-                and len(avail[_designated][0]) >= _min_inliers
-            )
-            if _des_ok:
-                primary_cam_id = _designated
-            else:
-                _with_prior = [
-                    cid for cid in avail
-                    if self.trackers[cid].prev_pose is not None
-                ]
-                if _with_prior:
-                    primary_cam_id = max(_with_prior, key=lambda cid: len(avail[cid][0]))
-                else:
-                    _cold_eligible = [
-                        cid for cid in avail if len(avail[cid][0]) >= _min_inliers
-                    ]
-                    if _cold_eligible:
-                        primary_cam_id = min(_cold_eligible, key=lambda cid: len(avail[cid][0]))
-                    else:
-                        primary_cam_id = max(avail, key=lambda cid: len(avail[cid][0]))
-
-        primary_tracker = self.trackers[primary_cam_id]
-        _, _, _, primary_orig = avail[primary_cam_id]
-
-        other_cameras_blobs = [
-            (self.cameras[cid], av[0], av[1])
-            for cid, av in avail.items()
-            if cid != primary_cam_id
-        ]
-        aux_orig: Dict[int, List[int]] = {
-            cid: av[3] for cid, av in avail.items() if cid != primary_cam_id
-        }
-
-        _prim_obs_full = obs_src[primary_cam_id]
-        _prim_rad_full = rad_src.get(primary_cam_id) if rad_src else None
-        _prim_brt_full = brt_src.get(primary_cam_id) if brt_src else None
-        _prim_mask = np.zeros(len(_prim_obs_full), dtype=bool)
-        _prim_mask[primary_orig] = True
-
-        # ── Primary camera track ───────────────────────────────────────────────
-        solution = primary_tracker.track(
-            _prim_obs_full,
-            blob_radii=_prim_rad_full,
-            blob_brightnesses=_prim_brt_full,
-            other_cameras_blobs=other_cameras_blobs,
-            blob_mask=_prim_mask,
-            occluders_per_cam=occluders_per_cam,
-        )
-
-        # ── Fallback cameras ───────────────────────────────────────────────────
-        _cold_start = primary_tracker.prev_pose is None
-        if solution is None and len(avail) > 1:
-            _fallback_order = sorted(
-                [cid for cid in avail if cid != primary_cam_id],
-                key=lambda cid: (
-                    0 if self.trackers[cid].prev_pose is not None else 1,
-                    len(avail[cid][0]) if _cold_start else -len(avail[cid][0]),
-                ),
-            )
-            for _fb_cid in _fallback_order:
-                _fb_blobs, _fb_radii, _fb_brts, _fb_orig = avail[_fb_cid]
-                if len(_fb_blobs) < 3:
+        # ── Every available camera searches independently ──────────────────────
+        # Own blobs only — no aux-camera folding at the per-camera search level;
+        # cross-camera fusion happens once, below, via fuse_camera_poses().
+        #
+        # Two passes: first with expensive (brute-force) fallback disabled — a
+        # camera with a prior whose proximity search comes up short can simply
+        # contribute nothing this frame and get warm-started next frame from the
+        # fused pose, at zero cost. Only if NO camera produced anything this frame
+        # (the controller is about to lose track entirely) do we pay for the
+        # expensive per-camera brute-force retries as a last resort. Cold-start
+        # brute-force (a camera with no prior at all) is unconditional either way.
+        def _search_all(allow_expensive_fallback: bool) -> List[dict]:
+            results: List[dict] = []
+            for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
+                if len(av_blobs) == 0:
                     continue
-                _fb_tracker = self.trackers[_fb_cid]
-                _fb_other = [
-                    (self.cameras[cid], av[0], av[1])
-                    for cid, av in avail.items() if cid != _fb_cid
-                ]
-                _fb_obs_full = obs_src[_fb_cid]
-                _fb_rad_full = rad_src.get(_fb_cid) if rad_src else None
-                _fb_brt_full = brt_src.get(_fb_cid) if brt_src else None
-                _fb_mask = np.zeros(len(_fb_obs_full), dtype=bool)
-                _fb_mask[_fb_orig] = True
-                solution = _fb_tracker.track(
-                    _fb_obs_full,
-                    blob_radii=_fb_rad_full,
-                    blob_brightnesses=_fb_brt_full,
-                    other_cameras_blobs=_fb_other,
-                    blob_mask=_fb_mask,
+                tracker  = self.trackers[cid]
+                obs_full = obs_src[cid]
+                rad_full = rad_src.get(cid) if rad_src else None
+                brt_full = brt_src.get(cid) if brt_src else None
+                mask = np.zeros(len(obs_full), dtype=bool)
+                mask[av_orig] = True
+                solution = tracker.search(
+                    obs_full,
+                    blob_radii=rad_full,
+                    blob_brightnesses=brt_full,
+                    other_cameras_blobs=None,
+                    blob_mask=mask,
                     occluders_per_cam=occluders_per_cam,
+                    allow_expensive_fallback=allow_expensive_fallback,
                 )
-                if solution is not None:
-                    primary_cam_id  = _fb_cid
-                    primary_tracker = _fb_tracker
-                    primary_orig    = _fb_orig
-                    aux_orig = {
-                        cid: av[3] for cid, av in avail.items() if cid != _fb_cid
-                    }
-                    break
+                if solution is None:
+                    continue
+                if not solution.get('_orig_idx', False):
+                    solution["assignment"] = [(av_orig[b], lid) for b, lid in solution["assignment"]]
+                results.append({"cam_id": cid, "tracker": tracker, "solution": solution})
+            return results
 
-        if solution is None:
+        cam_solutions = _search_all(allow_expensive_fallback=False)
+        if not cam_solutions:
+            cam_solutions = _search_all(allow_expensive_fallback=True)
+        if not cam_solutions:
             return None
 
-        solution["primary_cam"] = primary_cam_id
+        # ── Fuse every camera's independent solution into one pose ─────────────
+        _fuse_in = [
+            {
+                "camera":       self.cameras[cs["cam_id"]],
+                "blobs":        obs_src[cs["cam_id"]],
+                "pairs":        cs["solution"]["assignment"],
+                "T_world_ctrl": cs["solution"]["T_world_ctrl"],
+                "error":        cs["solution"]["error"],
+                "confidence":   cs["solution"].get("confidence", 1.0),
+            }
+            for cs in cam_solutions
+        ]
+        model_positions = next(iter(self.trackers.values())).model.positions
+        T_world_ctrl, fused_err = fuse_camera_poses(_fuse_in, model_positions)
 
-        # ── Primary switch logging ─────────────────────────────────────────────
+        # ── Anchor camera for reporting/self-cal: fixed_primary_cam if it solved
+        # this frame, else whichever camera had the most inlier pairs ──────────
+        _solved_ids = {cs["cam_id"] for cs in cam_solutions}
+        if fixed_primary_cam is not None and fixed_primary_cam in _solved_ids:
+            primary_cam_id = fixed_primary_cam
+        else:
+            primary_cam_id = max(
+                cam_solutions, key=lambda cs: len(cs["solution"]["assignment"])
+            )["cam_id"]
+        anchor_solution = next(
+            cs["solution"] for cs in cam_solutions if cs["cam_id"] == primary_cam_id
+        )
+
+        # ── Snap-recovery: a camera that failed its own independent search this
+        # frame still gets a cheap Hungarian snap against the fused pose above —
+        # no combinatorial search, just nearest-neighbour matching, but it recovers
+        # bonus correspondences for the fusion below at near-zero cost. Confidence
+        # is fixed and conservative since a raw snap has no RANSAC/hypothesis
+        # validation behind it, unlike an independent solve.
+        _snap_extra_aux: List[dict] = []
+        _failed_cids = [cid for cid in avail if cid not in _solved_ids]
+        if _failed_cids:
+            _snap_confidence = float(self._matching_cfg.get('joint_snap_confidence', 0.5))
+            _anchor_ps = self.trackers[primary_cam_id]._pose_searcher
+            for cid in _failed_cids:
+                _snapped = _anchor_ps.snap_camera(
+                    T_world_ctrl, self.cameras[cid], obs_src[cid], occluders_per_cam,
+                )
+                if len(_snapped) >= 3:
+                    _snap_extra_aux.append({
+                        "camera": self.cameras[cid], "blobs": obs_src[cid],
+                        "pairs": _snapped, "confidence": _snap_confidence,
+                    })
+                    logger.debug(
+                        f"[{self.ctrl_name}] cam{cid} snap-recovered "
+                        f"{len(_snapped)} pairs against fused pose"
+                    )
+
+        if _snap_extra_aux:
+            T_world_ctrl, fused_err = fuse_camera_poses(
+                _fuse_in, model_positions, extra_aux=_snap_extra_aux,
+            )
+
+        solution = dict(anchor_solution)
+        solution["primary_cam"]  = primary_cam_id
+        solution["T_world_ctrl"] = T_world_ctrl
+        solution["error"]        = fused_err
+        _other_assignments = {
+            cs["cam_id"]: cs["solution"]["assignment"]
+            for cs in cam_solutions if cs["cam_id"] != primary_cam_id
+        }
+        for _snap in _snap_extra_aux:
+            _other_assignments[_snap["camera"].camera_idx] = _snap["pairs"]
+        solution["aux_assignments"] = _other_assignments
+        solution["aux_cameras"] = [(cid, len(pairs)) for cid, pairs in _other_assignments.items()]
+
         if self._prev_primary is not None and primary_cam_id != self._prev_primary:
             logger.info(
-                f"[{self.ctrl_name}] Primary camera switched "
+                f"[{self.ctrl_name}] Anchor camera switched "
                 f"cam{self._prev_primary} → cam{primary_cam_id}"
             )
-        self._prev_primary = primary_cam_id
-        if fixed_primary_cam is None:
-            self._designated_primary = primary_cam_id
+        self._prev_primary       = primary_cam_id
+        self._designated_primary = primary_cam_id
 
-        # ── Index remapping ────────────────────────────────────────────────────
-        if not solution.get('_orig_idx', False):
-            solution["assignment"] = [
-                (primary_orig[b], lid) for b, lid in solution["assignment"]
-            ]
-        _raw_aux = solution.get("aux_assignments") or {}
-        if _raw_aux:
-            solution["aux_assignments"] = {
-                cid: [(aux_orig[cid][b], lid) for b, lid in pairs]
-                for cid, pairs in _raw_aux.items()
-                if cid in aux_orig
-            }
+        # ── Register claimed blobs (every camera that actually solved, plus snaps) ──
+        for cs in cam_solutions:
+            for b, _ in cs["solution"]["assignment"]:
+                claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
+        for _snap in _snap_extra_aux:
+            for b, _ in _snap["pairs"]:
+                claimed_blobs.setdefault(_snap["camera"].camera_idx, set()).add(b)
 
-        # ── Register claimed blobs ─────────────────────────────────────────────
-        for b, _ in solution["assignment"]:
-            claimed_blobs.setdefault(primary_cam_id, set()).add(b)
-        for cid, pairs in (solution.get("aux_assignments") or {}).items():
-            for b, _ in pairs:
-                claimed_blobs.setdefault(cid, set()).add(b)
-
-        # ── Self-calibration feed ──────────────────────────────────────────────
+        # ── Self-calibration feed ────────────────────────────────────────────────
         if (self_cal is not None
                 and primary_cam_id == self_cal.primary_camera.camera_idx):
-            _R_prim, _ = cv2.Rodrigues(solution["rvec"].reshape(3, 1).astype(np.float32))
-            _t_prim = solution["tvec"].reshape(3).astype(np.float32)
+            _T_cam_ctrl_anchor = self.cameras[primary_cam_id].T_world_cam.inverse().compose(T_world_ctrl)
+            _R_prim = _T_cam_ctrl_anchor.R.astype(np.float32)
+            _rv_prim, _ = cv2.Rodrigues(_R_prim)
+            _t_prim = _T_cam_ctrl_anchor.t.astype(np.float32)
             _sc_aux_obs: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-            for _aux_cid, _aux_pairs in (solution.get("aux_assignments") or {}).items():
+            for _aux_cid, _aux_pairs in _other_assignments.items():
                 if len(_aux_pairs) < 3:
                     continue
                 _led_ids   = np.array([lid for _, lid in _aux_pairs], dtype=np.int32)
                 _blob_idxs = np.array([b   for b, _  in _aux_pairs], dtype=np.int32)
-                _led_pos   = primary_tracker.model.positions[_led_ids]
+                _led_pos   = self.trackers[primary_cam_id].model.positions[_led_ids]
                 _pts_prim  = (_R_prim @ _led_pos.T).T + _t_prim
                 _blobs_aux = obs_src[_aux_cid][_blob_idxs]
                 _sc_aux_obs[_aux_cid] = (_pts_prim, _blobs_aux)
             if _sc_aux_obs:
                 self_cal.add_frame(
-                    solution["rvec"], solution["tvec"],
-                    primary_error=solution["error"],
-                    primary_inliers=len(solution["assignment"]),
+                    _rv_prim, _t_prim,
+                    primary_error=fused_err,
+                    primary_inliers=len(anchor_solution["assignment"]),
                     aux_observations=_sc_aux_obs,
                 )
 
-        # ── State propagation to non-primary cameras ───────────────────────────
-        T_world_ctrl = solution["T_world_ctrl"]
-        aux_asgns    = solution.get("aux_assignments") or {}
+        # ── State propagation: every camera's own history is warm-started from
+        # the one fused pose, using that camera's own assignment if it solved ──
+        _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
         for _cid, _tracker in self.trackers.items():
-            if _cid == primary_cam_id:
-                continue
             _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
             _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
             _tv_np = _T_cam_ctrl.t.astype(np.float32)
             if _tracker.prev_pose is not None:
                 _step = (_tv_np.reshape(3).astype(np.float64)
                          - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
-                _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
                 _tracker.vel_ema = (_beta * _step + (1.0 - _beta) * _tracker.vel_ema
                                    if _tracker.vel_ema is not None else _step)
             _tracker.prev_prev_pose = _tracker.prev_pose
             _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
             _tracker.last_good_pose = _tracker.prev_pose
             _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np))
-            _aux_asgn = aux_asgns.get(_cid)
-            if _aux_asgn is not None:
-                _tracker.prev_assignment      = _aux_asgn
-                _tracker.last_good_assignment = _aux_asgn
+            _own_asgn = (
+                anchor_solution["assignment"] if _cid == primary_cam_id
+                else _other_assignments.get(_cid)
+            )
+            if _own_asgn is not None:
+                _tracker.prev_assignment      = _own_asgn
+                _tracker.last_good_assignment = _own_asgn
             elif _tracker.prev_assignment is None:
                 _tracker.last_good_assignment = None
             _tracker.consecutive_failures = 0
-
-        # ── Camera handoff check ───────────────────────────────────────────────
-        if bool(_cfg.get('camera_handoff', True)) and fixed_primary_cam is None:
-            _ratio_thr  = float(_cfg.get('handoff_coverage_ratio',   1.5))
-            _min_adv    = int(  _cfg.get('handoff_min_advantage',     3))
-            _hysteresis = int(  _cfg.get('handoff_hysteresis_frames', 3))
-            _n_primary  = len(solution["assignment"])
-            for _aux_cid, _aux_pairs in aux_asgns.items():
-                _aux_n = len(_aux_pairs)
-                if (_aux_n >= _ratio_thr * _n_primary
-                        and _aux_n - _n_primary >= _min_adv):
-                    self._handoff_counter[_aux_cid] = self._handoff_counter.get(_aux_cid, 0) + 1
-                    if self._handoff_counter[_aux_cid] >= _hysteresis:
-                        logger.info(
-                            f"[{self.ctrl_name}] Camera handoff: "
-                            f"cam{primary_cam_id}({_n_primary} LEDs)"
-                            f" → cam{_aux_cid}({_aux_n} LEDs)"
-                            f" — warm start from propagated pose"
-                        )
-                        self._designated_primary = _aux_cid
-                        self._handoff_counter.clear()
-                else:
-                    self._handoff_counter[_aux_cid] = 0
 
         return solution
 
@@ -877,18 +856,11 @@ class TrackingSystem:
                 ctrl.name, self.cameras, ctrl_cam_trackers, matching_cfg=matching_cfg,
             )
 
-        if self._fixed_primary_cam is not None:
-            for ctrl in controllers:
-                self.ctrl_trackers[ctrl.name]._designated_primary = self._fixed_primary_cam
-
-
-
     def get_designated_primary_cameras(self) -> Dict[str, Optional[int]]:
-        """Return {ctrl_name: primary_cam_id} as of the last successful tracking frame.
+        """Return {ctrl_name: anchor_cam_id} as of the last successful tracking frame.
 
-        Used at detection time to choose per-camera search radii before tracking runs.
-        None means no designation exists yet (cold start); callers should treat all
-        cameras as equally primary in that case.
+        Informational only — every camera searches independently every frame regardless
+        of this value. None means no successful frame has been tracked yet.
         """
         return {name: ct._designated_primary for name, ct in self.ctrl_trackers.items()}
 

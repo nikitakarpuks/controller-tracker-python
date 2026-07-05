@@ -1,12 +1,13 @@
 import math
 import time
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 from loguru import logger
 from scipy.optimize import linear_sum_assignment, least_squares
 from scipy.spatial.distance import cdist
-from itertools import combinations, product
+from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
 from scipy.spatial import KDTree
@@ -279,9 +280,13 @@ def _joint_refine_pose(
     primary_blobs: np.ndarray,
     aux_cam_data: List,                      # [(Camera, blobs_np, [(blob_j, led_id)])]
     model_positions: np.ndarray,
-    max_nfev: int = 200,
+    max_nfev: int = 50,
     primary_weight: float = 2.0,
     huber_scale: float = 1.5,
+    ftol: float = 1e-4,
+    xtol: float = 1e-4,
+    gtol: float = 1e-4,
+    cam_confidence: Optional[Dict[int, float]] = None,
 ) -> Tuple[Optional[Transform], float]:
     """
     Refine T_world_ctrl jointly over all cameras via Trust-Region with Huber loss.
@@ -292,6 +297,11 @@ def _joint_refine_pose(
     correspondence count. Primary camera gets an additional `primary_weight`
     multiplier to keep the RANSAC-validated fit dominant.
 
+    cam_confidence: optional {camera_idx: confidence in (0, 1]} — an extra per-camera
+    multiplier on top of the count-based weight, e.g. reflecting how much of that
+    camera's own match was ambiguous/hard-won (see proximity_search's "confidence").
+    Missing entries default to 1.0 (no change from today's behaviour).
+
     Huber loss (f_scale=huber_scale) down-weights aux outliers without
     discarding them entirely — mismatched aux pairs influence the solution
     much less than valid ones.
@@ -300,6 +310,7 @@ def _joint_refine_pose(
     """
     # Pre-assemble immutable per-camera arrays once — avoids object creation in the hot loop.
     cam_data = []
+    cam_conf = []
     for cam, blobs_c, pairs_c in (
         [(primary_cam, primary_blobs, primary_pairs)] +
         [(ac, ab, ap) for ac, ab, ap in aux_cam_data if ap]
@@ -318,15 +329,17 @@ def _joint_refine_pose(
             blobs_c[b_idx].astype(np.float32),
             getattr(cam, "is_fisheye", False),
         ))
+        cam_conf.append(float((cam_confidence or {}).get(cam.camera_idx, 1.0)))
 
     if sum(len(e[4]) for e in cam_data) < 4:
         return None, np.inf
 
     # Per-camera residual weight: normalise by 1/sqrt(n_pairs) so each camera
-    # contributes equally to the total objective regardless of correspondence count.
+    # contributes equally to the total objective regardless of correspondence count,
+    # then scale by that camera's own confidence (1.0 = no change from count-only weighting).
     # Primary gets an additional `primary_weight` multiplier.
     cam_weights = np.array([
-        (primary_weight if i == 0 else 1.0) / float(np.sqrt(max(len(e[4]), 1)))
+        (primary_weight if i == 0 else 1.0) / float(np.sqrt(max(len(e[4]), 1))) * cam_conf[i]
         for i, e in enumerate(cam_data)
     ], dtype=np.float64)
 
@@ -361,11 +374,16 @@ def _joint_refine_pose(
             parts.append(((proj.reshape(-1, 2) - blobs_ref) * w).ravel())
         return np.concatenate(parts).astype(np.float64)
 
+    # With no analytic jac supplied, each TRF iteration costs 6 extra residual
+    # evaluations (finite-diff, one per parameter) — ftol/xtol/gtol control how
+    # many iterations run before "converged"; tighter than needed for pixel-level
+    # precision burns iterations for no measurable accuracy gain (1e-4 verified
+    # numerically equivalent to 1e-7 here, at 2-3x fewer iterations).
     try:
         result = least_squares(
             _residuals, x0, method='trf',
             loss='huber', f_scale=huber_scale,
-            ftol=1e-7, xtol=1e-7, gtol=1e-7, max_nfev=max_nfev,
+            ftol=ftol, xtol=xtol, gtol=gtol, max_nfev=max_nfev,
         )
     except Exception:
         return None, np.inf
@@ -381,6 +399,110 @@ def _joint_refine_pose(
         (result.fun / flat_weights).reshape(-1, 2), axis=1
     )))
     return T_opt, mean_err
+
+
+def fuse_camera_poses(
+    cam_solutions: List[dict],
+    model_positions: np.ndarray,
+    extra_aux: Optional[List[dict]] = None,
+) -> Tuple[Optional[Transform], float]:
+    """
+    Fuse independent per-camera pose solves (each camera searched using only its own
+    blobs) into one controller pose.
+
+    cam_solutions: one dict per camera that produced its own valid solution this frame,
+    each with keys: 'camera' (Camera), 'blobs' (Nx2 array, that camera's full per-frame
+    blob array — indices in 'pairs' refer to this array), 'pairs' ([(blob_idx, led_id)]),
+    'T_world_ctrl' (Transform, that camera's own solo estimate), 'error' (float, px),
+    and optionally 'confidence' (float in (0, 1], default 1.0 — how unambiguous/clean
+    that camera's own match was; see proximity_search's "confidence").
+
+    extra_aux: optional additional camera correspondences with NO independent solve of
+    their own (e.g. a cheap Hungarian snap — see PoseSearcher.snap_camera — against the
+    fused pose, from a camera whose own search failed this frame). Same 'camera'/'blobs'/
+    'pairs'/'confidence' keys, but no 'T_world_ctrl'/'error' — these only ever refine the
+    fusion, never seed it.
+
+    With one camera and no extra_aux, its own estimate is returned unchanged — no fusion
+    needed for a single view. Otherwise, every contributor is weighted by pair count times
+    its own confidence — a camera (or snap) that had to guess through a lot of ambiguity,
+    or has no independent validation at all, contributes less than a clean, independently
+    solved one — seeded from whichever cam_solutions entry had the lowest solo error.
+
+    Returns (fused T_world_ctrl, mean_reproj_err_px), or (None, inf) if cam_solutions is empty.
+    """
+    if not cam_solutions:
+        return None, float('inf')
+    if len(cam_solutions) == 1 and not extra_aux:
+        sol = cam_solutions[0]
+        return sol['T_world_ctrl'], sol['error']
+
+    seed   = min(cam_solutions, key=lambda s: s['error'])
+    others = [s for s in cam_solutions if s is not seed]
+    aux_cam_data   = [(s['camera'], s['blobs'], s['pairs']) for s in others]
+    aux_cam_data  += [(s['camera'], s['blobs'], s['pairs']) for s in (extra_aux or [])]
+    cam_confidence = {s['camera'].camera_idx: float(s.get('confidence', 1.0)) for s in cam_solutions}
+    cam_confidence.update({
+        s['camera'].camera_idx: float(s.get('confidence', 1.0)) for s in (extra_aux or [])
+    })
+
+    T_joint, err_joint = _joint_refine_pose(
+        seed['T_world_ctrl'], seed['camera'], seed['pairs'], seed['blobs'],
+        aux_cam_data, model_positions, primary_weight=1.0,
+        cam_confidence=cam_confidence,
+    )
+    if T_joint is None:
+        return seed['T_world_ctrl'], seed['error']
+    return T_joint, err_joint
+
+
+@dataclass
+class BruteSearchState:
+    """
+    Externalized state for one resumable brute-force recovery attempt (one camera,
+    one pose_prior), split into per-tier calls via PoseSearcher.brute_search_tier.
+    See PoseSearcher.new_brute_state for construction and
+    PoseSearcher.finalize_brute_state for extracting the accepted result.
+
+    Fields above the cross-tier-mutated section are attempt-scoped constants (built
+    once, unchanged across tiers); fields below are mutated by brute_search_tier and
+    carried forward tier-to-tier — most notably prev_blob_max_per_triple(_edge), which
+    lets a later tier skip (LED triple, blob pair) combinations an earlier tier for
+    this same attempt already covered.
+    """
+    # Attempt-scoped inputs (constant across tiers within one recovery attempt)
+    blobs: np.ndarray
+    avail_idx: np.ndarray
+    n_available: int
+    min_inliers_eff: int
+    strong_inliers_eff: int
+    blob_nbr: object
+    blobs_undist: np.ndarray
+    pose_prior: Optional[Tuple[np.ndarray, np.ndarray]]
+    R_prior: Optional[np.ndarray]
+    tvec_prior: Optional[np.ndarray]
+    other_cameras_blobs: Optional[List]
+    blob_radii: Optional[np.ndarray]
+    blob_mask: Optional[np.ndarray]
+    occluders_per_cam: Optional[Dict]
+    prev_blob_max_per_triple: np.ndarray
+    prev_blob_max_per_triple_edge: np.ndarray
+
+    # Cross-tier mutated state (see brute_search_tier)
+    best_solution: Optional[Dict] = None
+    best_inliers: int = 0
+    best_inliers_total: int = 0
+    best_error: float = float('inf')
+    best_orient_err: float = float('inf')
+    best_tvec_err: float = float('inf')
+    strong_found: bool = False
+    solution_tier: Optional[int] = None
+    seen_bijections: set = field(default_factory=set)
+    bijection_counts: Optional[Dict] = None
+    rng: object = None
+    tier_p3p_calls: List[int] = field(default_factory=list)
+    tier_lq_tried:  List[int] = field(default_factory=list)
+    tier_lq_total:  List[int] = field(default_factory=list)
 
 
 class PoseSearcher:
@@ -422,6 +544,10 @@ class PoseSearcher:
         self._c_joint_prefilter_px  = float(_cfg.get('joint_aux_prefilter_px',            8.0))
         self._c_joint_primary_w     = float(_cfg.get('joint_primary_weight',              2.0))
         self._c_joint_huber_scale   = float(_cfg.get('joint_huber_scale',                1.5))
+        self._c_joint_lm_max_nfev   = int(  _cfg.get('joint_lm_max_nfev',                  50))
+        self._c_joint_lm_ftol       = float(_cfg.get('joint_lm_ftol',                    1e-4))
+        self._c_joint_lm_xtol       = float(_cfg.get('joint_lm_xtol',                    1e-4))
+        self._c_joint_lm_gtol       = float(_cfg.get('joint_lm_gtol',                    1e-4))
         # proximity
         self._c_prox_reproj_px      = float(_cfg.get('proximity_reprojection_threshold',  2.0))
         self._c_prox_min_inliers    = int(  _cfg.get('proximity_min_inliers',
@@ -436,6 +562,7 @@ class PoseSearcher:
         self._c_prox_none_branch_w  = int(  _cfg.get('proximity_none_branch_width',        5))
         self._c_prox_score_metric   = str(  _cfg.get('proximity_score_metric',           'max'))
         self._c_prox_top_k_ransac        = int(  _cfg.get('proximity_top_k_ransac',           3))
+        self._c_prox_redundancy_ref      = float(_cfg.get('proximity_redundancy_ref',         3.0))
         self._c_vis_occlusion_margin_m   = float(_cfg.get('visibility_occlusion_margin_m',  0.0))
         self._c_prox_vis_score_threshold = float(_cfg.get('proximity_vis_score_threshold',  0.95))
         # constrained
@@ -512,6 +639,44 @@ class PoseSearcher:
                 vis_scores[_cross_occ] = 0.0
         return R, t, rv, focal, vis_scores >= 1.0
 
+    def snap_camera(
+        self,
+        T_world_ref: Transform,
+        ocam,
+        oblobs: np.ndarray,
+        occluders_per_cam: Optional[Dict] = None,
+    ) -> List[Tuple[int, int]]:
+        """
+        Cheap Hungarian snap: project this model's visible LEDs into `ocam` under
+        the already-resolved `T_world_ref` and nearest-neighbour-match against its
+        raw blobs. No combinatorial search — just geometric matching against a pose
+        someone else already solved. Used to recover bonus correspondences from a
+        camera whose own independent search failed this frame, at near-zero cost.
+
+        Returns (blob_idx, led_id) pairs, indices into `oblobs`.
+        """
+        oblobs = np.asarray(oblobs, dtype=np.float32).reshape(-1, 2)
+        if len(oblobs) == 0:
+            return []
+        R, t, rv, focal, vis = self._aux_cam_vis(ocam, T_world_ref, occluders_per_cam)
+        vis_ids = np.where(vis)[0]
+        if len(vis_ids) == 0:
+            return []
+        vis_pos = self.model.positions[vis_ids].astype(np.float32)
+        proj = _project_points(rv, t, vis_pos, ocam.camera_matrix, ocam.dist_coeffs,
+                                is_fisheye=ocam.is_fisheye)
+        cost = cdist(proj, oblobs)
+        n_vis = len(vis_ids)
+        # Dummy-column pattern: lets a LED go unmatched rather than stealing a
+        # distant blob just because it's the least-bad option in the row.
+        cost_aug = np.hstack([cost, np.full((n_vis, n_vis), self._c_joint_prefilter_px - 1e-6)])
+        row, col = linear_sum_assignment(cost_aug)
+        pairs: List[Tuple[int, int]] = []
+        for r, c in zip(row, col):
+            if c < len(oblobs) and cost[r, c] < self._c_joint_prefilter_px:
+                pairs.append((int(c), int(vis_ids[r])))
+        return pairs
+
     def _snap_led_pairs(
         self,
         lids: List[int],
@@ -583,8 +748,12 @@ class PoseSearcher:
             return None
         _T_joint, _joint_err = _joint_refine_pose(
             _T_wc, self.camera, primary_pairs, blobs, _aux, self.model.positions,
+            max_nfev=self._c_joint_lm_max_nfev,
             primary_weight=self._c_joint_primary_w,
             huber_scale=self._c_joint_huber_scale,
+            ftol=self._c_joint_lm_ftol,
+            xtol=self._c_joint_lm_xtol,
+            gtol=self._c_joint_lm_gtol,
         )
         if _T_joint is None:
             return None
@@ -839,7 +1008,6 @@ class PoseSearcher:
                 best_none      = 0
                 best_hyp_blobs = None
                 n_tried        = 0
-                n_collisions   = 0
                 # Top-K candidates for stage-2 RANSAC rescoring (sorted ascending by key).
                 top_candidates: list = []
 
@@ -883,12 +1051,11 @@ class PoseSearcher:
                 _zero_none_combos: list = []
                 if _min_none_forced == 0:
                     _t0 = time.perf_counter()
-                    for _vals in product(*[candidates[hyp_k[i]] for i in range(len(hyp_k))]):
-                        _combo = list(_vals)
-                        _ms = set(_combo)
-                        if len(_ms) < len(_combo) or _ms & truly_locked_blobs:
-                            n_collisions += 1
-                            continue
+                    # _bt_combos(0) prunes duplicate-blob branches during the search
+                    # itself, rather than generating the full Cartesian product of
+                    # candidate lists and filtering collisions after the fact — the
+                    # product can be huge when many LEDs share overlapping candidates.
+                    for _combo in _bt_combos(0):
                         _raw = sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k)))
                         _zero_none_combos.append((_raw, _combo))
                     _t_collisions += time.perf_counter() - _t0
@@ -909,7 +1076,6 @@ class PoseSearcher:
                 )
 
                 _stopped_early = False
-                _first_valid_level_seen = _had_zero_none_candidates
                 _level_parents: list = []  # (key, combo, resid_map) — top-K from the previous None level
 
                 def _log_hyp(n_tried, combo_blobs, score, key, best_key):
@@ -949,7 +1115,7 @@ class PoseSearcher:
                     if n_tried >= self._c_prox_max_hyp:
                         logger.debug(
                             f"[{self._ctrl} | cam {self._cam}] Proximity: hypothesis cap "
-                            f"({self._c_prox_max_hyp}) reached  ({n_collisions} collisions skipped)"
+                            f"({self._c_prox_max_hyp}) reached"
                         )
                         break
 
@@ -1025,8 +1191,6 @@ class PoseSearcher:
                                 continue  # this n_none has no valid combos; try next level
                             break         # branching: empty children → no grandchildren either
 
-                        _is_first_available = not _first_valid_level_seen
-                        _first_valid_level_seen = True
                         if n_none_base is None:
                             n_none_base = n_none
 
@@ -1045,12 +1209,12 @@ class PoseSearcher:
                             if n_tried >= self._c_prox_max_hyp:
                                 logger.debug(
                                     f"[{self._ctrl} | cam {self._cam}] Proximity: hypothesis cap "
-                                    f"({self._c_prox_max_hyp}) reached  ({n_collisions} collisions skipped)"
+                                    f"({self._c_prox_max_hyp}) reached"
                                 )
                                 _cap_hit = True
                                 break
 
-                            if _is_first_available and score <= self._c_prox_strong_match_px:
+                            if score <= self._c_prox_strong_match_px:
                                 _stopped_early = True
                                 logger.debug(
                                     f"[{self._ctrl} | cam {self._cam}] Proximity: early stop "
@@ -1067,8 +1231,8 @@ class PoseSearcher:
                 if best_hyp_blobs is None:
                     best_hyp_blobs = []
                     logger.debug(
-                        f"[{self._ctrl} | cam {self._cam}] Proximity: all {n_tried + n_collisions} combos invalid"
-                        f"  ({n_collisions} collisions), using truly-locked pairs only"
+                        f"[{self._ctrl} | cam {self._cam}] Proximity: no collision-free combo found, "
+                        f"using truly-locked pairs only"
                     )
                 else:
                     best_none_cost = self._c_prox_none_penalty * sum(
@@ -1079,7 +1243,6 @@ class PoseSearcher:
                     _err_label = f"best_{self._c_prox_score_metric}_err"
                     logger.debug(
                         f"[{self._ctrl} | cam {self._cam}] Proximity: {n_tried} hypotheses evaluated"
-                        f"  {n_collisions} skipped (collision)"
                         f"  {_err_label}={best_err:.2f}px  matched={n_matched}/{len(hyp_k)} hyp LEDs"
                         f"  best_hyp_leds={_fmt_leds(best_hyp_blobs)}"
                     )
@@ -1277,38 +1440,14 @@ class PoseSearcher:
 
         aux_snapped_per_cam: Dict[int, List] = {}
 
-        # Aux cameras: Hungarian over all model-visible LEDs × all aux blobs.
-        # Same dummy-column pattern as the primary path prevents LEDs without a
-        # nearby blob from stealing real blobs from LEDs that have one.
+        # Aux cameras: cheap Hungarian snap against this camera's already-resolved
+        # pose (see snap_camera) — not a search, just nearest-neighbour matching.
         _t_aux_start = time.perf_counter()
         if other_cameras_blobs:
             _R_ref, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
             _T_world_ref = self.T_world_cam.compose(Transform(_R_ref, np.asarray(tvec, dtype=np.float32).reshape(3)))
             for _ocam, _oblobs, _ in other_cameras_blobs:
-                _oblobs = np.asarray(_oblobs, dtype=np.float32)
-                _pairs_i: List = []
-                if len(_oblobs) > 0:
-                    _R_i_r, _t_i_r, _rv_i_r, _focal_i_r, _vis_i_r = self._aux_cam_vis(
-                        _ocam, _T_world_ref, occluders_per_cam
-                    )
-
-                    _vis_ids_i  = np.where(_vis_i_r)[0]
-                    if len(_vis_ids_i) > 0:
-                        _vis_pos_i  = self.model.positions[_vis_ids_i].astype(np.float32)
-                        _proj_i_r   = _project_points(_rv_i_r, _t_i_r, _vis_pos_i,
-                                                      _ocam.camera_matrix, _ocam.dist_coeffs,
-                                                      is_fisheye=_ocam.is_fisheye)
-
-                        _cost_i_r = cdist(_proj_i_r, _oblobs)
-
-                        _n_vis_i   = len(_vis_ids_i)
-                        _cost_i_aug = np.hstack([_cost_i_r,
-                                                 np.full((_n_vis_i, _n_vis_i), self._c_joint_prefilter_px - 1e-6)])
-                        _row_r, _col_r = linear_sum_assignment(_cost_i_aug)
-                        for _rr, _cc in zip(_row_r, _col_r):
-                            if _cc < len(_oblobs) and _cost_i_r[_rr, _cc] < self._c_joint_prefilter_px:
-                                _pairs_i.append((int(_cc), int(_vis_ids_i[_rr])))
-
+                _pairs_i = self.snap_camera(_T_world_ref, _ocam, _oblobs, occluders_per_cam)
                 aux_snapped_per_cam[_ocam.camera_idx] = _pairs_i
                 if is_deep() and _pairs_i:
                     logger.debug(
@@ -1343,6 +1482,27 @@ class PoseSearcher:
             f"[{self._ctrl} | cam {self._cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}"
             f"  bench: coll={_t_collisions*1000:.1f}ms  score={_t_scoring*1000:.1f}ms  s2={_t_stage2*1000:.1f}ms  aux={_t_aux*1000:.1f}ms  lm={_t_lm*1000:.1f}ms"
         )
+
+        # Confidence for multi-camera fusion weighting (see fuse_camera_poses): how much
+        # of this camera's own match was unambiguous (locked_ratio), how close its error
+        # is to a confidently-good fit (err_factor), and how much redundancy backs that
+        # error at all (redundancy_factor). All three are 1.0 for a clean, unambiguous,
+        # low-error camera with several points beyond the minimal 3-point PnP case — the
+        # common case — so fusion weighting is unaffected there.
+        #
+        # redundancy_factor matters because a 3-point fit has zero spare degrees of
+        # freedom (6 DOF pose, 2 equations/point): some pose generically fits 3 points
+        # almost exactly regardless of whether the correspondence is actually correct,
+        # so a near-zero error there is not evidence of a good match — it's just what an
+        # under-constrained fit looks like. Without this term a lucky/degenerate 3-point
+        # camera can end up as confident as a genuinely well-matched 12-point one.
+        _n_locked     = len(truly_locked_k)
+        _n_hyp        = len(hyp_k)
+        _locked_ratio = _n_locked / max(_n_locked + _n_hyp, 1)
+        _err_factor   = min(1.0, self._c_prox_strong_match_px / max(error, 1e-6))
+        _redundancy_factor = min(1.0, max(0.0, len(final_pairs) - 3) / max(self._c_prox_redundancy_ref, 1e-6))
+        _confidence   = _locked_ratio * _err_factor * _redundancy_factor
+
         return {
             "rvec":       rvec,
             "tvec":       tvec,
@@ -1352,6 +1512,9 @@ class PoseSearcher:
             "aux_inliers":     aux_inlier_count,
             "aux_cameras":     aux_cameras_result or None,
             "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,
+            "n_locked":   _n_locked,
+            "n_hyp":      _n_hyp,
+            "confidence": _confidence,
         }
 
     def constrained_search(
@@ -1628,6 +1791,707 @@ class PoseSearcher:
             "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,
         }
 
+    def new_brute_state(
+        self,
+        blobs: np.ndarray,
+        pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        other_cameras_blobs: Optional[List] = None,
+        blob_radii: Optional[np.ndarray] = None,
+        blob_mask: Optional[np.ndarray] = None,
+        occluders_per_cam: Optional[Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = None,
+    ) -> Optional[BruteSearchState]:
+        """
+        Build the state for one resumable brute-force recovery attempt (one camera,
+        one pose_prior) — everything that's constant across tiers within that attempt,
+        plus zero-initialized cross-tier bookkeeping. Call brute_search_tier(state,
+        tier_idx) once per tier (in order, 0..len(depth_tiers)-1, stopping early if
+        state.strong_found becomes True); call finalize_brute_state(state) once done
+        to run joint-LM refinement + logging and get the accepted result.
+
+        Returns None if there aren't enough available blobs to ever succeed (mirrors
+        brute_search's own early-return — the caller should treat that the same way,
+        i.e. skip tier calls and finalize entirely).
+        """
+        blobs   = np.asarray(blobs, dtype=np.float32)
+        n_blobs = len(blobs)
+        avail_idx = (np.where(blob_mask)[0].astype(np.int32) if blob_mask is not None
+                     else np.arange(n_blobs, dtype=np.int32))
+        n_available = len(avail_idx)
+        if n_available < 4:
+            return None
+
+        if self._c_brute_min_frac is not None:
+            fraction_floor     = int(np.ceil(self._c_brute_min_frac * n_available))
+            min_inliers_eff    = max(self._c_brute_min_inliers, fraction_floor)
+            strong_inliers_eff = min(self._c_brute_strong_in, fraction_floor)
+        else:
+            min_inliers_eff    = self._c_brute_min_inliers
+            strong_inliers_eff = self._c_brute_strong_in
+
+        max_blob_depth = max(t[1] for t in self._c_brute_depth_tiers)
+        blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
+
+        # Undistort blobs once (mirrors OpenHMD's correspondence_search_set_blobs).
+        # Gate check uses pinhole projection which is valid in undistorted space.
+        blobs_undist = self.camera.undistort_points(blobs, P=self.camera.camera_matrix).astype(np.float32)
+
+        R_prior    = None
+        tvec_prior = None
+        if pose_prior is not None:
+            rvec_pr, tvec_pr = pose_prior
+            R_prior, _ = cv2.Rodrigues(np.asarray(rvec_pr, dtype=np.float32).reshape(3, 1))
+            tvec_prior = np.asarray(tvec_pr, dtype=np.float32).reshape(3)
+
+        n_tiers = len(self._c_brute_depth_tiers)
+        return BruteSearchState(
+            blobs=blobs,
+            avail_idx=avail_idx,
+            n_available=n_available,
+            min_inliers_eff=min_inliers_eff,
+            strong_inliers_eff=strong_inliers_eff,
+            blob_nbr=blob_nbr,
+            blobs_undist=blobs_undist,
+            pose_prior=pose_prior,
+            R_prior=R_prior,
+            tvec_prior=tvec_prior,
+            other_cameras_blobs=other_cameras_blobs,
+            blob_radii=blob_radii,
+            blob_mask=blob_mask,
+            occluders_per_cam=occluders_per_cam,
+            prev_blob_max_per_triple=np.zeros(len(self._led_triple_idx), dtype=np.int32),
+            prev_blob_max_per_triple_edge=np.zeros(len(self._led_triple_idx_edge), dtype=np.int32),
+            bijection_counts={} if is_deep() else None,
+            rng=np.random.default_rng(self._c_brute_rng_seed),
+            tier_p3p_calls=[0] * n_tiers,
+            tier_lq_tried=[0] * n_tiers,
+            tier_lq_total=[0] * n_tiers,
+        )
+
+    def brute_search_tier(self, state: BruteSearchState, tier_idx: int) -> None:
+        """
+        Run exactly one depth-tier of a brute-force recovery attempt, mutating `state`
+        in place (running-best bundle, per-triple dedup progress, telemetry). No-op if
+        the attempt is already done (state.strong_found) or tier_idx is out of range.
+
+        This is the literal per-tier body of the original monolithic brute_search's
+        tier loop, made callable one tier at a time so a caller can interleave tier
+        rounds across multiple cameras (try tier_0 for everyone before widening to
+        tier_1 for anyone, etc.) instead of one camera exhausting its whole ladder
+        before the next camera is even tried.
+        """
+        if state.strong_found or tier_idx >= len(self._c_brute_depth_tiers):
+            return
+
+        blobs               = state.blobs
+        _avail_idx          = state.avail_idx
+        blob_mask           = state.blob_mask
+        blob_radii          = state.blob_radii
+        other_cameras_blobs = state.other_cameras_blobs
+        occluders_per_cam   = state.occluders_per_cam
+        R_prior             = state.R_prior
+        tvec_prior          = state.tvec_prior
+        min_inliers_eff     = state.min_inliers_eff
+        blob_nbr            = state.blob_nbr
+        blobs_undist        = state.blobs_undist
+        n_available         = state.n_available
+        rng                 = state.rng
+        seen_bijections     = state.seen_bijections
+        bijection_counts    = state.bijection_counts
+        tier_p3p_calls      = state.tier_p3p_calls
+        tier_lq_tried       = state.tier_lq_tried
+        tier_lq_total       = state.tier_lq_total
+
+        positions = self.model.positions.astype(np.float32)
+        normals   = self.model.normals.astype(np.float32)
+        K         = self.camera.camera_matrix
+        dc        = self.camera.dist_coeffs
+        focal_px  = float(max(K[0, 0], K[1, 1]))
+
+        led_triple_idx   = self._led_triple_idx
+        led_triple_depth = self._led_triple_depth
+        led_triple_gates = self._led_triple_gates
+
+        led_triple_idx_edge   = self._led_triple_idx_edge
+        led_triple_depth_edge = self._led_triple_depth_edge
+        led_triple_gates_edge = self._led_triple_gates_edge
+
+        geom = self._geometry
+
+        p4_thresh_sq = self._c_brute_p4_px ** 2
+        fx, fy       = float(K[0, 0]), float(K[1, 1])
+        cx, cy       = float(K[0, 2]), float(K[1, 2])
+        _log_size_filter = is_deep() and self._c_log_size_filter
+        _track_gate_dist = is_deep()
+
+        _dbg_leds, _dbg_blobs = get_debug_triple()
+        debug_active      = _dbg_leds is not None or _dbg_blobs is not None
+        debug_led_anchor  = int(_dbg_leds[0])     if _dbg_leds  is not None else None
+        debug_led_set     = frozenset(_dbg_leds)  if _dbg_leds  is not None else None
+        debug_blob_anchor = int(_dbg_blobs[0])    if _dbg_blobs is not None else None
+        debug_blob_set    = frozenset(_dbg_blobs) if _dbg_blobs is not None else None
+
+        tier_spec = self._c_brute_depth_tiers[tier_idx]
+        led_max, blob_max = tier_spec[0], tier_spec[1]
+        nbr_type = tier_spec[2] if len(tier_spec) > 2 else 'standard'
+
+        if nbr_type == 'edge':
+            cur_triple_idx   = led_triple_idx_edge
+            cur_triple_depth = led_triple_depth_edge
+            cur_triple_gates = led_triple_gates_edge
+            cur_prev_blob    = state.prev_blob_max_per_triple_edge
+        else:
+            cur_triple_idx   = led_triple_idx
+            cur_triple_depth = led_triple_depth
+            cur_triple_gates = led_triple_gates
+            cur_prev_blob    = state.prev_blob_max_per_triple
+
+        eligible_mask = cur_triple_depth <= led_max
+        eligible_triple_idx = np.where(eligible_mask)[0]
+
+        # Keep only triples that have new blob pairs to explore at this tier.
+        has_new_blob_pairs = cur_prev_blob[eligible_triple_idx] < blob_max
+        active_triple_idx  = eligible_triple_idx[has_new_blob_pairs]
+        tier_lq_total[tier_idx] = len(active_triple_idx)
+
+        if len(active_triple_idx) == 0:
+            return
+
+        active_triple_idx = active_triple_idx[rng.permutation(len(active_triple_idx))]
+
+        for triple_i in active_triple_idx:
+            led_ids            = cur_triple_idx[triple_i]    # [anchor, l1, l2]
+            p3p_world_pts      = positions[led_ids]           # (3, 3) world points for P3P
+            gate_led           = cur_triple_gates[triple_i]
+            gate_led_world_pts = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
+
+            # Start blob-pair enumeration from where the previous tier left off for
+            # this triple; avoids re-evaluating combinations already covered earlier.
+            min_blob_i2 = int(cur_prev_blob[triple_i])
+            did_p3p = False
+
+            for b_anchor in _avail_idx:
+                if state.strong_found:
+                    break
+                blob_neighbors   = blob_nbr[b_anchor]
+                if blob_mask is not None:
+                    blob_neighbors = blob_neighbors[blob_mask[blob_neighbors]]
+                n_blob_neighbors = min(len(blob_neighbors), blob_max)
+                if n_blob_neighbors < 2:
+                    continue
+
+                for i1, i2 in combinations(range(n_blob_neighbors), 2):
+                    if state.strong_found:
+                        break
+                    if i2 < min_blob_i2:
+                        continue
+                    b1 = int(blob_neighbors[i1])
+                    b2 = int(blob_neighbors[i2])
+
+                    gate_blob_idx    = [int(blob_neighbors[j]) for j in range(n_blob_neighbors) if j != i1 and j != i2]
+                    # If gate_blob_idx is empty (n_blob_neighbors == 2), _gate_any_point
+                    # returns False — a 4th blob neighbour is required for gate validation.
+                    gate_blob_img_pts = blobs_undist[gate_blob_idx] if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
+
+                    for b1_ord, b2_ord in ((b1, b2), (b2, b1)):
+                        if state.strong_found:
+                            break
+
+                        # ── Debug trigger ─────────────────────────────────────
+                        # Anchors are matched positionally (first element of each
+                        # debug triple); l1/l2 and b1/b2 are matched as sets so
+                        # their internal ordering doesn't matter.  This gives at
+                        # most 2 prints per frame: one per b1↔b2 swap.
+                        dbg = is_verbose_all() or (
+                            debug_active and
+                            (debug_led_set  is None or (
+                                int(led_ids[0]) == debug_led_anchor and
+                                frozenset(led_ids) == debug_led_set)) and
+                            (debug_blob_set is None or (
+                                b_anchor == debug_blob_anchor and
+                                frozenset([b_anchor, b1_ord, b2_ord]) == debug_blob_set))
+                        )
+                        if dbg:
+                            logger.debug(
+                                f"Target triple reached — "
+                                f"LEDs {list(led_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
+                                f"tier={tier_idx} ({_tier_label(tier_spec)})"
+                            )
+                            logger.debug(
+                                f"  gate LEDs={list(gate_led)}  gate blobs={gate_blob_idx}"
+                            )
+
+                        p3p_img_pts = blobs[[b_anchor, b1_ord, b2_ord]]
+
+                        bij = frozenset(((int(led_ids[0]), b_anchor),
+                                         (int(led_ids[1]), b1_ord),
+                                         (int(led_ids[2]), b2_ord)))
+
+                        if bij in seen_bijections:
+                            continue
+                        seen_bijections.add(bij)
+
+                        if bijection_counts is not None:
+                            bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
+
+                        # ── 1. P3P → up to 4 pose hypotheses ─────────────────
+                        tier_p3p_calls[tier_idx] += 1
+                        did_p3p = True
+                        # solveP3P only supports standard polynomial distortion
+                        # internally. Pre-undistort to normalised coords and pass
+                        # identity K so both radtan8 and kb4 work correctly.
+                        p3p_img_norm = self.camera.undistort_points(p3p_img_pts)
+                        n_sols, rvecs, tvecs = cv2.solveP3P(
+                            p3p_world_pts.reshape(3, 1, 3),
+                            p3p_img_norm.reshape(3, 1, 2).astype(np.float32),
+                            np.eye(3, dtype=np.float32),
+                            np.zeros(4, dtype=np.float32),
+                            flags=cv2.SOLVEPNP_P3P,
+                        )
+                        self._dbg(dbg, f"  P3P returned {n_sols} solutions")
+                        if not n_sols or rvecs is None:
+                            continue
+
+                        # Sort hypotheses by rotation distance to prior so the
+                        # closest-to-prior solution is tried first — increases the
+                        # chance of strong_found triggering early.
+                        if R_prior is not None and n_sols > 1:
+                            def _rot_score(rv):
+                                R_i, _ = cv2.Rodrigues(rv.reshape(3, 1).astype(np.float32))
+                                return float(np.trace(R_i @ R_prior.T))
+                            order  = sorted(range(n_sols), key=lambda k: -_rot_score(rvecs[k]))
+                            rvecs  = [rvecs[k] for k in order]
+                            tvecs  = [tvecs[k] for k in order]
+
+                        for sol_i, (rvec_h, tvec_h) in enumerate(zip(rvecs, tvecs)):
+                            if state.strong_found:
+                                break
+                            rvec_h = rvec_h.reshape(3, 1).astype(np.float32)
+                            tvec_h = tvec_h.reshape(3).astype(np.float32)
+
+                            # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
+                            z_ok = _check_z_range(tvec_h)
+                            self._dbg(dbg, f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
+                            if not z_ok:
+                                continue
+
+                            R_h, _ = cv2.Rodrigues(rvec_h)
+
+                            # ── 3. Gate check (any gate LED near any gate blob) ─
+                            gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_led_world_pts, gate_blob_img_pts, fx, fy, cx, cy, p4_thresh_sq, _track_gate_dist)
+                            self._dbg(dbg, f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
+                            if not gate_ok:
+                                continue
+
+                            # ── 4. Full inlier count on all visible LEDs ───────
+                            vis_mask_h = _visible_mask(
+                                R_h, tvec_h, positions, normals,
+                                geom,
+                                cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+                                cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
+                                facing_threshold_deg=self._c_facing_deg,
+                            ) >= 1.0
+                            vis_ids = np.where(vis_mask_h)[0]
+                            self._dbg(dbg, f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
+                            if len(vis_ids) < self._c_brute_min_inliers:
+                                continue
+
+                            proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc,
+                                                       is_fisheye=self.camera.is_fisheye)
+                            cost     = cdist(blobs, proj_all)
+                            if blob_mask is not None:
+                                _cost_sub = cost[_avail_idx]
+                                _sub_rows, hungarian_led_cols = linear_sum_assignment(_cost_sub)
+                                hungarian_blob_rows = _avail_idx[_sub_rows]
+                            else:
+                                hungarian_blob_rows, hungarian_led_cols = linear_sum_assignment(cost)
+
+                            inlier_mask    = cost[hungarian_blob_rows, hungarian_led_cols] < self._c_brute_hungarian_px
+                            inlier_blobs   = hungarian_blob_rows[inlier_mask]
+                            inlier_leds    = vis_ids[hungarian_led_cols[inlier_mask]]
+
+                            if dbg:
+                                outlier_mask     = cost[hungarian_blob_rows, hungarian_led_cols] >= self._c_brute_hungarian_px
+                                outlier_blob_rows = hungarian_blob_rows[outlier_mask]
+                                outlier_led_cols  = vis_ids[hungarian_led_cols[outlier_mask]]
+                                logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after Hungarian "
+                                             f"(need {min_inliers_eff})")
+                            if len(inlier_blobs) < min_inliers_eff:
+                                continue
+
+                            # ── 5. RANSAC PnP refinement on inliers ───────────
+                            ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
+                                positions[inlier_leds], blobs[inlier_blobs], K, dc,
+                                rvec_h, tvec_h.reshape(3, 1),
+                                reprojection_px=self._c_brute_reproj_px,
+                                is_fisheye=self.camera.is_fisheye,
+                            )
+                            self._dbg(dbg, f"  sol {sol_i}: RANSAC ok={ok_r}, "
+                                           f"inliers={len(ransac_inliers) if ok_r else 0}")
+                            if not ok_r:
+                                continue
+
+                            inlier_leds  = inlier_leds[ransac_inliers]
+                            inlier_blobs = inlier_blobs[ransac_inliers]
+
+                            if len(inlier_blobs) < min_inliers_eff:
+                                continue
+
+                            # ── 6. Visibility recheck with the refined pose ────
+                            # Recompute on ALL LEDs so that:
+                            #   (a) the denominator for coverage is accurate,
+                            #   (b) inliers occluded under the refined pose are dropped.
+                            R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
+                            tvec_r_flat = tvec_r.reshape(3)
+                            vis_scores_r = _visible_mask(
+                                R_r, tvec_r_flat, positions, normals,
+                                geom,
+                                cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
+                                cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
+                                facing_threshold_deg=self._c_facing_deg,
+                            )
+                            if occluders_per_cam:
+                                _occ_r = occluders_per_cam.get(self.camera.camera_idx)
+                                if _occ_r is not None:
+                                    _R_occ_r, _t_occ_r, _geom_occ_r = _occ_r
+                                    _cross_occ_r = _cross_occluded_mask(
+                                        R_r, tvec_r_flat, positions,
+                                        _R_occ_r, _t_occ_r, _geom_occ_r,
+                                        self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
+                                        log_tag=f"[{self._ctrl} | cam {self._cam}]",
+                                        vis_mask=vis_scores_r > 0.0,
+                                    )
+                                    vis_scores_r[_cross_occ_r] = 0.0
+                            vis_mask_r = vis_scores_r >= 1.0
+                            # Drop inliers that became occluded under the refined pose.
+                            inlier_still_visible = vis_mask_r[inlier_leds]
+                            inlier_leds  = inlier_leds[inlier_still_visible]
+                            inlier_blobs = inlier_blobs[inlier_still_visible]
+                            self._dbg(dbg, f"  sol {sol_i}: {len(inlier_blobs)} inliers after vis recheck")
+                            if len(inlier_blobs) < min_inliers_eff:
+                                continue
+
+                            vis_ids_r = np.where(vis_mask_r)[0]
+
+                            # ── 6.5. Post-RANSAC blob recovery ────────────────
+                            # Blobs outside hungarian_threshold_px on the coarse
+                            # P3P pose may land within reprojection_threshold
+                            # under the refined pose.  One greedy nearest-
+                            # neighbour pass recovers them (one cdist, no PnP).
+                            matched_blob_set  = set(inlier_blobs.tolist())
+                            matched_led_set   = set(inlier_leds.tolist())
+                            unmatched_blobs   = np.array([b for b in _avail_idx if b not in matched_blob_set], dtype=np.int32)
+                            unmatched_col_idx = np.array([j for j, lid in enumerate(vis_ids_r) if int(lid) not in matched_led_set], dtype=np.int32)
+
+                            if len(unmatched_blobs) > 0 and len(unmatched_col_idx) > 0:
+                                proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc,
+                                                              is_fisheye=self.camera.is_fisheye)
+                                cost_r     = cdist(blobs, proj_vis_r)
+                                sub_min    = cost_r[np.ix_(unmatched_blobs, unmatched_col_idx)].min(axis=0)
+                                _led_cam_r = ((R_r @ positions[vis_ids_r].T).T + tvec_r_flat
+                                              if blob_radii is not None else None)
+                                extra_blobs: List[int] = []
+                                extra_leds:  List[int] = []
+                                for order_j in np.argsort(sub_min):
+                                    if sub_min[order_j] >= self._c_brute_reproj_px:
+                                        break
+                                    col    = int(unmatched_col_idx[order_j])
+                                    led_id = int(vis_ids_r[col])
+                                    _exp_px_rc = (focal_px * (self._c_led_radius_mm / 1000.0) /
+                                                  float(max(_led_cam_r[col, 2], 0.01))
+                                                  if _led_cam_r is not None else None)
+                                    for row_i in np.argsort(cost_r[unmatched_blobs, col]):
+                                        b = int(unmatched_blobs[row_i])
+                                        if b in matched_blob_set:
+                                            continue
+                                        if cost_r[b, col] >= self._c_brute_reproj_px:
+                                            break
+                                        if (_exp_px_rc is not None and not (
+                                                _exp_px_rc * self._c_blob_size_min
+                                                <= float(blob_radii[b])
+                                                <= _exp_px_rc * self._c_blob_size_max)):
+                                            if _log_size_filter:
+                                                logger.debug(
+                                                    f"  LED {led_id}: blob {b}"
+                                                    f" size-filtered (brute extra-blob)"
+                                                    f"  r={float(blob_radii[b]):.2f}  expected"
+                                                    f" {_exp_px_rc*self._c_blob_size_min:.2f}–{_exp_px_rc*self._c_blob_size_max:.2f}px"
+                                                )
+                                            continue
+                                        matched_blob_set.add(b)
+                                        extra_blobs.append(b)
+                                        extra_leds.append(led_id)
+                                        break
+                                if extra_blobs:
+                                    inlier_blobs = np.concatenate([inlier_blobs, np.array(extra_blobs, dtype=inlier_blobs.dtype)])
+                                    inlier_leds  = np.concatenate([inlier_leds,  np.array(extra_leds,  dtype=inlier_leds.dtype)])
+                                    self._dbg(dbg, f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
+
+                            # ── 6.7. Aux-camera validation ────────────────────
+                            # Lift refined pose to world frame and score against
+                            # each aux camera's blobs. These correspondences
+                            # are not added to the primary-cam assignment but do
+                            # increase the pooled coverage and inlier count used
+                            # for hypothesis ranking.
+                            extra_vis_weight      = 0.0
+                            extra_inlier_weight   = 0.0
+                            extra_inlier_count    = 0
+                            aux_blob_denom        = 0
+                            aux_cameras_current   = []
+                            aux_assignments_current: Dict[int, List] = {}
+                            if other_cameras_blobs:
+                                T_world_ctrl = self.T_world_cam.compose(
+                                    Transform(R_r, tvec_r_flat)
+                                )
+                                for _ocam, _oblobs, _oradii in other_cameras_blobs:
+                                    _oblobs = np.asarray(_oblobs, dtype=np.float32)
+                                    if len(_oblobs) == 0:
+                                        continue
+                                    _R_i, _t_i, _rv_i, _focal_i, _vis_i = self._aux_cam_vis(
+                                        _ocam, T_world_ctrl, occluders_per_cam
+                                    )
+                                    _vis_ids_i = np.where(_vis_i)[0]
+                                    if len(_vis_ids_i) == 0:
+                                        continue
+
+                                    _proj_i = _project_points(
+                                        _rv_i, _t_i, positions[_vis_ids_i],
+                                        _ocam.camera_matrix, _ocam.dist_coeffs,
+                                        is_fisheye=_ocam.is_fisheye,
+                                    )
+                                    _cost_i = cdist(_oblobs, _proj_i)
+                                    _rows_i, _cols_i = linear_sum_assignment(_cost_i)
+                                    _inlier_i = _cost_i[_rows_i, _cols_i] < self._c_brute_aux_reproj_px
+                                    _led_cam_i = (_R_i @ positions[_vis_ids_i].T).T + _t_i
+                                    if _oradii is not None:
+                                        for _k in range(len(_rows_i)):
+                                            if not _inlier_i[_k]:
+                                                continue
+                                            _depth_k = float(max(_led_cam_i[_cols_i[_k], 2], 0.01))
+                                            _exp_px_k = _focal_i * (self._c_led_radius_mm / 1000.0) / _depth_k
+                                            if not (_exp_px_k * self._c_blob_size_min
+                                                    <= float(_oradii[_rows_i[_k]])
+                                                    <= _exp_px_k * self._c_blob_size_max):
+                                                if _log_size_filter:
+                                                    logger.debug(
+                                                        f"  LED {int(_vis_ids_i[_cols_i[_k]])}: blob {int(_rows_i[_k])}"
+                                                        f" size-filtered (brute aux-inlier cam{_ocam.camera_idx})"
+                                                        f"  r={float(_oradii[_rows_i[_k]]):.2f}  expected"
+                                                        f" {_exp_px_k*self._c_blob_size_min:.2f}–{_exp_px_k*self._c_blob_size_max:.2f}px"
+                                                    )
+                                                _inlier_i[_k] = False
+                                    _n_aux = int(_inlier_i.sum())
+                                    if dbg:
+                                        _matched_dists = _cost_i[_rows_i, _cols_i]
+                                        logger.debug(
+                                            f"  sol {sol_i}: aux cam{_ocam.camera_idx} "
+                                            f"vis={len(_vis_ids_i)} blobs={len(_oblobs)} "
+                                            f"matched_dists={_matched_dists.round(1).tolist()} "
+                                            f"thresh={self._c_brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
+                                        )
+                                    extra_inlier_count += _n_aux
+                                    aux_blob_denom     += min(len(_oblobs), len(_vis_ids_i))
+                                    aux_cameras_current.append((_ocam.camera_idx, _n_aux))
+                                    aux_assignments_current[_ocam.camera_idx] = [
+                                        (int(_rows_i[_k]), int(_vis_ids_i[_cols_i[_k]]))
+                                        for _k in range(len(_rows_i)) if _inlier_i[_k]
+                                    ]
+
+                                    _led_nrm_i = (_R_i @ normals[_vis_ids_i].T).T
+                                    _vdirs_i   = -_led_cam_i / (np.linalg.norm(_led_cam_i, axis=1, keepdims=True) + 1e-9)
+                                    _w_i       = np.clip((_led_nrm_i * _vdirs_i).sum(axis=1), 0.0, 1.0)
+
+                                    extra_vis_weight    += float(_w_i.sum())
+                                    extra_inlier_weight += float(_w_i[_cols_i[_inlier_i]].sum())
+
+                            # ── 7. Visibility coverage check ──────────────────
+                            # Weight each visible LED by cos(θ) — the dot product
+                            # of its normal with the view direction.  LEDs at
+                            # grazing angles (θ → 90°) may be theoretically
+                            # visible but are rarely detected reliably, so they
+                            # contribute less to both numerator and denominator.
+                            # This prevents those LEDs from unfairly failing the
+                            # coverage gate when they simply aren't bright enough.
+                            # Counts from other cameras (extra_*) are pooled in so
+                            # that combined multi-camera evidence can satisfy the
+                            # threshold even when one camera sees few LEDs.
+                            n_visible_leds = len(vis_ids_r)
+                            n_inlier_blobs = len(inlier_blobs)
+                            n_inlier_total = n_inlier_blobs + extra_inlier_count
+
+                            led_cam_pts    = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
+                            led_cam_normals = (R_r @ normals[vis_ids_r].T).T
+                            led_view_dirs  = -led_cam_pts / (np.linalg.norm(led_cam_pts, axis=1, keepdims=True) + 1e-9)
+                            led_vis_weights = np.clip((led_cam_normals * led_view_dirs).sum(axis=1), 0.0, 1.0)
+
+                            # inlier_leds ⊂ vis_ids_r is guaranteed by step 6; searchsorted
+                            # maps each inlier LED index to its position in vis_ids_r so we
+                            # can index led_vis_weights without a full boolean mask.
+                            inlier_idx_in_vis    = np.searchsorted(vis_ids_r, inlier_leds)
+                            weighted_visible_count = float(led_vis_weights.sum()) + extra_vis_weight
+                            weighted_inlier_count  = float(led_vis_weights[inlier_idx_in_vis].sum()) + extra_inlier_weight
+
+                            # Balanced F1-style coverage: harmonic mean of LED recall and blob
+                            # precision. LED recall (weighted by cos θ) measures how many of the
+                            # model-visible LEDs were matched. Blob precision measures how many of
+                            # the detected blobs the pose explains, with the denominator capped at
+                            # n_visible_leds so that blobs from the other controller or noise do
+                            # not unfairly penalise a correct pose. Both sides pool aux cameras.
+                            led_cov  = (weighted_inlier_count / weighted_visible_count
+                                        if weighted_visible_count > 0 else 1.0)
+                            _blob_denom = min(n_available, n_visible_leds) + aux_blob_denom
+                            blob_cov = ((n_inlier_blobs + extra_inlier_count) / _blob_denom
+                                        if _blob_denom > 0 else 1.0)
+                            balanced_coverage = (2.0 * led_cov * blob_cov / (led_cov + blob_cov)
+                                                 if led_cov + blob_cov > 0.0 else 0.0)
+                            if balanced_coverage < self._c_brute_min_vis_cov:
+                                if dbg:
+                                    logger.debug(
+                                        f"  sol {sol_i}: balanced coverage {balanced_coverage:.2f} < {self._c_brute_min_vis_cov:.2f}"
+                                        f"  led_cov={led_cov:.2f}  blob_cov={blob_cov:.2f}"
+                                        f"  (primary {n_inlier_blobs}/{n_visible_leds} leds,"
+                                        f" {n_inlier_blobs}/{min(n_available, n_visible_leds)} blobs"
+                                        f" +{extra_inlier_count} aux)"
+                                    )
+                                continue
+
+                            proj_r = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc,
+                                                     is_fisheye=self.camera.is_fisheye)
+                            err    = float(np.mean(np.linalg.norm(proj_r - blobs[inlier_blobs], axis=1)))
+
+                            orient_err = np.inf
+                            if R_prior is not None:
+                                cos_orient_angle = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
+                                orient_err = float(np.arccos(cos_orient_angle))
+
+                            tvec_err = np.inf
+                            if tvec_prior is not None:
+                                tvec_err = float(np.linalg.norm(tvec_r.reshape(3) - tvec_prior))
+
+                            # Prefer more inliers (pooled across all cameras); break
+                            # ties by primary error, then prior distances.
+                            # The error cap prevents a high-inlier solution at poor
+                            # accuracy from displacing a tight low-inlier one.
+                            is_better = (
+                                (n_inlier_total > state.best_inliers_total and err < state.best_error + 1.0) or
+                                (n_inlier_total >= state.best_inliers_total + 2 and err < state.best_error + 1.5) or
+                                (n_inlier_total == state.best_inliers_total and err < state.best_error) or
+                                (n_inlier_total == state.best_inliers_total and
+                                 abs(err - state.best_error) < 0.5 and
+                                 orient_err < state.best_orient_err) or
+                                (n_inlier_total == state.best_inliers_total and
+                                 abs(err - state.best_error) < 0.5 and
+                                 orient_err == state.best_orient_err and
+                                 tvec_err < state.best_tvec_err)
+                            )
+
+                            self._dbg(dbg, f"  sol {sol_i}: err={err:.3f} px  "
+                                           f"inliers={n_inlier_blobs}+{extra_inlier_count}aux={n_inlier_total}  "
+                                           f"is_better={is_better}")
+
+                            if is_better:
+                                state.best_solution = {
+                                    "rvec":             rvec_r,
+                                    "tvec":             tvec_r,
+                                    "inliers":          n_inlier_blobs,
+                                    "aux_inliers":      extra_inlier_count,
+                                    "aux_cameras":      aux_cameras_current or None,
+                                    "aux_assignments":  dict(aux_assignments_current) or None,
+                                    "error":            err,
+                                    "assignment":       list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
+                                    "method":           "p3p_systematic",
+                                }
+                                state.best_inliers       = n_inlier_blobs
+                                state.best_inliers_total = n_inlier_total
+                                state.best_error         = err
+                                state.best_orient_err    = orient_err
+                                state.best_tvec_err      = tvec_err
+                                state.solution_tier      = tier_idx
+
+                                if log_best():
+                                    _aux_dbg = ""
+                                    if aux_cameras_current:
+                                        _aux_dbg = "  aux=[" + ",".join(
+                                            f"cam{c}:{n}" for c, n in aux_cameras_current
+                                        ) + "]"
+                                    logger.debug(
+                                        f"  ★ [{self._ctrl} | cam {self._cam}] new best — tier={tier_idx} "
+                                        f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
+                                        f"sol={sol_i}  inliers={n_inlier_blobs}+{extra_inlier_count}aux  err={err:.3f}px  "
+                                        f"cov={balanced_coverage:.2f} (led={led_cov:.2f} blob={blob_cov:.2f})"
+                                        f"  matched={n_inlier_blobs}/{n_visible_leds}"
+                                        + _aux_dbg
+                                    )
+
+                                if state.best_error <= self._c_brute_strong_err and balanced_coverage >= self._c_brute_min_vis_cov:
+                                    state.strong_found = True
+
+            cur_prev_blob[triple_i] = blob_max
+            if did_p3p:
+                tier_lq_tried[tier_idx] += 1
+            if state.strong_found:
+                break
+
+    def finalize_brute_state(self, state: BruteSearchState) -> Optional[Dict]:
+        """
+        Run joint-LM refinement + final logging/telemetry summary for a brute-force
+        recovery attempt, and return the accepted solution (or None). Call once, after
+        brute_search_tier has been called for as many tiers as needed (either
+        state.strong_found tripped, or every tier has been tried).
+        """
+        best_solution = state.best_solution
+        K  = self.camera.camera_matrix
+        dc = self.camera.dist_coeffs
+
+        if best_solution is not None:
+            _joint_result = self._apply_joint_lm(
+                best_solution['rvec'].reshape(3, 1),
+                best_solution['tvec'].reshape(3),
+                best_solution['assignment'],
+                state.blobs,
+                best_solution.get('aux_assignments') or {},
+                state.other_cameras_blobs or [],
+                K, dc, "Brute", best_solution['error'],
+            )
+            if _joint_result is not None:
+                _rv_j, _tv_j, _err_j = _joint_result
+                best_solution['rvec']   = _rv_j
+                best_solution['tvec']   = _tv_j.reshape(3, 1)
+                best_solution['error']  = _err_j
+                best_solution['method'] = best_solution['method'] + '_mc'
+
+        total_p3p_tried = sum(state.tier_p3p_calls)
+
+        result_str = (
+            f"found in tier_{state.solution_tier} ({_tier_label(self._c_brute_depth_tiers[state.solution_tier])})  "
+            f"({state.best_inliers} inliers, {state.best_error:.2f} px)"
+            if best_solution is not None else "not found"
+        )
+        dup_line = ""
+        if state.bijection_counts is not None:
+            n_unique = len(state.bijection_counts)
+            n_dup    = total_p3p_tried - n_unique
+            max_dup  = max(state.bijection_counts.values(), default=0)
+            dup_line = (
+                f"\n  bijections — {n_unique} unique / {total_p3p_tried} calls  "
+                f"({n_dup} duplicate calls, max {max_dup}× same bijection)"
+            )
+        tier_lines = "\n".join(
+            f"  tier_{i} ({_tier_label(self._c_brute_depth_tiers[i])}) — "
+            f"{state.tier_p3p_calls[i]:>7} P3P calls  "
+            f"({state.tier_lq_tried[i]}/{state.tier_lq_total[i]} LED triples reached inner loop)"
+            for i in range(len(self._c_brute_depth_tiers))
+        )
+        logger.debug(
+            f"[{self._ctrl} | cam {self._cam}] Brute-force: {result_str}\n"
+            f"{tier_lines}\n"
+            f"  total — {total_p3p_tried:>7} P3P calls"
+            f"{dup_line}"
+        )
+
+        if best_solution is not None and state.blob_mask is not None:
+            best_solution['_orig_idx'] = True
+        return best_solution
+
     def brute_search(
         self,
         blobs: np.ndarray,
@@ -1663,641 +2527,18 @@ class PoseSearcher:
           - Blob pairs newly eligible because i2 ≥ prev blob_max for already-eligible triples
         Exits on strong match at the end of any tier's LED triple.
         """
-        _log_size_filter = is_deep() and self._c_log_size_filter
-
-        blobs   = np.asarray(blobs, dtype=np.float32)
-        n_blobs = len(blobs)
-        _avail_idx  = np.where(blob_mask)[0].astype(np.int32) if blob_mask is not None else np.arange(n_blobs, dtype=np.int32)
-        n_available = len(_avail_idx)
-        if n_available < 4:
+        # Thin wrapper around the resumable per-tier API (new_brute_state /
+        # brute_search_tier / finalize_brute_state) — preserves the exact
+        # sequential tier loop, rng draw sequence, and cross-tier dedup/best-so-far
+        # behavior of the original monolithic search.
+        state = self.new_brute_state(
+            blobs, pose_prior=pose_prior, other_cameras_blobs=other_cameras_blobs,
+            blob_radii=blob_radii, blob_mask=blob_mask, occluders_per_cam=occluders_per_cam,
+        )
+        if state is None:
             return None
-
-        if self._c_brute_min_frac is not None:
-            fraction_floor     = int(np.ceil(self._c_brute_min_frac * n_available))
-            min_inliers_eff    = max(self._c_brute_min_inliers, fraction_floor)
-            strong_inliers_eff = min(self._c_brute_strong_in, fraction_floor)
-        else:
-            min_inliers_eff    = self._c_brute_min_inliers
-            strong_inliers_eff = self._c_brute_strong_in
-
-        positions = self.model.positions.astype(np.float32)
-        normals   = self.model.normals.astype(np.float32)
-        K         = self.camera.camera_matrix
-        dc        = self.camera.dist_coeffs
-        focal_px  = float(max(K[0, 0], K[1, 1]))
-
-        led_triple_idx   = self._led_triple_idx    # (N_LT, 3) int32
-        led_triple_depth = self._led_triple_depth  # (N_LT,) int32
-        led_triple_gates = self._led_triple_gates  # List[np.ndarray] gate LED indices per triple
-
-        led_triple_idx_edge   = self._led_triple_idx_edge
-        led_triple_depth_edge = self._led_triple_depth_edge
-        led_triple_gates_edge = self._led_triple_gates_edge
-
-        geom = self._geometry
-
-        max_blob_depth = max(t[1] for t in self._c_brute_depth_tiers)
-        blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
-
-        # Undistort blobs once (mirrors OpenHMD's correspondence_search_set_blobs).
-        # Gate check uses pinhole projection which is valid in undistorted space.
-        blobs_undist = self.camera.undistort_points(blobs, P=K).astype(np.float32)
-
-        p4_thresh_sq = self._c_brute_p4_px ** 2
-        fx, fy       = float(K[0, 0]), float(K[1, 1])
-        cx, cy       = float(K[0, 2]), float(K[1, 2])
-
-        R_prior    = None
-        tvec_prior = None
-        if pose_prior is not None:
-            rvec_pr, tvec_pr = pose_prior
-            R_prior, _ = cv2.Rodrigues(np.asarray(rvec_pr, dtype=np.float32).reshape(3, 1))
-            tvec_prior = np.asarray(tvec_pr, dtype=np.float32).reshape(3)
-
-        best_solution      = None
-        best_inliers       = 0
-        best_inliers_total = 0
-        best_error         = np.inf
-        best_orient_err    = np.inf
-        best_tvec_err      = np.inf
-        strong_found       = False
-        solution_tier      = None
-
-        # Per-triple: how far blob depth has been explored (the blob_max of the last tier
-        # that processed this triple). Enables delta coverage across tiers.
-        # Maintained separately for each neighbourhood type so delta tracking is consistent.
-        prev_blob_max_per_triple      = np.zeros(len(led_triple_idx),      dtype=np.int32)
-        prev_blob_max_per_triple_edge = np.zeros(len(led_triple_idx_edge), dtype=np.int32)
-
-        rng = np.random.default_rng(self._c_brute_rng_seed)
-
-        _track_gate_dist = is_deep()
-
-        tier_p3p_calls = [0] * len(self._c_brute_depth_tiers)
-        tier_lq_tried  = [0] * len(self._c_brute_depth_tiers)
-        tier_lq_total  = [0] * len(self._c_brute_depth_tiers)
-
-        _dbg_leds, _dbg_blobs = get_debug_triple()
-        debug_active      = _dbg_leds is not None or _dbg_blobs is not None
-        debug_led_anchor  = int(_dbg_leds[0])     if _dbg_leds  is not None else None
-        debug_led_set     = frozenset(_dbg_leds)  if _dbg_leds  is not None else None
-        debug_blob_anchor = int(_dbg_blobs[0])    if _dbg_blobs is not None else None
-        debug_blob_set    = frozenset(_dbg_blobs) if _dbg_blobs is not None else None
-
-        seen_bijections:  set                  = set()
-        bijection_counts: Dict[frozenset, int] = {} if is_deep() else None
-
-        for tier_idx, tier_spec in enumerate(self._c_brute_depth_tiers):
-            if strong_found:
+        for tier_idx in range(len(self._c_brute_depth_tiers)):
+            if state.strong_found:
                 break
-
-            led_max, blob_max = tier_spec[0], tier_spec[1]
-            nbr_type = tier_spec[2] if len(tier_spec) > 2 else 'standard'
-
-            if nbr_type == 'edge':
-                cur_triple_idx   = led_triple_idx_edge
-                cur_triple_depth = led_triple_depth_edge
-                cur_triple_gates = led_triple_gates_edge
-                cur_prev_blob    = prev_blob_max_per_triple_edge
-            else:
-                cur_triple_idx   = led_triple_idx
-                cur_triple_depth = led_triple_depth
-                cur_triple_gates = led_triple_gates
-                cur_prev_blob    = prev_blob_max_per_triple
-
-            eligible_mask = cur_triple_depth <= led_max
-            eligible_triple_idx = np.where(eligible_mask)[0]
-
-            # Keep only triples that have new blob pairs to explore at this tier.
-            has_new_blob_pairs = cur_prev_blob[eligible_triple_idx] < blob_max
-            active_triple_idx  = eligible_triple_idx[has_new_blob_pairs]
-            tier_lq_total[tier_idx] = len(active_triple_idx)
-
-            if len(active_triple_idx) == 0:
-                continue
-
-            active_triple_idx = active_triple_idx[rng.permutation(len(active_triple_idx))]
-
-            for triple_i in active_triple_idx:
-                led_ids            = cur_triple_idx[triple_i]    # [anchor, l1, l2]
-                p3p_world_pts      = positions[led_ids]           # (3, 3) world points for P3P
-                gate_led           = cur_triple_gates[triple_i]
-                gate_led_world_pts = positions[gate_led].astype(np.float32) if len(gate_led) > 0 else np.zeros((0, 3), dtype=np.float32)
-
-                # Start blob-pair enumeration from where the previous tier left off for
-                # this triple; avoids re-evaluating combinations already covered earlier.
-                min_blob_i2 = int(cur_prev_blob[triple_i])
-                did_p3p = False
-
-                for b_anchor in _avail_idx:
-                    if strong_found:
-                        break
-                    blob_neighbors   = blob_nbr[b_anchor]
-                    if blob_mask is not None:
-                        blob_neighbors = blob_neighbors[blob_mask[blob_neighbors]]
-                    n_blob_neighbors = min(len(blob_neighbors), blob_max)
-                    if n_blob_neighbors < 2:
-                        continue
-
-                    for i1, i2 in combinations(range(n_blob_neighbors), 2):
-                        if strong_found:
-                            break
-                        if i2 < min_blob_i2:
-                            continue
-                        b1 = int(blob_neighbors[i1])
-                        b2 = int(blob_neighbors[i2])
-
-                        gate_blob_idx    = [int(blob_neighbors[j]) for j in range(n_blob_neighbors) if j != i1 and j != i2]
-                        # If gate_blob_idx is empty (n_blob_neighbors == 2), _gate_any_point
-                        # returns False — a 4th blob neighbour is required for gate validation.
-                        gate_blob_img_pts = blobs_undist[gate_blob_idx] if gate_blob_idx else np.zeros((0, 2), dtype=np.float32)
-
-                        for b1_ord, b2_ord in ((b1, b2), (b2, b1)):
-                            if strong_found:
-                                break
-
-                            # ── Debug trigger ─────────────────────────────────────
-                            # Anchors are matched positionally (first element of each
-                            # debug triple); l1/l2 and b1/b2 are matched as sets so
-                            # their internal ordering doesn't matter.  This gives at
-                            # most 2 prints per frame: one per b1↔b2 swap.
-                            dbg = is_verbose_all() or (
-                                debug_active and
-                                (debug_led_set  is None or (
-                                    int(led_ids[0]) == debug_led_anchor and
-                                    frozenset(led_ids) == debug_led_set)) and
-                                (debug_blob_set is None or (
-                                    b_anchor == debug_blob_anchor and
-                                    frozenset([b_anchor, b1_ord, b2_ord]) == debug_blob_set))
-                            )
-                            if dbg:
-                                logger.debug(
-                                    f"Target triple reached — "
-                                    f"LEDs {list(led_ids)}  blobs [{b_anchor},{b1_ord},{b2_ord}]  "
-                                    f"tier={tier_idx} ({_tier_label(tier_spec)})"
-                                )
-                                logger.debug(
-                                    f"  gate LEDs={list(gate_led)}  gate blobs={gate_blob_idx}"
-                                )
-
-                            p3p_img_pts = blobs[[b_anchor, b1_ord, b2_ord]]
-
-                            bij = frozenset(((int(led_ids[0]), b_anchor),
-                                             (int(led_ids[1]), b1_ord),
-                                             (int(led_ids[2]), b2_ord)))
-
-                            if bij in seen_bijections:
-                                continue
-                            seen_bijections.add(bij)
-
-                            if bijection_counts is not None:
-                                bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
-
-                            # ── 1. P3P → up to 4 pose hypotheses ─────────────────
-                            tier_p3p_calls[tier_idx] += 1
-                            did_p3p = True
-                            # solveP3P only supports standard polynomial distortion
-                            # internally. Pre-undistort to normalised coords and pass
-                            # identity K so both radtan8 and kb4 work correctly.
-                            p3p_img_norm = self.camera.undistort_points(p3p_img_pts)
-                            n_sols, rvecs, tvecs = cv2.solveP3P(
-                                p3p_world_pts.reshape(3, 1, 3),
-                                p3p_img_norm.reshape(3, 1, 2).astype(np.float32),
-                                np.eye(3, dtype=np.float32),
-                                np.zeros(4, dtype=np.float32),
-                                flags=cv2.SOLVEPNP_P3P,
-                            )
-                            self._dbg(dbg, f"  P3P returned {n_sols} solutions")
-                            if not n_sols or rvecs is None:
-                                continue
-
-                            # Sort hypotheses by rotation distance to prior so the
-                            # closest-to-prior solution is tried first — increases the
-                            # chance of strong_found triggering early.
-                            if R_prior is not None and n_sols > 1:
-                                def _rot_score(rv):
-                                    R_i, _ = cv2.Rodrigues(rv.reshape(3, 1).astype(np.float32))
-                                    return float(np.trace(R_i @ R_prior.T))
-                                order  = sorted(range(n_sols), key=lambda k: -_rot_score(rvecs[k]))
-                                rvecs  = [rvecs[k] for k in order]
-                                tvecs  = [tvecs[k] for k in order]
-
-                            for sol_i, (rvec_h, tvec_h) in enumerate(zip(rvecs, tvecs)):
-                                if strong_found:
-                                    break
-                                rvec_h = rvec_h.reshape(3, 1).astype(np.float32)
-                                tvec_h = tvec_h.reshape(3).astype(np.float32)
-
-                                # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
-                                z_ok = _check_z_range(tvec_h)
-                                self._dbg(dbg, f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
-                                if not z_ok:
-                                    continue
-
-                                R_h, _ = cv2.Rodrigues(rvec_h)
-
-                                # ── 3. Gate check (any gate LED near any gate blob) ─
-                                gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_led_world_pts, gate_blob_img_pts, fx, fy, cx, cy, p4_thresh_sq, _track_gate_dist)
-                                self._dbg(dbg, f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
-                                if not gate_ok:
-                                    continue
-
-                                # ── 4. Full inlier count on all visible LEDs ───────
-                                vis_mask_h = _visible_mask(
-                                    R_h, tvec_h, positions, normals,
-                                    geom,
-                                    cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-                                    cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
-                                    facing_threshold_deg=self._c_facing_deg,
-                                ) >= 1.0
-                                vis_ids = np.where(vis_mask_h)[0]
-                                self._dbg(dbg, f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
-                                if len(vis_ids) < self._c_brute_min_inliers:
-                                    continue
-
-                                proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc,
-                                                           is_fisheye=self.camera.is_fisheye)
-                                cost     = cdist(blobs, proj_all)
-                                if blob_mask is not None:
-                                    _cost_sub = cost[_avail_idx]
-                                    _sub_rows, hungarian_led_cols = linear_sum_assignment(_cost_sub)
-                                    hungarian_blob_rows = _avail_idx[_sub_rows]
-                                else:
-                                    hungarian_blob_rows, hungarian_led_cols = linear_sum_assignment(cost)
-
-                                inlier_mask    = cost[hungarian_blob_rows, hungarian_led_cols] < self._c_brute_hungarian_px
-                                inlier_blobs   = hungarian_blob_rows[inlier_mask]
-                                inlier_leds    = vis_ids[hungarian_led_cols[inlier_mask]]
-
-                                if dbg:
-                                    outlier_mask     = cost[hungarian_blob_rows, hungarian_led_cols] >= self._c_brute_hungarian_px
-                                    outlier_blob_rows = hungarian_blob_rows[outlier_mask]
-                                    outlier_led_cols  = vis_ids[hungarian_led_cols[outlier_mask]]
-                                    logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after Hungarian "
-                                                 f"(need {min_inliers_eff})")
-                                if len(inlier_blobs) < min_inliers_eff:
-                                    continue
-
-                                # ── 5. RANSAC PnP refinement on inliers ───────────
-                                ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
-                                    positions[inlier_leds], blobs[inlier_blobs], K, dc,
-                                    rvec_h, tvec_h.reshape(3, 1),
-                                    reprojection_px=self._c_brute_reproj_px,
-                                    is_fisheye=self.camera.is_fisheye,
-                                )
-                                self._dbg(dbg, f"  sol {sol_i}: RANSAC ok={ok_r}, "
-                                               f"inliers={len(ransac_inliers) if ok_r else 0}")
-                                if not ok_r:
-                                    continue
-
-                                inlier_leds  = inlier_leds[ransac_inliers]
-                                inlier_blobs = inlier_blobs[ransac_inliers]
-
-                                if len(inlier_blobs) < min_inliers_eff:
-                                    continue
-
-                                # ── 6. Visibility recheck with the refined pose ────
-                                # Recompute on ALL LEDs so that:
-                                #   (a) the denominator for coverage is accurate,
-                                #   (b) inliers occluded under the refined pose are dropped.
-                                R_r, _ = cv2.Rodrigues(rvec_r.reshape(3, 1).astype(np.float32))
-                                tvec_r_flat = tvec_r.reshape(3)
-                                vis_scores_r = _visible_mask(
-                                    R_r, tvec_r_flat, positions, normals,
-                                    geom,
-                                    cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
-                                    cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
-                                    facing_threshold_deg=self._c_facing_deg,
-                                )
-                                if occluders_per_cam:
-                                    _occ_r = occluders_per_cam.get(self.camera.camera_idx)
-                                    if _occ_r is not None:
-                                        _R_occ_r, _t_occ_r, _geom_occ_r = _occ_r
-                                        _cross_occ_r = _cross_occluded_mask(
-                                            R_r, tvec_r_flat, positions,
-                                            _R_occ_r, _t_occ_r, _geom_occ_r,
-                                            self._c_occ_radius, self._c_occ_radius, focal_px, self._c_occ_margin_px,
-                                            log_tag=f"[{self._ctrl} | cam {self._cam}]",
-                                            vis_mask=vis_scores_r > 0.0,
-                                        )
-                                        vis_scores_r[_cross_occ_r] = 0.0
-                                vis_mask_r = vis_scores_r >= 1.0
-                                # Drop inliers that became occluded under the refined pose.
-                                inlier_still_visible = vis_mask_r[inlier_leds]
-                                inlier_leds  = inlier_leds[inlier_still_visible]
-                                inlier_blobs = inlier_blobs[inlier_still_visible]
-                                self._dbg(dbg, f"  sol {sol_i}: {len(inlier_blobs)} inliers after vis recheck")
-                                if len(inlier_blobs) < min_inliers_eff:
-                                    continue
-
-                                vis_ids_r = np.where(vis_mask_r)[0]
-
-                                # ── 6.5. Post-RANSAC blob recovery ────────────────
-                                # Blobs outside hungarian_threshold_px on the coarse
-                                # P3P pose may land within reprojection_threshold
-                                # under the refined pose.  One greedy nearest-
-                                # neighbour pass recovers them (one cdist, no PnP).
-                                matched_blob_set  = set(inlier_blobs.tolist())
-                                matched_led_set   = set(inlier_leds.tolist())
-                                unmatched_blobs   = np.array([b for b in _avail_idx if b not in matched_blob_set], dtype=np.int32)
-                                unmatched_col_idx = np.array([j for j, lid in enumerate(vis_ids_r) if int(lid) not in matched_led_set], dtype=np.int32)
-
-                                if len(unmatched_blobs) > 0 and len(unmatched_col_idx) > 0:
-                                    proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc,
-                                                                  is_fisheye=self.camera.is_fisheye)
-                                    cost_r     = cdist(blobs, proj_vis_r)
-                                    sub_min    = cost_r[np.ix_(unmatched_blobs, unmatched_col_idx)].min(axis=0)
-                                    _led_cam_r = ((R_r @ positions[vis_ids_r].T).T + tvec_r_flat
-                                                  if blob_radii is not None else None)
-                                    extra_blobs: List[int] = []
-                                    extra_leds:  List[int] = []
-                                    for order_j in np.argsort(sub_min):
-                                        if sub_min[order_j] >= self._c_brute_reproj_px:
-                                            break
-                                        col    = int(unmatched_col_idx[order_j])
-                                        led_id = int(vis_ids_r[col])
-                                        _exp_px_rc = (focal_px * (self._c_led_radius_mm / 1000.0) /
-                                                      float(max(_led_cam_r[col, 2], 0.01))
-                                                      if _led_cam_r is not None else None)
-                                        for row_i in np.argsort(cost_r[unmatched_blobs, col]):
-                                            b = int(unmatched_blobs[row_i])
-                                            if b in matched_blob_set:
-                                                continue
-                                            if cost_r[b, col] >= self._c_brute_reproj_px:
-                                                break
-                                            if (_exp_px_rc is not None and not (
-                                                    _exp_px_rc * self._c_blob_size_min
-                                                    <= float(blob_radii[b])
-                                                    <= _exp_px_rc * self._c_blob_size_max)):
-                                                if _log_size_filter:
-                                                    logger.debug(
-                                                        f"  LED {led_id}: blob {b}"
-                                                        f" size-filtered (brute extra-blob)"
-                                                        f"  r={float(blob_radii[b]):.2f}  expected"
-                                                        f" {_exp_px_rc*self._c_blob_size_min:.2f}–{_exp_px_rc*self._c_blob_size_max:.2f}px"
-                                                    )
-                                                continue
-                                            matched_blob_set.add(b)
-                                            extra_blobs.append(b)
-                                            extra_leds.append(led_id)
-                                            break
-                                    if extra_blobs:
-                                        inlier_blobs = np.concatenate([inlier_blobs, np.array(extra_blobs, dtype=inlier_blobs.dtype)])
-                                        inlier_leds  = np.concatenate([inlier_leds,  np.array(extra_leds,  dtype=inlier_leds.dtype)])
-                                        self._dbg(dbg, f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
-
-                                # ── 6.7. Aux-camera validation ────────────────────
-                                # Lift refined pose to world frame and score against
-                                # each aux camera's blobs. These correspondences
-                                # are not added to the primary-cam assignment but do
-                                # increase the pooled coverage and inlier count used
-                                # for hypothesis ranking.
-                                extra_vis_weight      = 0.0
-                                extra_inlier_weight   = 0.0
-                                extra_inlier_count    = 0
-                                aux_blob_denom        = 0
-                                aux_cameras_current   = []
-                                aux_assignments_current: Dict[int, List] = {}
-                                if other_cameras_blobs:
-                                    T_world_ctrl = self.T_world_cam.compose(
-                                        Transform(R_r, tvec_r_flat)
-                                    )
-                                    for _ocam, _oblobs, _oradii in other_cameras_blobs:
-                                        _oblobs = np.asarray(_oblobs, dtype=np.float32)
-                                        if len(_oblobs) == 0:
-                                            continue
-                                        _R_i, _t_i, _rv_i, _focal_i, _vis_i = self._aux_cam_vis(
-                                            _ocam, T_world_ctrl, occluders_per_cam
-                                        )
-                                        _vis_ids_i = np.where(_vis_i)[0]
-                                        if len(_vis_ids_i) == 0:
-                                            continue
-
-                                        _proj_i = _project_points(
-                                            _rv_i, _t_i, positions[_vis_ids_i],
-                                            _ocam.camera_matrix, _ocam.dist_coeffs,
-                                            is_fisheye=_ocam.is_fisheye,
-                                        )
-                                        _cost_i = cdist(_oblobs, _proj_i)
-                                        _rows_i, _cols_i = linear_sum_assignment(_cost_i)
-                                        _inlier_i = _cost_i[_rows_i, _cols_i] < self._c_brute_aux_reproj_px
-                                        _led_cam_i = (_R_i @ positions[_vis_ids_i].T).T + _t_i
-                                        if _oradii is not None:
-                                            for _k in range(len(_rows_i)):
-                                                if not _inlier_i[_k]:
-                                                    continue
-                                                _depth_k = float(max(_led_cam_i[_cols_i[_k], 2], 0.01))
-                                                _exp_px_k = _focal_i * (self._c_led_radius_mm / 1000.0) / _depth_k
-                                                if not (_exp_px_k * self._c_blob_size_min
-                                                        <= float(_oradii[_rows_i[_k]])
-                                                        <= _exp_px_k * self._c_blob_size_max):
-                                                    if _log_size_filter:
-                                                        logger.debug(
-                                                            f"  LED {int(_vis_ids_i[_cols_i[_k]])}: blob {int(_rows_i[_k])}"
-                                                            f" size-filtered (brute aux-inlier cam{_ocam.camera_idx})"
-                                                            f"  r={float(_oradii[_rows_i[_k]]):.2f}  expected"
-                                                            f" {_exp_px_k*self._c_blob_size_min:.2f}–{_exp_px_k*self._c_blob_size_max:.2f}px"
-                                                        )
-                                                    _inlier_i[_k] = False
-                                        _n_aux = int(_inlier_i.sum())
-                                        if dbg:
-                                            _matched_dists = _cost_i[_rows_i, _cols_i]
-                                            logger.debug(
-                                                f"  sol {sol_i}: aux cam{_ocam.camera_idx} "
-                                                f"vis={len(_vis_ids_i)} blobs={len(_oblobs)} "
-                                                f"matched_dists={_matched_dists.round(1).tolist()} "
-                                                f"thresh={self._c_brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
-                                            )
-                                        extra_inlier_count += _n_aux
-                                        aux_blob_denom     += min(len(_oblobs), len(_vis_ids_i))
-                                        aux_cameras_current.append((_ocam.camera_idx, _n_aux))
-                                        aux_assignments_current[_ocam.camera_idx] = [
-                                            (int(_rows_i[_k]), int(_vis_ids_i[_cols_i[_k]]))
-                                            for _k in range(len(_rows_i)) if _inlier_i[_k]
-                                        ]
-
-                                        _led_nrm_i = (_R_i @ normals[_vis_ids_i].T).T
-                                        _vdirs_i   = -_led_cam_i / (np.linalg.norm(_led_cam_i, axis=1, keepdims=True) + 1e-9)
-                                        _w_i       = np.clip((_led_nrm_i * _vdirs_i).sum(axis=1), 0.0, 1.0)
-
-                                        extra_vis_weight    += float(_w_i.sum())
-                                        extra_inlier_weight += float(_w_i[_cols_i[_inlier_i]].sum())
-
-                                # ── 7. Visibility coverage check ──────────────────
-                                # Weight each visible LED by cos(θ) — the dot product
-                                # of its normal with the view direction.  LEDs at
-                                # grazing angles (θ → 90°) may be theoretically
-                                # visible but are rarely detected reliably, so they
-                                # contribute less to both numerator and denominator.
-                                # This prevents those LEDs from unfairly failing the
-                                # coverage gate when they simply aren't bright enough.
-                                # Counts from other cameras (extra_*) are pooled in so
-                                # that combined multi-camera evidence can satisfy the
-                                # threshold even when one camera sees few LEDs.
-                                n_visible_leds = len(vis_ids_r)
-                                n_inlier_blobs = len(inlier_blobs)
-                                n_inlier_total = n_inlier_blobs + extra_inlier_count
-
-                                led_cam_pts    = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
-                                led_cam_normals = (R_r @ normals[vis_ids_r].T).T
-                                led_view_dirs  = -led_cam_pts / (np.linalg.norm(led_cam_pts, axis=1, keepdims=True) + 1e-9)
-                                led_vis_weights = np.clip((led_cam_normals * led_view_dirs).sum(axis=1), 0.0, 1.0)
-
-                                # inlier_leds ⊂ vis_ids_r is guaranteed by step 6; searchsorted
-                                # maps each inlier LED index to its position in vis_ids_r so we
-                                # can index led_vis_weights without a full boolean mask.
-                                inlier_idx_in_vis    = np.searchsorted(vis_ids_r, inlier_leds)
-                                weighted_visible_count = float(led_vis_weights.sum()) + extra_vis_weight
-                                weighted_inlier_count  = float(led_vis_weights[inlier_idx_in_vis].sum()) + extra_inlier_weight
-
-                                # Balanced F1-style coverage: harmonic mean of LED recall and blob
-                                # precision. LED recall (weighted by cos θ) measures how many of the
-                                # model-visible LEDs were matched. Blob precision measures how many of
-                                # the detected blobs the pose explains, with the denominator capped at
-                                # n_visible_leds so that blobs from the other controller or noise do
-                                # not unfairly penalise a correct pose. Both sides pool aux cameras.
-                                led_cov  = (weighted_inlier_count / weighted_visible_count
-                                            if weighted_visible_count > 0 else 1.0)
-                                _blob_denom = min(n_available, n_visible_leds) + aux_blob_denom
-                                blob_cov = ((n_inlier_blobs + extra_inlier_count) / _blob_denom
-                                            if _blob_denom > 0 else 1.0)
-                                balanced_coverage = (2.0 * led_cov * blob_cov / (led_cov + blob_cov)
-                                                     if led_cov + blob_cov > 0.0 else 0.0)
-                                if balanced_coverage < self._c_brute_min_vis_cov:
-                                    if dbg:
-                                        logger.debug(
-                                            f"  sol {sol_i}: balanced coverage {balanced_coverage:.2f} < {self._c_brute_min_vis_cov:.2f}"
-                                            f"  led_cov={led_cov:.2f}  blob_cov={blob_cov:.2f}"
-                                            f"  (primary {n_inlier_blobs}/{n_visible_leds} leds,"
-                                            f" {n_inlier_blobs}/{min(n_available, n_visible_leds)} blobs"
-                                            f" +{extra_inlier_count} aux)"
-                                        )
-                                    continue
-
-                                proj_r = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc,
-                                                         is_fisheye=self.camera.is_fisheye)
-                                err    = float(np.mean(np.linalg.norm(proj_r - blobs[inlier_blobs], axis=1)))
-
-                                orient_err = np.inf
-                                if R_prior is not None:
-                                    cos_orient_angle = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
-                                    orient_err = float(np.arccos(cos_orient_angle))
-
-                                tvec_err = np.inf
-                                if tvec_prior is not None:
-                                    tvec_err = float(np.linalg.norm(tvec_r.reshape(3) - tvec_prior))
-
-                                # Prefer more inliers (pooled across all cameras); break
-                                # ties by primary error, then prior distances.
-                                # The error cap prevents a high-inlier solution at poor
-                                # accuracy from displacing a tight low-inlier one.
-                                is_better = (
-                                    (n_inlier_total > best_inliers_total and err < best_error + 1.0) or
-                                    (n_inlier_total >= best_inliers_total + 2 and err < best_error + 1.5) or
-                                    (n_inlier_total == best_inliers_total and err < best_error) or
-                                    (n_inlier_total == best_inliers_total and
-                                     abs(err - best_error) < 0.5 and
-                                     orient_err < best_orient_err) or
-                                    (n_inlier_total == best_inliers_total and
-                                     abs(err - best_error) < 0.5 and
-                                     orient_err == best_orient_err and
-                                     tvec_err < best_tvec_err)
-                                )
-
-                                self._dbg(dbg, f"  sol {sol_i}: err={err:.3f} px  "
-                                               f"inliers={n_inlier_blobs}+{extra_inlier_count}aux={n_inlier_total}  "
-                                               f"is_better={is_better}")
-
-                                if is_better:
-                                    best_solution = {
-                                        "rvec":             rvec_r,
-                                        "tvec":             tvec_r,
-                                        "inliers":          n_inlier_blobs,
-                                        "aux_inliers":      extra_inlier_count,
-                                        "aux_cameras":      aux_cameras_current or None,
-                                        "aux_assignments":  dict(aux_assignments_current) or None,
-                                        "error":            err,
-                                        "assignment":       list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
-                                        "method":           "p3p_systematic",
-                                    }
-                                    best_inliers       = n_inlier_blobs
-                                    best_inliers_total = n_inlier_total
-                                    best_error         = err
-                                    best_orient_err    = orient_err
-                                    best_tvec_err      = tvec_err
-                                    solution_tier      = tier_idx
-
-                                    if log_best():
-                                        _aux_dbg = ""
-                                        if aux_cameras_current:
-                                            _aux_dbg = "  aux=[" + ",".join(
-                                                f"cam{c}:{n}" for c, n in aux_cameras_current
-                                            ) + "]"
-                                        logger.debug(
-                                            f"  ★ [{self._ctrl} | cam {self._cam}] new best — tier={tier_idx} "
-                                            f"LEDs{list(led_ids)} blobs[{b_anchor},{b1_ord},{b2_ord}] "
-                                            f"sol={sol_i}  inliers={n_inlier_blobs}+{extra_inlier_count}aux  err={err:.3f}px  "
-                                            f"cov={balanced_coverage:.2f} (led={led_cov:.2f} blob={blob_cov:.2f})"
-                                            f"  matched={n_inlier_blobs}/{n_visible_leds}"
-                                            + _aux_dbg
-                                        )
-
-                                    if best_error <= self._c_brute_strong_err and balanced_coverage >= self._c_brute_min_vis_cov:
-                                        strong_found = True
-
-                cur_prev_blob[triple_i] = blob_max
-                if did_p3p:
-                    tier_lq_tried[tier_idx] += 1
-                if strong_found:
-                    break
-
-        # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
-        if best_solution is not None:
-            _joint_result = self._apply_joint_lm(
-                best_solution['rvec'].reshape(3, 1),
-                best_solution['tvec'].reshape(3),
-                best_solution['assignment'],
-                blobs,
-                best_solution.get('aux_assignments') or {},
-                other_cameras_blobs or [],
-                K, dc, "Brute", best_solution['error'],
-            )
-            if _joint_result is not None:
-                _rv_j, _tv_j, _err_j = _joint_result
-                best_solution['rvec']   = _rv_j
-                best_solution['tvec']   = _tv_j.reshape(3, 1)
-                best_solution['error']  = _err_j
-                best_solution['method'] = best_solution['method'] + '_mc'
-
-        total_p3p_tried = sum(tier_p3p_calls)
-
-        result_str = (
-            f"found in tier_{solution_tier} ({_tier_label(self._c_brute_depth_tiers[solution_tier])})  "
-            f"({best_inliers} inliers, {best_error:.2f} px)"
-            if best_solution is not None else "not found"
-        )
-        dup_line = ""
-        if bijection_counts is not None:
-            n_unique = len(bijection_counts)
-            n_dup    = total_p3p_tried - n_unique
-            max_dup  = max(bijection_counts.values(), default=0)
-            dup_line = (
-                f"\n  bijections — {n_unique} unique / {total_p3p_tried} calls  "
-                f"({n_dup} duplicate calls, max {max_dup}× same bijection)"
-            )
-        tier_lines = "\n".join(
-            f"  tier_{i} ({_tier_label(self._c_brute_depth_tiers[i])}) — "
-            f"{tier_p3p_calls[i]:>7} P3P calls  "
-            f"({tier_lq_tried[i]}/{tier_lq_total[i]} LED triples reached inner loop)"
-            for i in range(len(self._c_brute_depth_tiers))
-        )
-        logger.debug(
-            f"[{self._ctrl} | cam {self._cam}] Brute-force: {result_str}\n"
-            f"{tier_lines}\n"
-            f"  total — {total_p3p_tried:>7} P3P calls"
-            f"{dup_line}"
-        )
-
-        if best_solution is not None and blob_mask is not None:
-            best_solution['_orig_idx'] = True
-        return best_solution
+            self.brute_search_tier(state, tier_idx)
+        return self.finalize_brute_state(state)
