@@ -1,5 +1,5 @@
 data:
-  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a/a"
+  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
 #  root: "./data/datasets/first_ds"
   img_width: 2560
   img_height: 481
@@ -142,8 +142,12 @@ matching:
   # Proximity match
   # --------------------------------------------------------------------------
   use_proximity_match: true              # set to false to always use brute force
-  proximity_min_inliers: 3               # min inliers for proximity match (can be lower than min_inliers
-                                          # because the pose prior is already close; null = use min_inliers)
+  proximity_min_inliers: 4               # min inliers for proximity match — kept at the brute-force floor;
+                                          # 3 is a zero-redundancy PnP fit (6 DOF, 2 eqns/point) whose error
+                                          # can look deceptively perfect regardless of correctness
+  proximity_redundancy_ref: 3            # confidence ramps from 0 at the 3-point (zero-redundancy) PnP
+                                          # floor to full trust this many points beyond it; guards fusion
+                                          # weighting against under-constrained per-camera fits
   proximity_reprojection_threshold: 2.5  # RANSAC threshold (tighter than brute — prior is already close)
   proximity_expansion_px: 5.0           # neighbourhood radius (px) per LED; velocity-scaled: gate = base + k * v_px
   proximity_max_hypotheses: 128          # cap on valid hypothesis evaluations before best-so-far is accepted
@@ -151,7 +155,8 @@ matching:
   proximity_none_penalty_factor: 1.5    # geometric growth per None level: k-th None costs penalty * factor^(k-1); 1.0 = flat (linear)
   proximity_strong_match_px: 0.5        # 0-None hypothesis below this error triggers early termination
   proximity_branch_k: 2                 # top-K hypotheses per None level to branch from at the next level
-  proximity_none_branch_width: 5
+  proximity_none_branch_width: 4
+  proximity_level0_max_hyp: 8
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_top_k_ransac: 3
   visibility_occlusion_margin_m: 0.01   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
@@ -192,6 +197,14 @@ matching:
   joint_primary_weight: 2.0        # primary-camera residual multiplier (slight preference: RANSAC-validated vs Hungarian)
   joint_huber_scale: 1.5           # Huber loss threshold in pixels; residuals beyond this are soft-capped
   joint_aux_prefilter_px: 2.0      # drop aux pairs with reprojection > this before joint LM
+  joint_snap_confidence: 0.5       # fusion confidence for a camera recovered via cheap Hungarian
+                                    # snap (no independent solve) rather than its own search — see
+                                    # ControllerTracker's snap-recovery step
+  joint_lm_max_nfev: 50            # hard cap on residual evaluations; no analytic jacobian, so each TRF
+                                    # iteration costs ~7x this (1 baseline + 6 finite-diff perturbations)
+  joint_lm_ftol: 0.001            # TRF convergence tolerances (cost/param/gradient); looser = fewer
+  joint_lm_xtol: 0.001            # iterations before "converged", at the expense of solution precision.
+  joint_lm_gtol: 0.001            # 1e-4 verified numerically equivalent to 1e-7 at pixel-level precision.
 
   # --------------------------------------------------------------------------
   # Cross-controller occlusion
