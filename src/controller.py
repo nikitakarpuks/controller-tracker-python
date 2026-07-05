@@ -1,4 +1,5 @@
 import copy
+import time
 import cv2
 import numpy as np
 from collections import deque
@@ -66,6 +67,138 @@ def mirror_primitives(prim_cfg: dict) -> dict:
 # =========================================================
 # 3. TRACKER (per camera + controller)
 # =========================================================
+
+def cheap_search_core(
+    pose_searcher,
+    prior: dict,
+    matching_cfg: dict,
+    blobs: np.ndarray,
+    blob_radii: Optional[np.ndarray] = None,
+    blob_brightnesses: Optional[np.ndarray] = None,
+    other_cameras_blobs: Optional[List] = None,
+    blob_mask: Optional[np.ndarray] = None,
+    occluders_per_cam: Optional[Dict] = None,
+) -> Tuple[Optional[Dict], Optional[Tuple[np.ndarray, np.ndarray]], Optional[Tuple], Optional[Tuple]]:
+    """
+    Pure proximity + prior_constrained search — no brute-force, no CameraTracker
+    instance needed, just a PoseSearcher and an explicit prior-state bundle. This is
+    what lets a worker process run the cheap search using only its own resident
+    PoseSearcher (see src/parallel_search.py) — a live CameraTracker's mutable
+    tracking state can't be shared with a worker (fork only gives it a stale
+    snapshot), so the caller must pass that state in explicitly instead.
+
+    prior: {'prev_pose', 'prev_prev_pose', 'pose_history', 'vel_ema', 'prev_assignment'}
+    — the same fields CameraTracker.search_cheap() reads from self.
+
+    Returns (solution_or_None, predicted_pose, normalized_prev_pose,
+    normalized_prev_prev_pose) — the normalized values mirror the idempotent
+    (3,1)/(3,) canonicalisation CameraTracker.search_cheap() applies to
+    self.prev_pose/self.prev_prev_pose as a side effect; a caller with live state
+    (CameraTracker.search_cheap) writes these back, a stateless worker just returns
+    them for the orchestrator to write back into the real tracker.
+    """
+    blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
+    n_blobs = len(blobs)
+
+    if blob_mask is not None:
+        _avail_idx  = np.where(blob_mask)[0].astype(np.int32)
+        blobs_prox  = blobs[_avail_idx]
+        radii_prox  = blob_radii[_avail_idx]  if blob_radii        is not None else None
+        brts_prox   = blob_brightnesses[_avail_idx] if blob_brightnesses is not None else None
+        n_available = len(blobs_prox)
+    else:
+        blobs_prox  = blobs
+        radii_prox  = blob_radii
+        brts_prox   = blob_brightnesses
+        n_available = n_blobs
+
+    _cfg = matching_cfg
+    _use_proximity = bool(_cfg.get('use_proximity_match', True))
+
+    prev_pose       = prior.get('prev_pose')
+    prev_prev_pose  = prior.get('prev_prev_pose')
+    pose_history    = prior.get('pose_history')
+    vel_ema         = prior.get('vel_ema')
+    prev_assignment = prior.get('prev_assignment')
+
+    # Normalise prev_pose shapes (idempotent — canonicalises (3,1) rvec and (3,) tvec)
+    if prev_pose is not None:
+        rvec, tvec = prev_pose
+        prev_pose = (
+            np.asarray(rvec, dtype=np.float32).reshape(3, 1),
+            np.asarray(tvec, dtype=np.float32).reshape(3),
+        )
+    if prev_prev_pose is not None:
+        rvec, tvec = prev_prev_pose
+        prev_prev_pose = (
+            np.asarray(rvec, dtype=np.float32).reshape(3, 1),
+            np.asarray(tvec, dtype=np.float32).reshape(3),
+        )
+
+    predicted_pose = CameraTracker._predict_pose(
+        pose_history,
+        weight_decay=float(_cfg.get("pose_prediction_weight_decay", 0.7)),
+        vel_ema=vel_ema,
+    )
+
+    # Velocity-scaled search gates: expand proximity radius proportionally to speed.
+    # v_px = ‖predicted.t − prev.t‖ × fx / depth  (pixels/frame, camera-agnostic)
+    _v_px = 0.0
+    if predicted_pose is not None and prev_pose is not None:
+        _v_vec = predicted_pose[1].reshape(3) - np.asarray(prev_pose[1], np.float64).reshape(3)
+        _depth = max(float(np.asarray(prev_pose[1]).reshape(3)[2]), 0.1)
+        _v_px  = float(np.linalg.norm(_v_vec)) * pose_searcher.camera.fx / _depth
+    _base_expansion = float(_cfg.get('proximity_expansion_px', 8.0))
+    _prox_vel_k     = float(_cfg.get('proximity_expansion_velocity_k', 0.0))
+    _eff_expansion  = _base_expansion + _prox_vel_k * _v_px
+    # Uncertainty term: larger neighbourhood when prediction history is short.
+    # Decays as 1/n — full boost at n=1 (constant-position), half at n=2, etc.
+    _uncertainty_k = float(_cfg.get('proximity_expansion_uncertainty_k', 0.0))
+    if _uncertainty_k > 0.0:
+        _eff_expansion += _uncertainty_k / max(len(pose_history), 1)
+    # Depth term: closer controller → larger pixel-space uncertainty → bigger neighbourhood.
+    _depth_k = float(_cfg.get('proximity_expansion_depth_k', 0.0))
+    if _depth_k > 0.0 and predicted_pose is not None:
+        _ctrl_depth = max(float(predicted_pose[1].reshape(3)[2]), 0.01)
+        _eff_expansion += _depth_k / _ctrl_depth
+
+    solution = None
+
+    if prev_pose is not None:
+        # --- Primary: proximity (fast, assignment-locked) ---
+        if _use_proximity and n_available >= 3:
+            solution = pose_searcher.proximity_search(
+                blobs_prox, predicted_pose,
+                blob_brightnesses=brts_prox,
+                other_cameras_blobs=other_cameras_blobs,
+                occluders_per_cam=occluders_per_cam,
+                expansion_px=_eff_expansion,
+            )
+            # Remap proximity result indices from filtered → full array space.
+            if solution is not None and blob_mask is not None:
+                solution['assignment'] = [(_avail_idx[b], lid) for b, lid in solution['assignment']]
+                solution['_orig_idx']  = True
+
+        # ------------------------------------------------------------------
+        # Low-blob-count fallback: prior-constrained translation solve
+        # P2P (3 blobs): fix R, solve t from 2 pairs, validate with 3rd.
+        # P1P (2 blobs): fix R + depth, solve (tx,ty) from 1 pair, validate with 2nd.
+        # ------------------------------------------------------------------
+        if (solution is None and prev_assignment is not None
+                and 2 <= n_available <= 3):
+            logger.debug(f"[{pose_searcher._ctrl} | cam {pose_searcher._cam} | track] n_blobs={n_available} + prior → prior_constrained_match")
+            solution = pose_searcher.constrained_search(
+                blobs_prox, predicted_pose,
+                prior_assignment=prev_assignment,
+                blob_radii=radii_prox,
+                other_cameras_blobs=other_cameras_blobs,
+            )
+            if solution is not None and blob_mask is not None:
+                solution['assignment'] = [(_avail_idx[b], lid) for b, lid in solution['assignment']]
+                solution['_orig_idx']  = True
+
+    return solution, predicted_pose, prev_pose, prev_prev_pose
+
 
 class CameraTracker:
     def __init__(self, camera: Camera, model: ControllerModel, matching_cfg: dict = None, geometry_cfg: dict = None):
@@ -303,49 +436,65 @@ class CameraTracker:
     # -----------------------------------------------------
     # Tracking
     # -----------------------------------------------------
-    def search(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
-               blob_brightnesses: Optional[np.ndarray] = None,
-               other_cameras_blobs: Optional[List] = None,
-               blob_mask: Optional[np.ndarray] = None,
-               occluders_per_cam: Optional[Dict] = None,
-               allow_expensive_fallback: bool = True) -> Optional[Dict]:
-        """Pure pose solve — reads self state, does not commit results.
+    def search_cheap(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+                      blob_brightnesses: Optional[np.ndarray] = None,
+                      other_cameras_blobs: Optional[List] = None,
+                      blob_mask: Optional[np.ndarray] = None,
+                      occluders_per_cam: Optional[Dict] = None,
+                      ) -> Tuple[Optional[Dict], Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """Proximity + prior_constrained only — no brute-force. Reads self state (does
+        not commit). Returns (solution_or_None, predicted_pose).
 
-        Returns a validated solution dict (error below threshold, T_world_ctrl populated)
-        or None.  Call apply() with the returned value to commit state changes.
+        A None solution here means this camera needs brute-force recovery to get any
+        candidate at all this frame — whether because it has no prior (cold-start) or
+        because proximity/prior_constrained came up empty despite having one. Callers
+        doing cross-camera recovery should treat both cases identically: proceed to
+        brute-force with pose_prior=predicted_pose (None for cold-start, matching
+        today's unprimed cold-start brute call).
+        """
+        prior = {
+            'prev_pose':       self.prev_pose,
+            'prev_prev_pose':  self.prev_prev_pose,
+            'pose_history':    self.pose_history,
+            'vel_ema':         self.vel_ema,
+            'prev_assignment': self.prev_assignment,
+        }
+        solution, predicted_pose, norm_prev, norm_prev_prev = cheap_search_core(
+            self._pose_searcher, prior, self._matching_cfg,
+            blobs, blob_radii, blob_brightnesses,
+            other_cameras_blobs, blob_mask, occluders_per_cam,
+        )
+        self.prev_pose      = norm_prev
+        self.prev_prev_pose = norm_prev_prev
+        return solution, predicted_pose
+
+    def finalize_search(self, solution: Optional[Dict],
+                         predicted_pose: Optional[Tuple[np.ndarray, np.ndarray]],
+                         blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+                         other_cameras_blobs: Optional[List] = None,
+                         blob_mask: Optional[np.ndarray] = None,
+                         occluders_per_cam: Optional[Dict] = None,
+                         allow_expensive_fallback: bool = True) -> Optional[Dict]:
+        """Validate and accept/reject an already-obtained candidate `solution` — from
+        search_cheap(), or from a brute-force recovery attempt (cold-start or
+        proximity-failed). Reads self state, does not commit results — call apply()
+        with the returned value to commit state changes.
 
         allow_expensive_fallback: gates the brute-force retries that fire when this
-        camera HAS a prior but proximity still comes up short (failed outright, a
-        pose-jump, or error too high) — brute-force can cost hundreds of ms for no
-        result. Cold-start brute-force (no prior at all) is unconditional regardless
-        of this flag, since it's the only way to ever acquire a track. Callers with
-        other cameras available this frame should pass False on a first pass and only
-        retry with True if the whole controller came up empty — a struggling camera
-        can otherwise be warm-started next frame from a fused pose at zero cost.
+        camera HAS a prior but the candidate is a pose-jump or its error is too high —
+        brute-force can cost hundreds of ms for no result. Callers with other cameras
+        available this frame should pass False on a first pass and only retry with
+        True if the whole controller came up empty — a struggling camera can otherwise
+        be warm-started next frame from a fused pose at zero cost.
         """
         blobs   = np.asarray(blobs, dtype=np.float32).reshape(-1, 2)
         n_blobs = len(blobs)
-
-        # When blob_mask provided, blobs is the full camera observation array.
-        # Proximity and prior_constrained use the filtered subset; brute uses the full array.
-        if blob_mask is not None:
-            _avail_idx  = np.where(blob_mask)[0].astype(np.int32)
-            blobs_prox  = blobs[_avail_idx]
-            radii_prox  = blob_radii[_avail_idx]  if blob_radii        is not None else None
-            brts_prox   = blob_brightnesses[_avail_idx] if blob_brightnesses is not None else None
-            n_available = len(blobs_prox)
-        else:
-            blobs_prox  = blobs
-            radii_prox  = blob_radii
-            brts_prox   = blob_brightnesses
-            n_available = n_blobs
+        n_available = int(blob_mask.sum()) if blob_mask is not None else n_blobs
 
         cam_idx = self.camera.camera_idx
         ctrl_name = self.model.name.replace("_controller", "")
 
-        # Per-axis jump thresholds from config (fall back to scalar defaults if absent).
         _cfg = self._matching_cfg
-        _use_proximity = bool(_cfg.get('use_proximity_match', True))
         _accept_err_px = float(_cfg.get('accept_error_px', 3.0))
         _pos_ax = _cfg.get('pose_jump_pos_thresh_m')
         _rot_ax = _cfg.get('pose_jump_rot_thresh_deg')
@@ -355,121 +504,22 @@ class CameraTracker:
         if _rot_ax is not None:
             _jump_kw['rot_thresh_xyz_deg'] = tuple(_rot_ax)
 
-        # Normalise prev_pose shapes (idempotent — canonicalises (3,1) rvec and (3,) tvec)
-        if self.prev_pose is not None:
-            rvec, tvec = self.prev_pose
-            self.prev_pose = (
-                np.asarray(rvec, dtype=np.float32).reshape(3, 1),
-                np.asarray(tvec, dtype=np.float32).reshape(3),
-            )
-        if self.prev_prev_pose is not None:
-            rvec, tvec = self.prev_prev_pose
-            self.prev_prev_pose = (
-                np.asarray(rvec, dtype=np.float32).reshape(3, 1),
-                np.asarray(tvec, dtype=np.float32).reshape(3),
-            )
-
-        predicted_pose = self._predict_pose(
-            self.pose_history,
-            weight_decay=float(self._matching_cfg.get("pose_prediction_weight_decay", 0.7)),
-            vel_ema=self.vel_ema,
-        )
-
-        # Velocity-scaled search gates: expand proximity radius proportionally to speed.
-        # v_px = ‖predicted.t − prev.t‖ × fx / depth  (pixels/frame, camera-agnostic)
-        _v_px = 0.0
-        if predicted_pose is not None and self.prev_pose is not None:
-            _v_vec = predicted_pose[1].reshape(3) - np.asarray(self.prev_pose[1], np.float64).reshape(3)
-            _depth = max(float(np.asarray(self.prev_pose[1]).reshape(3)[2]), 0.1)
-            _v_px  = float(np.linalg.norm(_v_vec)) * self.camera.fx / _depth
-        _base_expansion = float(_cfg.get('proximity_expansion_px', 8.0))
-        _prox_vel_k     = float(_cfg.get('proximity_expansion_velocity_k', 0.0))
-        _eff_expansion  = _base_expansion + _prox_vel_k * _v_px
-        # Uncertainty term: larger neighbourhood when prediction history is short.
-        # Decays as 1/n — full boost at n=1 (constant-position), half at n=2, etc.
-        _uncertainty_k = float(_cfg.get('proximity_expansion_uncertainty_k', 0.0))
-        if _uncertainty_k > 0.0:
-            _eff_expansion += _uncertainty_k / max(len(self.pose_history), 1)
-        # Depth term: closer controller → larger pixel-space uncertainty → bigger neighbourhood.
-        _depth_k = float(_cfg.get('proximity_expansion_depth_k', 0.0))
-        if _depth_k > 0.0 and predicted_pose is not None:
-            _ctrl_depth = max(float(predicted_pose[1].reshape(3)[2]), 0.01)
-            _eff_expansion += _depth_k / _ctrl_depth
-
-        # ------------------------------------------------------------------
-        # Candidate search
-        # ------------------------------------------------------------------
-        solution = None
-
-        if self.prev_pose is not None:
-            # --- Primary: proximity (fast, assignment-locked) ---
-            if _use_proximity and n_available >= 3:
-                solution = self.proximity_match(
-                    blobs_prox, predicted_pose,
-                    blob_brightnesses=brts_prox,
-                    other_cameras_blobs=other_cameras_blobs,
-                    occluders_per_cam=occluders_per_cam,
-                    expansion_px=_eff_expansion,
-                )
-                # Remap proximity result indices from filtered → full array space.
-                if solution is not None and blob_mask is not None:
-                    solution['assignment'] = [(_avail_idx[b], lid) for b, lid in solution['assignment']]
-                    solution['_orig_idx']  = True
-
-            # --- Fallback: brute only when proximity found no solution ---
-            if solution is None and allow_expensive_fallback and n_available >= 4:
-                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity → None, running brute fallback")
-                brute = self.brute_match(blobs, pose_prior=predicted_pose,
-                                         other_cameras_blobs=other_cameras_blobs,
-                                         blob_radii=blob_radii,
-                                         blob_mask=blob_mask,
-                                         occluders_per_cam=occluders_per_cam)
-                if brute is not None:
-                    solution = brute
-
-        else:
-            # --- No prior pose: brute-force re-acquisition ---
-            if n_available >= 4:
-                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] no prev_pose → cold-start brute")
-                solution = self.brute_match(blobs, other_cameras_blobs=other_cameras_blobs,
-                                            blob_radii=blob_radii,
-                                            blob_mask=blob_mask,
-                                            occluders_per_cam=occluders_per_cam)
-
-                # In deep-debug mode frames are non-consecutive, so the last_good_pose
-                # plausibility check is skipped — the controller can be anywhere.
-                if solution is not None and self.last_good_pose is not None and not is_deep():
-                    rvec_lg, tvec_lg = self.last_good_pose
-                    if self._pose_jump_too_large(
-                        solution["rvec"], solution["tvec"],
-                        rvec_lg, tvec_lg,
-                        max_dist_m=0.5,
-                        max_angle_deg=60.0,
-                        **_jump_kw,
-                    ):
-                        logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
-                        solution = None
-
-        # ------------------------------------------------------------------
-        # Low-blob-count fallback: prior-constrained translation solve
-        # P2P (3 blobs): fix R, solve t from 2 pairs, validate with 3rd.
-        # P1P (2 blobs): fix R + depth, solve (tx,ty) from 1 pair, validate with 2nd.
-        # Only reachable when prev_pose exists (prior quality requirement).
-        # ------------------------------------------------------------------
-        if (solution is None
-                and self.prev_pose is not None
-                and self.prev_assignment is not None
-                and 2 <= n_available <= 3):
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] n_blobs={n_available} + prior → prior_constrained_match")
-            solution = self.prior_constrained_match(
-                blobs_prox, predicted_pose,
-                prior_assignment=self.prev_assignment,
-                blob_radii=radii_prox,
-                other_cameras_blobs=other_cameras_blobs,
-            )
-            if solution is not None and blob_mask is not None:
-                solution['assignment'] = [(_avail_idx[b], lid) for b, lid in solution['assignment']]
-                solution['_orig_idx']  = True
+        # Cold-start plausibility check (brute re-acquisition only): reject a
+        # candidate that's too far from the last known good pose. In deep-debug mode
+        # frames are non-consecutive, so this check is skipped — the controller can
+        # be anywhere.
+        if (solution is not None and self.prev_pose is None
+                and self.last_good_pose is not None and not is_deep()):
+            rvec_lg, tvec_lg = self.last_good_pose
+            if self._pose_jump_too_large(
+                solution["rvec"], solution["tvec"],
+                rvec_lg, tvec_lg,
+                max_dist_m=0.5,
+                max_angle_deg=60.0,
+                **_jump_kw,
+            ):
+                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
+                solution = None
 
         # ------------------------------------------------------------------
         # Pose-jump guard against prev_pose (tight, per-frame)
@@ -536,6 +586,52 @@ class CameraTracker:
             logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
         return None
 
+    def search(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+               blob_brightnesses: Optional[np.ndarray] = None,
+               other_cameras_blobs: Optional[List] = None,
+               blob_mask: Optional[np.ndarray] = None,
+               occluders_per_cam: Optional[Dict] = None,
+               allow_expensive_fallback: bool = True) -> Optional[Dict]:
+        """Pure pose solve — reads self state, does not commit results.
+
+        Returns a validated solution dict (error below threshold, T_world_ctrl populated)
+        or None.  Call apply() with the returned value to commit state changes.
+
+        Thin wrapper: search_cheap() for a candidate; if none and this camera can use
+        brute-force (cold-start is unconditional; otherwise gated on
+        allow_expensive_fallback — same reasoning as finalize_search), run it
+        monolithically; then finalize_search() to validate/accept.
+        """
+        solution, predicted_pose = self.search_cheap(
+            blobs, blob_radii, blob_brightnesses, other_cameras_blobs,
+            blob_mask, occluders_per_cam,
+        )
+
+        if solution is None:
+            n_available = int(blob_mask.sum()) if blob_mask is not None else len(np.asarray(blobs).reshape(-1, 2))
+            cam_idx = self.camera.camera_idx
+            ctrl_name = self.model.name.replace("_controller", "")
+            if self.prev_pose is not None:
+                if allow_expensive_fallback and n_available >= 4:
+                    logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity → None, running brute fallback")
+                    solution = self.brute_match(blobs, pose_prior=predicted_pose,
+                                                other_cameras_blobs=other_cameras_blobs,
+                                                blob_radii=blob_radii,
+                                                blob_mask=blob_mask,
+                                                occluders_per_cam=occluders_per_cam)
+            else:
+                if n_available >= 4:
+                    logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] no prev_pose → cold-start brute")
+                    solution = self.brute_match(blobs, other_cameras_blobs=other_cameras_blobs,
+                                                blob_radii=blob_radii,
+                                                blob_mask=blob_mask,
+                                                occluders_per_cam=occluders_per_cam)
+
+        return self.finalize_search(
+            solution, predicted_pose, blobs, blob_radii, other_cameras_blobs,
+            blob_mask, occluders_per_cam, allow_expensive_fallback,
+        )
+
     def apply(self, result: Optional[Dict]) -> None:
         """Commit a search() result to tracker state.
 
@@ -599,7 +695,6 @@ class ControllerTracker:
         # Informational only (reporting/self-cal anchor from the last successful frame) —
         # every camera searches independently every frame, so this no longer gates work.
         self._designated_primary: Optional[int]  = None
-        self._prev_primary:       Optional[int]  = None
 
     def update(
         self,
@@ -611,6 +706,7 @@ class ControllerTracker:
         fixed_primary_cam: Optional[int] = None,
         occluders_per_cam: Optional[Dict] = None,
         self_cal=None,
+        pool=None,
     ) -> Optional[Dict]:
         if not avail:
             return None
@@ -621,43 +717,152 @@ class ControllerTracker:
         # Own blobs only — no aux-camera folding at the per-camera search level;
         # cross-camera fusion happens once, below, via fuse_camera_poses().
         #
-        # Two passes: first with expensive (brute-force) fallback disabled — a
-        # camera with a prior whose proximity search comes up short can simply
-        # contribute nothing this frame and get warm-started next frame from the
-        # fused pose, at zero cost. Only if NO camera produced anything this frame
-        # (the controller is about to lose track entirely) do we pay for the
-        # expensive per-camera brute-force retries as a last resort. Cold-start
-        # brute-force (a camera with no prior at all) is unconditional either way.
-        def _search_all(allow_expensive_fallback: bool) -> List[dict]:
-            results: List[dict] = []
+        # Pass 1: cheap methods (proximity + prior_constrained) for every camera — a
+        # camera with a prior whose cheap methods come up short can simply contribute
+        # nothing this frame and get warm-started next frame from the fused pose, at
+        # zero cost. Only if NO camera produced anything this frame (the controller is
+        # about to lose track entirely) do we pay for brute-force recovery — run in
+        # tier-rounds across every camera needing it (see below), rather than one
+        # camera exhausting its whole tier ladder before the next is even tried.
+        #
+        # When `pool` is given, both stages dispatch to it: pass 1 submits one cheap-
+        # search task per camera; the tier-round loop submits one brute-tier task per
+        # camera still needing that round, waiting for the whole round before
+        # deciding to widen or stop (no mid-tier cancellation — see plan). Without a
+        # pool, both stages fall back to the equivalent sequential loop.
+        cam_solutions: List[dict] = []
+        predicted_pose_by_cid: Dict[int, Optional[Tuple[np.ndarray, np.ndarray]]] = {}
+
+        _cheap_specs = []   # (cid, tracker, obs_full, rad_full, brt_full, mask, av_orig)
+        for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
+            if len(av_blobs) == 0:
+                continue
+            tracker  = self.trackers[cid]
+            obs_full = obs_src[cid]
+            rad_full = rad_src.get(cid) if rad_src else None
+            brt_full = brt_src.get(cid) if brt_src else None
+            mask = np.zeros(len(obs_full), dtype=bool)
+            mask[av_orig] = True
+            _cheap_specs.append((cid, tracker, obs_full, rad_full, brt_full, mask, av_orig))
+
+        _cheap_raw: Dict[int, tuple] = {}   # cid -> (solution, predicted_pose)
+        if pool is not None and _cheap_specs:
+            from src.parallel_search import run_cheap_search
+            _futures = {}
+            for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
+                prior = {
+                    'prev_pose':       tracker.prev_pose,
+                    'prev_prev_pose':  tracker.prev_prev_pose,
+                    'pose_history':    tracker.pose_history,
+                    'vel_ema':         tracker.vel_ema,
+                    'prev_assignment': tracker.prev_assignment,
+                }
+                _futures[cid] = pool.submit(
+                    run_cheap_search, (self.ctrl_name, cid), self._matching_cfg, prior,
+                    obs_full, rad_full, brt_full, mask, occluders_per_cam,
+                )
+            for cid, fut in _futures.items():
+                solution, predicted_pose, norm_prev, norm_prev_prev = fut.result()
+                self.trackers[cid].prev_pose      = norm_prev
+                self.trackers[cid].prev_prev_pose = norm_prev_prev
+                _cheap_raw[cid] = (solution, predicted_pose)
+        else:
+            for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
+                _cheap_raw[cid] = tracker.search_cheap(
+                    obs_full, blob_radii=rad_full, blob_brightnesses=brt_full,
+                    other_cameras_blobs=None, blob_mask=mask,
+                    occluders_per_cam=occluders_per_cam,
+                )
+
+        for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
+            solution, predicted_pose = _cheap_raw[cid]
+            predicted_pose_by_cid[cid] = predicted_pose
+            solution = tracker.finalize_search(
+                solution, predicted_pose, obs_full,
+                blob_radii=rad_full, other_cameras_blobs=None,
+                blob_mask=mask, occluders_per_cam=occluders_per_cam,
+                allow_expensive_fallback=False,
+            )
+            if solution is None:
+                continue
+            if not solution.get('_orig_idx', False):
+                solution["assignment"] = [(av_orig[b], lid) for b, lid in solution["assignment"]]
+            cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": solution})
+
+        if not cam_solutions:
+            # ── Tier-round brute-force recovery ─────────────────────────────────
+            # tier_0 for every camera with a chance (>=4 available blobs); wait for
+            # the whole round to finish before deciding anything (no mid-tier
+            # cancellation); stop widening the instant any camera hits strong_found
+            # this round.
+            states: Dict[int, object] = {}
             for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
                 if len(av_blobs) == 0:
                     continue
                 tracker  = self.trackers[cid]
                 obs_full = obs_src[cid]
                 rad_full = rad_src.get(cid) if rad_src else None
-                brt_full = brt_src.get(cid) if brt_src else None
                 mask = np.zeros(len(obs_full), dtype=bool)
                 mask[av_orig] = True
-                solution = tracker.search(
-                    obs_full,
-                    blob_radii=rad_full,
-                    blob_brightnesses=brt_full,
-                    other_cameras_blobs=None,
-                    blob_mask=mask,
-                    occluders_per_cam=occluders_per_cam,
-                    allow_expensive_fallback=allow_expensive_fallback,
+                states[cid] = tracker._pose_searcher.new_brute_state(
+                    obs_full, pose_prior=predicted_pose_by_cid.get(cid),
+                    other_cameras_blobs=None, blob_radii=rad_full,
+                    blob_mask=mask, occluders_per_cam=occluders_per_cam,
                 )
-                if solution is None:
-                    continue
-                if not solution.get('_orig_idx', False):
-                    solution["assignment"] = [(av_orig[b], lid) for b, lid in solution["assignment"]]
-                results.append({"cam_id": cid, "tracker": tracker, "solution": solution})
-            return results
 
-        cam_solutions = _search_all(allow_expensive_fallback=False)
-        if not cam_solutions:
-            cam_solutions = _search_all(allow_expensive_fallback=True)
+            _any_ps = next(
+                (self.trackers[cid]._pose_searcher for cid, st in states.items() if st is not None),
+                None,
+            )
+            max_tiers = len(_any_ps._c_brute_depth_tiers) if _any_ps is not None else 0
+
+            if pool is not None:
+                from src.parallel_search import run_brute_tier
+                for tier_idx in range(max_tiers):
+                    remaining = [cid for cid, st in states.items() if st is not None and not st.strong_found]
+                    if not remaining:
+                        break
+                    _futures = {
+                        cid: pool.submit(run_brute_tier, (self.ctrl_name, cid), states[cid], tier_idx)
+                        for cid in remaining
+                    }
+                    for cid, fut in _futures.items():
+                        states[cid] = fut.result()
+                    if any(states[cid].strong_found for cid in remaining):
+                        break
+            else:
+                for tier_idx in range(max_tiers):
+                    remaining = [cid for cid, st in states.items() if st is not None and not st.strong_found]
+                    if not remaining:
+                        break
+                    for cid in remaining:
+                        self.trackers[cid]._pose_searcher.brute_search_tier(states[cid], tier_idx)
+                    if any(states[cid].strong_found for cid in remaining):
+                        break
+
+            for cid, st in states.items():
+                if st is None:
+                    continue
+                tracker = self.trackers[cid]
+                sol = tracker._pose_searcher.finalize_brute_state(st)
+                if sol is None:
+                    continue
+                _, _, _, av_orig = avail[cid]
+                if not sol.get('_orig_idx', False):
+                    sol["assignment"] = [(av_orig[b], lid) for b, lid in sol["assignment"]]
+                obs_full = obs_src[cid]
+                rad_full = rad_src.get(cid) if rad_src else None
+                mask = np.zeros(len(obs_full), dtype=bool)
+                mask[av_orig] = True
+                sol = tracker.finalize_search(
+                    sol, predicted_pose_by_cid.get(cid), obs_full,
+                    blob_radii=rad_full, other_cameras_blobs=None,
+                    blob_mask=mask, occluders_per_cam=occluders_per_cam,
+                    allow_expensive_fallback=True,
+                )
+                if sol is not None:
+                    cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": sol})
+
         if not cam_solutions:
             return None
 
@@ -674,7 +879,11 @@ class ControllerTracker:
             for cs in cam_solutions
         ]
         model_positions = next(iter(self.trackers.values())).model.positions
-        T_world_ctrl, fused_err = fuse_camera_poses(_fuse_in, model_positions)
+        _t_fuse_start = time.perf_counter()
+        T_world_ctrl, fused_err = fuse_camera_poses(
+            _fuse_in, model_positions, matching_cfg=self._matching_cfg,
+        )
+        _t_fuse = time.perf_counter() - _t_fuse_start
 
         # ── Anchor camera for reporting/self-cal: fixed_primary_cam if it solved
         # this frame, else whichever camera had the most inlier pairs ──────────
@@ -715,9 +924,33 @@ class ControllerTracker:
                     )
 
         if _snap_extra_aux:
+            _t_fuse_start = time.perf_counter()
             T_world_ctrl, fused_err = fuse_camera_poses(
                 _fuse_in, model_positions, extra_aux=_snap_extra_aux,
+                matching_cfg=self._matching_cfg,
             )
+            _t_fuse += time.perf_counter() - _t_fuse_start
+
+        # Per-camera importance: each contributor's share of the fusion weight —
+        # (1/sqrt(n_pairs)) * confidence, normalised to sum to 1 — i.e. how much
+        # this frame's fused pose actually leaned on each camera. Replaces the old
+        # "anchor camera" concept for reporting purposes.
+        _importance_in = _fuse_in + _snap_extra_aux
+        _raw_w = {
+            e["camera"].camera_idx: float(e.get("confidence", 1.0)) / max(len(e["pairs"]), 1) ** 0.5
+            for e in _importance_in
+        }
+        _w_total = sum(_raw_w.values()) or 1.0
+        _importance_str = "  ".join(
+            f"cam{cid}={w / _w_total:.2f}" for cid, w in sorted(_raw_w.items())
+        )
+
+        logger.debug(
+            f"[{self.ctrl_name}] Joint fusion: {len(cam_solutions)} solved"
+            f"{f' + {len(_snap_extra_aux)} snapped' if _snap_extra_aux else ''}  "
+            f"err={fused_err:.2f}px  lm={_t_fuse*1000:.1f}ms  "
+            f"importance=[{_importance_str}]"
+        )
 
         solution = dict(anchor_solution)
         solution["primary_cam"]  = primary_cam_id
@@ -732,12 +965,8 @@ class ControllerTracker:
         solution["aux_assignments"] = _other_assignments
         solution["aux_cameras"] = [(cid, len(pairs)) for cid, pairs in _other_assignments.items()]
 
-        if self._prev_primary is not None and primary_cam_id != self._prev_primary:
-            logger.info(
-                f"[{self.ctrl_name}] Anchor camera switched "
-                f"cam{self._prev_primary} → cam{primary_cam_id}"
-            )
-        self._prev_primary       = primary_cam_id
+        # Reporting/self-cal anchor tracking (per-camera importance above is now the
+        # reported signal; kept only for get_designated_primary_cameras()).
         self._designated_primary = primary_cam_id
 
         # ── Register claimed blobs (every camera that actually solved, plus snaps) ──
@@ -844,6 +1073,10 @@ class TrackingSystem:
         self.trackers: Dict[Tuple[str, int], CameraTracker] = {}
         self.ctrl_trackers: Dict[str, ControllerTracker]    = {}
 
+        _parallel_enabled = bool(self._matching_cfg.get('parallel_search_enabled', True))
+        if _parallel_enabled:
+            from src.parallel_search import register_pose_searcher_spec
+
         for ctrl in controllers:
             ctrl_cam_trackers: Dict[int, CameraTracker] = {}
             for cam in cameras:
@@ -852,9 +1085,37 @@ class TrackingSystem:
                 cam_tracker = CameraTracker(cam, ctrl, matching_cfg=matching_cfg, geometry_cfg=geo)
                 self.trackers[key]           = cam_tracker
                 ctrl_cam_trackers[cam.camera_idx] = cam_tracker
+                if _parallel_enabled:
+                    # Register the picklable construction spec (not the live
+                    # PoseSearcher) — the pool uses 'spawn', so each worker builds
+                    # its own PoseSearcher from these at startup. See
+                    # src/parallel_search.py's module docstring for why not 'fork'.
+                    register_pose_searcher_spec(key, cam, ctrl, geo, matching_cfg)
             self.ctrl_trackers[ctrl.name] = ControllerTracker(
                 ctrl.name, self.cameras, ctrl_cam_trackers, matching_cfg=matching_cfg,
             )
+
+        # ── Persistent process pool for parallel cheap-search / brute-tier dispatch ──
+        self._pool = None
+        if _parallel_enabled:
+            from src.parallel_search import create_pool, warmup_pool
+            from src import debug_config
+            _workers_cfg = self._matching_cfg.get('parallel_search_workers')
+            _n_workers = int(_workers_cfg) if _workers_cfg is not None else max(1, len(self.cameras))
+            self._pool = create_pool(_n_workers, debug_cfg=debug_config.get_config())
+            import atexit
+            atexit.register(self._pool.shutdown)
+            # Force every worker to spawn now (interpreter boot + heavy imports +
+            # PoseSearcher construction) instead of lazily on the first tracked
+            # frame — spawn only starts a worker when it has a task to run.
+            warmup_pool(self._pool, _n_workers)
+
+    def shutdown(self) -> None:
+        """Cleanly shut down the process pool, if one was created. Safe to call more
+        than once; also registered via atexit as a safety net."""
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
 
     def get_designated_primary_cameras(self) -> Dict[str, Optional[int]]:
         """Return {ctrl_name: anchor_cam_id} as of the last successful tracking frame.
@@ -1160,6 +1421,7 @@ class TrackingSystem:
                 fixed_primary_cam=self._fixed_primary_cam,
                 occluders_per_cam=_occluders_per_cam,
                 self_cal=self._self_cal,
+                pool=self._pool,
             )
 
         return results

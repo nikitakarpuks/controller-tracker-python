@@ -247,32 +247,6 @@ def _tier_label(t):
 # Joint multi-camera LM refinement
 # ---------------------------------------------------------------------------
 
-def _filter_aux_by_reprojection(
-    T_world_ctrl,
-    aux_joint_data: List,   # [(Camera, blobs_np, [(blob_idx, led_id)])]
-    positions: np.ndarray,
-    threshold_px: float,
-) -> List:
-    """Return aux_joint_data with each camera's pairs pre-filtered to reprojection < threshold_px."""
-    result = []
-    for _ocam, _oblobs, _pairs in aux_joint_data:
-        if not _pairs:
-            continue
-        _T_ci = _ocam.T_world_cam.inverse().compose(T_world_ctrl)
-        _rv_ci, _ = cv2.Rodrigues(_T_ci.R.astype(np.float32))
-        _tv_ci = _T_ci.t.astype(np.float32)
-        _led_ids   = [led_id for _, led_id in _pairs]
-        _blob_idxs = [b_idx  for b_idx, _  in _pairs]
-        _pts3d = positions[_led_ids].astype(np.float32)
-        _proj  = _project_points(_rv_ci, _tv_ci, _pts3d, _ocam.camera_matrix, _ocam.dist_coeffs,
-                                 is_fisheye=_ocam.is_fisheye)
-        _errs  = np.linalg.norm(_proj - _oblobs[_blob_idxs], axis=1)
-        _kept  = [_pairs[i] for i in range(len(_pairs)) if _errs[i] < threshold_px]
-        if _kept:
-            result.append((_ocam, _oblobs, _kept))
-    return result
-
-
 def _joint_refine_pose(
     T_world_ctrl_init: Transform,
     primary_cam,
@@ -405,6 +379,7 @@ def fuse_camera_poses(
     cam_solutions: List[dict],
     model_positions: np.ndarray,
     extra_aux: Optional[List[dict]] = None,
+    matching_cfg: Optional[dict] = None,
 ) -> Tuple[Optional[Transform], float]:
     """
     Fuse independent per-camera pose solves (each camera searched using only its own
@@ -446,10 +421,16 @@ def fuse_camera_poses(
         s['camera'].camera_idx: float(s.get('confidence', 1.0)) for s in (extra_aux or [])
     })
 
+    _cfg = matching_cfg or {}
     T_joint, err_joint = _joint_refine_pose(
         seed['T_world_ctrl'], seed['camera'], seed['pairs'], seed['blobs'],
         aux_cam_data, model_positions, primary_weight=1.0,
         cam_confidence=cam_confidence,
+        max_nfev=int(_cfg.get('joint_lm_max_nfev', 50)),
+        huber_scale=float(_cfg.get('joint_huber_scale', 1.5)),
+        ftol=float(_cfg.get('joint_lm_ftol', 1e-4)),
+        xtol=float(_cfg.get('joint_lm_xtol', 1e-4)),
+        gtol=float(_cfg.get('joint_lm_gtol', 1e-4)),
     )
     if T_joint is None:
         return seed['T_world_ctrl'], seed['error']
@@ -539,15 +520,11 @@ class PoseSearcher:
         self._c_occ_radius          = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
         self._c_occ_margin_px       = float(_cfg.get('cross_occlusionself._c_occ_margin_px',   20.0))
         self._c_log_size_filter     = bool( _cfg.get('log_size_filter',                  False))
-        # joint optimisation
-        self._c_joint_opt           = bool( _cfg.get('joint_optimization',               True))
+        # joint optimisation — snap_camera's own prefilter; the fusion LM itself
+        # (huber_scale, max_nfev, ftol/xtol/gtol) is read directly from matching_cfg
+        # by fuse_camera_poses, since that's a module-level function shared across
+        # cameras, not a PoseSearcher method.
         self._c_joint_prefilter_px  = float(_cfg.get('joint_aux_prefilter_px',            8.0))
-        self._c_joint_primary_w     = float(_cfg.get('joint_primary_weight',              2.0))
-        self._c_joint_huber_scale   = float(_cfg.get('joint_huber_scale',                1.5))
-        self._c_joint_lm_max_nfev   = int(  _cfg.get('joint_lm_max_nfev',                  50))
-        self._c_joint_lm_ftol       = float(_cfg.get('joint_lm_ftol',                    1e-4))
-        self._c_joint_lm_xtol       = float(_cfg.get('joint_lm_xtol',                    1e-4))
-        self._c_joint_lm_gtol       = float(_cfg.get('joint_lm_gtol',                    1e-4))
         # proximity
         self._c_prox_reproj_px      = float(_cfg.get('proximity_reprojection_threshold',  2.0))
         self._c_prox_min_inliers    = int(  _cfg.get('proximity_min_inliers',
@@ -713,81 +690,6 @@ class PoseSearcher:
                 used.add(j)
         return pairs
 
-    def _apply_joint_lm(
-        self,
-        rvec: np.ndarray,
-        tvec: np.ndarray,
-        primary_pairs: List[Tuple[int, int]],
-        blobs: np.ndarray,
-        aux_assignments: Dict[int, List],
-        other_cameras_blobs: List,
-        K: np.ndarray,
-        dc: np.ndarray,
-        label: str,
-        prior_error: float,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
-        """
-        Joint multi-camera LM refinement over all cameras simultaneously.
-        Returns (rvec_refined, tvec_refined, error_refined) or None if skipped/failed.
-        """
-        if not self._c_joint_opt or not aux_assignments or not other_cameras_blobs:
-            return None
-        _aux = [
-            (ocam, np.asarray(oblobs, dtype=np.float32), aux_assignments.get(ocam.camera_idx, []))
-            for ocam, oblobs, _ in other_cameras_blobs
-            if aux_assignments.get(ocam.camera_idx)
-        ]
-        if not _aux:
-            return None
-        _R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float32).reshape(3, 1))
-        _T_wc = self.T_world_cam.compose(
-            Transform(_R.astype(np.float64), np.asarray(tvec, dtype=np.float64).reshape(3))
-        )
-        _aux = _filter_aux_by_reprojection(_T_wc, _aux, self.model.positions, self._c_joint_prefilter_px)
-        if not _aux:
-            return None
-        _T_joint, _joint_err = _joint_refine_pose(
-            _T_wc, self.camera, primary_pairs, blobs, _aux, self.model.positions,
-            max_nfev=self._c_joint_lm_max_nfev,
-            primary_weight=self._c_joint_primary_w,
-            huber_scale=self._c_joint_huber_scale,
-            ftol=self._c_joint_lm_ftol,
-            xtol=self._c_joint_lm_xtol,
-            gtol=self._c_joint_lm_gtol,
-        )
-        if _T_joint is None:
-            return None
-        _T_prim = self.T_world_cam.inverse().compose(_T_joint)
-        _rv_j   = cv2.Rodrigues(_T_prim.R.astype(np.float32))[0]
-        _tv_j   = _T_prim.t.astype(np.float32)
-        _lo     = self.model.positions[[l for _, l in primary_pairs]].astype(np.float32)
-        _li     = blobs[[b for b, _ in primary_pairs]].astype(np.float32)
-        _err_j  = float(np.mean(np.linalg.norm(_project_points(_rv_j, _tv_j, _lo, K, dc,
-                                                                is_fisheye=self.camera.is_fisheye) - _li, axis=1)))
-        logger.debug(
-            f"[{self._ctrl} | cam {self._cam}] {label} joint LM: "
-            f"primary err {prior_error:.2f}→{_err_j:.2f}px  joint mean {_joint_err:.2f}px"
-        )
-        for _aux_cam_j, _aux_blobs_j, _aux_pr_j in _aux:
-            if not _aux_pr_j:
-                continue
-            _T_aux_j  = _aux_cam_j.T_world_cam.inverse().compose(_T_joint)
-            _rv_aux_j = cv2.Rodrigues(_T_aux_j.R.astype(np.float32))[0]
-            _tv_aux_j = _T_aux_j.t.astype(np.float32)
-            _leds_j   = self.model.positions[[l for _, l in _aux_pr_j]].astype(np.float32)
-            _blobs_j  = _aux_blobs_j[[b for b, _ in _aux_pr_j]].astype(np.float32)
-            _err_ax   = float(np.mean(np.linalg.norm(
-                _project_points(_rv_aux_j, _tv_aux_j, _leds_j,
-                                _aux_cam_j.camera_matrix, _aux_cam_j.dist_coeffs,
-                                is_fisheye=_aux_cam_j.is_fisheye) - _blobs_j,
-                axis=1,
-            )))
-            logger.debug(
-                f"[{self._ctrl} | cam {self._cam}] {label} joint LM cam{_aux_cam_j.camera_idx}: "
-                f"err={_err_ax:.2f}px  ({len(_aux_pr_j)} pairs)"
-            )
-        return _rv_j, _tv_j, _err_j
-
     def proximity_search(
         self,
         blobs: np.ndarray,
@@ -809,7 +711,7 @@ class PoseSearcher:
         rvec_pred = np.asarray(rvec_pred, dtype=np.float32).reshape(3, 1)
         tvec_pred = np.asarray(tvec_pred, dtype=np.float32).reshape(3)
 
-        _t_collisions = _t_scoring = _t_stage2 = _t_aux = _t_lm = 0.0
+        _t_collisions = _t_scoring = _t_stage2 = _t_aux = 0.0
 
         K  = self.camera.camera_matrix
         dc = self.camera.dist_coeffs
@@ -1464,23 +1366,12 @@ class PoseSearcher:
 
         _t_aux = time.perf_counter() - _t_aux_start
 
-        # Joint LM refinement: optimise T_world_ctrl over all cameras simultaneously.
-        _t_lm_start = time.perf_counter()
-        _joint_result = self._apply_joint_lm(
-            rvec, tvec, final_pairs, blobs,
-            aux_snapped_per_cam, other_cameras_blobs or [],
-            K, dc, "Proximity", error,
-        )
-        if _joint_result is not None:
-            rvec, tvec, error = _joint_result
-        _t_lm = time.perf_counter() - _t_lm_start
-
         _aux_log = ""
         if aux_cameras_result:
             _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result if n > 0) + "]"
         logger.debug(
             f"[{self._ctrl} | cam {self._cam}] Proximity: OK  inliers={len(final_pairs)}  err={error:.2f}px  max={max_error:.2f}px{_aux_log}"
-            f"  bench: coll={_t_collisions*1000:.1f}ms  score={_t_scoring*1000:.1f}ms  s2={_t_stage2*1000:.1f}ms  aux={_t_aux*1000:.1f}ms  lm={_t_lm*1000:.1f}ms"
+            f"  bench: coll={_t_collisions*1000:.1f}ms  score={_t_scoring*1000:.1f}ms  s2={_t_stage2*1000:.1f}ms  aux={_t_aux*1000:.1f}ms"
         )
 
         # Confidence for multi-camera fusion weighting (see fuse_camera_poses): how much
@@ -1508,7 +1399,7 @@ class PoseSearcher:
             "tvec":       tvec,
             "error":      error,
             "assignment": final_pairs,
-            "method":          "proximity_hungarian",
+            "method":          "proximity",
             "aux_inliers":     aux_inlier_count,
             "aux_cameras":     aux_cameras_result or None,
             "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,
@@ -2433,31 +2324,13 @@ class PoseSearcher:
 
     def finalize_brute_state(self, state: BruteSearchState) -> Optional[Dict]:
         """
-        Run joint-LM refinement + final logging/telemetry summary for a brute-force
-        recovery attempt, and return the accepted solution (or None). Call once, after
-        brute_search_tier has been called for as many tiers as needed (either
-        state.strong_found tripped, or every tier has been tried).
+        Run final logging/telemetry summary for a brute-force recovery attempt, and
+        return the accepted solution (or None). Call once, after brute_search_tier has
+        been called for as many tiers as needed (either state.strong_found tripped, or
+        every tier has been tried). Cross-camera fusion happens once at the
+        ControllerTracker level via fuse_camera_poses, not per camera here.
         """
         best_solution = state.best_solution
-        K  = self.camera.camera_matrix
-        dc = self.camera.dist_coeffs
-
-        if best_solution is not None:
-            _joint_result = self._apply_joint_lm(
-                best_solution['rvec'].reshape(3, 1),
-                best_solution['tvec'].reshape(3),
-                best_solution['assignment'],
-                state.blobs,
-                best_solution.get('aux_assignments') or {},
-                state.other_cameras_blobs or [],
-                K, dc, "Brute", best_solution['error'],
-            )
-            if _joint_result is not None:
-                _rv_j, _tv_j, _err_j = _joint_result
-                best_solution['rvec']   = _rv_j
-                best_solution['tvec']   = _tv_j.reshape(3, 1)
-                best_solution['error']  = _err_j
-                best_solution['method'] = best_solution['method'] + '_mc'
 
         total_p3p_tried = sum(state.tier_p3p_calls)
 

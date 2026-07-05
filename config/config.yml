@@ -114,6 +114,14 @@ geometry:
 matching:
 
   # --------------------------------------------------------------------------
+  # Parallel search
+  # --------------------------------------------------------------------------
+  parallel_search_enabled: true    # dispatch per-camera cheap search and brute-force
+                                    # tier rounds to a persistent process pool; false
+                                    # falls back to the equivalent sequential loop
+  parallel_search_workers: null    # pool size; null = number of cameras
+
+  # --------------------------------------------------------------------------
   # LED physical model
   # --------------------------------------------------------------------------
   led_facing_angle_deg: 85.0      # emission half-angle; LEDs beyond this from camera axis are culled
@@ -193,8 +201,9 @@ matching:
   # --------------------------------------------------------------------------
   # Joint multi-camera optimisation
   # --------------------------------------------------------------------------
-  joint_optimization: true         # run joint LM over all cameras after RANSAC when aux correspondences exist
-  joint_primary_weight: 2.0        # primary-camera residual multiplier (slight preference: RANSAC-validated vs Hungarian)
+  # (joint_optimization / joint_primary_weight removed: every camera now searches
+  # independently and fuse_camera_poses() always fuses whoever solved — no on/off
+  # toggle, no "primary" bias, all cameras weighted by pair count x confidence.)
   joint_huber_scale: 1.5           # Huber loss threshold in pixels; residuals beyond this are soft-capped
   joint_aux_prefilter_px: 2.0      # drop aux pairs with reprojection > this before joint LM
   joint_snap_confidence: 0.5       # fusion confidence for a camera recovered via cheap Hungarian
