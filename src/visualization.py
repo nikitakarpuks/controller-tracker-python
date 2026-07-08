@@ -3,6 +3,7 @@ import trimesh
 import cv2
 import rerun as rr
 import rerun.blueprint as rrb
+from loguru import logger
 
 from src.transformations import Transform
 from src._visibility import _visible_mask, _cross_occluded_mask
@@ -461,31 +462,23 @@ class ControllerAnimatorRerun:
             collapse_panels=False,
         )
 
-    def start(self, poses_per_ctrl: dict, assignments_per_ctrl: dict,
-              blobs_all, cameras: dict,
-              contours_all=None,
-              save_path: str = None,
-              primary_cams_all: dict = None,
-              aux_assignments_all: dict = None,
-              frozen_poses_all: dict = None,
-              blob_vis_all: list = None):
+    def begin(self, cameras: dict, save_path: str = None) -> None:
         """
-        Log all frames to rerun.
-        Opens the viewer automatically (spawn=True).
+        One-time setup, called once before the tracking loop starts. Follow
+        with one log_frame() call per frame, in order, as each frame's
+        tracking result becomes available — do not buffer frames across the
+        sequence and replay them here, or their per-frame data (poses, blobs,
+        blob-debug canvases, ...) sits in process memory for the whole run
+        instead of being hand off to rerun (and, with save_path, flushed to
+        disk) as it's produced. Call finish() once the sequence is done.
 
         Args:
-            poses_per_ctrl:       {ctrl_name: [pose_or_None, ...]}
-            assignments_per_ctrl: {ctrl_name: [assignment_or_None, ...]}
-            cameras:              {cam_idx: Camera} for all selected cameras.
-            primary_cams_all:     {ctrl_name: [cam_idx_or_None, ...]}
-            aux_assignments_all:  {ctrl_name: [aux_asgn_or_None, ...]}
-            save_path:            Optional path for an .rrd recording file.
-            frozen_poses_all:     {ctrl_name: [T_world_ctrl_or_None, ...]}
-                                  Non-None entries are used when the current
-                                  pose is None but blobs were visible (case 3:
-                                  between cameras).  None hides the controller.
+            cameras:   {cam_idx: Camera} for all selected cameras.
+            save_path: Optional path for an .rrd recording file.
         """
         self._cameras = cameras
+        self._save_path = save_path
+        self._frame_count = 0
 
         spawn_viewer = save_path is None
         rr.init("controller_animator", spawn=spawn_viewer)
@@ -494,8 +487,8 @@ class ControllerAnimatorRerun:
             import os
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
             rr.save(save_path)
-            print(f"[rerun] Saving recording to: {save_path}  (no live viewer)", flush=True)
-            print(f"[rerun] Replay later with:   rerun {save_path}", flush=True)
+            logger.info(f"[rerun] Saving recording to: {save_path}  (no live viewer)")
+            logger.info(f"[rerun] Replay later with:   rerun {save_path}")
 
         blueprint = self._build_blueprint(cameras, frustum_z=self.vis_cfg.get("frustum_z", 0.05))
         rr.send_blueprint(blueprint)
@@ -535,68 +528,74 @@ class ControllerAnimatorRerun:
                     static=True,
                 )
 
-        n_frames = len(next(iter(poses_per_ctrl.values())))
+    def log_frame(self, idx: int,
+                  T_world_ctrl_per_ctrl: dict,
+                  assignments_per_ctrl: dict = None,
+                  blobs_per_ctrl: dict = None,
+                  contours_per_ctrl: dict = None,
+                  primary_cam_per_ctrl: dict = None,
+                  aux_assignments_per_ctrl: dict = None,
+                  frozen_T_world_ctrl_per_ctrl: dict = None,
+                  blob_vis_frame: dict = None) -> None:
+        """
+        Log a single frame to rerun. Call once per tracked frame, in
+        increasing idx order, right after that frame's tracking result is
+        computed. Every arg here is this frame's data only (a dict keyed by
+        ctrl_name, not a list over the whole sequence) — the caller must not
+        accumulate per-frame history to call this later.
 
-        for idx in range(n_frames):
-            rr.set_time("frame", sequence=idx)
+        Args:
+            T_world_ctrl_per_ctrl:         {ctrl_name: pose}, absent/None entries
+                                            are skipped (tracking lost this frame).
+            frozen_T_world_ctrl_per_ctrl:   {ctrl_name: T_world_ctrl_or_None}, used
+                                            when the current pose is None but blobs
+                                            were visible (case 3: between cameras).
+                                            None hides the controller (ghost).
+            blob_vis_frame:                {ctrl_name: {cam_idx: {mode_key: canvas}}}
+                                            for this frame only, see _log_blob_debug.
+        """
+        rr.set_time("frame", sequence=idx)
 
-            if blob_vis_all is not None and idx < len(blob_vis_all):
-                self._log_blob_debug(blob_vis_all[idx])
+        if blob_vis_frame:
+            self._log_blob_debug(blob_vis_frame)
 
-            # Build per-controller T_world_ctrl for this frame.
-            T_world_ctrl_per_ctrl: dict = {}
-            for ctrl_name, poses in poses_per_ctrl.items():
-                pose = poses[idx] if idx < len(poses) else None
-                if pose is None:
-                    continue
-                T_world_ctrl_per_ctrl[ctrl_name] = pose  # T_world_ctrl stored directly
+        # Build ghost world-frame transforms for case-3 lost frames.
+        ghost_T_world_model_per_ctrl: dict = {}
+        for ctrl_name in self._controllers_vis:
+            if ctrl_name in T_world_ctrl_per_ctrl:
+                continue
+            T_world_ctrl = (frozen_T_world_ctrl_per_ctrl or {}).get(ctrl_name)
+            if T_world_ctrl is not None:
+                T_ctrl_model = self._ctrl_state[ctrl_name]["T_ctrl_model"]
+                ghost_T_world_model_per_ctrl[ctrl_name] = T_world_ctrl.compose(T_ctrl_model)
 
-            # Build ghost world-frame transforms for case-3 lost frames.
-            ghost_T_world_model_per_ctrl: dict = {}
-            for ctrl_name in self._controllers_vis:
-                if ctrl_name in T_world_ctrl_per_ctrl:
-                    continue
-                frozen_list = (frozen_poses_all or {}).get(ctrl_name, [])
-                T_world_ctrl = frozen_list[idx] if idx < len(frozen_list) else None
-                if T_world_ctrl is not None:
-                    T_ctrl_model = self._ctrl_state[ctrl_name]["T_ctrl_model"]
-                    ghost_T_world_model_per_ctrl[ctrl_name] = T_world_ctrl.compose(T_ctrl_model)
+        assignments_frame = {
+            n: (assignments_per_ctrl or {}).get(n) for n in self._controllers_vis
+        }
+        primary_cams_frame = {
+            n: ((primary_cam_per_ctrl or {}).get(n)
+                if (primary_cam_per_ctrl or {}).get(n) is not None else 0)
+            for n in self._controllers_vis
+        }
+        aux_assignments_frame = {
+            n: (aux_assignments_per_ctrl or {}).get(n) for n in self._controllers_vis
+        }
 
-            blobs    = blobs_all[idx]    if blobs_all    is not None and idx < len(blobs_all)    else None
-            contours = contours_all[idx] if contours_all is not None and idx < len(contours_all) else None
+        self._log_frame(idx, T_world_ctrl_per_ctrl, assignments_frame,
+                        blobs_per_ctrl=blobs_per_ctrl, contours_per_ctrl=contours_per_ctrl,
+                        primary_cam_per_ctrl=primary_cams_frame,
+                        aux_assignments_per_ctrl=aux_assignments_frame,
+                        ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl)
 
-            # Slice per-controller lists for this frame.
-            assignments_frame = {
-                n: (assignments_per_ctrl[n][idx]
-                    if assignments_per_ctrl is not None and idx < len(assignments_per_ctrl[n])
-                    else None)
-                for n in self._controllers_vis
-            }
-            primary_cams_frame = {
-                n: (primary_cams_all[n][idx]
-                    if primary_cams_all is not None and idx < len(primary_cams_all[n])
-                       and primary_cams_all[n][idx] is not None
-                    else 0)
-                for n in self._controllers_vis
-            }
-            aux_assignments_frame = {
-                n: (aux_assignments_all[n][idx]
-                    if aux_assignments_all is not None and idx < len(aux_assignments_all[n])
-                    else None)
-                for n in self._controllers_vis
-            }
+        self._frame_count += 1
 
-            self._log_frame(idx, T_world_ctrl_per_ctrl, assignments_frame,
-                            blobs_per_ctrl=blobs, contours_per_ctrl=contours,
-                            primary_cam_per_ctrl=primary_cams_frame,
-                            aux_assignments_per_ctrl=aux_assignments_frame,
-                            ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl)
-
-        msg = f"[rerun] Logged {n_frames} frames."
-        if save_path:
-            msg += f" Recording saved to: {save_path}"
-            msg += f"\n[rerun] Replay with:  rerun {save_path}"
-        print(msg)
+    def finish(self) -> None:
+        """Call once after the last log_frame() call for the sequence."""
+        msg = f"[rerun] Logged {self._frame_count} frames."
+        if self._save_path:
+            msg += f" Recording saved to: {self._save_path}"
+            msg += f"\n[rerun] Replay with:  rerun {self._save_path}"
+        logger.info(msg)
 
     # ------------------------------------------------------------------
     # Blob debug images (logged per frame under blob_debug/ subtree)

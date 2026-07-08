@@ -67,7 +67,7 @@ blob_detection:
   visualize: false
   min_threshold: 6                  # pixels >= this are included in a blob
   min_area: 2
-  max_area: 350
+  max_area: 500
   min_split_dist: 4.0
   split_valley_ratio: 0.6           # saddle_min/lower_peak must be below this to allow splitting
   min_circularity: 0.5              # 4π·area/perimeter² must exceed this; rejects elongated shapes
@@ -124,7 +124,7 @@ matching:
   # --------------------------------------------------------------------------
   # LED physical model
   # --------------------------------------------------------------------------
-  led_facing_angle_deg: 85.0      # emission half-angle; LEDs beyond this from camera axis are culled
+  led_facing_angle_deg: 90.0      # emission half-angle; LEDs beyond this from camera axis are culled
   led_radius_mm: 3.0              # physical emitter radius; drives depth-scaled snap and size thresholds
 
   # --------------------------------------------------------------------------
@@ -168,7 +168,7 @@ matching:
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_top_k_ransac: 3
   visibility_occlusion_margin_m: 0.01   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
-  proximity_vis_score_threshold: 0.98   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
+  proximity_vis_score_threshold: 0.95   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
 
   proximity_expansion_velocity_k: 0.3   # extra px per px/frame of estimated velocity
   proximity_expansion_uncertainty_k: 1.0  # extra px / n_history; largest at n=1 (2nd frame), decays as 1/n
