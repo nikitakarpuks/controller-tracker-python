@@ -601,15 +601,24 @@ class ControllerAnimatorRerun:
     # Blob debug images (logged per frame under blob_debug/ subtree)
     # ------------------------------------------------------------------
 
+    # Fixed left-to-right order when multiple canvases are present for one
+    # camera/controller — "local" first since it's the *failed* warm-path
+    # attempt (main.py keeps it instead of discarding it when a lost-track
+    # cold re-detect follows), so the panel reads as "what proximity saw" →
+    # "what cold detection found" left to right.
+    _BLOB_DEBUG_CANVAS_ORDER = ("local", "pass1", "pass2")
+
     def _log_blob_debug(self, frame_vis: dict) -> None:
         """Log blob detection canvases and a mode summary for the current frame.
 
         frame_vis: {ctrl_name: {cam_idx: {mode_key: canvas_bgr}}}
-        mode_key is "local", "pass1", or "pass2".
+        mode_key is "local", "pass1", or "pass2" — any subset/combination may be
+        present for a given camera (e.g. all three when a lost-track cold
+        re-detect ran this frame: the failed warm attempt plus both cold passes).
 
-        For 2-pass frames (pass1 + pass2 present) the two canvases are placed
-        side-by-side in a single image so both are visible in one panel.
-        The composite image is logged directly at the panel origin path so that
+        Multiple canvases are placed side-by-side in a single composite image
+        (see _BLOB_DEBUG_CANVAS_ORDER) so all are visible in one panel. The
+        composite image is logged directly at the panel origin path so that
         Rerun updates it reliably when scrubbing the timeline.
         """
         mode_lines = []
@@ -619,29 +628,29 @@ class ControllerAnimatorRerun:
                 if not canvases:
                     continue
 
-                if "pass1" in canvases and "pass2" in canvases:
-                    p1 = canvases["pass1"]
-                    p2 = canvases["pass2"]
-                    if p1.shape[0] != p2.shape[0]:
-                        # Pad shorter canvas to match height
-                        h = max(p1.shape[0], p2.shape[0])
-                        def _pad(img, h):
-                            if img.shape[0] < h:
-                                pad = np.zeros((h - img.shape[0], img.shape[1], 3), dtype=np.uint8)
-                                return np.vstack([img, pad])
-                            return img
-                        p1, p2 = _pad(p1, h), _pad(p2, h)
-                    # Thin separator between the two passes
-                    sep = np.full((p1.shape[0], 3, 3), 80, dtype=np.uint8)
-                    composite = np.hstack([p1, sep, p2])
-                    mode_str = "pass1|pass2"
-                elif "local" in canvases:
-                    composite = canvases["local"]
-                    mode_str = "local"
+                present = [k for k in self._BLOB_DEBUG_CANVAS_ORDER if canvases.get(k) is not None]
+                # Any keys outside the known order (shouldn't happen, but don't
+                # silently drop a canvas if it does) — append at the end.
+                present += [k for k in canvases if k not in present and canvases.get(k) is not None]
+                imgs = [canvases[k] for k in present]
+
+                if len(imgs) > 1:
+                    h = max(img.shape[0] for img in imgs)
+                    def _pad(img, h):
+                        if img.shape[0] < h:
+                            pad = np.zeros((h - img.shape[0], img.shape[1], 3), dtype=np.uint8)
+                            return np.vstack([img, pad])
+                        return img
+                    sep = np.full((h, 3, 3), 80, dtype=np.uint8)
+                    parts = []
+                    for i, img in enumerate(imgs):
+                        if i > 0:
+                            parts.append(sep)
+                        parts.append(_pad(img, h))
+                    composite = np.hstack(parts)
                 else:
-                    # pass1 only (cold start, pass2 skipped)
-                    composite = next(iter(canvases.values()))
-                    mode_str = next(iter(canvases))
+                    composite = imgs[0]
+                mode_str = "|".join(present)
 
                 rr.log(
                     f"blob_debug/cam{cam_idx}/{ctrl_label}",

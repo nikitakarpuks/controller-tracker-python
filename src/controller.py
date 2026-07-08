@@ -73,6 +73,7 @@ def cheap_search_core(
     prior: dict,
     matching_cfg: dict,
     blobs: np.ndarray,
+    frame_ts_ns: int,
     blob_radii: Optional[np.ndarray] = None,
     blob_brightnesses: Optional[np.ndarray] = None,
     other_cameras_blobs: Optional[List] = None,
@@ -88,7 +89,13 @@ def cheap_search_core(
     snapshot), so the caller must pass that state in explicitly instead.
 
     prior: {'prev_pose', 'prev_prev_pose', 'pose_history', 'vel_ema', 'prev_assignment'}
-    — the same fields CameraTracker.search_cheap() reads from self.
+    — the same fields CameraTracker.search_cheap() reads from self. 'pose_history'
+    entries are (rvec, tvec, ts_ns); 'vel_ema' is a position-per-second rate, not a
+    raw step — see CameraTracker._predict_pose's docstring.
+
+    frame_ts_ns: the current frame's real capture timestamp (nanoseconds, parsed
+    from the frame's filename in main.py) — _predict_pose extrapolates against
+    this exact elapsed time rather than assuming uniform frame spacing.
 
     Returns (solution_or_None, predicted_pose, normalized_prev_pose,
     normalized_prev_prev_pose) — the normalized values mirror the idempotent
@@ -137,8 +144,9 @@ def cheap_search_core(
 
     predicted_pose = CameraTracker._predict_pose(
         pose_history,
+        frame_ts_ns,
         weight_decay=float(_cfg.get("pose_prediction_weight_decay", 0.7)),
-        vel_ema=vel_ema,
+        vel_ema_rate=vel_ema,
     )
 
     # Velocity-scaled search gates: expand proximity radius proportionally to speed.
@@ -359,22 +367,40 @@ class CameraTracker:
     @staticmethod
     def _predict_pose(
         pose_history,
+        target_ts_ns: int,
         weight_decay: float = 0.7,
-        vel_ema: Optional[np.ndarray] = None,
+        vel_ema_rate: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Predict pose at frame n+1 from pose history.
+        """Predict pose at `target_ts_ns` from pose history.
 
-        pose_history[0] = most recent (rvec, tvec); index increases toward older frames.
+        pose_history[0] = most recent (rvec, tvec, ts_ns); index increases toward
+        older frames. Real capture intervals are NOT uniform (consecutive frame
+        gaps can alternate between substantially different durations) — every
+        branch below extrapolates against actual elapsed time, never "one
+        history slot ahead".
 
-        vel_ema: if provided, overrides translation prediction with pose_history[0].tvec + vel_ema.
+        vel_ema_rate: if provided, a position-per-second rate (EMA-smoothed)
+                 that overrides translation prediction:
+                 pose_history[0].tvec + vel_ema_rate * dt_target.
                  Rotation prediction is always derived from pose history.
 
         n=0 → None (no information)
-        n=1 → constant position (same pose)
-        n=2 → constant-velocity extrapolation (matrix-based rotation)
-        n>=3 → weighted degree-1 (linear) fit; exponential weights (weight_decay^i)
+        n=1 → constant position (same pose) — vel_ema_rate is provably always
+              None here in practice (nothing has been tracked long enough yet
+              to populate it), kept for defensive symmetry only.
+        n=2 → constant-velocity extrapolation scaled by the ratio of the target
+              gap to the one known historical gap (matrix-based rotation,
+              scaled via a fractional Rodrigues vector — see below).
+        n>=3 → weighted degree-1 (linear) fit over real elapsed time; exponential
+               weights (weight_decay^i, still per history slot, not per elapsed
+               time — see module notes on why that's a deliberate simplification).
                Computes a weighted mean velocity across the window — averaging out
                the alternating big/small step oscillation from fast hand motion.
+
+        Degenerate timestamps (dt_hist <= 0 from duplicate/out-of-order frames,
+        or dt_target <= 0 from deep-debug mode's non-consecutive replay) fall
+        back to a one-unit-step assumption rather than dividing by zero or
+        extrapolating backwards.
         """
         n = len(pose_history)
 
@@ -387,9 +413,12 @@ class CameraTracker:
                 np.asarray(pose_history[0][1], np.float32).reshape(3),
             )
 
-        if vel_ema is not None:
+        ts0 = int(pose_history[0][2])
+        dt_target = (target_ts_ns - ts0) / 1e9  # seconds; may be <=0, guarded per branch
+
+        if vel_ema_rate is not None:
             tvec_pred = (np.asarray(pose_history[0][1], np.float32).reshape(3)
-                         + vel_ema.reshape(3)).astype(np.float32)
+                         + vel_ema_rate.reshape(3) * dt_target).astype(np.float32)
         else:
             tvec_pred = None  # filled in by the branch below
 
@@ -398,13 +427,25 @@ class CameraTracker:
             tvec_n   = np.asarray(pose_history[0][1], np.float64).reshape(3)
             rvec_nm1 = np.asarray(pose_history[1][0], np.float32).reshape(3, 1)
             tvec_nm1 = np.asarray(pose_history[1][1], np.float64).reshape(3)
+            ts_nm1   = int(pose_history[1][2])
+
+            dt_hist = (ts0 - ts_nm1) / 1e9
+            # frac=1.0 reproduces the old "assume one uniform step" behavior
+            # exactly, for degenerate timestamps only.
+            frac = (dt_target / dt_hist) if (dt_hist > 0 and dt_target > 0) else 1.0
 
             if tvec_pred is None:
-                tvec_pred = (2.0 * tvec_n - tvec_nm1).astype(np.float32)
+                tvec_pred = (tvec_n + (tvec_n - tvec_nm1) * frac).astype(np.float32)
 
             R_n,   _ = cv2.Rodrigues(rvec_n)
             R_nm1, _ = cv2.Rodrigues(rvec_nm1)
-            R_pred    = (R_n @ R_nm1.T) @ R_n
+            # Fractional rotation: scale the relative-rotation Rodrigues vector by
+            # frac (small-angle-safe "fraction of a rotation") instead of always
+            # applying the full historical step once more regardless of gap size.
+            rvec_rel, _ = cv2.Rodrigues((R_n @ R_nm1.T).astype(np.float32))
+            rvec_rel_scaled = (rvec_rel.reshape(3) * frac).astype(np.float32)
+            R_rel_scaled, _ = cv2.Rodrigues(rvec_rel_scaled.reshape(3, 1))
+            R_pred = R_rel_scaled @ R_n
             rvec_pred, _ = cv2.Rodrigues(R_pred.astype(np.float32))
 
             return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
@@ -412,16 +453,19 @@ class CameraTracker:
         # n >= 3: weighted degree-1 (linear) fit — estimates a single average velocity
         # across the window. Degree-2 would add an acceleration term that amplifies
         # the alternating big/small step oscillation typical of fast hand motion.
-        # time axis: most recent pose = t=0, one frame older = t=-1, …; predict at t=+1
-        t_pts   = -np.arange(n, dtype=np.float64)
+        # time axis: real elapsed seconds from the most recent pose (t=0, negative
+        # for older frames); predict at t=dt_target — the actual elapsed time to the
+        # frame being predicted for, not always +1.
+        t_pts   = np.array([(int(p[2]) - ts0) / 1e9 for p in pose_history], dtype=np.float64)
         weights = weight_decay ** np.arange(n, dtype=np.float64)
+        _t_eval = dt_target if dt_target > 0 else 1.0
 
         # Translation: linear fit per axis (skipped when vel_ema already set tvec_pred)
         if tvec_pred is None:
             tvecs = np.stack([np.asarray(p[1], np.float64).reshape(3) for p in pose_history])
             tvec_pred = np.empty(3, dtype=np.float32)
             for ax in range(3):
-                tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=1, w=weights), 1.0)
+                tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=1, w=weights), _t_eval)
 
         # Rotation: linear fit in the tangent space of R_0 (most recent rotation).
         # rel_rvecs[i] = log(R_0^T @ R_i) — rotation from current pose back to the i-th
@@ -436,7 +480,7 @@ class CameraTracker:
 
         rvec_rel_pred = np.empty(3, dtype=np.float32)
         for ax in range(3):
-            rvec_rel_pred[ax] = np.polyval(np.polyfit(t_pts, rel_rvecs[:, ax], deg=1, w=weights), 1.0)
+            rvec_rel_pred[ax] = np.polyval(np.polyfit(t_pts, rel_rvecs[:, ax], deg=1, w=weights), _t_eval)
 
         R_rel_pred, _ = cv2.Rodrigues(rvec_rel_pred.reshape(3, 1).astype(np.float32))
         rvec_pred, _ = cv2.Rodrigues((R_0 @ R_rel_pred).astype(np.float32))
@@ -446,7 +490,8 @@ class CameraTracker:
     # -----------------------------------------------------
     # Tracking
     # -----------------------------------------------------
-    def search_cheap(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
+    def search_cheap(self, blobs: np.ndarray, frame_ts_ns: int,
+                      blob_radii: Optional[np.ndarray] = None,
                       blob_brightnesses: Optional[np.ndarray] = None,
                       other_cameras_blobs: Optional[List] = None,
                       blob_mask: Optional[np.ndarray] = None,
@@ -471,7 +516,7 @@ class CameraTracker:
         }
         solution, predicted_pose, norm_prev, norm_prev_prev = cheap_search_core(
             self._pose_searcher, prior, self._matching_cfg,
-            blobs, blob_radii, blob_brightnesses,
+            blobs, frame_ts_ns, blob_radii, blob_brightnesses,
             other_cameras_blobs, blob_mask, occluders_per_cam,
         )
         self.prev_pose      = norm_prev
@@ -722,6 +767,7 @@ class ControllerTracker:
         rad_src:       Dict,
         brt_src:       Dict,
         claimed_blobs: Dict[int, Set[int]],     # mutated in place
+        frame_ts_ns:   int,
         fixed_primary_cam: Optional[int] = None,
         occluders_per_cam: Optional[Dict] = None,
         self_cal=None,
@@ -797,7 +843,7 @@ class ControllerTracker:
                     }
                     _futures[cid] = pool.submit(
                         run_cheap_search, (self.ctrl_name, cid), self._matching_cfg, prior,
-                        obs_full, rad_full, brt_full, mask, occluders_per_cam,
+                        obs_full, frame_ts_ns, rad_full, brt_full, mask, occluders_per_cam,
                     )
                 for cid, fut in _futures.items():
                     solution, predicted_pose, norm_prev, norm_prev_prev = fut.result()
@@ -807,7 +853,7 @@ class ControllerTracker:
             else:
                 for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
                     _cheap_raw[cid] = tracker.search_cheap(
-                        obs_full, blob_radii=rad_full, blob_brightnesses=brt_full,
+                        obs_full, frame_ts_ns, blob_radii=rad_full, blob_brightnesses=brt_full,
                         other_cameras_blobs=None, blob_mask=mask,
                         occluders_per_cam=occluders_per_cam,
                     )
@@ -1049,12 +1095,22 @@ class ControllerTracker:
             if _tracker.prev_pose is not None:
                 _step = (_tv_np.reshape(3).astype(np.float64)
                          - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
-                _tracker.vel_ema = (_beta * _step + (1.0 - _beta) * _tracker.vel_ema
-                                   if _tracker.vel_ema is not None else _step)
+                # vel_ema is a position-per-second RATE, not a raw per-call step —
+                # pose_history is non-empty whenever prev_pose is set (both are
+                # always written together, right here), so [0][2] is this
+                # tracker's previous frame's real timestamp.
+                _prev_ts_ns = int(_tracker.pose_history[0][2])
+                _dt_s = (frame_ts_ns - _prev_ts_ns) / 1e9
+                if _dt_s > 0:
+                    _step_rate = _step / _dt_s
+                    _tracker.vel_ema = (_beta * _step_rate + (1.0 - _beta) * _tracker.vel_ema
+                                       if _tracker.vel_ema is not None else _step_rate)
+                # else: degenerate/duplicate timestamp — leave vel_ema at its
+                # previous value rather than dividing by a non-positive dt.
             _tracker.prev_prev_pose = _tracker.prev_pose
             _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
             _tracker.last_good_pose = _tracker.prev_pose
-            _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np))
+            _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np, frame_ts_ns))
             _own_asgn = (
                 anchor_solution["assignment"] if _cid == primary_cam_id
                 else _other_assignments.get(_cid)
@@ -1078,7 +1134,8 @@ class TrackingSystem:
     def __init__(self, controllers: List[ControllerModel], cameras: List[Camera],
                  matching_cfg: dict = None, geometry_cfg: dict = None,
                  geometry_cfg_per_ctrl: dict = None,
-                 self_calibration_cfg: dict = None):
+                 self_calibration_cfg: dict = None,
+                 blob_detection_cfg: dict = None):
 
         self.cameras: Dict[int, Camera] = {cam.camera_idx: cam for cam in cameras}
 
@@ -1133,7 +1190,22 @@ class TrackingSystem:
                 ctrl.name, self.cameras, ctrl_cam_trackers, matching_cfg=matching_cfg,
             )
 
-        # ── Persistent process pool for parallel cheap-search / brute-tier dispatch ──
+        # Independent of parallel_search_enabled — lets blob-detection parallelism be
+        # turned off on its own (e.g. if IPC/pickling the debug canvases turns out to
+        # dominate the warm path's actual per-LED-ROI compute) without giving up
+        # pose-search parallelism, which still needs the pool regardless.
+        self._blob_parallel_enabled = (
+            _parallel_enabled
+            and bool(self._matching_cfg.get('parallel_blob_detection_enabled', True))
+            and blob_detection_cfg is not None
+        )
+        if self._blob_parallel_enabled:
+            from src.parallel_search import register_blob_detector_spec
+            for cam in cameras:
+                register_blob_detector_spec(cam.camera_idx, blob_detection_cfg)
+
+        # ── Persistent process pool for parallel cheap-search / brute-tier dispatch,
+        # and (when enabled) parallel blob detection ──────────────────────────────
         self._pool = None
         if _parallel_enabled:
             from src.parallel_search import create_pool, warmup_pool
@@ -1144,9 +1216,21 @@ class TrackingSystem:
             import atexit
             atexit.register(self._pool.shutdown)
             # Force every worker to spawn now (interpreter boot + heavy imports +
-            # PoseSearcher construction) instead of lazily on the first tracked
-            # frame — spawn only starts a worker when it has a task to run.
+            # PoseSearcher/BlobDetector construction) instead of lazily on the first
+            # tracked frame — spawn only starts a worker when it has a task to run.
             warmup_pool(self._pool, _n_workers)
+
+    def get_pool(self):
+        """The persistent process pool (or None if parallel search is disabled).
+        Callers submitting blob-detection tasks must also check
+        blob_parallel_enabled — the pool can exist for pose search alone while blob
+        parallelism is independently turned off, in which case workers never built a
+        _BLOB_DETECTORS registry."""
+        return self._pool
+
+    @property
+    def blob_parallel_enabled(self) -> bool:
+        return self._blob_parallel_enabled
 
     def shutdown(self) -> None:
         """Cleanly shut down the process pool, if one was created. Safe to call more
@@ -1165,8 +1249,13 @@ class TrackingSystem:
 
     def get_predicted_led_projections_per_camera(
         self,
+        frame_ts_ns: int,
     ) -> Tuple[Dict[int, Dict[str, Optional[np.ndarray]]], Dict[int, Dict[str, float]]]:
         """Return (proj_hints, vel_hints).
+
+        frame_ts_ns: the current frame's real capture timestamp (nanoseconds,
+        parsed from the frame's filename) — predictions are extrapolated to this
+        exact elapsed time, not an assumed uniform frame step.
 
         proj_hints: {cam_id: {ctrl_name: Nx5 array or None}}
           Each row: [proj_x, proj_y, depth_m, facing_cos, led_id]
@@ -1174,7 +1263,8 @@ class TrackingSystem:
           None when no prior pose exists for this (ctrl, cam) pair.
 
         vel_hints: {cam_id: {ctrl_name: v_px}}
-          Estimated controller speed in pixels/frame for this camera.
+          Estimated pixel displacement expected over THIS frame's actual gap
+          since the last known pose (not a fixed "per-frame" rate — see below).
           0.0 when no prediction is available.
         """
         ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
@@ -1202,8 +1292,9 @@ class TrackingSystem:
                 tracker = self.trackers.get((ctrl_name, cam_id))
                 pred = (CameraTracker._predict_pose(
                             tracker.pose_history,
+                            frame_ts_ns,
                             weight_decay=_weight_decay,
-                            vel_ema=tracker.vel_ema,
+                            vel_ema_rate=tracker.vel_ema,
                         ) if tracker else None)
                 if pred is None:
                     proj_per_ctrl[ctrl_name]   = None
@@ -1212,13 +1303,20 @@ class TrackingSystem:
                     continue
                 rvec_pred, tvec_pred = pred
                 _ph = tracker.pose_history
+                # dt from the last known pose to THIS frame — converts a rate
+                # (vel_ema, position/second) or a historical per-step delta into
+                # the expected displacement over the actual upcoming gap, not a
+                # fixed "per assumed-uniform-frame" amount.
+                _dt_target = max((frame_ts_ns - int(_ph[0][2])) / 1e9, 0.0) if _ph else 0.0
                 if tracker.vel_ema is not None:
-                    vel_3d = tracker.vel_ema.astype(np.float64)
+                    vel_disp_3d = tracker.vel_ema.astype(np.float64) * _dt_target
                 elif len(_ph) >= 2:
-                    vel_3d = (np.asarray(_ph[0][1], np.float64).reshape(3)
-                              - np.asarray(_ph[1][1], np.float64).reshape(3))
+                    _dt_hist = (int(_ph[0][2]) - int(_ph[1][2])) / 1e9
+                    _step    = (np.asarray(_ph[0][1], np.float64).reshape(3)
+                                - np.asarray(_ph[1][1], np.float64).reshape(3))
+                    vel_disp_3d = (_step / _dt_hist * _dt_target) if _dt_hist > 0 else np.zeros(3, np.float64)
                 else:
-                    vel_3d = np.zeros(3, np.float64)
+                    vel_disp_3d = np.zeros(3, np.float64)
 
                 R_pred, _ = cv2.Rodrigues(rvec_pred.reshape(3, 1))
                 R_pred    = R_pred.astype(np.float32)
@@ -1260,7 +1358,7 @@ class TrackingSystem:
                 ])  # (M, 5): proj_x, proj_y, depth_m, facing_cos, led_id
 
                 _depth_pred = max(float(tvec_pred[2]), 0.1)
-                _v_px       = float(np.linalg.norm(vel_3d)) * camera.fx / _depth_pred
+                _v_px       = float(np.linalg.norm(vel_disp_3d)) * camera.fx / _depth_pred
                 vel_per_ctrl[ctrl_name] = _v_px
 
                 # Full effective blob-detection search radius — mirrors track() expansion logic
@@ -1298,6 +1396,7 @@ class TrackingSystem:
     def update(
         self,
         observations_per_camera: Dict[int, np.ndarray],
+        frame_ts_ns: int,
         radii_per_camera: Optional[Dict[int, np.ndarray]] = None,
         brightnesses_per_camera: Optional[Dict[int, np.ndarray]] = None,
         per_ctrl_observations: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
@@ -1309,6 +1408,10 @@ class TrackingSystem:
     ) -> Dict[str, Optional[Dict]]:
         """
         Run tracking for every controller using a single primary camera.
+
+        frame_ts_ns: the current frame's real capture timestamp (nanoseconds,
+        parsed from the frame's filename) — required; used to extrapolate pose
+        history against actual elapsed time rather than an assumed uniform step.
 
         Blob ownership model: observations_per_camera is never mutated. Instead,
         claimed_blobs tracks which original blob indices have been consumed by
@@ -1467,6 +1570,7 @@ class TrackingSystem:
             results[ctrl_name] = self.ctrl_trackers[ctrl_name].update(
                 avail, _obs_src, _rad_src, _brt_src,
                 claimed_blobs,
+                frame_ts_ns,
                 fixed_primary_cam=self._fixed_primary_cam,
                 occluders_per_cam=_occluders_per_cam,
                 self_cal=self._self_cal,
