@@ -191,18 +191,28 @@ def _gate_any_point(
     Return True if ANY gate LED projects within sqrt(thresh_sq) pixels of ANY gate blob.
     If either pool is empty, returns True (no gate to fail).
     Returns (passed, min_dist_px); min_dist is only tracked when track_dist=True.
+
+    Projects all gate LEDs in one batched matmul (measured ~35% faster than one
+    R_h @ obj matvec per LED in a Python loop — gate_obj is tiny, ≤6 points, but
+    that's exactly why the per-point numpy call overhead dominated; batching it
+    removes ~N-1 of those calls). The gate_img comparison loop stays a plain
+    early-exit Python loop deliberately: gate_img is typically 0-1 points, too
+    small for numpy batching to help, and the early exit keeps the (rare) hit
+    case cheap — a full-vectorized rewrite of that inner loop was benchmarked
+    and found ~7x slower for hits since it can't exit early.
     """
     if len(gate_obj) == 0 or len(gate_img) == 0:
         return True, 0.0
 
+    proj_cam = gate_obj @ R_h.T + tvec_h
     min_dist = np.inf if track_dist else 0.0
-    for obj in gate_obj:
-        p = R_h @ obj + tvec_h
-        if p[2] <= 0:
+    for i in range(len(proj_cam)):
+        z = proj_cam[i, 2]
+        if z <= 0:
             continue
-        iz = 1.0 / p[2]
-        px = fx * p[0] * iz + cx
-        py = fy * p[1] * iz + cy
+        iz = 1.0 / z
+        px = fx * proj_cam[i, 0] * iz + cx
+        py = fy * proj_cam[i, 1] * iz + cy
         for img in gate_img:
             dx = px - img[0]
             dy = py - img[1]
@@ -369,8 +379,14 @@ def _joint_refine_pose(
     R_opt = cv2.Rodrigues(result.x[:3].astype(np.float32).reshape(3, 1))[0].astype(np.float64)
     T_opt = Transform(R_opt, tv_opt)
     # Divide weighted residuals by flat_weights to recover unweighted pixel errors.
+    # A camera with confidence=0 (e.g. all-hypothesis proximity match, no locked
+    # anchors) has flat_weights==0 for its rows, making that division 0/0 — mask
+    # those rows out instead of letting the resulting NaN poison the whole mean.
+    nonzero = flat_weights != 0
+    if not np.any(nonzero):
+        return None, np.inf
     mean_err = float(np.mean(np.linalg.norm(
-        (result.fun / flat_weights).reshape(-1, 2), axis=1
+        (result.fun[nonzero] / flat_weights[nonzero]).reshape(-1, 2), axis=1
     )))
     return T_opt, mean_err
 
@@ -378,7 +394,6 @@ def _joint_refine_pose(
 def fuse_camera_poses(
     cam_solutions: List[dict],
     model_positions: np.ndarray,
-    extra_aux: Optional[List[dict]] = None,
     matching_cfg: Optional[dict] = None,
 ) -> Tuple[Optional[Transform], float]:
     """
@@ -390,36 +405,31 @@ def fuse_camera_poses(
     blob array — indices in 'pairs' refer to this array), 'pairs' ([(blob_idx, led_id)]),
     'T_world_ctrl' (Transform, that camera's own solo estimate), 'error' (float, px),
     and optionally 'confidence' (float in (0, 1], default 1.0 — how unambiguous/clean
-    that camera's own match was; see proximity_search's "confidence").
+    that camera's own match was; see proximity_search's "confidence"). A camera whose own
+    search failed this frame is simply absent from cam_solutions — there is no fallback
+    contribution for it (a raw, unvalidated snap against the fused pose was tried here
+    previously; removed since it can only ever score confidence=0 anyway, and its pairs
+    risked being falsely registered as claimed against a different controller for zero
+    benefit to the fused pose).
 
-    extra_aux: optional additional camera correspondences with NO independent solve of
-    their own (e.g. a cheap Hungarian snap — see PoseSearcher.snap_camera — against the
-    fused pose, from a camera whose own search failed this frame). Same 'camera'/'blobs'/
-    'pairs'/'confidence' keys, but no 'T_world_ctrl'/'error' — these only ever refine the
-    fusion, never seed it.
-
-    With one camera and no extra_aux, its own estimate is returned unchanged — no fusion
-    needed for a single view. Otherwise, every contributor is weighted by pair count times
-    its own confidence — a camera (or snap) that had to guess through a lot of ambiguity,
-    or has no independent validation at all, contributes less than a clean, independently
-    solved one — seeded from whichever cam_solutions entry had the lowest solo error.
+    With one camera, its own estimate is returned unchanged — no fusion needed for a
+    single view. Otherwise, every contributor is weighted by pair count times its own
+    confidence — a camera that had to guess through a lot of ambiguity, or scored a low
+    RANSAC-validated inlier ratio, contributes less than a clean, independently solved
+    one — seeded from whichever cam_solutions entry had the lowest solo error.
 
     Returns (fused T_world_ctrl, mean_reproj_err_px), or (None, inf) if cam_solutions is empty.
     """
     if not cam_solutions:
         return None, float('inf')
-    if len(cam_solutions) == 1 and not extra_aux:
+    if len(cam_solutions) == 1:
         sol = cam_solutions[0]
         return sol['T_world_ctrl'], sol['error']
 
     seed   = min(cam_solutions, key=lambda s: s['error'])
     others = [s for s in cam_solutions if s is not seed]
     aux_cam_data   = [(s['camera'], s['blobs'], s['pairs']) for s in others]
-    aux_cam_data  += [(s['camera'], s['blobs'], s['pairs']) for s in (extra_aux or [])]
     cam_confidence = {s['camera'].camera_idx: float(s.get('confidence', 1.0)) for s in cam_solutions}
-    cam_confidence.update({
-        s['camera'].camera_idx: float(s.get('confidence', 1.0)) for s in (extra_aux or [])
-    })
 
     _cfg = matching_cfg or {}
     T_joint, err_joint = _joint_refine_pose(
@@ -459,6 +469,7 @@ class BruteSearchState:
     strong_inliers_eff: int
     blob_nbr: object
     blobs_undist: np.ndarray
+    blobs_norm: np.ndarray
     pose_prior: Optional[Tuple[np.ndarray, np.ndarray]]
     R_prior: Optional[np.ndarray]
     tvec_prior: Optional[np.ndarray]
@@ -1375,24 +1386,40 @@ class PoseSearcher:
         )
 
         # Confidence for multi-camera fusion weighting (see fuse_camera_poses): how much
-        # of this camera's own match was unambiguous (locked_ratio), how close its error
-        # is to a confidently-good fit (err_factor), and how much redundancy backs that
-        # error at all (redundancy_factor). All three are 1.0 for a clean, unambiguous,
-        # low-error camera with several points beyond the minimal 3-point PnP case — the
-        # common case — so fusion weighting is unaffected there.
+        # of this camera's attempted match actually held up under the final RANSAC
+        # consistency check (ransac_inlier_ratio), how close its error is to a
+        # confidently-good fit (err_factor), and how much redundancy backs that error
+        # at all (redundancy_factor). All three are 1.0 for a clean, low-error camera
+        # with several points beyond the minimal 3-point PnP case — the common case —
+        # so fusion weighting is unaffected there.
+        #
+        # ransac_inlier_ratio replaces an earlier locked_ratio term (fraction of LEDs
+        # with a single unambiguous candidate blob, pre-validation). locked_ratio only
+        # measured how *easy* candidate generation was going in, not whether the
+        # resulting fit was actually correct — a camera whose neighbourhood happens to
+        # be dense (everything contested, locked_ratio=0) but whose hypothesis search
+        # resolves it perfectly (0 dropped pairs) deserves full confidence, not zero.
+        # Conversely, several LEDs can look "locked" (single nearby candidate) and
+        # still be *wrong* if the predicted pose driving that proximity search was
+        # off (e.g. bad velocity extrapolation) — the final RANSAC pass below is what
+        # actually tests geometric consistency and drops those pairs as outliers, so
+        # ransac_inlier_ratio reflects validated correctness, not input-side ambiguity.
         #
         # redundancy_factor matters because a 3-point fit has zero spare degrees of
         # freedom (6 DOF pose, 2 equations/point): some pose generically fits 3 points
         # almost exactly regardless of whether the correspondence is actually correct,
         # so a near-zero error there is not evidence of a good match — it's just what an
-        # under-constrained fit looks like. Without this term a lucky/degenerate 3-point
-        # camera can end up as confident as a genuinely well-matched 12-point one.
-        _n_locked     = len(truly_locked_k)
-        _n_hyp        = len(hyp_k)
-        _locked_ratio = _n_locked / max(_n_locked + _n_hyp, 1)
-        _err_factor   = min(1.0, self._c_prox_strong_match_px / max(error, 1e-6))
-        _redundancy_factor = min(1.0, max(0.0, len(final_pairs) - 3) / max(self._c_prox_redundancy_ref, 1e-6))
-        _confidence   = _locked_ratio * _err_factor * _redundancy_factor
+        # under-constrained fit looks like. This is independent of ransac_inlier_ratio:
+        # a 4-point fit can have 100% of its pairs survive RANSAC and still be a weak,
+        # barely-constrained fit compared to a well-redundant 12-point one. Without this
+        # term a lucky/degenerate near-minimal camera can end up as confident as a
+        # genuinely well-matched, highly redundant one.
+        _n_locked            = len(truly_locked_k)
+        _n_hyp               = len(hyp_k)
+        _ransac_inlier_ratio = len(final_pairs) / max(len(pairs), 1)
+        _err_factor          = min(1.0, self._c_prox_strong_match_px / max(error, 1e-6))
+        _redundancy_factor   = min(1.0, max(0.0, len(final_pairs) - 3) / max(self._c_prox_redundancy_ref, 1e-6))
+        _confidence          = _ransac_inlier_ratio * _err_factor * _redundancy_factor
 
         return {
             "rvec":       rvec,
@@ -1719,12 +1746,30 @@ class PoseSearcher:
             min_inliers_eff    = self._c_brute_min_inliers
             strong_inliers_eff = self._c_brute_strong_in
 
+        _t0 = time.perf_counter()
         max_blob_depth = max(t[1] for t in self._c_brute_depth_tiers)
         blob_nbr = _build_blob_neighbor_lists(blobs, k=max_blob_depth)
+        _t_blob_nbr = time.perf_counter() - _t0
 
         # Undistort blobs once (mirrors OpenHMD's correspondence_search_set_blobs).
         # Gate check uses pinhole projection which is valid in undistorted space.
+        _t0 = time.perf_counter()
         blobs_undist = self.camera.undistort_points(blobs, P=self.camera.camera_matrix).astype(np.float32)
+        _t_undistort = time.perf_counter() - _t0
+
+        # Normalised (P=None) coords for every blob, once — P3P needs these per
+        # bijection; precomputing here turns ~hundreds of per-bijection
+        # undistort_points calls (one per P3P triple) into a single batched call.
+        _t0 = time.perf_counter()
+        blobs_norm = self.camera.undistort_points(blobs).astype(np.float32)
+        _t_norm = time.perf_counter() - _t0
+
+        logger.debug(
+            f"[{self._ctrl} | cam {self._cam}] new_brute_state setup: "
+            f"undistort={_t_undistort*1000:.1f}ms norm={_t_norm*1000:.1f}ms "
+            f"blob_nbr={_t_blob_nbr*1000:.1f}ms "
+            f"(n_blobs={n_blobs}, n_available={n_available})"
+        )
 
         R_prior    = None
         tvec_prior = None
@@ -1742,6 +1787,7 @@ class PoseSearcher:
             strong_inliers_eff=strong_inliers_eff,
             blob_nbr=blob_nbr,
             blobs_undist=blobs_undist,
+            blobs_norm=blobs_norm,
             pose_prior=pose_prior,
             R_prior=R_prior,
             tvec_prior=tvec_prior,
@@ -1784,6 +1830,7 @@ class PoseSearcher:
         min_inliers_eff     = state.min_inliers_eff
         blob_nbr            = state.blob_nbr
         blobs_undist        = state.blobs_undist
+        blobs_norm          = state.blobs_norm
         n_available         = state.n_available
         rng                 = state.rng
         seen_bijections     = state.seen_bijections
@@ -1791,6 +1838,16 @@ class PoseSearcher:
         tier_p3p_calls      = state.tier_p3p_calls
         tier_lq_tried       = state.tier_lq_tried
         tier_lq_total       = state.tier_lq_total
+
+        # Per-stage bench timers (see finalize_brute_state's caller docs / plan) —
+        # mirrors proximity_search's _t_collisions/_t_scoring/... pattern.
+        t_p3p = t_gate = t_vis = t_hungarian = t_ransac = 0.0
+        t_vis_recheck = t_recovery = t_aux = t_coverage_tail = 0.0
+        n_gate_calls = n_reached_vis = 0
+        n_reached_hungarian = n_reached_ransac = n_reached_ransac_ok = n_reached_coverage = 0
+        # Funnel for the coarse _visible_mask call inside gate_vis — see
+        # _visibility.py's stage_counter param for key meanings.
+        vis_stage_counter: Dict[str, int] = {}
 
         positions = self.model.positions.astype(np.float32)
         normals   = self.model.normals.astype(np.float32)
@@ -1911,8 +1968,6 @@ class PoseSearcher:
                                 f"  gate LEDs={list(gate_led)}  gate blobs={gate_blob_idx}"
                             )
 
-                        p3p_img_pts = blobs[[b_anchor, b1_ord, b2_ord]]
-
                         bij = frozenset(((int(led_ids[0]), b_anchor),
                                          (int(led_ids[1]), b1_ord),
                                          (int(led_ids[2]), b2_ord)))
@@ -1925,12 +1980,15 @@ class PoseSearcher:
                             bijection_counts[bij] = bijection_counts.get(bij, 0) + 1
 
                         # ── 1. P3P → up to 4 pose hypotheses ─────────────────
+                        _t0 = time.perf_counter()
                         tier_p3p_calls[tier_idx] += 1
                         did_p3p = True
                         # solveP3P only supports standard polynomial distortion
-                        # internally. Pre-undistort to normalised coords and pass
-                        # identity K so both radtan8 and kb4 work correctly.
-                        p3p_img_norm = self.camera.undistort_points(p3p_img_pts)
+                        # internally. blobs_norm is pre-undistorted to normalised
+                        # coords once per attempt (new_brute_state) so identity K
+                        # works correctly for both radtan8 and kb4 here, without
+                        # re-undistorting these same 3 points on every bijection.
+                        p3p_img_norm = blobs_norm[[b_anchor, b1_ord, b2_ord]]
                         n_sols, rvecs, tvecs = cv2.solveP3P(
                             p3p_world_pts.reshape(3, 1, 3),
                             p3p_img_norm.reshape(3, 1, 2).astype(np.float32),
@@ -1940,11 +1998,19 @@ class PoseSearcher:
                         )
                         self._dbg(dbg, f"  P3P returned {n_sols} solutions")
                         if not n_sols or rvecs is None:
+                            t_p3p += time.perf_counter() - _t0
                             continue
 
                         # Sort hypotheses by rotation distance to prior so the
                         # closest-to-prior solution is tried first — increases the
                         # chance of strong_found triggering early.
+                        #
+                        # Measured (timeit, n_sols=2 and 4): a "vectorized" numpy
+                        # Rodrigues+einsum batch here is actually slower than plain
+                        # cv2.Rodrigues per solution — n_sols is at most 4, too small
+                        # a batch to amortize numpy's per-call array-construction
+                        # overhead against cv2.Rodrigues's tight C++ implementation.
+                        # Keep the direct per-solution form.
                         if R_prior is not None and n_sols > 1:
                             def _rot_score(rv):
                                 R_i, _ = cv2.Rodrigues(rv.reshape(3, 1).astype(np.float32))
@@ -1952,6 +2018,7 @@ class PoseSearcher:
                             order  = sorted(range(n_sols), key=lambda k: -_rot_score(rvecs[k]))
                             rvecs  = [rvecs[k] for k in order]
                             tvecs  = [tvecs[k] for k in order]
+                        t_p3p += time.perf_counter() - _t0
 
                         for sol_i, (rvec_h, tvec_h) in enumerate(zip(rvecs, tvecs)):
                             if state.strong_found:
@@ -1959,20 +2026,26 @@ class PoseSearcher:
                             rvec_h = rvec_h.reshape(3, 1).astype(np.float32)
                             tvec_h = tvec_h.reshape(3).astype(np.float32)
 
+                            _t0 = time.perf_counter()
                             # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
                             z_ok = _check_z_range(tvec_h)
                             self._dbg(dbg, f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
                             if not z_ok:
+                                t_gate += time.perf_counter() - _t0
                                 continue
 
                             R_h, _ = cv2.Rodrigues(rvec_h)
 
                             # ── 3. Gate check (any gate LED near any gate blob) ─
+                            n_gate_calls += 1
                             gate_ok, gate_dist = _gate_any_point(R_h, tvec_h, gate_led_world_pts, gate_blob_img_pts, fx, fy, cx, cy, p4_thresh_sq, _track_gate_dist)
                             self._dbg(dbg, f"  sol {sol_i}: gate_ok={gate_ok}, dist={gate_dist:.2f}px")
+                            t_gate += time.perf_counter() - _t0
                             if not gate_ok:
                                 continue
 
+                            n_reached_vis += 1
+                            _t0 = time.perf_counter()
                             # ── 4. Full inlier count on all visible LEDs ───────
                             vis_mask_h = _visible_mask(
                                 R_h, tvec_h, positions, normals,
@@ -1980,12 +2053,16 @@ class PoseSearcher:
                                 cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
                                 cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
                                 facing_threshold_deg=self._c_facing_deg,
+                                stage_counter=vis_stage_counter,
                             ) >= 1.0
                             vis_ids = np.where(vis_mask_h)[0]
                             self._dbg(dbg, f"  sol {sol_i}: {len(vis_ids)} visible LEDs")
+                            t_vis += time.perf_counter() - _t0
                             if len(vis_ids) < self._c_brute_min_inliers:
                                 continue
 
+                            n_reached_hungarian += 1
+                            _t0 = time.perf_counter()
                             proj_all = _project_points(rvec_h, tvec_h, positions[vis_ids], K, dc,
                                                        is_fisheye=self.camera.is_fisheye)
                             cost     = cdist(blobs, proj_all)
@@ -2006,9 +2083,12 @@ class PoseSearcher:
                                 outlier_led_cols  = vis_ids[hungarian_led_cols[outlier_mask]]
                                 logger.debug(f"  sol {sol_i}: {len(inlier_blobs)} inliers after Hungarian "
                                              f"(need {min_inliers_eff})")
+                            t_hungarian += time.perf_counter() - _t0
                             if len(inlier_blobs) < min_inliers_eff:
                                 continue
 
+                            n_reached_ransac += 1
+                            _t0 = time.perf_counter()
                             # ── 5. RANSAC PnP refinement on inliers ───────────
                             ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
                                 positions[inlier_leds], blobs[inlier_blobs], K, dc,
@@ -2019,14 +2099,18 @@ class PoseSearcher:
                             self._dbg(dbg, f"  sol {sol_i}: RANSAC ok={ok_r}, "
                                            f"inliers={len(ransac_inliers) if ok_r else 0}")
                             if not ok_r:
+                                t_ransac += time.perf_counter() - _t0
                                 continue
 
                             inlier_leds  = inlier_leds[ransac_inliers]
                             inlier_blobs = inlier_blobs[ransac_inliers]
+                            t_ransac += time.perf_counter() - _t0
 
                             if len(inlier_blobs) < min_inliers_eff:
                                 continue
+                            n_reached_ransac_ok += 1
 
+                            _t0 = time.perf_counter()
                             # ── 6. Visibility recheck with the refined pose ────
                             # Recompute on ALL LEDs so that:
                             #   (a) the denominator for coverage is accurate,
@@ -2058,11 +2142,13 @@ class PoseSearcher:
                             inlier_leds  = inlier_leds[inlier_still_visible]
                             inlier_blobs = inlier_blobs[inlier_still_visible]
                             self._dbg(dbg, f"  sol {sol_i}: {len(inlier_blobs)} inliers after vis recheck")
+                            t_vis_recheck += time.perf_counter() - _t0
                             if len(inlier_blobs) < min_inliers_eff:
                                 continue
 
                             vis_ids_r = np.where(vis_mask_r)[0]
 
+                            _t0 = time.perf_counter()
                             # ── 6.5. Post-RANSAC blob recovery ────────────────
                             # Blobs outside hungarian_threshold_px on the coarse
                             # P3P pose may land within reprojection_threshold
@@ -2116,7 +2202,9 @@ class PoseSearcher:
                                     inlier_blobs = np.concatenate([inlier_blobs, np.array(extra_blobs, dtype=inlier_blobs.dtype)])
                                     inlier_leds  = np.concatenate([inlier_leds,  np.array(extra_leds,  dtype=inlier_leds.dtype)])
                                     self._dbg(dbg, f"  sol {sol_i}: +{len(extra_blobs)} blob(s) recovered post-RANSAC")
+                            t_recovery += time.perf_counter() - _t0
 
+                            _t0 = time.perf_counter()
                             # ── 6.7. Aux-camera validation ────────────────────
                             # Lift refined pose to world frame and score against
                             # each aux camera's blobs. These correspondences
@@ -2193,7 +2281,10 @@ class PoseSearcher:
 
                                     extra_vis_weight    += float(_w_i.sum())
                                     extra_inlier_weight += float(_w_i[_cols_i[_inlier_i]].sum())
+                            t_aux += time.perf_counter() - _t0
 
+                            n_reached_coverage += 1
+                            _t0 = time.perf_counter()
                             # ── 7. Visibility coverage check ──────────────────
                             # Weight each visible LED by cos(θ) — the dot product
                             # of its normal with the view direction.  LEDs at
@@ -2243,6 +2334,7 @@ class PoseSearcher:
                                         f" {n_inlier_blobs}/{min(n_available, n_visible_leds)} blobs"
                                         f" +{extra_inlier_count} aux)"
                                     )
+                                t_coverage_tail += time.perf_counter() - _t0
                                 continue
 
                             proj_r = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc,
@@ -2315,12 +2407,34 @@ class PoseSearcher:
 
                                 if state.best_error <= self._c_brute_strong_err and balanced_coverage >= self._c_brute_min_vis_cov:
                                     state.strong_found = True
+                            t_coverage_tail += time.perf_counter() - _t0
 
             cur_prev_blob[triple_i] = blob_max
             if did_p3p:
                 tier_lq_tried[tier_idx] += 1
             if state.strong_found:
                 break
+
+        logger.debug(
+            f"[{self._ctrl} | cam {self._cam}] Brute tier_{tier_idx} bench: "
+            f"p3p={t_p3p*1000:.1f}ms gate={t_gate*1000:.1f}ms vis={t_vis*1000:.1f}ms "
+            f"hung={t_hungarian*1000:.1f}ms ransac={t_ransac*1000:.1f}ms "
+            f"vis_recheck={t_vis_recheck*1000:.1f}ms recovery={t_recovery*1000:.1f}ms "
+            f"aux={t_aux*1000:.1f}ms tail={t_coverage_tail*1000:.1f}ms  "
+            f"(p3p_calls={tier_p3p_calls[tier_idx]} -> gate_calls={n_gate_calls} "
+            f"-> reached_vis={n_reached_vis} -> hungarian={n_reached_hungarian} "
+            f"-> ransac={n_reached_ransac} -> ransac_ok={n_reached_ransac_ok} "
+            f"-> coverage={n_reached_coverage})"
+        )
+        logger.debug(
+            f"[{self._ctrl} | cam {self._cam}] Brute tier_{tier_idx} vis funnel: "
+            f"total={vis_stage_counter.get('total', 0)} "
+            f"exit_facing={vis_stage_counter.get('exit_facing', 0)} "
+            f"exit_infame={vis_stage_counter.get('exit_infame', 0)} "
+            f"reached_frustum={vis_stage_counter.get('reached_frustum', 0)} "
+            f"exit_frustum={vis_stage_counter.get('exit_frustum', 0)} "
+            f"reached_handle={vis_stage_counter.get('reached_handle', 0)}"
+        )
 
     def finalize_brute_state(self, state: BruteSearchState) -> Optional[Dict]:
         """

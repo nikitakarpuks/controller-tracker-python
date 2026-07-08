@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from typing import Optional
+from typing import Dict, Optional
 
 from loguru import logger
 
@@ -388,7 +388,8 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   cam_is_fisheye: bool = False,
                   facing_threshold_deg: float = 86.0,
                   occlusion_margin_m: float = 0.0,
-                  debug: bool = False) -> np.ndarray:
+                  debug: bool = False,
+                  stage_counter: Optional[Dict[str, int]] = None) -> np.ndarray:
     """
     Visibility score (float32, N,) for each LED. 1.0 = cleanly visible; 0.0 = not visible.
     Values in (0, 1) indicate borderline visibility near a geometric threshold.
@@ -422,7 +423,14 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     cam_rpmax         : max valid normalised radius; 0 disables the check.
     occlusion_margin_m: penetration depth (metres) that maps to score 0 in checks 3 & 4.
                         0 = hard binary (original behaviour).
+    stage_counter     : optional dict, mutated in place with call-funnel counts (keys:
+                        'total', 'exit_facing', 'exit_infame', 'reached_frustum',
+                        'exit_frustum', 'reached_handle') — diagnostic only, never
+                        affects the returned scores. None (default) skips all counting.
     """
+    if stage_counter is not None:
+        stage_counter['total'] = stage_counter.get('total', 0) + 1
+
     N      = len(positions)
     scores = np.zeros(N, dtype=np.float32)
 
@@ -446,6 +454,8 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     # Working set: LEDs with any chance of being visible
     active = np.where(scores > 0.0)[0]
     if len(active) == 0:
+        if stage_counter is not None:
+            stage_counter['exit_facing'] = stage_counter.get('exit_facing', 0) + 1
         return scores
 
     if debug:
@@ -485,6 +495,8 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                           f"proj=({pts[k,0]:.1f}, {pts[k,1]:.1f})")
         active = active[in_frame]
         if len(active) == 0:
+            if stage_counter is not None:
+                stage_counter['exit_infame'] = stage_counter.get('exit_infame', 0) + 1
             return scores
 
     cam_world = -(R.T @ tvec)
@@ -497,6 +509,8 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
         print(f"[frustum debug] inner LEDs ({len(inner_ids)}): {inner_ids}")
         print(f"[frustum debug] outer LEDs ({len(outer_ids)}): {outer_ids}")
     if _is_inner is not None and np.any(_is_inner):
+        if stage_counter is not None:
+            stage_counter['reached_frustum'] = stage_counter.get('reached_frustum', 0) + 1
         ring_axis      = geom.ring_axis
         ring_centroid  = geom.ring_centroid
         R_fc           = geom.R_fc
@@ -649,10 +663,14 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
         scores[inner_active] = np.minimum(scores[inner_active], frustum_scores)
         active = np.where(scores > 0.0)[0]
         if len(active) == 0:
+            if stage_counter is not None:
+                stage_counter['exit_frustum'] = stage_counter.get('exit_frustum', 0) + 1
             return scores
 
     # ── Check 4: handle body occlusion (boxes + cylinders, all LEDs) ─────────
     if len(active) > 0 and (geom.boxes or geom.cylinders):
+        if stage_counter is not None:
+            stage_counter['reached_handle'] = stage_counter.get('reached_handle', 0) + 1
         seg_len    = np.linalg.norm(positions[active] - cam_world, axis=1)
         body_score = np.ones(len(active), dtype=np.float32)
 

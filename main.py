@@ -143,8 +143,8 @@ def main():
 
     for batch in tqdm(get_data(config["data"])):
         img_path, cam_images = batch[0][0], batch[0][1]
-        # if img_path.name == "30633726268015.png":
-        #     pass
+        if img_path.name == "58750954068441.png":
+            pass
         # cam_images: {cam_idx: numpy array}
 
         proj_hints, vel_hints, radius_hints = tracking_system.get_predicted_led_projections_per_camera()
@@ -181,6 +181,7 @@ def main():
                     threshold_scale=_thr_scale,
                     visualize=True,
                     img_path=img_path if _blob_cfg["visualize"] else None,
+                    frame_name=img_path.name,
                 )
                 per_ctrl_blobs[ctrl_name][cam_idx] = _det_result[0]
                 if _det_result[1]:

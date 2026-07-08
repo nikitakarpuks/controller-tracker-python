@@ -101,7 +101,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    min_circularity_override=None,
                    interior_exclude_blobs=None,
                    warm_mode=False,
-                   vis_patch_out=None):
+                   vis_patch_out=None,
+                   frame_name=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -277,6 +278,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     new_blob_max_pixels = []
     new_blob_peaks    = []  # cached (peak_y, peak_x) per post-split blob for H2 reuse
     blob_is_split     = []
+    blob_split_group  = []  # shared id for the 2 halves of one split; -1 otherwise
 
     for i in range(len(centroids)):
         ys_b, xs_b = blob_pixels_list[i]
@@ -294,6 +296,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 new_blob_max_pixels.append(blob_max_pixels[i])
                 new_blob_peaks.append(peak)
                 blob_is_split.append(False)
+                blob_split_group.append(-1)
                 continue
             split_result = _split_blob_at_seeds(image, intensities, ys_b, xs_b, maxima[0], maxima[1])
             if split_result is not None:
@@ -303,6 +306,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                     new_centroids.append((pcx, pcy))
                     new_blob_contours.append(part_cnt)
                     blob_is_split.append(True)
+                    blob_split_group.append(i)  # original pre-split blob index pairs the 2 halves
                     part_mask = (dist_a <= dist_b_) if part_idx == 0 else (dist_a > dist_b_)
                     part_pix  = image[ys_b[part_mask], xs_b[part_mask]] if part_mask.any() else np.array([0])
                     new_blob_max_pixels.append(int(part_pix.max()))
@@ -314,6 +318,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         new_blob_max_pixels.append(blob_max_pixels[i])
         new_blob_peaks.append(peak)
         blob_is_split.append(False)
+        blob_split_group.append(-1)
 
     centroids       = new_centroids
     blob_contours   = new_blob_contours
@@ -323,6 +328,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     centroids_arr       = np.array(centroids, dtype=np.float32) if centroids else np.empty((0, 2), dtype=np.float32)
     blob_max_pixels_arr = np.array(blob_max_pixels, dtype=np.float32) if blob_max_pixels else np.empty(0, dtype=np.float32)
     blob_is_split_arr   = np.array(blob_is_split, dtype=bool)
+    blob_split_group_arr = np.array(blob_split_group, dtype=np.int32) if blob_split_group else np.empty(0, dtype=np.int32)
 
     # ── 3. Post-split outlier filters ────────────────────────────────────────
     areas_arr = np.array(
@@ -366,6 +372,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     filtered_centroids   = centroids_arr[kept_indices]
     filtered_contours    = [blob_contours[i] for i in kept_indices]
     filtered_is_split    = blob_is_split_arr[kept_indices] if len(blob_is_split_arr) else np.zeros(0, dtype=bool)
+    filtered_split_group = (blob_split_group_arr[kept_indices] if len(blob_split_group_arr)
+                            else np.empty(0, dtype=np.int32))
     filtered_brightnesses = blob_max_pixels_arr[kept_indices] if len(kept_indices) else np.empty(0, dtype=np.float32)
     rejected_centroids   = centroids_arr[rejected_indices]
     rejected_contours    = [blob_contours[i] for i in rejected_indices]
@@ -392,6 +400,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         C_INTERIOR = (100, 180, 255) # light blue  — H1: deep inside large blob (cold path only)
         C_KEPT     = (255, 255, 255) # white       — kept
         C_SPLT     = (0, 255, 128)   # cyan        — kept (split)
+        C_SPLT_CUT = (0, 0, 0)       # black       — divider mark between a split pair
 
         def _draw_cnt(cnt, color):
             cv2.drawContours(vis, [cnt.reshape(-1, 1, 2).astype(np.int32)], -1, color, 1)
@@ -413,7 +422,35 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             color = C_SPLT if is_split else C_KEPT
             _draw_cnt(cnt, color)
             pt = (int(round(pt_f[0])), int(round(pt_f[1])))
-            cv2.circle(vis, pt, 2, color, -1)
+            # Split halves sit right next to each other by construction (that's
+            # why splitting was needed) — a same-color outline alone reads as
+            # one blob. Shrink the split dot so it never touches its sibling,
+            # and draw an explicit black divider across the seam below.
+            cv2.circle(vis, pt, 1 if is_split else 2, color, -1)
+
+        # Draw a 1px black divider across the seam of each split pair, so the
+        # boundary between the two halves is unambiguous regardless of how
+        # close together (or how tiny) they are.
+        if len(filtered_split_group) > 0:
+            groups: dict = {}
+            for i, g in enumerate(filtered_split_group):
+                if g >= 0:
+                    groups.setdefault(int(g), []).append(i)
+            for idxs in groups.values():
+                if len(idxs) != 2:
+                    continue
+                p1 = filtered_centroids[idxs[0]]
+                p2 = filtered_centroids[idxs[1]]
+                dx, dy = float(p2[0] - p1[0]), float(p2[1] - p1[1])
+                seam_len = float(np.hypot(dx, dy))
+                if seam_len < 1e-3:
+                    continue
+                mx, my = (p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0
+                nx, ny = -dy / seam_len, dx / seam_len  # unit normal to the pair axis
+                half = max(2.0, (float(filtered_radii[idxs[0]]) + float(filtered_radii[idxs[1]])) / 2.0)
+                a = (int(round(mx - nx * half)), int(round(my - ny * half)))
+                b = (int(round(mx + nx * half)), int(round(my + ny * half)))
+                cv2.line(vis, a, b, C_SPLT_CUT, 1, cv2.LINE_AA)
 
         if warm_mode:
             # Return the annotated crop patch; the caller composites and saves.
@@ -423,7 +460,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             # Cold path: add legend strip and save.
             strip_entries = [
                 (C_KEPT,     "kept"),
-                (C_SPLT,     "split"),
+                (C_SPLT,     "split (black seam divides pair)"),
                 (C_CIRC,     f"not circular (< {min_circularity})"),
                 (C_SPAT,     "spatial outlier"),
                 (C_INTERIOR, "deep in large blob (no-prior)"),
@@ -447,6 +484,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                     (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
                     x += tw + 10
             thr_label = f"pixel_thr={pixel_threshold}  required_thr={required_threshold}"
+            if frame_name:
+                thr_label += f"   [{frame_name}]"
             cv2.putText(strip, thr_label, (6, row_h * 2 + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
             vis = np.vstack([vis, strip])
@@ -509,13 +548,19 @@ def _nms_blobs(all_blobs, min_split_dist):
     Deduplicate blobs from per-LED detection runs.
 
     Two blobs are considered the same physical detection when their centroids are
-    within min_split_dist pixels of each other.  In that case the blob detected
-    under the higher pixel_threshold is kept (more discriminating detection).
-    Blobs with genuinely different centroids always both survive — even if one is
-    brighter, they may belong to different LEDs from different controllers.
+    within min_split_dist pixels of each other.  In that case the blob with the
+    larger edge_dist (further from its own search-ROI boundary, i.e. less likely
+    to have had its true footprint truncated by that ROI's circular mask or the
+    image border) is kept, since a truncated detection's intensity-weighted
+    centroid is systematically biased.  pixel_threshold — a per-LED predicted
+    brightness, not a detection-quality score — only breaks ties when edge_dist
+    is equal.  Blobs with genuinely different centroids always both survive —
+    even if one is brighter, they may belong to different LEDs from different
+    controllers.
     """
-    # Higher pixel_threshold = more discriminating = preferred in a tie.
-    all_blobs = sorted(all_blobs, key=lambda b: -b["pixel_threshold"])
+    # Primary: larger edge_dist (further from any boundary) wins. Secondary:
+    # higher pixel_threshold breaks ties when edge_dist is equal.
+    all_blobs = sorted(all_blobs, key=lambda b: (-b["edge_dist"], -b["pixel_threshold"]))
     kept = []
     for blob in all_blobs:
         cx, cy = blob["cx"], blob["cy"]
@@ -530,7 +575,8 @@ def _nms_blobs(all_blobs, min_split_dist):
 
 def _detect_blobs_local(image, led_projections, cfg,
                         visualize=False, img_path=None, vis_suffix="",
-                        search_radius_px=None, threshold_scale: float = 1.0):
+                        search_radius_px=None, threshold_scale: float = 1.0,
+                        frame_name=None):
     """
     Pose-guided per-LED local blob detection.
 
@@ -615,11 +661,20 @@ def _detect_blobs_local(image, led_projections, cfg,
         if x2 <= x1 or y2 <= y1:
             continue
 
+        # Sides where the ROI rectangle was cut short by the image border
+        # rather than by its own radius — needed below to detect truncation
+        # that the circular mask distance check alone wouldn't catch.
+        clamped_left   = (cx_i - sr) < 0
+        clamped_top    = (cy_i - sr) < 0
+        clamped_right  = (cx_i + sr + 1) > w_img
+        clamped_bottom = (cy_i + sr + 1) > h_img
+
         # Mask pixels outside the circle within the crop
         crop = image[y1:y2, x1:x2].copy()
         ch, cw = crop.shape[:2]
         gy, gx = np.ogrid[:ch, :cw]
-        circle_mask = ((gx - (cx_i - x1)) ** 2 + (gy - (cy_i - y1)) ** 2) <= sr ** 2
+        ccx, ccy = cx_i - x1, cy_i - y1
+        circle_mask = ((gx - ccx) ** 2 + (gy - ccy) ** 2) <= sr ** 2
         crop[~circle_mask] = 0
 
         pixel_thr_i = int(pixel_thrs[i])
@@ -660,6 +715,31 @@ def _detect_blobs_local(image, led_projections, cfg,
         )
 
         for j in range(len(centroids_full)):
+            # Clearance between this blob's farthest contour extent and the
+            # nearest boundary that could have truncated it (the circular
+            # search mask, plus the image border on any clamped side). Larger
+            # = more safely interior = a more trustworthy centroid; near zero
+            # = touching a boundary = likely truncated/biased.
+            cnt_local = contours_crop[j]
+            if cnt_local.size:
+                dx = cnt_local[:, 0] - ccx
+                dy = cnt_local[:, 1] - ccy
+                # Single sqrt on the max squared distance, not one per contour
+                # point (cv2.CHAIN_APPROX_NONE contours can have dozens of
+                # points even for a small blob) — max-of-squares == square-of-max.
+                max_dist = float(np.sqrt((dx * dx + dy * dy).max()))
+                edge_dist = sr - max_dist
+                if clamped_left:
+                    edge_dist = min(edge_dist, float(cnt_local[:, 0].min()))
+                if clamped_right:
+                    edge_dist = min(edge_dist, float((cw - 1) - cnt_local[:, 0].max()))
+                if clamped_top:
+                    edge_dist = min(edge_dist, float(cnt_local[:, 1].min()))
+                if clamped_bottom:
+                    edge_dist = min(edge_dist, float((ch - 1) - cnt_local[:, 1].max()))
+            else:
+                edge_dist = 0.0
+
             all_blobs.append({
                 "cx":              float(centroids_full[j, 0]),
                 "cy":              float(centroids_full[j, 1]),
@@ -668,6 +748,7 @@ def _detect_blobs_local(image, led_projections, cfg,
                 "brightness":      float(brightnesses[j]),
                 "pixel_threshold": pixel_thr_i,
                 "source_led_idx":  i,
+                "edge_dist":       edge_dist,
             })
 
     # ── NMS deduplication ─────────────────────────────────────────────────────
@@ -693,6 +774,8 @@ def _detect_blobs_local(image, led_projections, cfg,
         C_AREA_LG = (0, 140, 255)
         C_THRESH  = (180, 0, 0)
         C_CIRC    = (0, 255, 255)
+        C_NMS     = (0, 0, 255)  # red — dropped as cross-LED NMS duplicate
+        C_SPLT_VIS = (0, 255, 128)  # cyan — matches C_SPLT in _detect_blobs
         canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
         # Search circles + LED ID labels first (so blob pixels are drawn on top)
@@ -714,11 +797,86 @@ def _detect_blobs_local(image, led_projections, cfg,
             mask = patch.any(axis=2)
             dst[mask] = patch[mask]
 
+        # ── Per-neighborhood tile grid (non-overlapping, 1:1 scale) ───────────
+        # The canvas above overlaps neighboring LEDs' ROI patches when their
+        # search circles intersect, which gets unreadable with many/close
+        # LEDs. Render each LED's own crop as an isolated tile here, and mark
+        # detections that got merged away by the cross-LED NMS dedup below
+        # (a "split" patch can still collapse to one final blob if another
+        # LED's overlapping ROI independently found the same physical blob).
+        patches_by_led = {led_idx: (patch, x1, y1, pix_thr)
+                           for patch, x1, y1, led_idx, pix_thr, req_thr in vis_patches}
+        kept_ids = {id(b) for b in kept_blobs}
+        blobs_by_led = [[] for _ in range(n_leds)]
+        for b in all_blobs:
+            blobs_by_led[b["source_led_idx"]].append(b)
+
+        valid_ids = [i for i in range(n_leds) if i in patches_by_led]
+        grid_canvas = None
+        if valid_ids:
+            font_scale = 0.32
+            labels = {}
+            for i in valid_ids:
+                _, _, _, pix_thr = patches_by_led[i]
+                led_id_vis = int(led_projections[i, 4])
+                labels[i] = f"id={led_id_vis} px_thr={pix_thr}"
+            max_label_w = max(
+                cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0]
+                for lbl in labels.values()
+            )
+
+            max_sr    = int(search_rs[valid_ids].max())
+            content_w = max(2 * max_sr + 1, max_label_w)  # ensure the label always fits
+            content_h = 2 * max_sr + 1
+            label_h   = 14
+            g_pad     = 6
+            cell_w    = content_w + g_pad
+            cell_h    = content_h + label_h + g_pad
+            n_cols    = max(1, canvas.shape[1] // cell_w)
+            n_rows    = -(-len(valid_ids) // n_cols)
+            grid_canvas = np.full((n_rows * cell_h, canvas.shape[1], 3), 30, dtype=np.uint8)
+
+            for idx, i in enumerate(valid_ids):
+                patch, x1, y1, pix_thr = patches_by_led[i]
+                ph, pw = patch.shape[:2]
+
+                tile = cv2.cvtColor(image[y1:y1 + ph, x1:x1 + pw], cv2.COLOR_GRAY2BGR)
+                mask = patch.any(axis=2)
+                tile[mask] = patch[mask]
+
+                cx_i = int(round(led_projections[i, 0]))
+                cy_i = int(round(led_projections[i, 1]))
+                sr_i = int(search_rs[i])
+                cv2.circle(tile, (cx_i - x1, cy_i - y1), sr_i, C_ROI, 1)
+
+                for b in blobs_by_led[i]:
+                    if id(b) not in kept_ids:
+                        lx = int(round(b["cx"])) - x1
+                        ly = int(round(b["cy"])) - y1
+                        cv2.line(tile, (lx - 3, ly - 3), (lx + 3, ly + 3), C_NMS, 1, cv2.LINE_AA)
+                        cv2.line(tile, (lx - 3, ly + 3), (lx + 3, ly - 3), C_NMS, 1, cv2.LINE_AA)
+
+                row, col = divmod(idx, n_cols)
+                x0 = col * cell_w
+                y0 = row * cell_h
+
+                cv2.putText(grid_canvas, labels[i], (x0 + g_pad // 2, y0 + label_h - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (200, 200, 200), 1, cv2.LINE_AA)
+                cv2.rectangle(grid_canvas, (x0, y0 + label_h),
+                              (x0 + content_w - 1, y0 + cell_h - 1), (70, 70, 70), 1)
+
+                offx = (content_w - pw) // 2
+                offy = (content_h - ph) // 2
+                gy0  = y0 + label_h + offy
+                gx0  = x0 + offx
+                grid_canvas[gy0:gy0 + ph, gx0:gx0 + pw] = tile
+
         # Warm-mode legend strip
         strip_entries = [
             (C_KEPT,     "kept"),
-            ((0, 255, 128), "split"),
-            (C_CIRC,     f"not circular (< {min_circ_base:.2f}·angle_scale)"),
+            (C_SPLT_VIS, "split (black seam divides pair)"),
+            (C_NMS,      "dropped by NMS (dup)"),
+            (C_CIRC,     f"not circular (< {min_circ_base:.2f} x angle_scale)"),
             (C_THRESH,   f"too dim (< req_thr)"),
             (C_AREA_LG,  f"area > max_area"),
             (C_AREA_SM,  "pixels < min_area"),
@@ -739,9 +897,16 @@ def _detect_blobs_local(image, led_projections, cfg,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
                 (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
                 x += tw + 10
-        cv2.putText(strip, f"warm: {n_leds} LEDs  base_r={base_px:.1f}px  NMS min_dist={min_split_dist:.1f}px",
+        info_label = f"warm: {n_leds} LEDs  base_r={base_px:.1f}px  NMS min_dist={min_split_dist:.1f}px"
+        if frame_name:
+            info_label += f"   [{frame_name}]"
+        cv2.putText(strip, info_label,
                     (6, row_h * 2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
-        canvas = np.vstack([canvas, strip])
+        stack_parts = [canvas]
+        if grid_canvas is not None:
+            stack_parts.append(grid_canvas)
+        stack_parts.append(strip)
+        canvas = np.vstack(stack_parts)
 
         if img_path is not None:
             suffix_stripped = vis_suffix.lstrip("_")
@@ -826,6 +991,7 @@ class BlobDetector:
         threshold_scale: float = 1.0,
         visualize: bool = False,
         img_path=None,
+        frame_name=None,
     ) -> BlobResult:
         cfg     = self._cfg
         cam_idx = self.camera_idx
@@ -844,6 +1010,7 @@ class BlobDetector:
                 visualize, img_path, f"{cam_str}{ctrl_str}",
                 search_radius_px=local_search_radius_px,
                 threshold_scale=threshold_scale,
+                frame_name=frame_name,
             )
             canvases = {"local": raw[7]} if raw[7] is not None else {}
             return (BlobResult(centroids=raw[0], contours=raw[1],
@@ -859,7 +1026,8 @@ class BlobDetector:
 
         vis_suffix_1 = f"{cam_str}{ctrl_str}_pass1" if pass2_factor > 0 else f"{cam_str}{ctrl_str}"
         result = _detect_blobs(image, pixel_threshold, required_threshold, cfg,
-                               visualize, img_path, vis_suffix_1)
+                               visualize, img_path, vis_suffix_1,
+                               frame_name=frame_name)
         large_blobs_pass1 = result[6]
         canvases = {}
         if result[7] is not None:
@@ -913,6 +1081,7 @@ class BlobDetector:
                         max_area_override=max_area_pass2,
                         min_area_override=min_area_pass2,
                         interior_exclude_blobs=large_blobs_pass1,
+                        frame_name=frame_name,
                     )
                     if result2[7] is not None:
                         canvases["pass2"] = result2[7]
@@ -937,6 +1106,7 @@ class BlobDetector:
                 max_area_override=_mem["max_area"],
                 min_area_override=min_area_pass2,
                 interior_exclude_blobs=large_blobs_pass1,
+                frame_name=frame_name,
             )
             if result2[7] is not None:
                 canvases["pass2"] = result2[7]
