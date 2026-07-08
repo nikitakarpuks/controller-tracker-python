@@ -733,6 +733,7 @@ class ControllerTracker:
         cam_solutions: List[dict] = []
         predicted_pose_by_cid: Dict[int, Optional[Tuple[np.ndarray, np.ndarray]]] = {}
 
+        _t_cheap_start = time.perf_counter()
         _cheap_specs = []   # (cid, tracker, obs_full, rad_full, brt_full, mask, av_orig)
         for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
             if len(av_blobs) == 0:
@@ -789,6 +790,10 @@ class ControllerTracker:
                 solution["assignment"] = [(av_orig[b], lid) for b, lid in solution["assignment"]]
             cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": solution})
 
+        t_cheap = time.perf_counter() - _t_cheap_start
+        t_new_state = t_tier_rounds = t_finalize = 0.0
+        n_rounds = 0
+
         if not cam_solutions:
             # ── Tier-round brute-force recovery ─────────────────────────────────
             # tier_0 for every camera with a chance (>=4 available blobs); wait for
@@ -796,6 +801,7 @@ class ControllerTracker:
             # cancellation); stop widening the instant any camera hits strong_found
             # this round.
             states: Dict[int, object] = {}
+            _t_new_state_start = time.perf_counter()
             for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
                 if len(av_blobs) == 0:
                     continue
@@ -809,6 +815,7 @@ class ControllerTracker:
                     other_cameras_blobs=None, blob_radii=rad_full,
                     blob_mask=mask, occluders_per_cam=occluders_per_cam,
                 )
+            t_new_state = time.perf_counter() - _t_new_state_start
 
             _any_ps = next(
                 (self.trackers[cid]._pose_searcher for cid, st in states.items() if st is not None),
@@ -816,18 +823,25 @@ class ControllerTracker:
             )
             max_tiers = len(_any_ps._c_brute_depth_tiers) if _any_ps is not None else 0
 
+            _t_tier_start = time.perf_counter()
             if pool is not None:
                 from src.parallel_search import run_brute_tier
                 for tier_idx in range(max_tiers):
                     remaining = [cid for cid, st in states.items() if st is not None and not st.strong_found]
                     if not remaining:
                         break
+                    n_rounds += 1
+                    _submit_t0 = time.perf_counter()
                     _futures = {
                         cid: pool.submit(run_brute_tier, (self.ctrl_name, cid), states[cid], tier_idx)
                         for cid in remaining
                     }
                     for cid, fut in _futures.items():
                         states[cid] = fut.result()
+                        logger.debug(
+                            f"[{self.ctrl_name}] cam{cid} tier_{tier_idx} pool round-trip "
+                            f"(submit->result)={(time.perf_counter() - _submit_t0)*1000:.1f}ms"
+                        )
                     if any(states[cid].strong_found for cid in remaining):
                         break
             else:
@@ -835,11 +849,14 @@ class ControllerTracker:
                     remaining = [cid for cid, st in states.items() if st is not None and not st.strong_found]
                     if not remaining:
                         break
+                    n_rounds += 1
                     for cid in remaining:
                         self.trackers[cid]._pose_searcher.brute_search_tier(states[cid], tier_idx)
                     if any(states[cid].strong_found for cid in remaining):
                         break
+            t_tier_rounds = time.perf_counter() - _t_tier_start
 
+            _t_finalize_start = time.perf_counter()
             for cid, st in states.items():
                 if st is None:
                     continue
@@ -862,6 +879,14 @@ class ControllerTracker:
                 )
                 if sol is not None:
                     cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": sol})
+            t_finalize = time.perf_counter() - _t_finalize_start
+
+        logger.debug(
+            f"[{self.ctrl_name}] update timing: cheap={t_cheap*1000:.1f}ms  "
+            f"brute(new_state={t_new_state*1000:.1f}ms "
+            f"tier_rounds={t_tier_rounds*1000:.1f}ms[{n_rounds} rounds] "
+            f"finalize={t_finalize*1000:.1f}ms)"
+        )
 
         if not cam_solutions:
             return None
@@ -898,47 +923,22 @@ class ControllerTracker:
             cs["solution"] for cs in cam_solutions if cs["cam_id"] == primary_cam_id
         )
 
-        # ── Snap-recovery: a camera that failed its own independent search this
-        # frame still gets a cheap Hungarian snap against the fused pose above —
-        # no combinatorial search, just nearest-neighbour matching, but it recovers
-        # bonus correspondences for the fusion below at near-zero cost. Confidence
-        # is fixed and conservative since a raw snap has no RANSAC/hypothesis
-        # validation behind it, unlike an independent solve.
-        _snap_extra_aux: List[dict] = []
-        _failed_cids = [cid for cid in avail if cid not in _solved_ids]
-        if _failed_cids:
-            _snap_confidence = float(self._matching_cfg.get('joint_snap_confidence', 0.5))
-            _anchor_ps = self.trackers[primary_cam_id]._pose_searcher
-            for cid in _failed_cids:
-                _snapped = _anchor_ps.snap_camera(
-                    T_world_ctrl, self.cameras[cid], obs_src[cid], occluders_per_cam,
-                )
-                if len(_snapped) >= 3:
-                    _snap_extra_aux.append({
-                        "camera": self.cameras[cid], "blobs": obs_src[cid],
-                        "pairs": _snapped, "confidence": _snap_confidence,
-                    })
-                    logger.debug(
-                        f"[{self.ctrl_name}] cam{cid} snap-recovered "
-                        f"{len(_snapped)} pairs against fused pose"
-                    )
-
-        if _snap_extra_aux:
-            _t_fuse_start = time.perf_counter()
-            T_world_ctrl, fused_err = fuse_camera_poses(
-                _fuse_in, model_positions, extra_aux=_snap_extra_aux,
-                matching_cfg=self._matching_cfg,
-            )
-            _t_fuse += time.perf_counter() - _t_fuse_start
+        # A camera whose own independent search failed this frame is left out of
+        # the fusion entirely — no Hungarian snap-recovery. Its confidence would
+        # be zero anyway (no RANSAC/hypothesis validation behind a raw nearest-
+        # neighbour snap), so it can't influence the fused pose either way; but an
+        # unvalidated snap's pairs still get registered in claimed_blobs/
+        # aux_assignments below, which can falsely block a *different* controller
+        # from matching a blob it actually owns in this camera this frame. Zero
+        # upside, real downside — so a failed camera is simply absent this frame.
 
         # Per-camera importance: each contributor's share of the fusion weight —
         # (1/sqrt(n_pairs)) * confidence, normalised to sum to 1 — i.e. how much
         # this frame's fused pose actually leaned on each camera. Replaces the old
         # "anchor camera" concept for reporting purposes.
-        _importance_in = _fuse_in + _snap_extra_aux
         _raw_w = {
             e["camera"].camera_idx: float(e.get("confidence", 1.0)) / max(len(e["pairs"]), 1) ** 0.5
-            for e in _importance_in
+            for e in _fuse_in
         }
         _w_total = sum(_raw_w.values()) or 1.0
         _importance_str = "  ".join(
@@ -946,8 +946,7 @@ class ControllerTracker:
         )
 
         logger.debug(
-            f"[{self.ctrl_name}] Joint fusion: {len(cam_solutions)} solved"
-            f"{f' + {len(_snap_extra_aux)} snapped' if _snap_extra_aux else ''}  "
+            f"[{self.ctrl_name}] Joint fusion: {len(cam_solutions)} solved  "
             f"err={fused_err:.2f}px  lm={_t_fuse*1000:.1f}ms  "
             f"importance=[{_importance_str}]"
         )
@@ -960,8 +959,6 @@ class ControllerTracker:
             cs["cam_id"]: cs["solution"]["assignment"]
             for cs in cam_solutions if cs["cam_id"] != primary_cam_id
         }
-        for _snap in _snap_extra_aux:
-            _other_assignments[_snap["camera"].camera_idx] = _snap["pairs"]
         solution["aux_assignments"] = _other_assignments
         solution["aux_cameras"] = [(cid, len(pairs)) for cid, pairs in _other_assignments.items()]
 
@@ -969,13 +966,10 @@ class ControllerTracker:
         # reported signal; kept only for get_designated_primary_cameras()).
         self._designated_primary = primary_cam_id
 
-        # ── Register claimed blobs (every camera that actually solved, plus snaps) ──
+        # ── Register claimed blobs (every camera that actually solved) ──────────
         for cs in cam_solutions:
             for b, _ in cs["solution"]["assignment"]:
                 claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
-        for _snap in _snap_extra_aux:
-            for b, _ in _snap["pairs"]:
-                claimed_blobs.setdefault(_snap["camera"].camera_idx, set()).add(b)
 
         # ── Self-calibration feed ────────────────────────────────────────────────
         if (self_cal is not None

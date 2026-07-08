@@ -5,7 +5,7 @@ data:
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
-  selected_cameras: [0, 2] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -142,7 +142,7 @@ matching:
   reprojection_threshold: 2.5    # RANSAC inlier threshold
   min_inliers: 4
   min_inlier_fraction: null      # e.g. 0.6 — overrides min_inliers if set (fraction of visible LEDs)
-  strong_match_error_px: 1.0
+  strong_match_error_px: 0.5
   min_vis_coverage: 0.7
   rng_seed: 42
 
@@ -153,7 +153,7 @@ matching:
   proximity_min_inliers: 4               # min inliers for proximity match — kept at the brute-force floor;
                                           # 3 is a zero-redundancy PnP fit (6 DOF, 2 eqns/point) whose error
                                           # can look deceptively perfect regardless of correctness
-  proximity_redundancy_ref: 3            # confidence ramps from 0 at the 3-point (zero-redundancy) PnP
+  proximity_redundancy_ref: 6            # confidence ramps from 0 at the 3-point (zero-redundancy) PnP
                                           # floor to full trust this many points beyond it; guards fusion
                                           # weighting against under-constrained per-camera fits
   proximity_reprojection_threshold: 2.5  # RANSAC threshold (tighter than brute — prior is already close)
@@ -206,9 +206,6 @@ matching:
   # toggle, no "primary" bias, all cameras weighted by pair count x confidence.)
   joint_huber_scale: 1.5           # Huber loss threshold in pixels; residuals beyond this are soft-capped
   joint_aux_prefilter_px: 2.0      # drop aux pairs with reprojection > this before joint LM
-  joint_snap_confidence: 0.5       # fusion confidence for a camera recovered via cheap Hungarian
-                                    # snap (no independent solve) rather than its own search — see
-                                    # ControllerTracker's snap-recovery step
   joint_lm_max_nfev: 50            # hard cap on residual evaluations; no analytic jacobian, so each TRF
                                     # iteration costs ~7x this (1 baseline + 6 finite-diff perturbations)
   joint_lm_ftol: 0.001            # TRF convergence tolerances (cost/param/gradient); looser = fewer
