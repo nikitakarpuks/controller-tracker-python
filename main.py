@@ -110,7 +110,10 @@ def main():
         geometry_cfg=config.get("geometry", {}),
         geometry_cfg_per_ctrl=geo_cfg_per_ctrl,
         self_calibration_cfg=config.get("self_calibration", {}),
+        blob_detection_cfg=config["blob_detection"],
     )
+    pool          = tracking_system.get_pool()
+    blob_parallel = tracking_system.blob_parallel_enabled
 
     if config["visualization"].get("fine_tune_alignment") and "right_controller" in enabled_ctrls:
         mesh = load_trimesh(config["visualization"]["3d_model_path"])
@@ -142,6 +145,12 @@ def main():
     # ── Tracking loop ──────────────────────────────────────────────────────
     any_valid_pose    = {n: False for n in enabled_ctrls}
     last_good_T_world = {n: None for n in enabled_ctrls}
+    # Cold-path BlobDetector EMA-threshold memory, round-tripped explicitly through
+    # run_blob_detect() rather than left as worker-resident state (a pool task isn't
+    # pinned to the same worker every call) — keyed per (cam_idx, ctrl_name) so two
+    # controllers cold-starting on the same camera in the same frame no longer
+    # clobber each other's memory (see run_blob_detect's docstring).
+    _cold_memory: dict = {}
 
     _csv_path = debug_cfg.get("calibration_csv")
     _csv_file = _csv_writer = None
@@ -160,7 +169,13 @@ def main():
             pass
         # cam_images: {cam_idx: numpy array}
 
-        proj_hints, vel_hints, radius_hints = tracking_system.get_predicted_led_projections_per_camera()
+        # Real capture timestamp (nanoseconds) — filenames encode it directly, and
+        # consecutive frames are NOT uniformly spaced (confirmed: alternates between
+        # substantially different gaps), so pose extrapolation uses this exact
+        # elapsed time rather than assuming one frame = one uniform step.
+        frame_ts_ns = int(img_path.stem)
+
+        proj_hints, vel_hints, radius_hints = tracking_system.get_predicted_led_projections_per_camera(frame_ts_ns)
         primary_cams       = tracking_system.get_designated_primary_cameras()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
@@ -173,31 +188,81 @@ def main():
         _match_cfg = config["matching"]
         _blob_cfg  = config["blob_detection"]
         _base_r    = float(_match_cfg.get("proximity_expansion_px", 8.0))
+
+        def _run_blob_detect_batch(ctrl_name, cam_kwargs: dict):
+            """Detect blobs for one controller across the given cameras — in
+            parallel (one task per camera, submitted to the shared pool) when
+            available, else sequentially against the local `blob_detectors`.
+
+            cam_kwargs: {cam_idx: {predicted_leds, local_search_radius_px,
+            threshold_scale}} — only predicted_leds is required, the rest default
+            to the cold-path values.
+
+            Returns ({cam_idx: (BlobResult, canvases)}, {cam_idx: elapsed_ms}).
+            """
+            ctrl_label   = ctrl_name.replace("_controller", "")
+            img_path_arg = img_path if _blob_cfg["visualize"] else None
+            results_by_cam: dict = {}
+            ms_by_cam: dict = {}
+            if pool is not None and blob_parallel:
+                from src.parallel_search import run_blob_detect
+                futures = {}
+                t0_by_cam = {}
+                for cam_idx, kwargs in cam_kwargs.items():
+                    t0_by_cam[cam_idx] = time()
+                    futures[cam_idx] = pool.submit(
+                        run_blob_detect, cam_idx, ctrl_label, cam_images[cam_idx],
+                        kwargs.get("predicted_leds"),
+                        kwargs.get("local_search_radius_px", 0.0),
+                        kwargs.get("threshold_scale", 1.0),
+                        True, img_path_arg, img_path.name,
+                        _cold_memory.get((cam_idx, ctrl_name)),
+                    )
+                for cam_idx, fut in futures.items():
+                    result, canvases, memory_out = fut.result()
+                    _cold_memory[(cam_idx, ctrl_name)] = memory_out
+                    results_by_cam[cam_idx] = (result, canvases)
+                    ms_by_cam[cam_idx] = (time() - t0_by_cam[cam_idx]) * 1000
+            else:
+                for cam_idx, kwargs in cam_kwargs.items():
+                    t0 = time()
+                    det_result = blob_detectors[cam_idx].detect(
+                        cam_images[cam_idx],
+                        ctrl_label=ctrl_label,
+                        predicted_leds=kwargs.get("predicted_leds"),
+                        local_search_radius_px=kwargs.get("local_search_radius_px", 0.0),
+                        threshold_scale=kwargs.get("threshold_scale", 1.0),
+                        visualize=True,
+                        img_path=img_path_arg,
+                        frame_name=img_path.name,
+                    )
+                    results_by_cam[cam_idx] = det_result
+                    ms_by_cam[cam_idx] = (time() - t0) * 1000
+            return results_by_cam, ms_by_cam
+
         for ctrl_name in ctrl_names_ordered:
             per_ctrl_blobs[ctrl_name] = {}
 
+            _thr_k   = float(_blob_cfg.get("velocity_threshold_k", 0.0))
+            _thr_min = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
+            _cam_kwargs = {}
             for cam_idx in cameras:
                 if cam_idx not in cam_images:
                     continue
-                predicted_leds = proj_hints.get(cam_idx, {}).get(ctrl_name)
-                _v_px       = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
-                _local_r_px = radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r)
-                _thr_k      = float(_blob_cfg.get("velocity_threshold_k", 0.0))
-                _thr_min    = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
-                _thr_scale  = max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0
-                _det_result = blob_detectors[cam_idx].detect(
-                    cam_images[cam_idx],
-                    ctrl_label=ctrl_name.replace("_controller", ""),
-                    predicted_leds=predicted_leds,
-                    local_search_radius_px=_local_r_px,
-                    threshold_scale=_thr_scale,
-                    visualize=True,
-                    img_path=img_path if _blob_cfg["visualize"] else None,
-                    frame_name=img_path.name,
+                _v_px = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
+                _cam_kwargs[cam_idx] = dict(
+                    predicted_leds=proj_hints.get(cam_idx, {}).get(ctrl_name),
+                    local_search_radius_px=radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r),
+                    threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
                 )
-                per_ctrl_blobs[ctrl_name][cam_idx] = _det_result[0]
-                if _det_result[1]:
-                    frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _det_result[1]
+
+            _phase1_results, _warm_ms_per_cam = _run_blob_detect_batch(ctrl_name, _cam_kwargs)
+            for cam_idx, (det_result_0, det_result_1) in _phase1_results.items():
+                per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
+                if det_result_1:
+                    frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = det_result_1
+            _warm_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _warm_ms_per_cam.items())
+            logger.info(f"[{ctrl_name}] warm detect: {_warm_str}")
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
         # centroid level (no image copy / pixel drawing needed) ─────────────────
@@ -242,6 +307,7 @@ def main():
             _ctrl_blobs = per_ctrl_blobs[ctrl_name]
             sol_map = tracking_system.update(
                 {},
+                frame_ts_ns=frame_ts_ns,
                 per_ctrl_observations={ctrl_name: {c: r.centroids    for c, r in _ctrl_blobs.items()}},
                 per_ctrl_radii=        {ctrl_name: {c: r.radii        for c, r in _ctrl_blobs.items()}},
                 per_ctrl_brightnesses= {ctrl_name: {c: r.brightnesses for c, r in _ctrl_blobs.items()}},
@@ -263,28 +329,27 @@ def main():
                 # that just proved untrustworthy, so brute-force against those SAME
                 # blobs has no better chance: a blob outside a wrong ROI was never
                 # detected at all. Re-detect this controller's blobs cold (full-image,
-                # no prior — same as frame 1) before falling back to brute, and swap
-                # the debug canvases for this frame to the cold-path (pass1/pass2)
-                # view so a lost-then-recovered frame shows what it actually saw.
-                _cold_ms_per_cam = {}
-                for cam_idx in cameras:
-                    if cam_idx not in cam_images:
-                        continue
-                    t0_cold = time()
-                    _det_result = blob_detectors[cam_idx].detect(
-                        cam_images[cam_idx],
-                        ctrl_label=ctrl_name.replace("_controller", ""),
-                        predicted_leds=None,
-                        visualize=True,
-                        img_path=img_path if _blob_cfg["visualize"] else None,
-                        frame_name=img_path.name,
-                    )
-                    per_ctrl_blobs[ctrl_name][cam_idx] = _det_result[0]
-                    if _det_result[1]:
-                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _det_result[1]
+                # no prior — same as frame 1) before falling back to brute, and add the
+                # cold-path (pass1/pass2) canvases to this frame's debug view alongside
+                # the failed warm-path ("local") one, instead of replacing it — seeing
+                # what the failed proximity attempt looked at is exactly what's needed
+                # to understand why it missed.
+                _cold_cams = [c for c in cameras if c in cam_images]
+                _warm_canvases = {
+                    cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
+                    for cam_idx in _cold_cams
+                }
+                _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
+                    ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
+                )
+                for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
+                    per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
+                    _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
+                    _merged_canvases.update(det_result_1 or {})
+                    if _merged_canvases:
+                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
                     else:
                         frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
-                    _cold_ms_per_cam[cam_idx] = (time() - t0_cold) * 1000
                 _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
                 logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
 

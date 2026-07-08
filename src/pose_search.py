@@ -551,6 +551,13 @@ class PoseSearcher:
         self._c_prox_score_metric   = str(  _cfg.get('proximity_score_metric',           'max'))
         self._c_prox_top_k_ransac        = int(  _cfg.get('proximity_top_k_ransac',           3))
         self._c_prox_redundancy_ref      = float(_cfg.get('proximity_redundancy_ref',         3.0))
+        # Skip stage-2 RANSAC rescoring entirely when the best ITERATIVE hypothesis
+        # is already this many multiples of accept_error_px — with so few points
+        # (proximity hypotheses are typically 3-5 LEDs), RANSAC has essentially no
+        # "outlier room" to drop enough pairs to close a gap that large, so every
+        # rescore attempt is a guaranteed-failing _ransac_pnp call paid for nothing.
+        self._c_accept_err_px             = float(_cfg.get('accept_error_px',                 3.0))
+        self._c_prox_stage2_max_err_factor = float(_cfg.get('proximity_stage2_max_err_factor', 4.0))
         self._c_vis_occlusion_margin_m   = float(_cfg.get('visibility_occlusion_margin_m',  0.0))
         self._c_prox_vis_score_threshold = float(_cfg.get('proximity_vis_score_threshold',  0.95))
         # constrained
@@ -1174,7 +1181,14 @@ class PoseSearcher:
                     # those Nones are unavoidable and carry no penalty.  Only Nones
                     # above the base — whether from the hypothesis or RANSAC drops —
                     # are penalised, using the same geometric series as the main loop.
-                    if self._c_prox_top_k_ransac >= 2 and len(top_candidates) >= 2:
+                    _stage2_err_cutoff = self._c_accept_err_px * self._c_prox_stage2_max_err_factor
+                    if best_err > _stage2_err_cutoff:
+                        logger.debug(
+                            f"[{self._ctrl} | cam {self._cam}] Proximity: skipping stage-2 RANSAC — "
+                            f"best_err={best_err:.2f}px exceeds {_stage2_err_cutoff:.2f}px "
+                            f"({self._c_prox_stage2_max_err_factor:.1f}x accept_error_px), too far to rescue"
+                        )
+                    elif self._c_prox_top_k_ransac >= 2 and len(top_candidates) >= 2:
                         _t_stage2_start = time.perf_counter()
                         _s2_best_key   = float('inf')
                         _s2_best_blobs = best_hyp_blobs

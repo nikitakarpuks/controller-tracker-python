@@ -622,7 +622,11 @@ def _detect_blobs_local(image, led_projections, cfg,
         max_areas  = np.full(n_leds, None,            dtype=object)
         min_areas  = np.full(n_leds, base_min_area)
     if threshold_scale != 1.0:
-        pixel_thrs = np.maximum((pixel_thrs * threshold_scale).astype(int), 1)
+        # Floor at base_pixel_thr (min_threshold), not 1 — velocity scaling is meant
+        # to relax the threshold at speed, not collapse it past the noise floor the
+        # formula's own "b" term (or min_threshold, when pose_guided_thresholds is
+        # unset) already establishes.
+        pixel_thrs = np.maximum((pixel_thrs * threshold_scale).astype(int), base_pixel_thr)
     req_thrs = np.clip((pixel_thrs * req_factor).astype(int), 0, 255)
 
     # Per-LED min_circularity: relax for LEDs seen at a steep angle.

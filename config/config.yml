@@ -1,5 +1,5 @@
 data:
-  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only/a"
 #  root: "./data/datasets/first_ds"
   img_width: 2560
   img_height: 481
@@ -73,7 +73,7 @@ blob_detection:
   min_circularity: 0.5              # 4π·area/perimeter² must exceed this; rejects elongated shapes
   min_circularity_angle_factor: 0.2
   min_circularity_floor: 0.1
-  required_threshold_factor: 1.1   # required_threshold = clip(pixel_threshold * factor, 255)
+  required_threshold_factor: 2.0   # required_threshold = clip(pixel_threshold * factor, 255)
   velocity_threshold_k: 0.013          # scale = 1/(1 + k*v_px); lowers threshold at speed; 0 = disabled
   velocity_threshold_min_factor: 0.75  # floor: threshold never drops below this fraction of base
 
@@ -132,8 +132,8 @@ matching:
   # --------------------------------------------------------------------------
   depth_tiers:                    # (anchor_leds, total_leds [, "edge"]) hypotheses to enumerate
     - [2, 3]
-    - [2, 4]
-    - [2, 4, "edge"]
+#    - [2, 4]
+#    - [2, 4, "edge"]
 #    - [3, 5]
 #    - [3, 5, "edge"]
 #    - [4, 6]
@@ -167,6 +167,7 @@ matching:
   proximity_level0_max_hyp: 8
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_top_k_ransac: 3
+  proximity_stage2_max_err_factor: 4.0  # skip stage-2 RANSAC rescoring when best ITERATIVE err > this × accept_error_px (too few points for RANSAC to rescue a fit that far off)
   visibility_occlusion_margin_m: 0.01   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
   proximity_vis_score_threshold: 0.95   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
 
@@ -187,9 +188,9 @@ matching:
   # --------------------------------------------------------------------------
   # Pose prediction
   # --------------------------------------------------------------------------
-  pose_history_window: 4             # max poses kept for _predict_pose; 1=constant pos, 2=const vel, 3+=linear fit
+  pose_history_window: 3             # max poses kept for _predict_pose; 1=constant pos, 2=const vel, 3+=linear fit
   pose_prediction_weight_decay: 0.7  # exponential weight decay per frame (0→only last frame, 1→equal weights)
-  pose_prediction_vel_ema_beta: 0.3  # EMA weight on newest velocity step (0=frozen, 1=no smoothing)
+  pose_prediction_vel_ema_beta: 0.7  # EMA weight on newest velocity step (0=frozen, 1=no smoothing)
   pose_gap_velocity_warmstart_frames: 2
   # --------------------------------------------------------------------------
   # Pose validation
