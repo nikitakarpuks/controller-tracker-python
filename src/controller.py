@@ -222,6 +222,16 @@ class CameraTracker:
         # Consecutive frames without a valid solution.
         self.consecutive_failures: int = 0
 
+        # Set (on every camera of a controller) when that controller's fused
+        # update() came up empty; cleared only once a solution is next accepted.
+        # prev_pose/pose_history/vel_ema are deliberately NOT cleared on a lost
+        # frame (a controller recovered by brute-force still warm-starts next
+        # frame from whatever history survives), so prev_pose stays non-None
+        # straight through a loss — this flag is what tells finalize_search() to
+        # use the loose re-acquisition check instead of the tight per-frame
+        # pose-jump guard for the frame that actually recovers.
+        self.tracking_lost_last_frame: bool = False
+
         self._matching_cfg = matching_cfg or {}
 
         _window = int(self._matching_cfg.get('pose_history_window', 5))
@@ -504,12 +514,20 @@ class CameraTracker:
         if _rot_ax is not None:
             _jump_kw['rot_thresh_xyz_deg'] = tuple(_rot_ax)
 
-        # Cold-start plausibility check (brute re-acquisition only): reject a
-        # candidate that's too far from the last known good pose. In deep-debug mode
+        # Re-acquisition: either a genuine cold start (prev_pose is None — not
+        # reachable in practice today, kept for completeness) or the first
+        # solution accepted after tracking_lost_last_frame was set. prev_pose/
+        # pose_history are deliberately left untouched by a lost frame (so a
+        # recovered controller can still warm-start from whatever history
+        # survives), so prev_pose being non-None is NOT by itself evidence of
+        # continuous per-frame tracking — tracking_lost_last_frame is.
+        _reacquiring = self.prev_pose is None or self.tracking_lost_last_frame
+
+        # Cold-start / re-acquisition plausibility check: reject a candidate
+        # that's too far from the last known good pose. In deep-debug mode
         # frames are non-consecutive, so this check is skipped — the controller can
         # be anywhere.
-        if (solution is not None and self.prev_pose is None
-                and self.last_good_pose is not None and not is_deep()):
+        if solution is not None and _reacquiring and self.last_good_pose is not None and not is_deep():
             rvec_lg, tvec_lg = self.last_good_pose
             if self._pose_jump_too_large(
                 solution["rvec"], solution["tvec"],
@@ -522,19 +540,20 @@ class CameraTracker:
                 solution = None
 
         # ------------------------------------------------------------------
-        # Pose-jump guard against prev_pose (tight, per-frame)
+        # Pose-jump guard against prev_pose (tight, per-frame — continuous
+        # tracking only; skipped while re-acquiring, see above)
         # ------------------------------------------------------------------
-        if solution is not None and self.prev_pose is not None:
+        if solution is not None and self.prev_pose is not None and not _reacquiring:
             rvec_p, tvec_p = self.prev_pose
             if self._pose_jump_too_large(
                 solution["rvec"], solution["tvec"],
                 rvec_p, tvec_p,
                 **_jump_kw,
             ):
-                print(f"[{ctrl_name} | cam {cam_idx} | tracking] Pose jump detected "
-                      f"(method={solution.get('method','?')}, "
-                      f"err={solution['error']:.2f} px) — "
-                      f"attempting brute recovery.")
+                logger.warning(f"[{ctrl_name} | cam {cam_idx} | tracking] Pose jump detected "
+                               f"(method={solution.get('method','?')}, "
+                               f"err={solution['error']:.2f} px) — "
+                               f"attempting brute recovery.")
                 solution = None
                 if allow_expensive_fallback and n_available >= 4:
                     _jump_prior = predicted_pose if predicted_pose is not None else self.prev_pose
@@ -707,8 +726,24 @@ class ControllerTracker:
         occluders_per_cam: Optional[Dict] = None,
         self_cal=None,
         pool=None,
+        allow_brute: bool = True,
+        force_brute: bool = False,
     ) -> Optional[Dict]:
+        """allow_brute=False stops after the cheap (proximity/prior_constrained)
+        pass and returns None instead of running tier-round brute-force recovery
+        — lets a caller detect "every camera's cheap search failed" and react
+        (e.g. re-detect blobs cold) before paying for brute-force on blobs that
+        were detected under a now-untrustworthy prediction.
+
+        force_brute=True skips the cheap pass entirely and goes straight to
+        brute-force, with no pose_prior (same as a cold-start first frame) —
+        for a caller that already re-detected blobs cold after cheap search
+        failed on the (now known bad) extrapolated pose: retrying cheap search
+        against that same untrustworthy prediction, just with a fuller blob
+        set, would fail for the same reason it failed the first time."""
         if not avail:
+            for _t in self.trackers.values():
+                _t.tracking_lost_last_frame = True
             return None
 
         from src.pose_search import fuse_camera_poses
@@ -733,68 +768,72 @@ class ControllerTracker:
         cam_solutions: List[dict] = []
         predicted_pose_by_cid: Dict[int, Optional[Tuple[np.ndarray, np.ndarray]]] = {}
 
-        _t_cheap_start = time.perf_counter()
-        _cheap_specs = []   # (cid, tracker, obs_full, rad_full, brt_full, mask, av_orig)
-        for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
-            if len(av_blobs) == 0:
-                continue
-            tracker  = self.trackers[cid]
-            obs_full = obs_src[cid]
-            rad_full = rad_src.get(cid) if rad_src else None
-            brt_full = brt_src.get(cid) if brt_src else None
-            mask = np.zeros(len(obs_full), dtype=bool)
-            mask[av_orig] = True
-            _cheap_specs.append((cid, tracker, obs_full, rad_full, brt_full, mask, av_orig))
+        t_cheap = 0.0
+        if not force_brute:
+            _t_cheap_start = time.perf_counter()
+            _cheap_specs = []   # (cid, tracker, obs_full, rad_full, brt_full, mask, av_orig)
+            for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
+                if len(av_blobs) == 0:
+                    continue
+                tracker  = self.trackers[cid]
+                obs_full = obs_src[cid]
+                rad_full = rad_src.get(cid) if rad_src else None
+                brt_full = brt_src.get(cid) if brt_src else None
+                mask = np.zeros(len(obs_full), dtype=bool)
+                mask[av_orig] = True
+                _cheap_specs.append((cid, tracker, obs_full, rad_full, brt_full, mask, av_orig))
 
-        _cheap_raw: Dict[int, tuple] = {}   # cid -> (solution, predicted_pose)
-        if pool is not None and _cheap_specs:
-            from src.parallel_search import run_cheap_search
-            _futures = {}
+            _cheap_raw: Dict[int, tuple] = {}   # cid -> (solution, predicted_pose)
+            if pool is not None and _cheap_specs:
+                from src.parallel_search import run_cheap_search
+                _futures = {}
+                for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
+                    prior = {
+                        'prev_pose':       tracker.prev_pose,
+                        'prev_prev_pose':  tracker.prev_prev_pose,
+                        'pose_history':    tracker.pose_history,
+                        'vel_ema':         tracker.vel_ema,
+                        'prev_assignment': tracker.prev_assignment,
+                    }
+                    _futures[cid] = pool.submit(
+                        run_cheap_search, (self.ctrl_name, cid), self._matching_cfg, prior,
+                        obs_full, rad_full, brt_full, mask, occluders_per_cam,
+                    )
+                for cid, fut in _futures.items():
+                    solution, predicted_pose, norm_prev, norm_prev_prev = fut.result()
+                    self.trackers[cid].prev_pose      = norm_prev
+                    self.trackers[cid].prev_prev_pose = norm_prev_prev
+                    _cheap_raw[cid] = (solution, predicted_pose)
+            else:
+                for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
+                    _cheap_raw[cid] = tracker.search_cheap(
+                        obs_full, blob_radii=rad_full, blob_brightnesses=brt_full,
+                        other_cameras_blobs=None, blob_mask=mask,
+                        occluders_per_cam=occluders_per_cam,
+                    )
+
             for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
-                prior = {
-                    'prev_pose':       tracker.prev_pose,
-                    'prev_prev_pose':  tracker.prev_prev_pose,
-                    'pose_history':    tracker.pose_history,
-                    'vel_ema':         tracker.vel_ema,
-                    'prev_assignment': tracker.prev_assignment,
-                }
-                _futures[cid] = pool.submit(
-                    run_cheap_search, (self.ctrl_name, cid), self._matching_cfg, prior,
-                    obs_full, rad_full, brt_full, mask, occluders_per_cam,
+                solution, predicted_pose = _cheap_raw[cid]
+                predicted_pose_by_cid[cid] = predicted_pose
+                solution = tracker.finalize_search(
+                    solution, predicted_pose, obs_full,
+                    blob_radii=rad_full, other_cameras_blobs=None,
+                    blob_mask=mask, occluders_per_cam=occluders_per_cam,
+                    allow_expensive_fallback=False,
                 )
-            for cid, fut in _futures.items():
-                solution, predicted_pose, norm_prev, norm_prev_prev = fut.result()
-                self.trackers[cid].prev_pose      = norm_prev
-                self.trackers[cid].prev_prev_pose = norm_prev_prev
-                _cheap_raw[cid] = (solution, predicted_pose)
-        else:
-            for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
-                _cheap_raw[cid] = tracker.search_cheap(
-                    obs_full, blob_radii=rad_full, blob_brightnesses=brt_full,
-                    other_cameras_blobs=None, blob_mask=mask,
-                    occluders_per_cam=occluders_per_cam,
-                )
+                if solution is None:
+                    continue
+                if not solution.get('_orig_idx', False):
+                    solution["assignment"] = [(av_orig[b], lid) for b, lid in solution["assignment"]]
+                cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": solution})
 
-        for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
-            solution, predicted_pose = _cheap_raw[cid]
-            predicted_pose_by_cid[cid] = predicted_pose
-            solution = tracker.finalize_search(
-                solution, predicted_pose, obs_full,
-                blob_radii=rad_full, other_cameras_blobs=None,
-                blob_mask=mask, occluders_per_cam=occluders_per_cam,
-                allow_expensive_fallback=False,
-            )
-            if solution is None:
-                continue
-            if not solution.get('_orig_idx', False):
-                solution["assignment"] = [(av_orig[b], lid) for b, lid in solution["assignment"]]
-            cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": solution})
+            t_cheap = time.perf_counter() - _t_cheap_start
 
-        t_cheap = time.perf_counter() - _t_cheap_start
         t_new_state = t_tier_rounds = t_finalize = 0.0
         n_rounds = 0
+        _pool_rt_ms: Dict[int, float] = {}   # cid -> worst brute-tier pool round-trip, if pool was used
 
-        if not cam_solutions:
+        if force_brute or (not cam_solutions and allow_brute):
             # ── Tier-round brute-force recovery ─────────────────────────────────
             # tier_0 for every camera with a chance (>=4 available blobs); wait for
             # the whole round to finish before deciding anything (no mid-tier
@@ -838,10 +877,8 @@ class ControllerTracker:
                     }
                     for cid, fut in _futures.items():
                         states[cid] = fut.result()
-                        logger.debug(
-                            f"[{self.ctrl_name}] cam{cid} tier_{tier_idx} pool round-trip "
-                            f"(submit->result)={(time.perf_counter() - _submit_t0)*1000:.1f}ms"
-                        )
+                        _rt = (time.perf_counter() - _submit_t0) * 1000
+                        _pool_rt_ms[cid] = max(_pool_rt_ms.get(cid, 0.0), _rt)
                     if any(states[cid].strong_found for cid in remaining):
                         break
             else:
@@ -881,14 +918,20 @@ class ControllerTracker:
                     cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": sol})
             t_finalize = time.perf_counter() - _t_finalize_start
 
+        _pool_rt_str = (
+            "  pool_rt=[" + " ".join(f"cam{c}={ms:.1f}ms" for c, ms in sorted(_pool_rt_ms.items())) + "]"
+            if _pool_rt_ms else ""
+        )
         logger.debug(
             f"[{self.ctrl_name}] update timing: cheap={t_cheap*1000:.1f}ms  "
             f"brute(new_state={t_new_state*1000:.1f}ms "
             f"tier_rounds={t_tier_rounds*1000:.1f}ms[{n_rounds} rounds] "
-            f"finalize={t_finalize*1000:.1f}ms)"
+            f"finalize={t_finalize*1000:.1f}ms){_pool_rt_str}"
         )
 
         if not cam_solutions:
+            for _t in self.trackers.values():
+                _t.tracking_lost_last_frame = True
             return None
 
         # ── Fuse every camera's independent solution into one pose ─────────────
@@ -1022,6 +1065,7 @@ class ControllerTracker:
             elif _tracker.prev_assignment is None:
                 _tracker.last_good_assignment = None
             _tracker.consecutive_failures = 0
+            _tracker.tracking_lost_last_frame = False
 
         return solution
 
@@ -1144,6 +1188,11 @@ class TrackingSystem:
         _vel_k  = float(self._matching_cfg.get('proximity_expansion_velocity_k', 0.0))
         _unc_k  = float(self._matching_cfg.get('proximity_expansion_uncertainty_k', 0.0))
         _dpt_k  = float(self._matching_cfg.get('proximity_expansion_depth_k', 0.0))
+        # Same weight_decay cheap_search_core passes to _predict_pose — keep this
+        # projection hint aligned with what proximity_search actually matches
+        # against, or the search ROI drawn here silently disagrees with cheap_search_core's
+        # own (vel_ema-corrected) prediction under fast/oscillating motion.
+        _weight_decay = float(self._matching_cfg.get('pose_prediction_weight_decay', 0.7))
 
         for cam_id, camera in self.cameras.items():
             proj_per_ctrl:   Dict[str, Optional[np.ndarray]] = {}
@@ -1151,7 +1200,11 @@ class TrackingSystem:
             radius_per_ctrl: Dict[str, float]               = {}
             for ctrl_name in ctrl_names:
                 tracker = self.trackers.get((ctrl_name, cam_id))
-                pred = CameraTracker._predict_pose(tracker.pose_history) if tracker else None
+                pred = (CameraTracker._predict_pose(
+                            tracker.pose_history,
+                            weight_decay=_weight_decay,
+                            vel_ema=tracker.vel_ema,
+                        ) if tracker else None)
                 if pred is None:
                     proj_per_ctrl[ctrl_name]   = None
                     vel_per_ctrl[ctrl_name]    = 0.0
@@ -1251,6 +1304,8 @@ class TrackingSystem:
         per_ctrl_radii: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
         per_ctrl_brightnesses: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
         ctrl_name_filter: Optional[str] = None,
+        allow_brute: bool = True,
+        force_brute: bool = False,
     ) -> Dict[str, Optional[Dict]]:
         """
         Run tracking for every controller using a single primary camera.
@@ -1416,6 +1471,8 @@ class TrackingSystem:
                 occluders_per_cam=_occluders_per_cam,
                 self_cal=self._self_cal,
                 pool=self._pool,
+                allow_brute=allow_brute,
+                force_brute=force_brute,
             )
 
         return results

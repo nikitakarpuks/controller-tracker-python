@@ -910,10 +910,10 @@ class PoseSearcher:
             # None is appended to each hyp LED's candidate list as a valid "no match" option.
             if not hyp_k:
                 best_hyp_blobs = []
-                logger.debug(
-                    f"[{self._ctrl} | cam {self._cam}] Proximity: no hypothesis LEDs, "
-                    f"direct assignment of {len(truly_locked_k)} locked pairs"
-                )
+                # logger.debug(
+                #     f"[{self._ctrl} | cam {self._cam}] Proximity: no hypothesis LEDs, "
+                #     f"direct assignment of {len(truly_locked_k)} locked pairs"
+                # )
             else:
                 # Score: error + none_penalty_px * n_none — a match is preferred only if
                 # it reduces reprojection error by more than the per-None penalty.
@@ -1018,7 +1018,7 @@ class PoseSearcher:
                 for _raw, combo_blobs in _zero_none_combos:
                     _t0 = time.perf_counter(); score, resid_map = _score_hyp(combo_blobs); _t_scoring += time.perf_counter() - _t0
                     key   = score  # none_cost == 0
-                    _log_hyp(n_tried, combo_blobs, score, key, best_key)
+                    # _log_hyp(n_tried, combo_blobs, score, key, best_key)  # too verbose — stage-2 RANSAC rank-N logging below covers the top candidates
                     if key < best_key:
                         best_key = key; best_none = 0; best_hyp_blobs = combo_blobs
                     _update_top_k(key, 0, combo_blobs)
@@ -1112,7 +1112,7 @@ class PoseSearcher:
                         for combo_blobs in _this_level:
                             _t0 = time.perf_counter(); score, resid_map = _score_hyp(combo_blobs); _t_scoring += time.perf_counter() - _t0
                             key   = score + none_cost
-                            _log_hyp(n_tried, combo_blobs, score, key, best_key)
+                            # _log_hyp(n_tried, combo_blobs, score, key, best_key)  # too verbose — stage-2 RANSAC rank-N logging below covers the top candidates
                             if key < best_key:
                                 best_key = key; best_none = n_none; best_hyp_blobs = combo_blobs
                             _update_top_k(key, n_none, combo_blobs)

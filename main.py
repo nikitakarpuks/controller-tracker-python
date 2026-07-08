@@ -116,19 +116,32 @@ def main():
         mesh = load_trimesh(config["visualization"]["3d_model_path"])
         fine_tune_alignment(ctrl_leds["right_controller"], mesh, right_ctrl_cfg)
 
+    # ── Visualiser setup (streamed, one log_frame() call per tracked frame —
+    # see ControllerAnimatorRerun.begin()'s docstring for why this must not be
+    # replaced with buffer-then-replay) ─────────────────────────────────────
+    animator = None
+    if enabled_ctrls:
+        controllers_vis = {}
+        for ctrl_name in enabled_ctrls:
+            pos, nrm, T = ctrl_geom[ctrl_name]
+            side = "right" if ctrl_name == "right_controller" else "left"
+            controllers_vis[ctrl_name] = {
+                "positions":    pos,
+                "normals":      nrm,
+                "T_model_ctrl": T,
+                "side":         side,
+                "geometry_cfg": geo_cfg_per_ctrl[ctrl_name],
+            }
+        animator = ControllerAnimatorRerun(
+            config["visualization"]["3d_model_path"],
+            controllers_vis,
+            matching_cfg=config.get("matching", {}),
+        )
+        animator.begin(cameras, save_path=config["visualization"].get("save_recording"))
+
     # ── Tracking loop ──────────────────────────────────────────────────────
-    poses_all            = {n: [] for n in enabled_ctrls}
-    assignments_all      = {n: [] for n in enabled_ctrls}
-    primary_cams_all     = {n: [] for n in enabled_ctrls}
-    aux_assignments_all  = {n: [] for n in enabled_ctrls}
-    # Per-frame T_world_ctrl for frames where tracking failed but blobs were
-    # present (case 3: between cameras / ambiguous).  None for truly invisible
-    # frames (case 1/2).  Visualiser holds the last known pose frozen.
-    frozen_poses_all     = {n: [] for n in enabled_ctrls}
-    last_good_T_world    = {n: None for n in enabled_ctrls}
-    blobs        = []
-    contours_all = []
-    blob_vis_all = []
+    any_valid_pose    = {n: False for n in enabled_ctrls}
+    last_good_T_world = {n: None for n in enabled_ctrls}
 
     _csv_path = debug_cfg.get("calibration_csv")
     _csv_file = _csv_writer = None
@@ -141,7 +154,7 @@ def main():
                                "brightness", "area"])
         logger.info(f"Calibration CSV → {_csv_path}")
 
-    for batch in tqdm(get_data(config["data"])):
+    for frame_idx, batch in enumerate(tqdm(get_data(config["data"]))):
         img_path, cam_images = batch[0][0], batch[0][1]
         if img_path.name == "58750954068441.png":
             pass
@@ -172,7 +185,6 @@ def main():
                 _thr_k      = float(_blob_cfg.get("velocity_threshold_k", 0.0))
                 _thr_min    = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
                 _thr_scale  = max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0
-                t0 = time()
                 _det_result = blob_detectors[cam_idx].detect(
                     cam_images[cam_idx],
                     ctrl_label=ctrl_name.replace("_controller", ""),
@@ -186,44 +198,47 @@ def main():
                 per_ctrl_blobs[ctrl_name][cam_idx] = _det_result[0]
                 if _det_result[1]:
                     frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _det_result[1]
-                logger.info(f"blob detection took {time() - t0} seconds")
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
         # centroid level (no image copy / pixel drawing needed) ─────────────────
         results         = {}
         elapsed_per_ctrl = {}
 
-        for ctrl_idx, ctrl_name in enumerate(ctrl_names_ordered):
-            # Remove blobs from preceding controllers' LED-matched positions.
-            if ctrl_idx > 0:
-                for cam_idx in list(per_ctrl_blobs[ctrl_name]):
-                    curr = per_ctrl_blobs[ctrl_name][cam_idx]
-                    if len(curr) == 0:
+        def _exclude_claimed_blobs(ctrl_idx, ctrl_name):
+            """Drop blobs from ctrl_name's per-camera detections that already
+            matched an earlier-processed controller's LEDs this frame — must be
+            re-run after any re-detection of ctrl_name's own blobs, since a fresh
+            detection pass isn't aware of other controllers' claims."""
+            if ctrl_idx == 0:
+                return
+            for cam_idx in list(per_ctrl_blobs[ctrl_name]):
+                curr = per_ctrl_blobs[ctrl_name][cam_idx]
+                if len(curr) == 0:
+                    continue
+                keep = np.ones(len(curr), dtype=bool)
+                for prev_ctrl in ctrl_names_ordered[:ctrl_idx]:
+                    sol = results.get(prev_ctrl)
+                    if sol is None:
                         continue
-                    keep = np.ones(len(curr), dtype=bool)
-                    for prev_ctrl in ctrl_names_ordered[:ctrl_idx]:
-                        sol = results.get(prev_ctrl)
-                        if sol is None:
-                            continue
-                        primary_cam = sol["primary_cam"]
-                        if cam_idx == primary_cam:
-                            matched_pairs = sol["assignment"]
-                        elif cam_idx in (sol.get("aux_assignments") or {}):
-                            matched_pairs = sol["aux_assignments"][cam_idx]
-                        else:
-                            continue
-                        src = per_ctrl_blobs[prev_ctrl].get(cam_idx)
-                        if not matched_pairs or src is None:
-                            continue
-                        m_idx = [b for b, _ in matched_pairs]
-                        dists = np.linalg.norm(
-                            curr.centroids[:, None, :] - src.centroids[m_idx][None, :, :], axis=2
-                        )
-                        too_close = (dists < (src.radii[m_idx] + _mask_margin)[None, :]).any(axis=1)
-                        keep &= ~too_close
-                    per_ctrl_blobs[ctrl_name][cam_idx] = curr.filter(keep)
+                    primary_cam = sol["primary_cam"]
+                    if cam_idx == primary_cam:
+                        matched_pairs = sol["assignment"]
+                    elif cam_idx in (sol.get("aux_assignments") or {}):
+                        matched_pairs = sol["aux_assignments"][cam_idx]
+                    else:
+                        continue
+                    src = per_ctrl_blobs[prev_ctrl].get(cam_idx)
+                    if not matched_pairs or src is None:
+                        continue
+                    m_idx = [b for b, _ in matched_pairs]
+                    dists = np.linalg.norm(
+                        curr.centroids[:, None, :] - src.centroids[m_idx][None, :, :], axis=2
+                    )
+                    too_close = (dists < (src.radii[m_idx] + _mask_margin)[None, :]).any(axis=1)
+                    keep &= ~too_close
+                per_ctrl_blobs[ctrl_name][cam_idx] = curr.filter(keep)
 
-            t0 = time()
+        def _update_ctrl(ctrl_name, allow_brute=True, force_brute=False):
             _ctrl_blobs = per_ctrl_blobs[ctrl_name]
             sol_map = tracking_system.update(
                 {},
@@ -231,15 +246,63 @@ def main():
                 per_ctrl_radii=        {ctrl_name: {c: r.radii        for c, r in _ctrl_blobs.items()}},
                 per_ctrl_brightnesses= {ctrl_name: {c: r.brightnesses for c, r in _ctrl_blobs.items()}},
                 ctrl_name_filter=ctrl_name,
+                allow_brute=allow_brute,
+                force_brute=force_brute,
             )
-            elapsed_per_ctrl[ctrl_name] = time() - t0
-            results[ctrl_name] = sol_map.get(ctrl_name)
+            return sol_map.get(ctrl_name)
 
-        blobs.append({ctrl: {cam: r.centroids for cam, r in cb.items()}
-                      for ctrl, cb in per_ctrl_blobs.items()})
-        contours_all.append({ctrl: {cam: r.contours for cam, r in cb.items()}
-                             for ctrl, cb in per_ctrl_blobs.items()})
-        blob_vis_all.append(frame_blob_vis)
+        for ctrl_idx, ctrl_name in enumerate(ctrl_names_ordered):
+            _exclude_claimed_blobs(ctrl_idx, ctrl_name)
+
+            t0 = time()
+            sol = _update_ctrl(ctrl_name, allow_brute=False)
+
+            if sol is None:
+                # Every camera's cheap (proximity/prior_constrained) search failed —
+                # the warm-path per-LED ROIs were centered on an extrapolated pose
+                # that just proved untrustworthy, so brute-force against those SAME
+                # blobs has no better chance: a blob outside a wrong ROI was never
+                # detected at all. Re-detect this controller's blobs cold (full-image,
+                # no prior — same as frame 1) before falling back to brute, and swap
+                # the debug canvases for this frame to the cold-path (pass1/pass2)
+                # view so a lost-then-recovered frame shows what it actually saw.
+                _cold_ms_per_cam = {}
+                for cam_idx in cameras:
+                    if cam_idx not in cam_images:
+                        continue
+                    t0_cold = time()
+                    _det_result = blob_detectors[cam_idx].detect(
+                        cam_images[cam_idx],
+                        ctrl_label=ctrl_name.replace("_controller", ""),
+                        predicted_leds=None,
+                        visualize=True,
+                        img_path=img_path if _blob_cfg["visualize"] else None,
+                        frame_name=img_path.name,
+                    )
+                    per_ctrl_blobs[ctrl_name][cam_idx] = _det_result[0]
+                    if _det_result[1]:
+                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _det_result[1]
+                    else:
+                        frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
+                    _cold_ms_per_cam[cam_idx] = (time() - t0_cold) * 1000
+                _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
+                logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
+
+                _exclude_claimed_blobs(ctrl_idx, ctrl_name)
+                # Straight to brute — no pose_prior, same as a cold-start first
+                # frame. Retrying cheap search here would just fail again for the
+                # same reason it failed above: cheap depends on the same
+                # extrapolated pose that's already proven untrustworthy, cold
+                # blobs or not.
+                sol = _update_ctrl(ctrl_name, force_brute=True)
+
+            elapsed_per_ctrl[ctrl_name] = time() - t0
+            results[ctrl_name] = sol
+
+        blobs_frame = {ctrl: {cam: r.centroids for cam, r in cb.items()}
+                      for ctrl, cb in per_ctrl_blobs.items()}
+        contours_frame = {ctrl: {cam: r.contours for cam, r in cb.items()}
+                         for ctrl, cb in per_ctrl_blobs.items()}
 
         total_blobs = sum(
             len(r)
@@ -247,17 +310,24 @@ def main():
             for r in ctrl_blobs.values()
         )
 
+        T_world_ctrl_frame        = {}
+        assignments_frame_out     = {}
+        primary_cams_frame_out    = {}
+        aux_assignments_frame_out = {}
+        frozen_T_world_ctrl_frame = {}
+
         for ctrl_name in enabled_ctrls:
             sol = results.get(ctrl_name)
             if sol:
                 T_world_ctrl    = sol["T_world_ctrl"]
                 primary_cam_idx = sol.get("primary_cam", 0)
-                poses_all[ctrl_name].append(T_world_ctrl)
-                assignments_all[ctrl_name].append(sol["assignment"].copy())
-                primary_cams_all[ctrl_name].append(primary_cam_idx)
-                aux_assignments_all[ctrl_name].append(sol.get("aux_assignments"))
+                T_world_ctrl_frame[ctrl_name]        = T_world_ctrl
+                assignments_frame_out[ctrl_name]     = sol["assignment"].copy()
+                primary_cams_frame_out[ctrl_name]    = primary_cam_idx
+                aux_assignments_frame_out[ctrl_name] = sol.get("aux_assignments")
                 last_good_T_world[ctrl_name] = T_world_ctrl
-                frozen_poses_all[ctrl_name].append(T_world_ctrl)
+                frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
+                any_valid_pose[ctrl_name] = True
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -295,24 +365,32 @@ def main():
                                     f"{float(np.pi * _radii[blob_idx] ** 2):.2f}",
                                 ])
             else:
-                poses_all[ctrl_name].append(None)
-                assignments_all[ctrl_name].append(None)
-                primary_cams_all[ctrl_name].append(None)
-                aux_assignments_all[ctrl_name].append(None)
                 # Case 3: had a prior good pose and cameras still see blobs →
                 # controller is between cameras or ambiguous; freeze last pose.
                 # Cases 1/2: never tracked or truly out of view → None (hidden).
                 last_good = last_good_T_world[ctrl_name]
-                if last_good is not None and total_blobs > 0:
-                    frozen_poses_all[ctrl_name].append(last_good)
-                else:
-                    frozen_poses_all[ctrl_name].append(None)
+                frozen_T_world_ctrl_frame[ctrl_name] = (
+                    last_good if last_good is not None and total_blobs > 0 else None
+                )
                 logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed_per_ctrl.get(ctrl_name, 0.0):.3f}s  TRACKING LOST")
+
+        if animator is not None:
+            animator.log_frame(
+                frame_idx,
+                T_world_ctrl_frame,
+                assignments_per_ctrl=assignments_frame_out,
+                blobs_per_ctrl=blobs_frame,
+                contours_per_ctrl=contours_frame,
+                primary_cam_per_ctrl=primary_cams_frame_out,
+                aux_assignments_per_ctrl=aux_assignments_frame_out,
+                frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
+                blob_vis_frame=frame_blob_vis,
+            )
 
         if out_slow is not None and sum(elapsed_per_ctrl.values()) > SLOW_MATCH_THRESHOLD_S:
             copy(img_path, out_slow / img_path.name)
-            logger.info(f"  → saved to deep_search_required (slow: {elapsed:.1f}s)")
-        if out_tracking_lost is not None and any(poses_all[n][-1] is None for n in enabled_ctrls):
+            logger.info(f"  → saved to deep_search_required (slow: {sum(elapsed_per_ctrl.values()):.1f}s)")
+        if out_tracking_lost is not None and any(n not in T_world_ctrl_frame for n in enabled_ctrls):
             copy(img_path, out_tracking_lost / img_path.name)
 
     if _csv_file:
@@ -324,38 +402,11 @@ def main():
 
     # ── Sanity check ───────────────────────────────────────────────────────
     for ctrl_name in enabled_ctrls:
-        if all(p is None for p in poses_all[ctrl_name]):
+        if not any_valid_pose[ctrl_name]:
             logger.warning(f"[{ctrl_name}] No valid poses found in the entire sequence.")
 
-    # ── Visualisation ──────────────────────────────────────────────────────
-    if enabled_ctrls:
-        controllers_vis = {}
-        for ctrl_name in enabled_ctrls:
-            pos, nrm, T = ctrl_geom[ctrl_name]
-            side = "right" if ctrl_name == "right_controller" else "left"
-            controllers_vis[ctrl_name] = {
-                "positions":    pos,
-                "normals":      nrm,
-                "T_model_ctrl": T,
-                "side":         side,
-                "geometry_cfg": geo_cfg_per_ctrl[ctrl_name],
-            }
-        animator = ControllerAnimatorRerun(
-            config["visualization"]["3d_model_path"],
-            controllers_vis,
-            matching_cfg=config.get("matching", {}),
-        )
-        animator.start(
-            poses_all,
-            assignments_all,
-            blobs, cameras,
-            contours_all=contours_all,
-            save_path=config["visualization"].get("save_recording"),
-            primary_cams_all=primary_cams_all,
-            aux_assignments_all=aux_assignments_all,
-            frozen_poses_all=frozen_poses_all,
-            blob_vis_all=blob_vis_all,
-        )
+    if animator is not None:
+        animator.finish()
 
     tracking_system.shutdown()
 
