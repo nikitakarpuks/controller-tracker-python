@@ -123,7 +123,7 @@ def main():
     # see ControllerAnimatorRerun.begin()'s docstring for why this must not be
     # replaced with buffer-then-replay) ─────────────────────────────────────
     animator = None
-    if enabled_ctrls:
+    if enabled_ctrls and config["visualization"].get("enabled", True):
         controllers_vis = {}
         for ctrl_name in enabled_ctrls:
             pos, nrm, T = ctrl_geom[ctrl_name]
@@ -254,6 +254,12 @@ def main():
         # when True (a per-camera gap, not a global cold-start where every
         # camera is needed to reacquire track).
         ctrl_has_prior: dict = {}
+        # {ctrl_name: ms} — wall-clock blob-detection time for this controller
+        # this frame (Phase 1's initial batch, plus Phase 2's cold-re-detect
+        # fallback if it fires) — reported alongside pose-search time in the
+        # per-frame summary line, since elapsed_per_ctrl alone only ever
+        # covered Phase 2 and was easy to mistake for the whole per-frame cost.
+        blob_ms_per_ctrl: dict = {}
 
         for ctrl_name in ctrl_names_ordered:
             per_ctrl_blobs[ctrl_name] = {}
@@ -288,7 +294,9 @@ def main():
                     threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
                 )
 
+            _t_blob0 = time()
             _phase1_results, _warm_ms_per_cam = _run_blob_detect_batch(ctrl_name, _cam_kwargs)
+            blob_ms_per_ctrl[ctrl_name] = (time() - _t_blob0) * 1000
             for cam_idx, (det_result_0, det_result_1) in _phase1_results.items():
                 per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
                 if det_result_1:
@@ -357,6 +365,7 @@ def main():
             _exclude_claimed_blobs(ctrl_idx, ctrl_name)
 
             t0 = time()
+            _redetect_s = 0.0
 
             if not ctrl_has_prior[ctrl_name]:
                 # True cold-start (frame 1, or a fully lost track): no camera
@@ -385,9 +394,15 @@ def main():
                         cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
                         for cam_idx in _cold_cams
                     }
+                    _t_redetect0 = time()
                     _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
                         ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
                     )
+                    # Extra blob-detection work triggered mid-Phase-2 — counts
+                    # toward this controller's total blob time, not pose time
+                    # (subtracted from elapsed_per_ctrl below).
+                    _redetect_s = time() - _t_redetect0
+                    blob_ms_per_ctrl[ctrl_name] = blob_ms_per_ctrl.get(ctrl_name, 0.0) + _redetect_s * 1000
                     for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
                         per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
                         _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
@@ -407,7 +422,7 @@ def main():
                     # blobs or not.
                     sol = _update_ctrl(ctrl_name, force_brute=True)
 
-            elapsed_per_ctrl[ctrl_name] = time() - t0
+            elapsed_per_ctrl[ctrl_name] = (time() - t0) - _redetect_s
             results[ctrl_name] = sol
 
         blobs_frame = {ctrl: {cam: r.centroids for cam, r in cb.items()}
@@ -429,6 +444,9 @@ def main():
 
         for ctrl_name in enabled_ctrls:
             sol = results.get(ctrl_name)
+            _blob_ms  = blob_ms_per_ctrl.get(ctrl_name, 0.0)
+            _pose_ms  = elapsed_per_ctrl.get(ctrl_name, 0.0) * 1000
+            _time_str = f"{_blob_ms:.1f}ms[blob] + {_pose_ms:.1f}ms[pose] = {_blob_ms + _pose_ms:.1f}ms"
             if sol:
                 T_world_ctrl    = sol["T_world_ctrl"]
                 primary_cam_idx = sol.get("primary_cam", 0)
@@ -448,7 +466,7 @@ def main():
                     aux_str = f"  +{sol['aux_inliers']}aux"
                 else:
                     aux_str = ""
-                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed_per_ctrl.get(ctrl_name, 0.0):.3f}s  "
+                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  "
                             f"cam={primary_cam}  err={sol['error']:.2f}px  "
                             f"matches={len(sol['assignment'])}{aux_str}  "
                             f"method={sol.get('method', '?')}")
@@ -483,9 +501,10 @@ def main():
                 frozen_T_world_ctrl_frame[ctrl_name] = (
                     last_good if last_good is not None and total_blobs > 0 else None
                 )
-                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {elapsed_per_ctrl.get(ctrl_name, 0.0):.3f}s  TRACKING LOST")
+                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  TRACKING LOST")
 
         if animator is not None:
+            _t_rerun0 = time()
             animator.log_frame(
                 frame_idx,
                 T_world_ctrl_frame,
@@ -497,10 +516,12 @@ def main():
                 frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
                 blob_vis_frame=(frame_blob_vis if _visualize_rerun else {}),
             )
+            logger.info(f"[{img_path.name}]  rerun log_frame: {(time() - _t_rerun0) * 1000:.1f}ms")
 
-        if out_slow is not None and sum(elapsed_per_ctrl.values()) > SLOW_MATCH_THRESHOLD_S:
+        _total_frame_s = sum(elapsed_per_ctrl.values()) + sum(blob_ms_per_ctrl.values()) / 1000
+        if out_slow is not None and _total_frame_s > SLOW_MATCH_THRESHOLD_S:
             copy(img_path, out_slow / img_path.name)
-            logger.info(f"  → saved to deep_search_required (slow: {sum(elapsed_per_ctrl.values()):.1f}s)")
+            logger.info(f"  → saved to deep_search_required (slow: {_total_frame_s:.1f}s)")
         if out_tracking_lost is not None and any(n not in T_world_ctrl_frame for n in enabled_ctrls):
             copy(img_path, out_tracking_lost / img_path.name)
 
