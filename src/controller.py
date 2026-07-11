@@ -1269,6 +1269,15 @@ class TrackingSystem:
         """
         ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
         _facing_deg  = float(self._matching_cfg.get('led_facing_angle_deg', 86.0))
+        # A camera predicting fewer visible LEDs than min_inliers cannot produce
+        # a valid pose solve regardless of detection quality (matching/proximity
+        # and brute-force both require >= this many inlier pairs — see
+        # PoseSearcher._c_prox_min_inliers / _c_brute_min_inliers in
+        # pose_search.py, same matching_cfg key) — so treat it the same as zero
+        # visible LEDs below, rather than handing it a prediction that's
+        # geometrically guaranteed not to help.
+        _min_vis_leds = int(self._matching_cfg.get(
+            'min_visible_leds_for_search', self._matching_cfg.get('min_inliers', 4)))
         result:       Dict[int, Dict[str, Optional[np.ndarray]]] = {}
         vel_hints:    Dict[int, Dict[str, float]]                = {}
         radius_hints: Dict[int, Dict[str, float]]                = {}
@@ -1332,7 +1341,7 @@ class TrackingSystem:
                     cam_is_fisheye=camera.is_fisheye,
                     facing_threshold_deg=_facing_deg,
                 ) >= 1.0)[0]
-                if len(vis_ids) == 0:
+                if len(vis_ids) < _min_vis_leds:
                     proj_per_ctrl[ctrl_name]   = None
                     vel_per_ctrl[ctrl_name]    = 0.0
                     radius_per_ctrl[ctrl_name] = _base_r

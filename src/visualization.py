@@ -528,6 +528,38 @@ class ControllerAnimatorRerun:
                     static=True,
                 )
 
+        # Static LED-disk mesh per controller, in controller-local space.
+        # LED positions/normals are rigid (fixed relative to the controller
+        # body) and the disk colour here is a constant, so — same as the
+        # controller mesh just above — the geometry only needs logging once;
+        # _log_frame only has to move it with a per-frame Transform3D instead
+        # of rebuilding+relogging the whole mesh (make_disk_mesh is a
+        # pure-Python per-LED loop, previously ~54% of _log_frame's own cost).
+        if self.vis_cfg.get("show_leds", True):
+            led_disk_radius = self.vis_cfg.get("led_disk_radius", 0.003)
+            for ctrl_name, cs in self._ctrl_state.items():
+                led_colors = np.tile([255, 192, 203], (len(cs["model_positions"]), 1))
+                led_verts, led_faces, led_vcols = make_disk_mesh(
+                    cs["model_positions"], cs["model_normals"], led_colors,
+                    radius=led_disk_radius,
+                )
+                # Cached for reuse by _log_frame's per-frame colour updates
+                # (live/ghost) — rr.Mesh3D requires vertex_positions on every
+                # log call, so a colour-only update still has to pass these
+                # through, but reusing the cached arrays costs nothing like
+                # make_disk_mesh's per-LED Python loop that built them here.
+                cs["led_verts"] = led_verts
+                cs["led_faces"] = led_faces
+                rr.log(
+                    f"world/{ctrl_name}/leds",
+                    rr.Mesh3D(
+                        vertex_positions=led_verts,
+                        triangle_indices=led_faces,
+                        vertex_colors=led_vcols,
+                    ),
+                    static=True,
+                )
+
     def log_frame(self, idx: int,
                   T_world_ctrl_per_ctrl: dict,
                   assignments_per_ctrl: dict = None,
@@ -849,23 +881,23 @@ class ControllerAnimatorRerun:
                 ctrl_path = f"world/{ctrl_name}"
                 R_disp = ghost_T_world_model.R
                 t_disp = ghost_T_world_model.t
-                pts_disp     = (R_disp @ cs["model_positions"].T).T + t_disp + offset
-                normals_disp = (R_disp @ cs["model_normals"].T).T
 
+                T4 = np.eye(4)
+                T4[:3, :3] = R_disp
+                T4[:3,  3] = t_disp + offset
                 if self.vis_cfg.get("show_mesh", True):
-                    T4 = np.eye(4)
-                    T4[:3, :3] = R_disp
-                    T4[:3,  3] = t_disp + offset
                     rr.log(f"{ctrl_path}/mesh",
                            rr.Transform3D(translation=T4[:3, 3], mat3x3=T4[:3, :3]))
 
+                # LED geometry is the static mesh logged once in begin() — only
+                # move it (Transform3D) and dim its colour, never rebuild it.
                 if self.vis_cfg.get("show_leds", True):
-                    colors = np.tile(ghost_led_color, (len(pts_disp), 1)).astype(np.uint8)
-                    verts, faces, vcols = make_disk_mesh(pts_disp, normals_disp, colors,
-                                                         radius=led_disk_radius)
+                    ghost_vcols = np.tile(ghost_led_color, (len(cs["model_positions"]), 1)).astype(np.uint8)
                     rr.log(f"{ctrl_path}/leds",
-                           rr.Mesh3D(vertex_positions=verts, triangle_indices=faces,
-                                     vertex_colors=vcols))
+                           rr.Transform3D(translation=T4[:3, 3], mat3x3=T4[:3, :3]))
+                    rr.log(f"{ctrl_path}/leds",
+                           rr.Mesh3D(vertex_positions=cs["led_verts"], triangle_indices=cs["led_faces"],
+                                     vertex_colors=ghost_vcols))
 
                 rr.log(f"{ctrl_path}/normals", rr.Clear(recursive=False))
                 for _ci in self._cameras:
@@ -959,13 +991,18 @@ class ControllerAnimatorRerun:
                     vis_scores[_cross_occ_vis] = 0.0
             vis_set = set(np.where(vis_scores >= 1.0)[0].tolist())
 
-            # ── LED disks ───────────────────────────────────────────────────
+            # ── LED disks (geometry is static, just update the pose — the
+            # mesh itself was logged once in begin(), same as {ctrl_path}/mesh).
+            # vertex_colors is re-sent every frame (cheap — a single np.tile,
+            # not a rebuild) so the live colour correctly overrides whatever
+            # the ghost branch above may have dimmed it to on a prior frame. ──
             if self.vis_cfg.get("show_leds", True):
-                colors = np.tile([255, 192, 203], (len(pts_disp), 1))
-                verts, faces, vcols = make_disk_mesh(pts_disp, normals_disp, colors,
-                                                     radius=led_disk_radius)
+                live_vcols = np.tile([255, 192, 203], (len(model_positions), 1)).astype(np.uint8)
                 rr.log(f"{ctrl_path}/leds",
-                       rr.Mesh3D(vertex_positions=verts, triangle_indices=faces, vertex_colors=vcols))
+                       rr.Transform3D(translation=T4[:3, 3], mat3x3=T4[:3, :3]))
+                rr.log(f"{ctrl_path}/leds",
+                       rr.Mesh3D(vertex_positions=cs["led_verts"], triangle_indices=cs["led_faces"],
+                                 vertex_colors=live_vcols))
 
             # ── Normals ─────────────────────────────────────────────────────
             if self.vis_cfg.get("show_normals", True):
