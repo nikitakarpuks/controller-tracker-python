@@ -1,47 +1,51 @@
 from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import cv2
 
 
-class ImageDataset(Dataset):
-    """Load images from a flat directory without labels"""
-
-    def __init__(self, root_dir, crops_per_cam: dict):
-        """
-        Args:
-            root_dir: Path to directory containing images
-            crops_per_cam: {cam_idx: (left, top, right, bottom)}
-        """
-        self.root_dir = Path(root_dir)
-        self.crops_per_cam = crops_per_cam
-
-        self.image_paths = sorted(self.root_dir.glob("*.png"))
-        print(f"Found {len(self.image_paths)} images in {root_dir}")
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('L')
-        cam_images = {
-            cam_idx: np.array(image.crop(crop))
-            for cam_idx, crop in self.crops_per_cam.items()
-        }
-        return img_path, cam_images
+def _load_frame(img_path: Path, crops_per_cam: dict):
+    image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+    cam_images = {
+        cam_idx: image[top:bottom, left:right].copy()
+        for cam_idx, (left, top, right, bottom) in crops_per_cam.items()
+    }
+    return img_path, cam_images
 
 
 def get_data(cfg):
+    """
+    Yields one [(img_path, cam_images)] batch per frame, sorted by filename —
+    same shape callers already unpack via `batch[0][0], batch[0][1]`.
+
+    Decodes one frame ahead on a background thread while the caller processes
+    the current frame: PNG decode is pure CPU-bound decompression (~7ms/frame,
+    confirmed to release the GIL), smaller than the rest of the per-frame
+    pipeline (blob detection + pose search + logging, ~20ms), so a single
+    frame of lookahead is enough to fully hide it — reading further ahead
+    wouldn't help, it would just buffer frames faster than the caller
+    consumes them.
+    """
     crops = get_crop_coordinates(cfg)
-    dataset = ImageDataset(root_dir=cfg["root"], crops_per_cam=crops)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=lambda batch: batch,
-    )
-    return dataloader
+    root_dir = Path(cfg["root"])
+    image_paths = sorted(root_dir.glob("*.png"))
+    print(f"Found {len(image_paths)} images in {root_dir}")
+
+    if not image_paths:
+        return
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_load_frame, image_paths[0], crops)
+        for idx in range(len(image_paths)):
+            img_path, cam_images = future.result()
+            if idx + 1 < len(image_paths):
+                future = executor.submit(_load_frame, image_paths[idx + 1], crops)
+            yield [(img_path, cam_images)]
+
+
+def count_images(cfg) -> int:
+    """Number of frames get_data(cfg) will yield — lets a caller pass tqdm(..., total=...)
+    without having to start iterating first (get_data is a generator, so it has no __len__)."""
+    return len(list(Path(cfg["root"]).glob("*.png")))
 
 
 def get_crop_coordinates(cfg) -> dict:

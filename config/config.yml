@@ -64,7 +64,12 @@ controllers:
 blob_detection:
 
   # ── Common (both warm and cold paths) ────────────────────────────────────
-  visualize: false
+  # Building the annotated per-blob debug canvas (drawing every kept/rejected
+  # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
+  # so it's only computed when one of its two sinks actually wants it:
+  visualize_save:  false   # write canvases to ./visualization/blobs/*.png
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+                           # this is what balloons recording file size
   min_threshold: 6                  # pixels >= this are included in a blob
   min_area: 2
   max_area: 500
@@ -78,6 +83,11 @@ blob_detection:
   velocity_threshold_min_factor: 0.75  # floor: threshold never drops below this fraction of base
 
   # ── Warm path (active when a predicted pose is available) ─────────────────
+  warm_strategy: "hybrid"    # "fit" = per-LED pose_guided_thresholds model (below);
+                          # "hybrid" = cold-style stats-based 2-pass detection
+                          # (see Cold path pass 1/2 settings below), scoped to
+                          # the union of predicted-LED search neighborhoods
+                          # instead of the full frame
   pose_guided_thresholds:
     # Formula: threshold = a * facing_cos / depth_m² + b
     #   a  — scales the Lambertian + inverse-square physics term

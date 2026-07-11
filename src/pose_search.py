@@ -1703,6 +1703,26 @@ class PoseSearcher:
         aux_cameras_result = [(idx, len(pairs))
                               for idx, pairs in aux_snapped_per_cam.items() if pairs]
 
+        # Confidence for multi-camera fusion weighting (see fuse_camera_poses).
+        # Unlike proximity, constrained_search never independently solves
+        # rotation (always fixed from the prior) and P1P without aux support
+        # doesn't even solve depth (copied straight from the prior) — so a low
+        # reprojection error here is close to tautological, not evidence of a
+        # correct match. Reusing proximity's own redundancy standard (a <=3
+        # point fit has zero spare DOF) against the TOTAL validated pairs
+        # (primary + aux) means a standalone P1P/P2P solve (2-3 primary pairs,
+        # no aux) naturally lands at confidence=0 — it won't drag down a real
+        # observation from another camera in the same frame's fusion — while
+        # aux-corroborated solves (enough independent pairs to clear the
+        # minimal-fit threshold) earn proportionate trust. This only matters
+        # when >=2 cameras solve this frame: fuse_camera_poses returns a lone
+        # contributor's own estimate unchanged regardless of confidence, so a
+        # standalone constrained_search result is unaffected by landing at 0.
+        _total_pairs        = len(all_primary) + aux_inlier_count
+        _err_factor          = min(1.0, self._c_prox_strong_match_px / max(error, 1e-6))
+        _redundancy_factor   = min(1.0, max(0.0, _total_pairs - 3) / max(self._c_prox_redundancy_ref, 1e-6))
+        _confidence          = _err_factor * _redundancy_factor
+
         _aux_log = ""
         if aux_cameras_result:
             _aux_log = "  aux=[" + ",".join(f"cam{c}:{n}" for c, n in aux_cameras_result) + "]"
@@ -1710,6 +1730,7 @@ class PoseSearcher:
             f"[{self._ctrl} | cam {self._cam}] prior_constrained ({mode}): OK  pairs={len(all_primary)}  err={error:.2f}px"
             + (f"  n_aux_solve={n_aux_pre}" if n_aux_pre > 0 else "")
             + _aux_log
+            + f"  confidence={_confidence:.2f}"
         )
 
         return {
@@ -1721,6 +1742,7 @@ class PoseSearcher:
             "aux_inliers":   aux_inlier_count,
             "aux_cameras":   aux_cameras_result or None,
             "aux_assignments": dict(aux_snapped_per_cam) if aux_snapped_per_cam else None,
+            "confidence":    _confidence,
         }
 
     def new_brute_state(

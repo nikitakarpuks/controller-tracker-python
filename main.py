@@ -16,7 +16,7 @@ from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.debug_config import DebugMode
 from src.load_config import load_yaml_config, load_json_config
-from src.preprocess_data import get_data
+from src.preprocess_data import get_data, count_images
 from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
                                fine_tune_alignment, load_trimesh)
 
@@ -163,7 +163,8 @@ def main():
                                "brightness", "area"])
         logger.info(f"Calibration CSV → {_csv_path}")
 
-    for frame_idx, batch in enumerate(tqdm(get_data(config["data"]))):
+    _n_frames = count_images(config["data"])
+    for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
         img_path, cam_images = batch[0][0], batch[0][1]
         if img_path.name == "58750954068441.png":
             pass
@@ -188,6 +189,11 @@ def main():
         _match_cfg = config["matching"]
         _blob_cfg  = config["blob_detection"]
         _base_r    = float(_match_cfg.get("proximity_expansion_px", 8.0))
+        # Building the annotated debug canvas has a real per-frame cost, so only
+        # pay for it when a sink (local save and/or Rerun logging) wants it.
+        _visualize_save    = bool(_blob_cfg.get("visualize_save", False))
+        _visualize_rerun   = bool(_blob_cfg.get("visualize_rerun", False))
+        _visualize_compute = _visualize_save or _visualize_rerun
 
         def _run_blob_detect_batch(ctrl_name, cam_kwargs: dict):
             """Detect blobs for one controller across the given cameras — in
@@ -201,7 +207,7 @@ def main():
             Returns ({cam_idx: (BlobResult, canvases)}, {cam_idx: elapsed_ms}).
             """
             ctrl_label   = ctrl_name.replace("_controller", "")
-            img_path_arg = img_path if _blob_cfg["visualize"] else None
+            img_path_arg = img_path if _visualize_save else None
             results_by_cam: dict = {}
             ms_by_cam: dict = {}
             if pool is not None and blob_parallel:
@@ -215,7 +221,7 @@ def main():
                         kwargs.get("predicted_leds"),
                         kwargs.get("local_search_radius_px", 0.0),
                         kwargs.get("threshold_scale", 1.0),
-                        True, img_path_arg, img_path.name,
+                        _visualize_compute, img_path_arg, img_path.name,
                         _cold_memory.get((cam_idx, ctrl_name)),
                     )
                 for cam_idx, fut in futures.items():
@@ -232,7 +238,7 @@ def main():
                         predicted_leds=kwargs.get("predicted_leds"),
                         local_search_radius_px=kwargs.get("local_search_radius_px", 0.0),
                         threshold_scale=kwargs.get("threshold_scale", 1.0),
-                        visualize=True,
+                        visualize=_visualize_compute,
                         img_path=img_path_arg,
                         frame_name=img_path.name,
                     )
@@ -240,18 +246,44 @@ def main():
                     ms_by_cam[cam_idx] = (time() - t0) * 1000
             return results_by_cam, ms_by_cam
 
+        # {ctrl_name: bool} — whether ANY camera has a predicted pose for this
+        # controller this frame. False means a true cold-start (frame 1, or a
+        # fully lost track) where no camera has anything to be "warm" about;
+        # Phase 2 uses this to skip a cheap/proximity pass that's guaranteed
+        # to fail, and the per-camera out-of-scope skip below only applies
+        # when True (a per-camera gap, not a global cold-start where every
+        # camera is needed to reacquire track).
+        ctrl_has_prior: dict = {}
+
         for ctrl_name in ctrl_names_ordered:
             per_ctrl_blobs[ctrl_name] = {}
 
             _thr_k   = float(_blob_cfg.get("velocity_threshold_k", 0.0))
             _thr_min = float(_blob_cfg.get("velocity_threshold_min_factor", 0.4))
             _cam_kwargs = {}
+            _skipped_cams = []
+            _ctrl_has_prior = any(
+                proj_hints.get(c, {}).get(ctrl_name) is not None
+                for c in cameras if c in cam_images
+            )
+            ctrl_has_prior[ctrl_name] = _ctrl_has_prior
             for cam_idx in cameras:
                 if cam_idx not in cam_images:
                     continue
+                _pred = proj_hints.get(cam_idx, {}).get(ctrl_name)
+                if _pred is None and _ctrl_has_prior:
+                    # Out of scope for this extrapolated view this frame — other
+                    # cameras DO have a prior, so this isn't a cold-start; skip
+                    # blob detection for this camera entirely (and, via
+                    # _filter_cam's None/empty handling in TrackingSystem.update,
+                    # pose search too) rather than paying for a cold/hybrid
+                    # detection pass whose predicted LEDs are known unusable.
+                    per_ctrl_blobs[ctrl_name][cam_idx] = BlobResult.empty()
+                    _skipped_cams.append(cam_idx)
+                    continue
                 _v_px = vel_hints.get(cam_idx, {}).get(ctrl_name, 0.0)
                 _cam_kwargs[cam_idx] = dict(
-                    predicted_leds=proj_hints.get(cam_idx, {}).get(ctrl_name),
+                    predicted_leds=_pred,
                     local_search_radius_px=radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r),
                     threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
                 )
@@ -262,7 +294,11 @@ def main():
                 if det_result_1:
                     frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = det_result_1
             _warm_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _warm_ms_per_cam.items())
-            logger.info(f"[{ctrl_name}] warm detect: {_warm_str}")
+            if _skipped_cams:
+                _skip_str = "  ".join(f"cam{c}=skip(out-of-scope)" for c in _skipped_cams)
+                _warm_str = f"{_warm_str}  {_skip_str}" if _warm_str else _skip_str
+            _mode_label = "warm detect" if _ctrl_has_prior else "cold detect"
+            logger.info(f"[{ctrl_name}] {_mode_label}: {_warm_str}")
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
         # centroid level (no image copy / pixel drawing needed) ─────────────────
@@ -321,45 +357,55 @@ def main():
             _exclude_claimed_blobs(ctrl_idx, ctrl_name)
 
             t0 = time()
-            sol = _update_ctrl(ctrl_name, allow_brute=False)
 
-            if sol is None:
-                # Every camera's cheap (proximity/prior_constrained) search failed —
-                # the warm-path per-LED ROIs were centered on an extrapolated pose
-                # that just proved untrustworthy, so brute-force against those SAME
-                # blobs has no better chance: a blob outside a wrong ROI was never
-                # detected at all. Re-detect this controller's blobs cold (full-image,
-                # no prior — same as frame 1) before falling back to brute, and add the
-                # cold-path (pass1/pass2) canvases to this frame's debug view alongside
-                # the failed warm-path ("local") one, instead of replacing it — seeing
-                # what the failed proximity attempt looked at is exactly what's needed
-                # to understand why it missed.
-                _cold_cams = [c for c in cameras if c in cam_images]
-                _warm_canvases = {
-                    cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
-                    for cam_idx in _cold_cams
-                }
-                _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
-                    ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
-                )
-                for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
-                    per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
-                    _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
-                    _merged_canvases.update(det_result_1 or {})
-                    if _merged_canvases:
-                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
-                    else:
-                        frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
-                _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
-                logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
-
-                _exclude_claimed_blobs(ctrl_idx, ctrl_name)
-                # Straight to brute — no pose_prior, same as a cold-start first
-                # frame. Retrying cheap search here would just fail again for the
-                # same reason it failed above: cheap depends on the same
-                # extrapolated pose that's already proven untrustworthy, cold
-                # blobs or not.
+            if not ctrl_has_prior[ctrl_name]:
+                # True cold-start (frame 1, or a fully lost track): no camera
+                # had a prediction, so a cheap/proximity pass is guaranteed to
+                # fail (search_cheap has nothing to search against) and blobs
+                # are already cold from Phase 1 — skip straight to brute
+                # instead of paying for a doomed cheap pass plus an identical
+                # redundant re-detect of the same cold blobs.
                 sol = _update_ctrl(ctrl_name, force_brute=True)
+            else:
+                sol = _update_ctrl(ctrl_name, allow_brute=False)
+
+                if sol is None:
+                    # Every camera's cheap (proximity/prior_constrained) search failed —
+                    # the warm-path per-LED ROIs were centered on an extrapolated pose
+                    # that just proved untrustworthy, so brute-force against those SAME
+                    # blobs has no better chance: a blob outside a wrong ROI was never
+                    # detected at all. Re-detect this controller's blobs cold (full-image,
+                    # no prior — same as frame 1) before falling back to brute, and add the
+                    # cold-path (pass1/pass2) canvases to this frame's debug view alongside
+                    # the failed warm-path ("local") one, instead of replacing it — seeing
+                    # what the failed proximity attempt looked at is exactly what's needed
+                    # to understand why it missed.
+                    _cold_cams = [c for c in cameras if c in cam_images]
+                    _warm_canvases = {
+                        cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
+                        for cam_idx in _cold_cams
+                    }
+                    _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
+                        ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
+                    )
+                    for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
+                        per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
+                        _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
+                        _merged_canvases.update(det_result_1 or {})
+                        if _merged_canvases:
+                            frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
+                        else:
+                            frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
+                    _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
+                    logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
+
+                    _exclude_claimed_blobs(ctrl_idx, ctrl_name)
+                    # Straight to brute — no pose_prior, same as a cold-start first
+                    # frame. Retrying cheap search here would just fail again for the
+                    # same reason it failed above: cheap depends on the same
+                    # extrapolated pose that's already proven untrustworthy, cold
+                    # blobs or not.
+                    sol = _update_ctrl(ctrl_name, force_brute=True)
 
             elapsed_per_ctrl[ctrl_name] = time() - t0
             results[ctrl_name] = sol
@@ -449,7 +495,7 @@ def main():
                 primary_cam_per_ctrl=primary_cams_frame_out,
                 aux_assignments_per_ctrl=aux_assignments_frame_out,
                 frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
-                blob_vis_frame=frame_blob_vis,
+                blob_vis_frame=(frame_blob_vis if _visualize_rerun else {}),
             )
 
         if out_slow is not None and sum(elapsed_per_ctrl.values()) > SLOW_MATCH_THRESHOLD_S:
