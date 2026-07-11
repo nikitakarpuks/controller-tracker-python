@@ -263,6 +263,10 @@ debug:
   debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
+  enabled: true  # set to false to skip Rerun entirely (no per-frame logging, no
+                 # viewer, no .rrd file) — for isolating tracking-only speed;
+                 # save_recording below only controls whether an enabled
+                 # session also gets written to disk, not whether it runs at all.
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
   fine_tune_alignment: false  # set to true to run alignment optimiser and print refined params
