@@ -610,7 +610,8 @@ class ControllerAnimatorRerun:
                   primary_cam_per_ctrl: dict = None,
                   aux_assignments_per_ctrl: dict = None,
                   frozen_T_world_ctrl_per_ctrl: dict = None,
-                  blob_vis_frame: dict = None) -> None:
+                  blob_vis_frame: dict = None,
+                  blob_vis_skipped: dict = None) -> None:
         """
         Log a single frame to rerun. Call once per tracked frame, in
         increasing idx order, right after that frame's tracking result is
@@ -627,11 +628,17 @@ class ControllerAnimatorRerun:
                                             None hides the controller (ghost).
             blob_vis_frame:                {ctrl_name: {cam_idx: {mode_key: canvas}}}
                                             for this frame only, see _log_blob_debug.
+            blob_vis_skipped:               {ctrl_name: [cam_idx, ...]} cameras with
+                                            no detect() call this frame (out-of-scope)
+                                            — cleared rather than left showing
+                                            whatever was last logged, which can
+                                            otherwise silently freeze for hundreds of
+                                            frames and look like a stuck cold scan.
         """
         rr.set_time("frame", sequence=idx)
 
-        if blob_vis_frame:
-            self._log_blob_debug(blob_vis_frame)
+        if blob_vis_frame or blob_vis_skipped:
+            self._log_blob_debug(blob_vis_frame or {}, blob_vis_skipped or {})
 
         # Build ghost world-frame transforms for case-3 lost frames.
         ghost_T_world_model_per_ctrl: dict = {}
@@ -682,7 +689,7 @@ class ControllerAnimatorRerun:
     # "what cold detection found" left to right.
     _BLOB_DEBUG_CANVAS_ORDER = ("local", "pass1", "pass2")
 
-    def _log_blob_debug(self, frame_vis: dict) -> None:
+    def _log_blob_debug(self, frame_vis: dict, skipped: dict = None) -> None:
         """Log blob detection canvases and a mode summary for the current frame.
 
         frame_vis: {ctrl_name: {cam_idx: {mode_key: canvas_bgr}}}
@@ -690,11 +697,25 @@ class ControllerAnimatorRerun:
         present for a given camera (e.g. all three when a lost-track cold
         re-detect ran this frame: the failed warm attempt plus both cold passes).
 
+        skipped: {ctrl_name: [cam_idx, ...]} — cameras with no detect() call
+        this frame (main.py's out-of-scope skip: no prediction for this
+        camera while the controller has one via another). These entities get
+        explicitly cleared rather than left alone — Rerun otherwise keeps
+        showing whatever image was last logged at that path, which for a
+        camera skipped many frames in a row (observed up to ~250 consecutive
+        frames) silently freezes and is indistinguishable from a permanently-
+        stuck cold-start scan.
+
         Multiple canvases are placed side-by-side in a single composite image
         (see _BLOB_DEBUG_CANVAS_ORDER) so all are visible in one panel. The
         composite image is logged directly at the panel origin path so that
         Rerun updates it reliably when scrubbing the timeline.
         """
+        for ctrl_name, cam_idxs in (skipped or {}).items():
+            ctrl_label = ctrl_name.replace("_controller", "")
+            for cam_idx in cam_idxs:
+                rr.log(f"blob_debug/cam{cam_idx}/{ctrl_label}", rr.Clear(recursive=False))
+
         mode_lines = []
         for ctrl_name, cam_dict in frame_vis.items():
             ctrl_label = ctrl_name.replace("_controller", "")
@@ -731,6 +752,11 @@ class ControllerAnimatorRerun:
                     rr.Image(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)),
                 )
                 mode_lines.append(f"cam{cam_idx}/{ctrl_label}: {mode_str}")
+
+        for ctrl_name, cam_idxs in (skipped or {}).items():
+            ctrl_label = ctrl_name.replace("_controller", "")
+            for cam_idx in cam_idxs:
+                mode_lines.append(f"cam{cam_idx}/{ctrl_label}: SKIPPED (out-of-scope)")
 
         if mode_lines:
             rr.log("blob_debug/modes", rr.TextLog("  |  ".join(mode_lines)))

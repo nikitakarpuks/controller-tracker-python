@@ -1383,6 +1383,40 @@ class TrackingSystem:
             radius_hints[cam_id]  = radius_per_ctrl
         return result, vel_hints, radius_hints
 
+    def solved_led_geometry(
+        self,
+        ctrl_name: str,
+        cam_id: int,
+        T_world_ctrl: Transform,
+        led_ids,
+    ) -> Dict[int, Tuple[float, float]]:
+        """Depth (m) and facing_cos for specific LEDs, computed from an
+        already-solved T_world_ctrl rather than the pre-match extrapolated
+        prediction (proj_hints from get_predicted_led_projections_per_camera)
+        — that prediction is the prior fed *into* pose search, and drifts from
+        the truth exactly when the controller is rotating/accelerating fast,
+        which is the regime calibration data most needs to be accurate for.
+        """
+        tracker = self.trackers.get((ctrl_name, cam_id))
+        if tracker is None:
+            return {}
+        camera     = self.cameras[cam_id]
+        T_cam_ctrl = camera.T_world_cam.inverse().compose(T_world_ctrl)
+        R_c = T_cam_ctrl.R.astype(np.float32)
+        t_c = T_cam_ctrl.t.reshape(3).astype(np.float32)
+
+        ids       = np.asarray(list(led_ids), dtype=int)
+        positions = tracker.model.positions[ids]
+        normals   = tracker.model.normals[ids]
+
+        led_cam     = (R_c @ positions.T).T + t_c
+        depths      = led_cam[:, 2]
+        view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
+        normals_cam = (R_c @ normals.T).T
+        facing_cos  = -(normals_cam * view_dir).sum(axis=1)
+
+        return {int(lid): (float(d), float(fc)) for lid, d, fc in zip(ids, depths, facing_cos)}
+
     def get_ctrl_processing_order(self) -> List[str]:
         """Return controller names in the same priority order used by update()."""
         ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
