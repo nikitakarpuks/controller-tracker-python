@@ -95,6 +95,24 @@ def _split_blob_at_seeds(image, intensities, ys, xs, seed_a, seed_b):
     return results
 
 
+def _filled_px_area(cnt) -> float:
+    """Exact filled pixel count for a contour, matching CC_STAT_AREA's
+    definition — unlike cv2.contourArea (a shoelace-formula boundary area),
+    which systematically underestimates small/irregular blobs (a 3-px
+    L-shape has geometric area ~0.5). _detect_blobs's own too_large/
+    too_small checks are computed against CC_STAT_AREA, so any area
+    comparison against max_area/min_area from outside that function (e.g.
+    building a max_area ceiling from a previous pass's *filtered_radii*,
+    which IS contourArea-derived — see the return statement below) must use
+    this, not radius-derived pi*r^2, or the two will disagree by exactly the
+    same systematic amount and silently reject correctly-sized blobs."""
+    x, y, w, h = cv2.boundingRect(cnt)
+    m = np.zeros((h, w), dtype=np.uint8)
+    shifted = cnt.reshape(-1, 1, 2).astype(np.int32) - [x, y]
+    cv2.drawContours(m, [shifted], -1, 255, -1)
+    return float(np.count_nonzero(m))
+
+
 # Above this many labels, a single full-image lut[labels] gather + one
 # findContours call beats per-label bbox-scoped extraction — each small
 # extraction's fixed per-call dispatch overhead starts to add up past this
@@ -125,10 +143,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    min_circularity_override=None,
                    interior_exclude_blobs=None,
                    warm_mode=False,
+                   skip_spatial_outlier=False,
                    vis_patch_out=None,
                    frame_name=None,
                    vis_background=None,
-                   vis_offset=(0, 0)):
+                   vis_offset=(0, 0),
+                   neighborhoods=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -159,30 +179,27 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
 
     Outlier filters (applied after splitting)
     ─────────────────────────────────────────
-    Three sequential stages, all depth-invariant:
+    DBSCAN 1-NN spatial filter — for each blob (from the area-kept set),
+    finds its nearest neighbour distance.  Any blob whose 1-NN distance
+    exceeds outlier_factor × median(1-NN distances) is rejected as spatially
+    isolated noise.  Epsilon is derived from the surviving blob distances, so
+    it scales naturally with depth.  Skipped when fewer than 2 blobs survive,
+    or when warm_mode/skip_spatial_outlier is set — in practice this makes it
+    cold-path only: the `fit`/local warm path and hybrid's union-of-
+    neighborhoods crop both have spatially spread-out LED priors, where an
+    outer-ring LED sitting far from its neighbors would be wrongly rejected.
 
-    1. Area filter — rejects blobs whose area exceeds
-       median(area) + area_outlier_k × MAD(area).  Catches large reflections
-       or unsplit merged groups without needing a pose estimate.  Skipped when
-       fewer than 3 blobs survive (MAD undefined / uninformative).
-
-    2. DBSCAN 1-NN spatial filter — for each blob (from the area-kept set),
-       finds its nearest neighbour distance.  Any blob whose 1-NN distance
-       exceeds outlier_factor × median(1-NN distances) is rejected as
-       spatially isolated noise.  Epsilon is derived from the surviving blob
-       distances, so it scales naturally with depth.  Skipped when fewer than
-       2 blobs survive.
-
-    3. Gradient smoothness filter (H2, very last) — for each surviving blob,
-       casts gradient_num_rays rays outward from the NMS peak (same logic as
-       split detection, tested on large blobs).  Each ray must be
-       monotonically non-increasing in the original unthresholded image
-       (within gradient_step_tolerance) until either the neighbourhood radius
-       is reached or a valley is detected (val < gradient_valley_ratio * peak,
-       indicating the boundary with a neighbouring blob — same valley logic
-       as merge splitting).  Blobs where more than gradient_max_bad_ray_fraction
-       of rays are non-monotonic are rejected as pseudo-LEDs (e.g. fragments
-       inside a bright window with no clear bright maximum).
+    max_area (this function's own area bound, min_area/max_area above) is the
+    only area filter `_detect_blobs` itself applies — no separate area-
+    outlier filter exists here.  BlobDetector.detect supplies this bound
+    differently per pass: pass 1 gets either the flat cfg["max_area"] (cold)
+    or a fit-based ceiling from pose_guided_thresholds.max_area evaluated at
+    the predicted LED depths (hybrid warm); pass 2 gets the biggest blob pass
+    1 actually found this frame (real data, already bounded by pass 1's own
+    ceiling — pass 2's threshold only ever shrinks blobs, never grows them,
+    so this can't clip a genuine pass-2 blob) — that logic lives in
+    BlobDetector.detect, not here, so keep this docstring in sync with that
+    split rather than re-describing it.
 
     Merged-blob splitting (optional)
     ────────────────────────────────
@@ -212,7 +229,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                           if min_circularity_override is not None
                           else float(cfg.get("min_circularity", 0.5)))
 
-    # H1: interior-of-large-blob exclusion (no-prior / 2-pass path only)
+    # H1: interior-of-large-blob exclusion — the shared 2-pass path only
+    # (cold or hybrid warm); never the per-LED fit/local path. Applies
+    # regardless of has_prior — only warm_mode gates it (see below).
     interior_edge_margin_px = float(cfg.get("interior_edge_margin_px", 10.0))
 
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
@@ -256,7 +275,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     det_rej_area_small = []
     det_rej_area_large = []
     det_rej_threshold  = []
-    det_rej_interior   = []   # H1: centroid deep inside a large blob (no-prior path only)
+    det_rej_interior   = []   # H1: centroid deep inside a large blob (2-pass path only, cold or hybrid)
     intensities = image.astype(np.float32)
 
     def _finish_candidate(cnt, label_id, x_b, y_b, w_b, h_b):
@@ -478,11 +497,15 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     keep_mask &= circ_keep_mask
 
     # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
-    # Skipped in local-search mode: LED projections are spatially spread across
-    # the image so outer-ring LEDs would be wrongly rejected as isolated.
+    # Skipped in local-search mode (warm_mode) and in hybrid's union-of-
+    # neighborhoods crop (skip_spatial_outlier) alike: LED projections are
+    # spatially spread across the image in both, so an outer-ring LED sitting
+    # alone (real, just far from its neighbors) would be wrongly rejected as
+    # spatially isolated noise — this filter is only meaningful when detection
+    # runs over a single tightly-clustered controller with no prior spread.
     candidates   = centroids_arr[keep_mask]
     min_nn_full  = np.full(len(centroids_arr), np.inf)
-    if not warm_mode and len(candidates) > 1:
+    if not (warm_mode or skip_spatial_outlier) and len(candidates) > 1:
         diffs    = candidates[:, None, :] - candidates[None, :, :]
         sq_dists = (diffs ** 2).sum(axis=-1)
         np.fill_diagonal(sq_dists, np.inf)
@@ -531,11 +554,19 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    if warm_mode else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))
             vis_ox, vis_oy = 0, 0
 
+        if neighborhoods is not None:
+            # Hybrid warm path only: green search-neighborhood circles, drawn
+            # first so blob markers land on top — mirrors _detect_blobs_local's
+            # C_ROI circles. Coordinates are already full-image (predicted_leds
+            # is never crop-local), matching vis's own coordinate space here
+            # (vis_background, when set, is the full image, not the crop).
+            _draw_search_neighborhoods(vis, neighborhoods[0], neighborhoods[1])
+
         C_AREA_SM  = (255, 0, 255)    # pink        — pixels < min_area or 1×1
         C_AREA_LG  = (0, 140, 255)   # dark orange — area > max_area (hard limit)
         C_THRESH   = (180, 0, 0)     # dark red    — below required brightness
         C_CIRC     = (0, 255, 255)   # yellow      — circularity filter
-        C_SPAT     = (128, 128, 128) # grey        — spatial (DBSCAN) outlier (cold path only)
+        C_SPAT     = (0, 0, 255) # grey        — spatial (DBSCAN) outlier (cold path only)
         C_INTERIOR = (100, 180, 255) # light blue  — H1: deep inside large blob (cold path only)
         C_KEPT     = (255, 255, 255) # white       — kept
         C_SPLT     = (0, 255, 128)   # cyan        — kept (split)
@@ -602,8 +633,14 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 (C_KEPT,     "kept"),
                 (C_SPLT,     "split (black seam divides pair)"),
                 (C_CIRC,     f"not circular (< {min_circularity})"),
-                (C_SPAT,     "spatial outlier"),
-                (C_INTERIOR, "deep in large blob (no-prior)"),
+            ]
+            if not skip_spatial_outlier:
+                # DBSCAN spatial-outlier filter never runs when
+                # skip_spatial_outlier is set (hybrid warm path) — see 3b
+                # above — so this entry would be dead/misleading there.
+                strip_entries.append((C_SPAT, "spatial outlier"))
+            strip_entries += [
+                (C_INTERIOR, "deep in large blob"),
                 (C_THRESH,   f"too dim (< {required_threshold})"),
                 (C_AREA_LG,  f"area > {int(max_area)}px"),
                 (C_AREA_SM,  f"pixels < {int(min_area)}"),
@@ -676,11 +713,20 @@ def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
     return r
 
 
-def _eval_model(block: dict, depth, facing_cos=1.0):
-    """Evaluate threshold model: a * facing_cos / depth_m² + b.
-    depth and facing_cos may be scalars or numpy arrays.
+def _eval_model(block: dict, depth, facing_cos=1.0, velocity_px=0.0):
+    """Evaluate threshold model: a * facing_cos / depth_m² + c * velocity_px + b.
+    depth, facing_cos and velocity_px may be scalars or numpy arrays. `c`
+    defaults to 0 (no velocity term) for blocks that don't define it, so
+    existing configs are unaffected until a block is explicitly calibrated
+    with one. `use_facing_cos` (default True) lets a block drop the cos term
+    entirely (area = a/depth² + b) — area-vs-angle calibration data showed no
+    reliable trend (noise across all facing_cos values, unlike the clean
+    inverse-square depth relationship), so max_area is calibrated cos-free.
     """
-    return block["a"] * np.asarray(facing_cos) / np.asarray(depth) ** 2 + block["b"]
+    cos_term = np.asarray(facing_cos) if block.get("use_facing_cos", True) else 1.0
+    return (block["a"] * cos_term / np.asarray(depth) ** 2
+            + block.get("c", 0.0) * np.asarray(velocity_px)
+            + block["b"])
 
 
 def _nms_blobs(all_blobs, min_split_dist):
@@ -749,9 +795,31 @@ def _build_neighborhood_crop(image: np.ndarray, led_projections: np.ndarray,
     return crop, x1, y1
 
 
+def _draw_search_neighborhoods(canvas, led_projections, search_radii,
+                                color=(0, 180, 0)) -> None:
+    """Overlay green search-neighborhood circles + LED-ID labels onto a
+    full-image-coordinate BGR canvas, in place — mirrors _detect_blobs_local's
+    C_ROI circles (same color) so the hybrid warm path's whole-scene pass1/
+    pass2 canvases show where the union-of-neighborhoods crop was actually
+    scoped to, same as the per-LED fit path already does. Hybrid has no
+    per-LED tile grid (a single global threshold applies to the whole crop,
+    unlike fit's per-LED thresholds), so this circle overlay on the shared
+    canvas is the only place that information would otherwise be visible."""
+    for i in range(len(led_projections)):
+        cx = int(round(float(led_projections[i, 0])))
+        cy = int(round(float(led_projections[i, 1])))
+        sr = int(search_radii[i])
+        led_id_vis = int(led_projections[i, 4])
+        cv2.circle(canvas, (cx, cy), sr, color, 1)
+        label_pos = (cx + sr + 2, cy - sr // 2 if cy - sr // 2 > 10 else cy + sr + 10)
+        cv2.putText(canvas, str(led_id_vis), label_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+
 def _detect_blobs_local(image, led_projections, cfg,
                         visualize=False, img_path=None, vis_suffix="",
                         search_radius_px=None, threshold_scale: float = 1.0,
+                        velocity_px: float = 0.0,
                         frame_name=None):
     """
     Pose-guided per-LED local blob detection.
@@ -785,7 +853,7 @@ def _detect_blobs_local(image, led_projections, cfg,
     base_min_area = float(cfg["min_area"])
     if pg is not None:
         pixel_thrs = np.maximum(
-            _eval_model(pg["pixel_threshold"], safe_d, cos_vals).astype(int),
+            _eval_model(pg["pixel_threshold"], safe_d, cos_vals, velocity_px).astype(int),
             base_pixel_thr,
         )
         max_areas  = _eval_model(pg["max_area"], safe_d, cos_vals)
@@ -1169,6 +1237,7 @@ class BlobDetector:
         predicted_leds: Optional[np.ndarray] = None,
         local_search_radius_px: float = 0.0,
         threshold_scale: float = 1.0,
+        velocity_px: float = 0.0,
         visualize: bool = False,
         img_path=None,
         frame_name=None,
@@ -1176,7 +1245,13 @@ class BlobDetector:
         cfg     = self._cfg
         cam_idx = self.camera_idx
 
-        pixel_threshold    = max(int(cfg["min_threshold"] * threshold_scale), 1)
+        # min_threshold is the noise floor — velocity relaxation must never
+        # push below it (that's what the pose-guided fit path's own `c`
+        # velocity term, applied per-LED above this floor, is for instead).
+        # threshold_scale historically multiplied this down; that effect is
+        # now confined to _detect_blobs_local's per-LED pixel_thrs, which has
+        # physics-model headroom above the floor to actually relax.
+        pixel_threshold    = int(cfg["min_threshold"])
         _req_factor        = float(cfg.get("required_threshold_factor", 1.5))
         required_threshold = min(int(pixel_threshold * _req_factor), 255)
 
@@ -1193,6 +1268,7 @@ class BlobDetector:
                 visualize, img_path, f"{cam_str}{ctrl_str}",
                 search_radius_px=local_search_radius_px,
                 threshold_scale=threshold_scale,
+                velocity_px=velocity_px,
                 frame_name=frame_name,
             )
             canvases = {"local": raw[7]} if raw[7] is not None else {}
@@ -1205,6 +1281,7 @@ class BlobDetector:
         offset_x = offset_y = 0
         vis_extra = ""
         search_image = image
+        max_area_pass1 = None
         if has_prior:  # warm_strategy == "hybrid"
             base_px = float(local_search_radius_px) if local_search_radius_px > 0 else 8.0
             depth_k = float(cfg.get("local_search_depth_k", 0.0))
@@ -1213,6 +1290,23 @@ class BlobDetector:
             search_image, offset_x, offset_y = _build_neighborhood_crop(
                 image, predicted_leds, search_radii)
             vis_extra = "_hybridwarm"
+
+            # Fit-based area ceiling for pass 1 — replaces the flat
+            # cfg["max_area"] with a per-frame bound from the predicted LED
+            # depths, evaluated per LED and maxed across LEDs (whichever is
+            # closest implies the loosest allowed area). No clean pass-1-only
+            # calibration data exists to fit this rigorously (calibration_csv
+            # rows mix pass-1/pass-2 blobs), so `b` is hand-tuned by observation
+            # rather than derived from a formal fit.
+            pg = cfg.get("pose_guided_thresholds")
+            if pg is not None and "max_area" in pg:
+                cos_vals_hyb   = predicted_leds[:, 3].astype(np.float64)
+                max_area_pass1 = float(np.max(_eval_model(pg["max_area"], depths, cos_vals_hyb, velocity_px)))
+                # Hard cap: an unreliable/near-degenerate depth estimate (e.g. a
+                # far-away, barely-still-projectable LED) can blow 1/depth² up
+                # arbitrarily large — no real LED area can exceed cfg["max_area"]
+                # regardless of what the formula outputs.
+                max_area_pass1 = min(max_area_pass1, cfg["max_area"])
 
         def _shift(centroids, contours):
             """Offset stats-path results from search_image-local coordinates
@@ -1233,11 +1327,16 @@ class BlobDetector:
         count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
         _mem = self._memory
 
+        _neighborhoods = (predicted_leds, search_radii) if has_prior else None
+
         vis_suffix_1 = f"{cam_str}{ctrl_str}{vis_extra}_pass1" if pass2_factor > 0 else f"{cam_str}{ctrl_str}{vis_extra}"
         result = _detect_blobs(search_image, pixel_threshold, required_threshold, cfg,
                                visualize, img_path, vis_suffix_1,
+                               max_area_override=max_area_pass1,
+                               skip_spatial_outlier=has_prior,
                                frame_name=frame_name,
-                               vis_background=image, vis_offset=(offset_x, offset_y))
+                               vis_background=image, vis_offset=(offset_x, offset_y),
+                               neighborhoods=_neighborhoods)
         large_blobs_pass1 = result[6]
         canvases = {}
         if result[7] is not None:
@@ -1248,7 +1347,6 @@ class BlobDetector:
 
         if pass2_factor > 0 and len(result[0]) >= 2:
             mean_vals = []
-            area_vals = []
             for cnt in result[1]:
                 cnt_int = cnt.reshape(-1, 1, 2).astype(np.int32)
                 xb, yb, wb, hb = cv2.boundingRect(cnt_int)
@@ -1260,7 +1358,6 @@ class BlobDetector:
                 px = search_image[yb:yb + hb, xb:xb + wb][roi_m > 0]
                 if px.size > 0:
                     mean_vals.append(float(np.mean(px)))
-                area_vals.append(float(cv2.contourArea(cnt_int)))
             if mean_vals:
                 ref_brightness   = float(np.percentile(mean_vals, pass2_brightness_percentile))
                 raw_pixel_thr    = int(ref_brightness * pass2_factor)
@@ -1284,23 +1381,53 @@ class BlobDetector:
                         pixel_threshold_2    = _mem["pixel_threshold"]
                         required_threshold_2 = _mem.get("required_threshold", required_threshold)
                         update_memory        = False
-                    max_area_pass2 = float(max(area_vals)) if area_vals else None
+
+                    # Area ceiling: the biggest blob pass 1 actually found this
+                    # frame — real data, not a modeled/scaled estimate. Pass 1's
+                    # own detection already enforced max_area_pass1 (the physics
+                    # cap) via max_area_override when it ran, so every blob in
+                    # `result` is already bounded by it; pass 2's threshold is
+                    # never lower than pass 1's, so a real blob can only shrink
+                    # or stay the same size going into pass 2 — meaning this
+                    # ceiling can never legitimately clip a genuine pass-2 blob.
+                    # No brightness ratio, no population statistics, no
+                    # stability guard needed.
+                    #
+                    # Must be measured via _filled_px_area (exact pixel count,
+                    # matching _detect_blobs's own too_large check), NOT via
+                    # result[2] (filtered_radii, which is contourArea-derived —
+                    # see the return statement above — and systematically
+                    # underestimates small/irregular blobs). Comparing a
+                    # contourArea-based ceiling against pass 2's CC_STAT_AREA-
+                    # based too_large check was rejecting correctly-sized pass-2
+                    # blobs by up to ~2x on real data.
+                    pass1_max_area = max_area_pass1 if max_area_pass1 is not None else cfg["max_area"]
+                    pass1_areas    = np.array([_filled_px_area(c) for c in result[1]], dtype=np.float64)
+                    max_area_pass2 = min(float(np.max(pass1_areas)), pass1_max_area)
+
                     result2 = _detect_blobs(
                         search_image, pixel_threshold_2, required_threshold_2, cfg,
                         visualize, img_path, f"{cam_str}{ctrl_str}{vis_extra}_pass2",
                         max_area_override=max_area_pass2,
                         min_area_override=min_area_pass2,
                         interior_exclude_blobs=large_blobs_pass1,
+                        skip_spatial_outlier=has_prior,
                         frame_name=frame_name,
                         vis_background=image, vis_offset=(offset_x, offset_y),
+                        neighborhoods=_neighborhoods,
                     )
                     if result2[7] is not None:
                         canvases["pass2"] = result2[7]
                     if len(result2[0]) >= 1:
+                        # Always a deterministic, physics-derived value (no
+                        # population stats involved) — always safe to remember
+                        # for the memory-reuse branch below, unlike the old
+                        # stats-based ceiling which could be a fallback/non-
+                        # measurement that shouldn't have been remembered.
+                        _mem["max_area"] = max_area_pass2
                         if update_memory:
                             _mem["pixel_threshold"]    = pixel_threshold_2
                             _mem["required_threshold"] = required_threshold_2
-                            _mem["max_area"]           = max_area_pass2
                             _mem["large_blobs"]        = large_blobs_pass1
                             _mem["blob_count"]         = cur_count
                         corrected_radii = _correct_radii_for_threshold(
@@ -1311,15 +1438,37 @@ class BlobDetector:
                                 canvases)
 
         elif pass2_factor > 0 and _mem:
+            # This branch means pass 1 found <2 blobs this frame — too few for
+            # the brightness-percentile calibration above, but that has
+            # nothing to do with the area ceiling. Use THIS frame's own pass-1
+            # blob(s) directly when there's at least one — even a single
+            # blob's real, current area is strictly better than a stale
+            # _mem["max_area"] left over from whenever memory was last
+            # updated, which could be a much earlier frame with a completely
+            # different (and possibly much smaller) set of visible blobs.
+            # Only fall back to stored/physics values when pass 1 found
+            # nothing at all this frame.
+            # Measured via _filled_px_area, not result[2] (contourArea-
+            # derived radii) — see the fresh-branch comment above for why.
+            _pass1_area_ref = max_area_pass1 if max_area_pass1 is not None else cfg["max_area"]
+            if len(result[1]) > 0:
+                _mem_max_area = min(max(_filled_px_area(c) for c in result[1]), _pass1_area_ref)
+            else:
+                _mem_max_area = _mem.get("max_area")
+                if _mem_max_area is None:
+                    _mem_max_area = _pass1_area_ref
+                _mem_max_area = min(_mem_max_area, _pass1_area_ref)
             result2 = _detect_blobs(
                 search_image, _mem["pixel_threshold"],
                 _mem.get("required_threshold", required_threshold), cfg,
                 visualize, img_path, f"{cam_str}{ctrl_str}{vis_extra}_pass2",
-                max_area_override=_mem["max_area"],
+                max_area_override=_mem_max_area,
                 min_area_override=min_area_pass2,
                 interior_exclude_blobs=large_blobs_pass1,
+                skip_spatial_outlier=has_prior,
                 frame_name=frame_name,
                 vis_background=image, vis_offset=(offset_x, offset_y),
+                neighborhoods=_neighborhoods,
             )
             if result2[7] is not None:
                 canvases["pass2"] = result2[7]

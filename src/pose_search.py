@@ -18,6 +18,17 @@ from src._pnp import _ransac_pnp, _project_points, _check_z_range
 from src._visibility import _visible_mask, _cross_occluded_mask
 from src.transformations import Transform
 
+# Identity intrinsics / zero distortion for solveP3P/solvePnP calls that
+# operate on already-normalized/undistorted points — these never vary per
+# call, so build them once instead of on every P3P hypothesis (measured
+# 130k+ redundant np.eye(3) constructions per brute-force run otherwise).
+# Safe to share the same array across calls: cv2's PnP/P3P solvers only read
+# these, they never mutate them in place.
+_IDENTITY_K_F32 = np.eye(3, dtype=np.float32)
+_ZERO_DIST_F32  = np.zeros(4, dtype=np.float32)
+_IDENTITY_K_F64 = np.eye(3, dtype=np.float64)
+_ZERO_DIST_F64  = np.zeros(4, dtype=np.float64)
+
 
 # ── LED graph helpers (from _led_graph.py) ──────────────────
 
@@ -416,7 +427,14 @@ def fuse_camera_poses(
     single view. Otherwise, every contributor is weighted by pair count times its own
     confidence — a camera that had to guess through a lot of ambiguity, or scored a low
     RANSAC-validated inlier ratio, contributes less than a clean, independently solved
-    one — seeded from whichever cam_solutions entry had the lowest solo error.
+    one — seeded from the highest-confidence entry (lowest solo error breaks ties),
+    not just whichever had the lowest solo error: a confidence=0 solve (e.g. a bare
+    2-3 point prior_constrained fit with fixed rotation and no aux, which can't
+    actually constrain depth) can score a deceptively tiny reprojection error while
+    still being a poor 3D estimate — picking it as the joint LM's initial guess would
+    hand the optimiser a bad starting point even though its own residuals are
+    correctly weighted to zero in the objective, risking a worse fused result than
+    the confident camera would have reached alone within the iteration budget.
 
     Returns (fused T_world_ctrl, mean_reproj_err_px), or (None, inf) if cam_solutions is empty.
     """
@@ -426,7 +444,7 @@ def fuse_camera_poses(
         sol = cam_solutions[0]
         return sol['T_world_ctrl'], sol['error']
 
-    seed   = min(cam_solutions, key=lambda s: s['error'])
+    seed   = min(cam_solutions, key=lambda s: (-float(s.get('confidence', 1.0)), s['error']))
     others = [s for s in cam_solutions if s is not seed]
     aux_cam_data   = [(s['camera'], s['blobs'], s['pairs']) for s in others]
     cam_confidence = {s['camera'].camera_idx: float(s.get('confidence', 1.0)) for s in cam_solutions}
@@ -847,7 +865,7 @@ class PoseSearcher:
                     _lk_ok, _lk_rv, _lk_tv = cv2.solvePnP(
                         _lk_obj.astype(np.float64).reshape(-1, 1, 3),
                         _lk_norm.astype(np.float64).reshape(-1, 1, 2),
-                        np.eye(3, dtype=np.float64), np.zeros(4, dtype=np.float64),
+                        _IDENTITY_K_F64, _ZERO_DIST_F64,
                         rvec_pred.astype(np.float64).copy(),
                         tvec_pred.astype(np.float64).reshape(3, 1).copy(),
                         useExtrinsicGuess=True,
@@ -884,7 +902,7 @@ class PoseSearcher:
                         ok_h, rvec_h, tvec_h = cv2.solvePnP(
                             all_obj.astype(np.float64).reshape(-1, 1, 3),
                             pts_norm.astype(np.float64).reshape(-1, 1, 2),
-                            np.eye(3, dtype=np.float64), np.zeros(4, dtype=np.float64),
+                            _IDENTITY_K_F64, _ZERO_DIST_F64,
                             rvec_pred.astype(np.float64).copy(),
                             tvec_pred.astype(np.float64).reshape(3, 1).copy(),
                             useExtrinsicGuess=True,
@@ -2028,8 +2046,8 @@ class PoseSearcher:
                         n_sols, rvecs, tvecs = cv2.solveP3P(
                             p3p_world_pts.reshape(3, 1, 3),
                             p3p_img_norm.reshape(3, 1, 2).astype(np.float32),
-                            np.eye(3, dtype=np.float32),
-                            np.zeros(4, dtype=np.float32),
+                            _IDENTITY_K_F32,
+                            _ZERO_DIST_F32,
                             flags=cv2.SOLVEPNP_P3P,
                         )
                         self._dbg(dbg, f"  P3P returned {n_sols} solutions")

@@ -159,7 +159,7 @@ def main():
         _csv_file = open(_csv_path, "w", newline="")
         _csv_writer = csv.writer(_csv_file)
         _csv_writer.writerow(["frame", "ctrl_name", "cam_idx",
-                               "led_id", "depth_m", "facing_cos",
+                               "led_id", "depth_m", "facing_cos", "velocity_px",
                                "brightness", "area"])
         logger.info(f"Calibration CSV → {_csv_path}")
 
@@ -184,6 +184,13 @@ def main():
         # per_ctrl_blobs: {ctrl_name: {cam_idx: BlobResult}}
         per_ctrl_blobs: dict = {}
         frame_blob_vis: dict = {}
+        # {ctrl_name: [cam_idx, ...]} — cameras skipped this frame (out-of-
+        # scope: no prediction while the controller has one via another
+        # camera). No detect() call means no canvas, so Rerun would otherwise
+        # keep showing whatever was last logged for that camera — frozen,
+        # possibly for hundreds of frames — which looks indistinguishable
+        # from a permanently-cold detection. See _log_blob_debug's use of this.
+        skipped_cams_per_ctrl: dict = {}
 
         # ── Phase 1: detect blobs for every controller on the original images ──
         _match_cfg = config["matching"]
@@ -221,6 +228,7 @@ def main():
                         kwargs.get("predicted_leds"),
                         kwargs.get("local_search_radius_px", 0.0),
                         kwargs.get("threshold_scale", 1.0),
+                        kwargs.get("velocity_px", 0.0),
                         _visualize_compute, img_path_arg, img_path.name,
                         _cold_memory.get((cam_idx, ctrl_name)),
                     )
@@ -238,6 +246,7 @@ def main():
                         predicted_leds=kwargs.get("predicted_leds"),
                         local_search_radius_px=kwargs.get("local_search_radius_px", 0.0),
                         threshold_scale=kwargs.get("threshold_scale", 1.0),
+                        velocity_px=kwargs.get("velocity_px", 0.0),
                         visualize=_visualize_compute,
                         img_path=img_path_arg,
                         frame_name=img_path.name,
@@ -292,7 +301,10 @@ def main():
                     predicted_leds=_pred,
                     local_search_radius_px=radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r),
                     threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
+                    velocity_px=_v_px,
                 )
+
+            skipped_cams_per_ctrl[ctrl_name] = list(_skipped_cams)
 
             _t_blob0 = time()
             _phase1_results, _warm_ms_per_cam = _run_blob_detect_batch(ctrl_name, _cam_kwargs)
@@ -473,23 +485,28 @@ def main():
                 if _csv_writer:
                     _proj = proj_hints.get(primary_cam_idx, {}).get(ctrl_name)
                     if _proj is not None:  # warm path was active for this camera
-                        led_lookup = {
-                            int(row[4]): (float(row[2]), float(row[3]))
-                            for row in _proj
-                        }
                         _cam_result = per_ctrl_blobs[ctrl_name].get(primary_cam_idx)
                         _brts  = _cam_result.brightnesses if _cam_result is not None else None
                         _radii = _cam_result.radii        if _cam_result is not None else None
                         if _brts is not None and _radii is not None:
+                            # Depth/facing_cos from the pose actually solved this
+                            # frame, not proj_hints' pre-match extrapolation —
+                            # the extrapolation is stale exactly when the
+                            # controller is rotating/accelerating fast.
+                            _led_ids = [led_id for _, led_id in sol["assignment"]]
+                            _geom = tracking_system.solved_led_geometry(
+                                ctrl_name, primary_cam_idx, T_world_ctrl, _led_ids)
+                            _vel_px = vel_hints.get(primary_cam_idx, {}).get(ctrl_name, 0.0)
                             for blob_idx, led_id in sol["assignment"]:
-                                if led_id not in led_lookup:
+                                if led_id not in _geom:
                                     continue
-                                _depth_m, _facing_cos = led_lookup[led_id]
+                                _depth_m, _facing_cos = _geom[led_id]
                                 _csv_writer.writerow([
                                     img_path.name, ctrl_name, primary_cam_idx,
                                     led_id,
                                     f"{_depth_m:.5f}",
                                     f"{_facing_cos:.5f}",
+                                    f"{_vel_px:.3f}",
                                     f"{float(_brts[blob_idx]):.1f}",
                                     f"{float(np.pi * _radii[blob_idx] ** 2):.2f}",
                                 ])
@@ -515,6 +532,7 @@ def main():
                 aux_assignments_per_ctrl=aux_assignments_frame_out,
                 frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
                 blob_vis_frame=(frame_blob_vis if _visualize_rerun else {}),
+                blob_vis_skipped=(skipped_cams_per_ctrl if _visualize_rerun else {}),
             )
             logger.info(f"[{img_path.name}]  rerun log_frame: {(time() - _t_rerun0) * 1000:.1f}ms")
 

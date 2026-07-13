@@ -1,6 +1,7 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only/a"
-#  root: "./data/datasets/first_ds"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
+#  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
+#  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
@@ -68,9 +69,9 @@ blob_detection:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of its two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
-  min_threshold: 6                  # pixels >= this are included in a blob
+  min_threshold: 7                  # pixels >= this are included in a blob
   min_area: 2
   max_area: 500
   min_split_dist: 4.0
@@ -89,15 +90,28 @@ blob_detection:
                           # the union of predicted-LED search neighborhoods
                           # instead of the full frame
   pose_guided_thresholds:
-    # Formula: threshold = a * facing_cos / depth_m² + b
+    # Formula: threshold = a * facing_cos / depth_m² + c * velocity_px + b
     #   a  — scales the Lambertian + inverse-square physics term
+    #   c  — velocity coefficient (per px/frame of controller motion); 0 = no
+    #        effect, omit or leave at 0 until calibrated from calibration_csv
+    #        data (previously velocity was only handled by the separate
+    #        velocity_threshold_k/threshold_scale relaxation below, which is
+    #        now floor-limited at min_threshold and largely inert for this path)
     #   b  — constant floor independent of geometry (noise baseline)
     pixel_threshold:
       a: 0.1
+      c: 0.0
       b: 6.0
     max_area:
-      a: 3.0
-      b: 35.0
+      # cos-free: area-vs-angle calibration data showed no reliable trend (noise
+      # across all facing_cos values), unlike the clean inverse-square depth fit —
+      # values below from MANUAL_AB=(0.8, 25) verification in fit_max_area.py with
+      # USE_FACING_COS=False; re-run that script's auto-fit (MANUAL_AB=None) for a
+      # precise lstsq value once more calibration data is collected.
+      use_facing_cos: false
+      a: 1.2
+      b: 40
+      c: 0.5
     min_area:
       a: 0.05
       b: -20.0
@@ -115,6 +129,9 @@ blob_detection:
   pass2_min_area: 2                 # null = use min_area; blobs shrink under higher threshold so can be smaller
   pass2_threshold_ema_alpha: 0.25   # EMA weight on the new threshold (0=frozen, 1=no smoothing)
   pass2_count_gate_max_factor: 1.7  # skip EMA update if blob count changes by more than this factor
+                                    # max_area_pass2 = the biggest blob pass 1 actually found this frame
+                                    # (already bounded by pass 1's own physics-based ceiling below) —
+                                    # no separate config needed; see BlobDetector.detect for details
 
 geometry:
   z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
@@ -254,7 +271,7 @@ self_calibration:
   plots_dir: "./data/cameras/"    # directory where self_cal_cam{N}.png plots are saved
 
 debug:
-  calibration_csv: null # "./data/calib_warm.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
+  calibration_csv: null # "./data/calib_warm_pass1.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
   mode_active: true
   split_to_folders: false
   verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
