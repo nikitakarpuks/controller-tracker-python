@@ -830,3 +830,157 @@ Phase 1 — Parallel race
 
 ✻ Baked for 43s
 
+so, we must consider some serious changes in the code.
+  1) we must enable parallel search for 2 controllers, they should go independently; this must be done for computation time sake
+  2) however strictly speaking this process is not fully independent
+  3) easiest case to handle - both controllers are warm, both have previous poses known. In this case we achieve full parallelization, the blob detection and pose search processes are
+  completely independent. In the case of intersecting neighborhoods we do nothing, we use our hyps check algorithm, and we rely on our extrapolation. The Voronoi filter idea is not
+  really needed. Consider a case when both controllers have exactly same blob. Theoretically it is possible that this is true indeed, 2 leds projection from 2 controllers lands in same
+  blob, and I have no problem with 2 controllers assign same blob as far as it improves their accuracy.
+  4) However cold-cold or cold-warm cases are much more complex
+  5) cold-warm - we know pose for one controller, do not know for 2nd. First idea is that we must do cold-brute in all frames for a cold controller. However we can fully black out warm
+  controller neighborhoods where we expect to see the warm controller blob. This doesn't create much risk
+  6) cold-cold scenario, hardest and most cross-dependent case. The blob detection is common, but the blob set is fully shared; I can easily imagine a situation when one controller
+  could get a match with other controller blobs. It would have relatively big error, but anyway. We could
+  6.1 do correspondece search in parallel
+  6.2 when one controller finds a good solution and we early stop, then both processes are stopped. One controller gets assignments and we black out its blobs; then unmatched controller
+  continues search with other controllers blobs blacked out. ASlso not to do double job, we can remember which combinations were already checked and we can skip them
+
+  This are my ideas in general, analyse them, think deep, comment each point, critisize
+
+  Good grounding first: I read pose_search.py's BruteSearchState and brute_search_tier. Two things there matter for this discussion — seen_bijections/prev_blob_max_per_triple(_edge)
+  already implement "remember what's been tried, skip it on the next tier" within one controller's own widening-tier search, and BruteSearchState currently tracks a single best_solution,
+  not a ranked list of alternates. Both facts bite on your point 6. Here's the point-by-point.
+
+  1) Parallelize controllers — agreed, but the blocker isn't compute, it's orchestration
+
+  The pool is already keyed by (ctrl_name, cam_idx) in _POSE_SEARCHERS/_BUILD_SPECS — the worker registry was built anticipating multi-controller dispatch. The actual obstacle is that
+  main.py calls tracking_system.update() once per controller, sequentially, with ctrl_name_filter set, and ControllerTracker.update() is synchronous end-to-end: it submits a batch of
+  per-camera futures, blocks on .result() for all of them, does tier rounds (each round also blocks on the whole round), then does the LM fusion — all before returning control to main.py,
+  which only then starts controller B. So today's "parallelism" is camera-level inside one controller's turn; controller-level work is fully serialized by the outer loop, regardless of
+  the pool.
+
+  Real parallelization means widening the batching from {cam_idx: future} to {(ctrl_name, cam_idx): future} — submit controller A's and B's per-camera cheap-search tasks in the same
+  round, gather together. This is a moderate refactor (the tier-round "wait for the whole round, then decide" pattern already exists in ControllerTracker.update() — it needs to move up to
+  TrackingSystem.update() so it can see both controllers at once), not a rewrite. Also don't forget: doubling concurrent submissions without resizing the pool (max(1, len(cameras))
+  workers today) just adds queueing, not speedup — pool sizing needs revisiting alongside this.
+
+  2) "Not fully independent" — correct, and this is really the crux of everything else
+
+  Worth being precise about where the dependency lives: blob detection is embarrassingly parallel for warm controllers (each does its own local ROI search, no shared mutable state —
+  genuinely independent). The dependency is entirely in the candidate pool for matching — cold-start brute-force draws from the same physical blob set — and, orthogonally, in physical
+  occlusion (one controller's body blocking another's LED). Your points 3–6 map cleanly onto these two dependency types, which is a good decomposition.
+
+  3) Warm-warm — agree it's the easy case, but this has a real consequence you should own explicitly
+
+  Your "sharing a blob is fine, RANSAC/hyp-check will sort it out" instinct is right, and I'd go further: it's why the current _exclude_claimed_blobs in main.py and the (currently
+  unreachable, since ctrl_name_filter collapses ordered to length 1) Voronoi-reservation block in TrackingSystem.update() exist at all — someone was worried about exactly this and built
+  explicit exclusion. If you commit to point 3's philosophy, the conclusion isn't just "Voronoi isn't needed" — it's "the existing claimed-blob exclusion between controllers should be
+  turned off for the warm-warm case," because right now it's the only thing standing between your stated philosophy and the code's actual behavior. That's worth stating as a decision, not
+  just an omission, since it's a behavior change from what ships today.
+
+  One thing to actually verify empirically, not just reason about: when a merged blob's centroid sits between two controllers' true LED positions (min_split_dist failed to separate them),
+  both controllers get a biased centroid, not a "shared but correct" one. Your argument that RANSAC/inlier-threshold self-corrects this only holds if each controller has enough other
+  good inliers that this one gets down-weighted or excluded — worth confirming min_inliers/RANSAC threshold margins hold up under a genuinely adversarial two-hands-touching test sequence
+  before trusting this in general, since that's precisely the geometry where it's most likely to bite and least likely to have spare inliers.
+
+  4/5) Cold-warm — mostly already-built machinery, one real risk you should name explicitly
+
+  "Blackout doesn't create much risk" undersells one thing: whatever mask you use has to be built from the warm controller's predicted pose (extrapolation), not its confirmed this-frame
+  pose, if you want cold and warm to actually run concurrently — the confirmed pose for this frame doesn't exist yet until warm's own cheap search resolves. That reintroduces exactly the
+  staleness this codebase is already careful about elsewhere (see the _reacquiring / current-frame-guard logic in finalize_search and the explicit "not a prev_pose carry-over" guard
+  called out for cross-controller occlusion in your own notes file). Concretely: if the warm controller is mid-fast-motion and its extrapolation has drifted, you could black out a region
+  that actually contains the cold controller's real LED, causing a spurious failure to reacquire — low probability, but concentrated exactly at the moments (controllers passing near each
+  other) where you most need cold-start to work.
+
+  Mitigation is basically free, though: reuse the radius that's already velocity/uncertainty-expanded for warm's own blob-detection ROI (radius_hints in main.py, proximity_expansion_*
+  config) rather than a fixed blackout radius — it's already self-widening under exactly the uncertainty conditions that make staleness dangerous. And mechanically this doesn't need new
+  infrastructure: it's a narrower, one-directional version of the dormant _ctrl_reservations block in TrackingSystem.update() — "always reserve for the warm one" instead of "reserve for
+  whichever prediction is closer." Getting cold-warm right is mostly a matter of re-enabling and simplifying code that's already written, not writing new algorithms.
+
+  6) Cold-cold — you're right this is hardest, and 6.2 has a real tension with 3 worth resolving explicitly
+
+  Worth being precise about where the dependency lives: blob detection is embarrassingly parallel for warm controllers (each does its own local ROI search, no shared mutable state —
+  genuinely independent). The dependency is entirely in the candidate pool for matching — cold-start brute-force draws from the same physical blob set — and, orthogonally, in physical
+  occlusion (one controller's body blocking another's LED). Your points 3–6 map cleanly onto these two dependency types, which is a good decomposition.
+
+  3) Warm-warm — agree it's the easy case, but this has a real consequence you should own explicitly
+
+  Your "sharing a blob is fine, RANSAC/hyp-check will sort it out" instinct is right, and I'd go further: it's why the current _exclude_claimed_blobs in main.py and the (currently
+  unreachable, since ctrl_name_filter collapses ordered to length 1) Voronoi-reservation block in TrackingSystem.update() exist at all — someone was worried about exactly this and built
+  explicit exclusion. If you commit to point 3's philosophy, the conclusion isn't just "Voronoi isn't needed" — it's "the existing claimed-blob exclusion between controllers should be
+  turned off for the warm-warm case," because right now it's the only thing standing between your stated philosophy and the code's actual behavior. That's worth stating as a decision, not
+  just an omission, since it's a behavior change from what ships today.
+
+  One thing to actually verify empirically, not just reason about: when a merged blob's centroid sits between two controllers' true LED positions (min_split_dist failed to separate them),
+  both controllers get a biased centroid, not a "shared but correct" one. Your argument that RANSAC/inlier-threshold self-corrects this only holds if each controller has enough other
+  good inliers that this one gets down-weighted or excluded — worth confirming min_inliers/RANSAC threshold margins hold up under a genuinely adversarial two-hands-touching test sequence
+  before trusting this in general, since that's precisely the geometry where it's most likely to bite and least likely to have spare inliers.
+
+  4/5) Cold-warm — mostly already-built machinery, one real risk you should name explicitly
+
+  "Blackout doesn't create much risk" undersells one thing: whatever mask you use has to be built from the warm controller's predicted pose (extrapolation), not its confirmed this-frame
+  pose, if you want cold and warm to actually run concurrently — the confirmed pose for this frame doesn't exist yet until warm's own cheap search resolves. That reintroduces exactly the
+  staleness this codebase is already careful about elsewhere (see the _reacquiring / current-frame-guard logic in finalize_search and the explicit "not a prev_pose carry-over" guard
+  called out for cross-controller occlusion in your own notes file). Concretely: if the warm controller is mid-fast-motion and its extrapolation has drifted, you could black out a region
+  that actually contains the cold controller's real LED, causing a spurious failure to reacquire — low probability, but concentrated exactly at the moments (controllers passing near each
+  other) where you most need cold-start to work.
+
+  Mitigation is basically free, though: reuse the radius that's already velocity/uncertainty-expanded for warm's own blob-detection ROI (radius_hints in main.py, proximity_expansion_*
+  config) rather than a fixed blackout radius — it's already self-widening under exactly the uncertainty conditions that make staleness dangerous. And mechanically this doesn't need new
+  infrastructure: it's a narrower, one-directional version of the dormant _ctrl_reservations block in TrackingSystem.update() — "always reserve for the warm one" instead of "reserve for
+  whichever prediction is closer." Getting cold-warm right is mostly a matter of re-enabling and simplifying code that's already written, not writing new algorithms.
+
+  6) Cold-cold — you're right this is hardest, and 6.2 has a real tension with 3 worth resolving explicitly
+
+  6.1 — fine, straightforward, same batching as point 1.
+
+  6.2, "stop both processes" — there's no real mid-task cancellation in a ProcessPoolExecutor; a submitted brute_search_tier task runs to completion. But you don't need true cancellation
+  — the existing tier-round loop already treats a tier boundary as the natural checkpoint (for tier_idx: submit; wait for round; if any strong_found: stop widening). Extend that same
+  barrier across controllers: run tier 0 for A and B together, check after the round whether either hit strong_found, and only then decide who continues. No new cancellation primitive
+  needed — just widen the existing round-barrier's key space, consistent with the point-1 refactor.
+
+  The "then unmatched controller continues" part is trickier than it sounds. B ran tier 0 concurrently against the un-blacked-out blob set, so it already built hypotheses that may use A's
+  now-claimed blobs. You can't "continue" B's search — its partial state is contaminated by blobs that are no longer eligible. What you actually want is either (a) reject, post-hoc, any
+  of B's already-considered hypotheses that touch a now-claimed blob and see if a surviving one is already good enough (cheap — no new search), falling back to (b) a fresh tier pass over
+  the reduced blob set only if nothing survives. (a) requires BruteSearchState to retain more than the single best_solution it does today — you'd want a small top-K candidate list per
+  tier so there's something to fall back to when the winner gets invalidated. That's a real, if contained, structural change.
+
+  This is also where 6.2 quietly contradicts 3. Point 3 says shared blobs are fine and self-correcting via RANSAC. Point 6 proposes forcibly excluding a claimed blob from the other
+  controller. I think the honest resolution is: they're solving different problems. In the warm case, a shared blob is a minor bias on an otherwise well-constrained fit — plenty of other
+  inliers absorb it. In cold brute-force, an ambiguous blob isn't a bias, it's a combinatorial contamination risk — a spurious-but-geometrically-consistent P3P hypothesis ("phantom pose")
+  is much more likely when the candidate pool is polluted by another controller's LEDs and there's no prior to disambiguate. So blackout in 6 is a search-space pruning heuristic to
+  suppress false positives in an unconstrained search, not a claim that shared blobs are physically illegitimate — worth stating that distinction explicitly so future-you doesn't read 3
+  and 6 as inconsistent.
+
+
+  Two more things worth flagging before you build this:
+  - Whichever controller reaches strong_found first in the shared round is a scheduling race, not a deterministic outcome. Non-deterministic frame-to-frame blob claims will make bad frames hard to
+  reproduce. Add a deterministic tie-break (e.g. current get_ctrl_processing_order priority, or lower fused error) for the case where both hit strong in the same round.
+  - The "remember checked combos" idea already has a namesake in this codebase — seen_bijections and prev_blob_max_per_triple(_edge) do exactly this, but scoped to widening tiers within one
+  controller's own attempt. Extending that cache to survive a cross-controller blob exclusion is a generalization, not a fresh feature, but it's not free: you'd need to reason about which cached
+  triples/bijections are invalidated by removing a blob, which is more bookkeeping than it first appears. I'd build 6.2 without this optimization first — plain re-search over the reduced set for
+  and 6 as inconsistent.
+
+  Two more things worth flagging before you build this:
+  Two more things worth flagging before you build this:
+  - Whichever controller reaches strong_found first in the shared round is a scheduling race, not a deterministic outcome. Non-deterministic frame-to-frame blob claims will make bad frames hard to
+  reproduce. Add a deterministic tie-break (e.g. current get_ctrl_processing_order priority, or lower fused error) for the case where both hit strong in the same round.
+  - The "remember checked combos" idea already has a namesake in this codebase — seen_bijections and prev_blob_max_per_triple(_edge) do exactly this, but scoped to widening tiers within one
+  controller's own attempt. Extending that cache to survive a cross-controller blob exclusion is a generalization, not a fresh feature, but it's not free: you'd need to reason about which cached
+  triples/bijections are invalidated by removing a blob, which is more bookkeeping than it first appears. I'd build 6.2 without this optimization first — plain re-search over the reduced set for
+  and 6 as inconsistent.
+  Two more things worth flagging before you build this:
+  - Whichever controller reaches strong_found first in the shared round is a scheduling race, not a deterministic outcome. Non-deterministic frame-to-frame blob claims will make bad
+  frames hard to reproduce. Add a deterministic tie-break (e.g. current get_ctrl_processing_order priority, or lower fused error) for the case where both hit strong in the same round.
+  - The "remember checked combos" idea already has a namesake in this codebase — seen_bijections and prev_blob_max_per_triple(_edge) do exactly this, but scoped to widening tiers within
+  one controller's own attempt. Extending that cache to survive a cross-controller blob exclusion is a generalization, not a fresh feature, but it's not free: you'd need to reason about
+  which cached triples/bijections are invalidated by removing a blob, which is more bookkeeping than it first appears. I'd build 6.2 without this optimization first — plain re-search over
+  the reduced set for the loser — and only add the dedup cache if profiling shows simultaneous cold-cold recovery (both controllers losing track in the same frame) is actually common
+  enough to matter. My guess is it's rare (mostly frame 1, or a shared occlusion event) and not worth the complexity up front.
+
+  Suggested build order
+
+  Given the risk/effort gradient you yourself laid out: (1) warm-warm batching + dropping cross-controller claimed-blob exclusion for that path — biggest win, least new code, mostly a
+  deletion plus widening the pool-batch key. (2) cold-warm blackout using the extrapolated (not confirmed) warm pose, reusing the existing expansion-radius logic. (3) cold-cold shared
+  tier-round barrier with post-hoc hypothesis rejection — no dedup cache yet. Only revisit the seen_bijections-style cache for cold-cold if real sequences show it's a hot path.

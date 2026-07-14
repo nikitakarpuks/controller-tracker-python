@@ -1,7 +1,10 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
+#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
 #  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
-#  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
+  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
+
+#  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
+
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
@@ -57,7 +60,7 @@ controllers:
           half_length: 0.037
           color: [255, 55, 55]
   left_controller:
-    enabled: false
+    enabled: true
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
@@ -69,7 +72,7 @@ blob_detection:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of its two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   min_threshold: 7                  # pixels >= this are included in a blob
   min_area: 2
@@ -117,6 +120,11 @@ blob_detection:
       b: -20.0
   local_search_depth_k: 0.0         # extra radius: r = base + k/depth_m (0 = fixed radius)
   blob_cross_mask_margin_px: 3      # extra px added to matched-blob radius when masking ctrl A from ctrl B
+  cross_controller_blackout: true   # before a controller's full-image COLD detection, zero out every
+                                     # other warm controller's expected LED neighborhoods (exact same
+                                     # radius that controller's own hybrid-warm detection already uses,
+                                     # no extra margin) — cold brute-force then never considers pixels
+                                     # already accounted for by another controller's tracked LEDs
 
   # ── Cold path – pass 1 (full-image detection, no prior) ───────────────────
   outlier_factor: 2.5               # 1-NN distance > this * median(1-NN) → spatial outlier
@@ -146,13 +154,22 @@ matching:
   parallel_search_enabled: true    # dispatch per-camera cheap search and brute-force
                                     # tier rounds to a persistent process pool; false
                                     # falls back to the equivalent sequential loop
-  parallel_search_workers: null    # pool size; null = number of cameras
+  parallel_search_workers: 6       # pool size; null = number of cameras (4). Bumped
+                                    # to nproc for warm-warm two-controller batching
+                                    # (up to 2 ctrl x 4 cams concurrent tasks); realistic
+                                    # load is usually <= this thanks to per-camera
+                                    # visibility pruning (out-of-scope cameras are
+                                    # skipped before dispatch, see main.py Phase 1).
 
   # --------------------------------------------------------------------------
   # LED physical model
   # --------------------------------------------------------------------------
   led_facing_angle_deg: 90.0      # emission half-angle; LEDs beyond this from camera axis are culled
   led_radius_mm: 3.0              # physical emitter radius; drives depth-scaled snap and size thresholds
+  max_warm_search_cameras: 2      # cap on how many cameras a warm controller searches per frame —
+                                   # ranked by sum(facing_cos) over visible LEDs (theoretical visibility
+                                   # alone often includes a barely-useful grazing-angle 3rd/4th camera);
+                                   # bounds both blob-detection and pose-search task count per controller
 
   # --------------------------------------------------------------------------
   # Brute match
@@ -280,7 +297,7 @@ debug:
   debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
-  enabled: true  # set to false to skip Rerun entirely (no per-frame logging, no
+  enabled: false  # set to false to skip Rerun entirely (no per-frame logging, no
                  # viewer, no .rrd file) — for isolating tracking-only speed;
                  # save_recording below only controls whether an enabled
                  # session also gets written to disk, not whether it runs at all.

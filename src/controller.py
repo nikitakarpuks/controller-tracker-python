@@ -792,8 +792,6 @@ class ControllerTracker:
                 _t.tracking_lost_last_frame = True
             return None
 
-        from src.pose_search import fuse_camera_poses
-
         # ── Every available camera searches independently ──────────────────────
         # Own blobs only — no aux-camera folding at the per-camera search level;
         # cross-camera fusion happens once, below, via fuse_camera_poses().
@@ -980,6 +978,35 @@ class ControllerTracker:
                 _t.tracking_lost_last_frame = True
             return None
 
+        return self._fuse_and_finalize(
+            cam_solutions, obs_src, claimed_blobs, frame_ts_ns,
+            fixed_primary_cam=fixed_primary_cam, self_cal=self_cal,
+        )
+
+    def _fuse_and_finalize(
+        self,
+        cam_solutions: List[dict],
+        obs_src: Dict[int, np.ndarray],
+        claimed_blobs: Optional[Dict[int, Set[int]]],
+        frame_ts_ns: int,
+        fixed_primary_cam: Optional[int] = None,
+        self_cal=None,
+    ) -> Dict:
+        """Fuse every camera's independent solution into one controller pose,
+        register claimed blobs, feed self-calibration, and propagate the fused
+        pose into every camera tracker's state. Shared tail for both the
+        tier-round recovery path (update(), above) and the batched warm-warm
+        path (TrackingSystem.update_warm_batch()) — extracted so the ~140
+        lines of fusion/propagation logic aren't duplicated between them.
+
+        claimed_blobs=None skips claim registration entirely — used by the
+        warm-warm batched path, which deliberately does not track
+        cross-controller blob claims (two controllers assigning the same
+        blob is accepted there; each controller's own RANSAC/inlier scoring
+        absorbs it). cam_solutions must be non-empty.
+        """
+        from src.pose_search import fuse_camera_poses
+
         # ── Fuse every camera's independent solution into one pose ─────────────
         _fuse_in = [
             {
@@ -1056,9 +1083,10 @@ class ControllerTracker:
         self._designated_primary = primary_cam_id
 
         # ── Register claimed blobs (every camera that actually solved) ──────────
-        for cs in cam_solutions:
-            for b, _ in cs["solution"]["assignment"]:
-                claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
+        if claimed_blobs is not None:
+            for cs in cam_solutions:
+                for b, _ in cs["solution"]["assignment"]:
+                    claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
 
         # ── Self-calibration feed ────────────────────────────────────────────────
         if (self_cal is not None
@@ -1278,6 +1306,11 @@ class TrackingSystem:
         # geometrically guaranteed not to help.
         _min_vis_leds = int(self._matching_cfg.get(
             'min_visible_leds_for_search', self._matching_cfg.get('min_inliers', 4)))
+        # Theoretical visibility (>= _min_vis_leds) doesn't mean "worth searching" —
+        # a controller can end up warm-tracked in 3-4 cameras when 2 would do, and a
+        # grazing-angle 3rd/4th camera is often barely useful. Capped below, after
+        # every camera's visibility is computed, by ranking on total facing_cos.
+        _max_warm_cams = int(self._matching_cfg.get('max_warm_search_cameras', 0)) or None
         result:       Dict[int, Dict[str, Optional[np.ndarray]]] = {}
         vel_hints:    Dict[int, Dict[str, float]]                = {}
         radius_hints: Dict[int, Dict[str, float]]                = {}
@@ -1381,6 +1414,34 @@ class TrackingSystem:
             result[cam_id]        = proj_per_ctrl
             vel_hints[cam_id]     = vel_per_ctrl
             radius_hints[cam_id]  = radius_per_ctrl
+
+        # ── Cap warm-search cameras per controller ──────────────────────────────
+        # Rank every camera that's theoretically visible for this controller by
+        # sum(facing_cos) over its visible LEDs — a single score that jointly
+        # captures "how many LEDs" and "how well-oriented" (column 3 of the Nx5
+        # array already computed above, zero new work), keep only the top
+        # max_warm_search_cameras. Demoted cameras are reset exactly like the
+        # "too few visible LEDs" branch above, so every downstream consumer
+        # (blob-detection skip, _filter_cam, update_warm_batch's non-empty check)
+        # treats them identically to "not visible" — no other code needs to know
+        # about this cap. A cold controller has no prediction on any camera, so
+        # this is a no-op for it (brute-force reacquisition isn't gated by
+        # proj_hints at all).
+        if _max_warm_cams is not None:
+            for ctrl_name in ctrl_names:
+                _scored = [
+                    (float(result[cid][ctrl_name][:, 3].sum()), cid)
+                    for cid in result
+                    if result[cid][ctrl_name] is not None
+                ]
+                if len(_scored) <= _max_warm_cams:
+                    continue
+                _scored.sort(reverse=True)
+                for _, cid in _scored[_max_warm_cams:]:
+                    result[cid][ctrl_name]       = None
+                    vel_hints[cid][ctrl_name]    = 0.0
+                    radius_hints[cid][ctrl_name] = _base_r
+
         return result, vel_hints, radius_hints
 
     def solved_led_geometry(
@@ -1622,4 +1683,185 @@ class TrackingSystem:
                 force_brute=force_brute,
             )
 
+        return results
+
+    def _build_extrapolated_occluders(
+        self, ctrl_names: List[str], frame_ts_ns: int,
+    ) -> Dict[str, Dict[int, Tuple[np.ndarray, np.ndarray, object]]]:
+        """Return {ctrl_name: {cam_id: (R_occ_in_cam, t_occ_in_cam, geometry)}}
+        — one controller's occlusion-relevant pose per camera, built from its
+        own *extrapolated* (predicted) pose rather than a same-frame
+        confirmed solution. This is what makes cross-controller occlusion
+        usable from update_warm_batch: unlike ControllerTracker.update()'s
+        sequential occluder-building (controller.py, in update()), which
+        needs an earlier-processed controller's already-solved T_world_ctrl
+        for THIS frame, extrapolation needs nothing from this frame at all —
+        every controller's dict can be built independently, before any
+        cheap-search task even runs, with no ordering dependency between
+        controllers. Cost is a handful of cheap host-side numpy/Rodrigues
+        ops (one _predict_pose + up to len(self.cameras) Transform
+        compositions per controller) — no image or blob data, no pool
+        round-trip.
+
+        Gated on the existing cross_controller_occlusion config flag (same
+        one the sequential path uses). Returns {} when disabled, when fewer
+        than 2 controllers are given, or when a controller has no pose
+        history yet to extrapolate from (its own entry is simply absent —
+        callers already treat occluders_per_cam.get(...) returning None as
+        "no occluder this frame", the same as the sequential path does for a
+        controller that hasn't solved yet).
+        """
+        if not bool(self._matching_cfg.get('cross_controller_occlusion', False)) or len(ctrl_names) < 2:
+            return {}
+
+        _weight_decay = float(self._matching_cfg.get('pose_prediction_weight_decay', 0.7))
+        occluders_by_ctrl: Dict[str, Dict[int, Tuple[np.ndarray, np.ndarray, object]]] = {}
+        for ctrl_name in ctrl_names:
+            _any_tracker = next(iter(self.ctrl_trackers[ctrl_name].trackers.values()), None)
+            if _any_tracker is None:
+                continue
+            _pred = CameraTracker._predict_pose(
+                _any_tracker.pose_history, frame_ts_ns,
+                weight_decay=_weight_decay, vel_ema_rate=_any_tracker.vel_ema,
+            )
+            if _pred is None:
+                continue
+            _rv_pred, _tv_pred = _pred
+            _R_pred, _ = cv2.Rodrigues(np.asarray(_rv_pred, np.float32).reshape(3, 1))
+            _T_cam_ctrl_pred = Transform(
+                _R_pred.astype(np.float32), np.asarray(_tv_pred, np.float32).reshape(3)
+            )
+            _T_world_ctrl_pred = _any_tracker.camera.T_world_cam.compose(_T_cam_ctrl_pred)
+            _geom = _any_tracker._geometry
+
+            _occ_per_cam: Dict[int, Tuple[np.ndarray, np.ndarray, object]] = {}
+            for cid, cam in self.cameras.items():
+                if cam.T_world_cam is None:
+                    continue
+                _T_cam_occ = cam.T_world_cam.inverse().compose(_T_world_ctrl_pred)
+                _occ_per_cam[cid] = (
+                    _T_cam_occ.R.astype(np.float32),
+                    _T_cam_occ.t.astype(np.float32),
+                    _geom,
+                )
+            occluders_by_ctrl[ctrl_name] = _occ_per_cam
+
+        if occluders_by_ctrl:
+            logger.debug(
+                f"[warm-batch] extrapolated occluders built for: "
+                f"{list(occluders_by_ctrl.keys())}"
+            )
+        return occluders_by_ctrl
+
+    def update_warm_batch(
+        self,
+        ctrl_names: List[str],
+        per_ctrl_observations: Dict[str, Dict[int, np.ndarray]],
+        per_ctrl_radii: Optional[Dict[str, Dict[int, np.ndarray]]],
+        per_ctrl_brightnesses: Optional[Dict[str, Dict[int, np.ndarray]]],
+        frame_ts_ns: int,
+    ) -> Dict[str, Optional[Dict]]:
+        """Batched cheap-search-only update for controllers that are ALL warm
+        this frame (every enabled controller has a prior pose). Submits every
+        (ctrl_name, cam_id) cheap-search task across every controller in ONE
+        pool round instead of the one-round-per-controller sequence update()
+        runs when called once per controller with ctrl_name_filter — this is
+        what actually lets two warm controllers' per-camera work overlap.
+        Mirrors ControllerTracker.update()'s cheap pass exactly, except for
+        the batching and the deliberate absence of blob_mask/claimed_blobs/
+        reservations: two controllers matching the same blob is accepted
+        here (each controller's own RANSAC/inlier scoring in its independent
+        fit absorbs it) — see the warm-warm design notes. No brute-force
+        fallback happens inside this path (out of scope for the warm-warm
+        case). Cross-controller occlusion IS applied here, but — unlike
+        ControllerTracker.update()'s sequential occluder-building, which
+        requires another controller's already-confirmed same-frame result
+        (structurally incompatible with this batched dispatch, since no
+        controller has a same-frame result before the round completes) —
+        each controller's occluder pose is its own *extrapolated* prediction
+        (see _predict_pose), not a same-frame solve. See
+        _build_extrapolated_occluders.
+
+        Returns {ctrl_name: solution_or_None}. None means this controller's
+        cheap pass didn't produce a fused solution this frame (e.g. every
+        camera came up empty) — the caller must fall back to the existing
+        sequential per-controller path (cold re-detect + brute) for that
+        controller only, exactly as it would on any other cheap-search
+        failure.
+        """
+        from src.parallel_search import run_cheap_search
+
+        specs = []   # (ctrl_name, cid, tracker, obs, rad, brt)
+        for ctrl_name in ctrl_names:
+            obs_src = per_ctrl_observations.get(ctrl_name) or {}
+            rad_src = (per_ctrl_radii or {}).get(ctrl_name) or {}
+            brt_src = (per_ctrl_brightnesses or {}).get(ctrl_name) or {}
+            for cid, tracker in self.ctrl_trackers[ctrl_name].trackers.items():
+                obs = obs_src.get(cid)
+                if obs is None or len(obs) == 0:
+                    continue
+                specs.append((ctrl_name, cid, tracker, obs, rad_src.get(cid), brt_src.get(cid)))
+
+        if not specs:
+            return {c: None for c in ctrl_names}
+
+        occluders_by_ctrl = self._build_extrapolated_occluders(ctrl_names, frame_ts_ns)
+
+        def _other_ctrl(name: str) -> Optional[str]:
+            return next((c for c in ctrl_names if c != name), None)
+
+        if self._pool is not None:
+            futures = {}
+            for ctrl_name, cid, tracker, obs, rad, brt in specs:
+                prior = {
+                    'prev_pose':       tracker.prev_pose,
+                    'prev_prev_pose':  tracker.prev_prev_pose,
+                    'pose_history':    tracker.pose_history,
+                    'vel_ema':         tracker.vel_ema,
+                    'prev_assignment': tracker.prev_assignment,
+                }
+                futures[(ctrl_name, cid)] = self._pool.submit(
+                    run_cheap_search, (ctrl_name, cid), self._matching_cfg, prior,
+                    obs, frame_ts_ns, rad, brt, None,
+                    occluders_by_ctrl.get(_other_ctrl(ctrl_name)),
+                )
+            raw: Dict[Tuple[str, int], Tuple] = {}
+            for key, fut in futures.items():
+                solution, predicted_pose, norm_prev, norm_prev_prev = fut.result()
+                _tracker = self.ctrl_trackers[key[0]].trackers[key[1]]
+                _tracker.prev_pose      = norm_prev
+                _tracker.prev_prev_pose = norm_prev_prev
+                raw[key] = (solution, predicted_pose)
+        else:
+            raw = {
+                (ctrl_name, cid): tracker.search_cheap(
+                    obs, frame_ts_ns, blob_radii=rad, blob_brightnesses=brt,
+                    occluders_per_cam=occluders_by_ctrl.get(_other_ctrl(ctrl_name)),
+                )
+                for ctrl_name, cid, tracker, obs, rad, brt in specs
+            }
+
+        cam_solutions_per_ctrl: Dict[str, list] = {c: [] for c in ctrl_names}
+        for ctrl_name, cid, tracker, obs, rad, brt in specs:
+            solution, predicted_pose = raw[(ctrl_name, cid)]
+            solution = tracker.finalize_search(
+                solution, predicted_pose, obs, blob_radii=rad,
+                allow_expensive_fallback=False,
+            )
+            if solution is not None:
+                cam_solutions_per_ctrl[ctrl_name].append(
+                    {"cam_id": cid, "tracker": tracker, "solution": solution}
+                )
+
+        results: Dict[str, Optional[Dict]] = {}
+        for ctrl_name in ctrl_names:
+            cam_solutions = cam_solutions_per_ctrl[ctrl_name]
+            if not cam_solutions:
+                results[ctrl_name] = None
+                continue
+            obs_src = per_ctrl_observations.get(ctrl_name) or {}
+            results[ctrl_name] = self.ctrl_trackers[ctrl_name]._fuse_and_finalize(
+                cam_solutions, obs_src, claimed_blobs=None, frame_ts_ns=frame_ts_ns,
+                fixed_primary_cam=self._fixed_primary_cam, self_cal=self._self_cal,
+            )
         return results
