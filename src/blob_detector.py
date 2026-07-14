@@ -795,6 +795,32 @@ def _build_neighborhood_crop(image: np.ndarray, led_projections: np.ndarray,
     return crop, x1, y1
 
 
+def _blackout_neighborhoods(image: np.ndarray, led_projections: np.ndarray,
+                             search_radii: np.ndarray) -> np.ndarray:
+    """
+    Inverse of _build_neighborhood_crop: return a copy of `image` with the
+    union of circular search neighborhoods around each predicted LED
+    projection zeroed out, everywhere else untouched (no cropping).
+
+    Used to exclude a warm controller's expected LED positions from a
+    *different* (cold) controller's full-image detection pass — the cold
+    controller's brute-force search then never considers pixels already
+    accounted for by another controller's tracked LEDs. Always returns a
+    copy; never mutates `image` in place, since the caller's source image is
+    shared across controllers and phases within a frame.
+    """
+    out = image.copy()
+    if len(led_projections) == 0:
+        return out
+    cxs = np.round(led_projections[:, 0]).astype(int)
+    cys = np.round(led_projections[:, 1]).astype(int)
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    for cx, cy, sr in zip(cxs, cys, search_radii):
+        cv2.circle(mask, (int(cx), int(cy)), int(sr), 255, -1)
+    out[mask.view(bool)] = 0
+    return out
+
+
 def _draw_search_neighborhoods(canvas, led_projections, search_radii,
                                 color=(0, 180, 0)) -> None:
     """Overlay green search-neighborhood circles + LED-ID labels onto a
