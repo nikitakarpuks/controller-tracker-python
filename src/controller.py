@@ -230,6 +230,10 @@ class CameraTracker:
         # Consecutive frames without a valid solution.
         self.consecutive_failures: int = 0
 
+        # Consecutive frames (cold-start only) this camera has shown >= min_inliers
+        # available blobs — see the cold brute-force confirm-streak gate in update().
+        self._consecutive_good_blob_frames: int = 0
+
         # Set (on every camera of a controller) when that controller's fused
         # update() came up empty; cleared only once a solution is next accepted.
         # prev_pose/pose_history/vel_ema are deliberately NOT cleared on a lost
@@ -760,6 +764,30 @@ class ControllerTracker:
         # every camera searches independently every frame, so this no longer gates work.
         self._designated_primary: Optional[int]  = None
 
+    def _mark_all_lost(self) -> None:
+        """Record a failed frame on every camera-tracker and, once the
+        configured grace period is exhausted, clear prev_pose/pose_history so
+        the controller stops warm-starting off stale history. A single retry
+        (the default grace of 1) still gets to warm-start next frame per the
+        tracking_lost_last_frame contract in CameraTracker.finalize_search;
+        beyond that, surviving history was letting a controller with no real
+        track (or one truly gone cold) look "warm" forever — see
+        get_predicted_led_projections_per_camera / ctrl_has_prior in main.py,
+        which key off pose_history alone and don't otherwise expire it.
+        Clearing here also starves _build_extrapolated_occluders (no
+        extrapolated pose survives), so a genuinely cold controller no longer
+        casts a phantom cross-controller occlusion mask.
+        """
+        _grace = int(self._matching_cfg.get('tracking_lost_grace_frames', 1))
+        for _t in self.trackers.values():
+            _t.tracking_lost_last_frame = True
+            _t.consecutive_failures += 1
+            if _t.consecutive_failures > _grace:
+                _t.prev_pose      = None
+                _t.prev_prev_pose = None
+                _t.vel_ema        = None
+                _t.pose_history.clear()
+
     def update(
         self,
         avail:         Dict[int, tuple],        # cam_id → (blobs, radii, brts, orig_idx)
@@ -788,8 +816,7 @@ class ControllerTracker:
         against that same untrustworthy prediction, just with a fuller blob
         set, would fail for the same reason it failed the first time."""
         if not avail:
-            for _t in self.trackers.values():
-                _t.tracking_lost_last_frame = True
+            self._mark_all_lost()
             return None
 
         # ── Every available camera searches independently ──────────────────────
@@ -885,10 +912,42 @@ class ControllerTracker:
             # this round.
             states: Dict[int, object] = {}
             _t_new_state_start = time.perf_counter()
+            _confirm_frames = int(self._matching_cfg.get('cold_brute_force_confirm_frames', 3))
             for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
+                tracker = self.trackers[cid]
+                # force_brute=True covers TWO distinct cases (main.py:585 and
+                # main.py:633): a truly cold controller (no prior anywhere), and
+                # a controller that was warm THIS frame whose cheap search just
+                # failed, falling back to an immediate cold re-detect + brute
+                # attempt. Only the former should pay the persistence-streak
+                # cost below — a just-lost controller's prior is still trusted
+                # (that's the whole point of tracking_lost_grace_frames) and
+                # deserves an immediate recovery attempt, not an added
+                # multi-frame confirmation delay. _mark_all_lost only clears
+                # prev_pose once the grace period is exhausted, so
+                # prev_pose is None is exactly "truly cold" here; prev_pose is
+                # still set means "recently lost, within grace" — skip the gate.
+                if force_brute and tracker.prev_pose is None:
+                    # Persistence gate: require _confirm_frames CONSECUTIVE
+                    # frames of >= min_inliers blobs before paying for a full
+                    # P3P/gate enumeration, since real reacquired LEDs persist
+                    # frame-to-frame while noise blobs don't (e.g. blob counts
+                    # 4,5,1 never trigger; 4,5,6 triggers on the 3rd frame).
+                    # Reset on success lives in _fuse_and_finalize alongside
+                    # consecutive_failures.
+                    if len(av_blobs) >= tracker._pose_searcher._c_brute_min_inliers:
+                        tracker._consecutive_good_blob_frames += 1
+                    else:
+                        tracker._consecutive_good_blob_frames = 0
+                    if tracker._consecutive_good_blob_frames < _confirm_frames:
+                        logger.debug(
+                            f"[{self.ctrl_name} | cam {cid}] cold brute-force gated: "
+                            f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
+                            f"(n_blobs={len(av_blobs)})"
+                        )
+                        continue
                 if len(av_blobs) == 0:
                     continue
-                tracker  = self.trackers[cid]
                 obs_full = obs_src[cid]
                 rad_full = rad_src.get(cid) if rad_src else None
                 mask = np.zeros(len(obs_full), dtype=bool)
@@ -974,8 +1033,7 @@ class ControllerTracker:
         )
 
         if not cam_solutions:
-            for _t in self.trackers.values():
-                _t.tracking_lost_last_frame = True
+            self._mark_all_lost()
             return None
 
         return self._fuse_and_finalize(
@@ -1149,6 +1207,7 @@ class ControllerTracker:
             elif _tracker.prev_assignment is None:
                 _tracker.last_good_assignment = None
             _tracker.consecutive_failures = 0
+            _tracker._consecutive_good_blob_frames = 0
             _tracker.tracking_lost_last_frame = False
 
         return solution
@@ -1278,8 +1337,9 @@ class TrackingSystem:
     def get_predicted_led_projections_per_camera(
         self,
         frame_ts_ns: int,
-    ) -> Tuple[Dict[int, Dict[str, Optional[np.ndarray]]], Dict[int, Dict[str, float]]]:
-        """Return (proj_hints, vel_hints).
+    ) -> Tuple[Dict[int, Dict[str, Optional[np.ndarray]]], Dict[int, Dict[str, float]],
+               Dict[int, Dict[str, float]], Dict[int, Dict[str, bool]]]:
+        """Return (proj_hints, vel_hints, radius_hints, search_eligible).
 
         frame_ts_ns: the current frame's real capture timestamp (nanoseconds,
         parsed from the frame's filename) — predictions are extrapolated to this
@@ -1288,32 +1348,64 @@ class TrackingSystem:
         proj_hints: {cam_id: {ctrl_name: Nx5 array or None}}
           Each row: [proj_x, proj_y, depth_m, facing_cos, led_id]
           for each LED visible from the predicted pose.
-          None when no prior pose exists for this (ctrl, cam) pair.
+          None when no prior pose exists for this (ctrl, cam) pair, i.e. zero
+          geometrically visible LEDs. A camera that's visible but lost the
+          warm-cam-cap ranking below still has a real (non-None) entry here —
+          see search_eligible.
 
-        vel_hints: {cam_id: {ctrl_name: v_px}}
-          Estimated pixel displacement expected over THIS frame's actual gap
-          since the last known pose (not a fixed "per-frame" rate — see below).
-          0.0 when no prediction is available.
+        vel_hints, radius_hints: {cam_id: {ctrl_name: v_px / search_radius_px}}
+          Estimated pixel displacement / effective search radius, for whatever
+          camera main.py actually searches. 0.0 / base radius when no
+          prediction is available. Retained (not reset) for cap-losing
+          cameras too, since _build_blackout_images uses radius_hints to size
+          the region it blacks out for them — see search_eligible.
+
+        search_eligible: {cam_id: {ctrl_name: bool}}
+          Whether main.py should actually run blob detection / pose search on
+          this (cam, ctrl) pair this frame. False whenever proj_hints is None
+          (nothing to search) OR the warm-cam-cap ranking demoted this camera
+          in favor of better candidates — in the latter case proj_hints/
+          vel_hints/radius_hints are still the real, non-reset values, kept
+          specifically so a cold-starting OTHER controller's
+          _build_blackout_images can still mask this controller's expected
+          LED neighborhoods there, even though this controller itself won't
+          search that camera this frame (warm-cold cross-controller
+          contamination guard; irrelevant in the warm-warm case since
+          _build_blackout_images is only invoked for a controller with no
+          prior at all — see its call site in main.py).
         """
         ctrl_names   = sorted({ctrl for ctrl, _ in self.trackers})
         _facing_deg  = float(self._matching_cfg.get('led_facing_angle_deg', 86.0))
-        # A camera predicting fewer visible LEDs than min_inliers cannot produce
-        # a valid pose solve regardless of detection quality (matching/proximity
-        # and brute-force both require >= this many inlier pairs — see
-        # PoseSearcher._c_prox_min_inliers / _c_brute_min_inliers in
-        # pose_search.py, same matching_cfg key) — so treat it the same as zero
-        # visible LEDs below, rather than handing it a prediction that's
-        # geometrically guaranteed not to help.
-        _min_vis_leds = int(self._matching_cfg.get(
-            'min_visible_leds_for_search', self._matching_cfg.get('min_inliers', 4)))
-        # Theoretical visibility (>= _min_vis_leds) doesn't mean "worth searching" —
-        # a controller can end up warm-tracked in 3-4 cameras when 2 would do, and a
-        # grazing-angle 3rd/4th camera is often barely useful. Capped below, after
-        # every camera's visibility is computed, by ranking on total facing_cos.
+        # Any geometric visibility at all (>= 1 LED) is candidacy, not a search
+        # guarantee — a controller can end up warm-tracked in 3-4 cameras when 2
+        # would do. Rather than pre-filtering candidacy on a per-camera-independent
+        # LED-count estimate (which has been observed to wrongly exclude a camera
+        # whose real image would actually be the best one to search — see the cap
+        # comment below), every camera with >=1 visible LED is a ranking candidate:
+        # cameras viewing the controller too edge-on are excluded outright
+        # (warm_cam_cap_min_facing_deg), survivors ranked by mean LED distance,
+        # top max_warm_search_cameras kept.
         _max_warm_cams = int(self._matching_cfg.get('max_warm_search_cameras', 0)) or None
-        result:       Dict[int, Dict[str, Optional[np.ndarray]]] = {}
-        vel_hints:    Dict[int, Dict[str, float]]                = {}
-        radius_hints: Dict[int, Dict[str, float]]                = {}
+        _min_facing_cos_gate = float(np.cos(np.radians(
+            float(self._matching_cfg.get('warm_cam_cap_min_facing_deg', 80.0)))))
+        result:          Dict[int, Dict[str, Optional[np.ndarray]]] = {}
+        vel_hints:       Dict[int, Dict[str, float]]                = {}
+        radius_hints:    Dict[int, Dict[str, float]]                = {}
+        search_eligible: Dict[int, Dict[str, bool]]                 = {}
+        # (ctrl_name, cam_id) -> mean perpendicular distance (m) from the
+        # controller's visible LEDs to that camera's optical axis (NOT Euclidean
+        # range to the camera center — see the lateral_dist comment below) — used
+        # below (together with _center_facing) to rank cameras for the warm-search
+        # cap.
+        _center_dist:   Dict[Tuple[str, int], float]              = {}
+        # (ctrl_name, cam_id) -> mean facing_cos over the controller's visible
+        # LEDs (how squarely they face this camera, averaged — NOT summed, so
+        # LED count doesn't leak into what's meant to be a pure angle score) —
+        # used below purely as a gate (grazing cameras excluded outright), not
+        # as the ranking key: a camera can score well here on a couple of
+        # borderline LEDs while still lacking enough of them to ever actually
+        # match — see the cap comment below.
+        _center_facing: Dict[Tuple[str, int], float]              = {}
 
         # Pre-read all four expansion terms once — same values used in track()
         _base_r = float(self._matching_cfg.get('proximity_expansion_px', 8.0))
@@ -1374,7 +1466,11 @@ class TrackingSystem:
                     cam_is_fisheye=camera.is_fisheye,
                     facing_threshold_deg=_facing_deg,
                 ) >= 1.0)[0]
-                if len(vis_ids) < _min_vis_leds:
+                if len(vis_ids) == 0:
+                    # Nothing to project or rank. The LED-count floor that used to
+                    # live here has moved entirely into the warm-cam-cap ranking
+                    # pass below, which now treats every camera with >=1 visible
+                    # LED as a candidate (see comment above).
                     proj_per_ctrl[ctrl_name]   = None
                     vel_per_ctrl[ctrl_name]    = 0.0
                     radius_per_ctrl[ctrl_name] = _base_r
@@ -1388,9 +1484,18 @@ class TrackingSystem:
 
                 led_cam     = (R_pred @ positions[vis_ids].T).T + tvec_pred  # (M, 3)
                 depths      = led_cam[:, 2]                                   # (M,)
-                view_dir    = led_cam / (np.linalg.norm(led_cam, axis=1, keepdims=True) + 1e-8)
+                led_ranges  = np.linalg.norm(led_cam, axis=1)                 # (M,) true 3D distance to camera center
+                view_dir    = led_cam / (led_ranges.reshape(-1, 1) + 1e-8)
                 normals_cam = (R_pred @ normals[vis_ids].T).T                 # (M, 3)
                 facing_cos  = -(normals_cam * view_dir).sum(axis=1)           # positive = faces cam
+                # Perpendicular distance from each LED to this camera's optical axis
+                # (the line through its center along local +z): for a point (x,y,z)
+                # in camera frame that's sqrt(x^2+y^2), i.e. range with the
+                # along-axis (depth) component removed. depths > 1e-6 is already
+                # guaranteed per-LED by _visible_mask, so "behind the projection
+                # surface" is already excluded before we get here — no separate
+                # reject step needed.
+                lateral_dist = np.linalg.norm(led_cam[:, :2], axis=1)         # (M,)
 
                 proj_per_ctrl[ctrl_name] = np.column_stack([
                     proj_pts.astype(np.float32),
@@ -1399,6 +1504,20 @@ class TrackingSystem:
                     vis_ids.astype(np.float32).reshape(-1, 1),
                 ])  # (M, 5): proj_x, proj_y, depth_m, facing_cos, led_id
 
+                # Mean perpendicular (off-axis) distance from the visible LEDs to
+                # this camera's optical axis — used as the ranking key below,
+                # replacing mean Euclidean range. A camera viewing the controller
+                # near edge-on has almost all its range in the lateral component
+                # (depth ~0), so this collapses toward the full range for such a
+                # camera, while a camera viewing it near head-on has most of its
+                # range in depth, so this collapses toward ~0 — a much starker
+                # separation than raw Euclidean distance gave between e.g. cam0/1
+                # (near head-on) and cam2/3 (near edge-on, ~180°-rotated) in
+                # practice. Mean facing_cos is kept as the gate below, not used
+                # for ranking. Both are means, not sums, so LED count doesn't leak
+                # into either score.
+                _center_dist[(ctrl_name, cam_id)]   = float(np.mean(lateral_dist))
+                _center_facing[(ctrl_name, cam_id)] = float(np.mean(facing_cos))
                 _depth_pred = max(float(tvec_pred[2]), 0.1)
                 _v_px       = float(np.linalg.norm(vel_disp_3d)) * camera.fx / _depth_pred
                 vel_per_ctrl[ctrl_name] = _v_px
@@ -1411,38 +1530,110 @@ class TrackingSystem:
                     _r += _dpt_k / _depth_pred
                 radius_per_ctrl[ctrl_name] = _r
 
-            result[cam_id]        = proj_per_ctrl
-            vel_hints[cam_id]     = vel_per_ctrl
-            radius_hints[cam_id]  = radius_per_ctrl
+            result[cam_id]          = proj_per_ctrl
+            vel_hints[cam_id]       = vel_per_ctrl
+            radius_hints[cam_id]    = radius_per_ctrl
+            search_eligible[cam_id] = {
+                ctrl_name: proj_per_ctrl[ctrl_name] is not None for ctrl_name in ctrl_names
+            }
 
         # ── Cap warm-search cameras per controller ──────────────────────────────
-        # Rank every camera that's theoretically visible for this controller by
-        # sum(facing_cos) over its visible LEDs — a single score that jointly
-        # captures "how many LEDs" and "how well-oriented" (column 3 of the Nx5
-        # array already computed above, zero new work), keep only the top
-        # max_warm_search_cameras. Demoted cameras are reset exactly like the
-        # "too few visible LEDs" branch above, so every downstream consumer
-        # (blob-detection skip, _filter_cam, update_warm_batch's non-empty check)
-        # treats them identically to "not visible" — no other code needs to know
-        # about this cap. A cold controller has no prediction on any camera, so
-        # this is a no-op for it (brute-force reacquisition isn't gated by
-        # proj_hints at all).
+        # Two-stage selection among cameras theoretically visible for this
+        # controller: (1) GATE — drop any camera whose mean facing_cos falls
+        # below warm_cam_cap_min_facing_deg's cosine outright, regardless of
+        # distance (a grazing view gives worse blobs — dimmer, more elongated,
+        # noisier centroid — no matter how close the camera is); (2) RANK the
+        # survivors by mean perpendicular (off-axis) distance from the visible
+        # LEDs to each camera's optical axis, closest wins, keep the top
+        # max_warm_search_cameras (see lateral_dist comment above). Three
+        # single-metric schemes were tried and rejected first: an original
+        # visible-LED-count / facing_cos-sum score let LED count leak into the
+        # ranking; pure mean-facing_cos ranking let a camera with a great angle
+        # on just a couple of borderline LEDs outrank one with plenty of LEDs
+        # at a merely-good angle; mean Euclidean range to the camera center
+        # worked much better but still occasionally lost on razor-thin margins
+        # (e.g. 0.280m vs 0.286m) to a camera that structurally never produces
+        # a match — a ~180°-rotated camera's near-edge-on view keeps its
+        # Euclidean range deceptively similar to a well-facing camera's, since
+        # range doesn't distinguish "close and off to the side" from "close and
+        # dead ahead". Off-axis distance separates these sharply (observed
+        # 0.048m/0.188m for two good cameras vs 0.278m for the bad one, on the
+        # exact frame the Euclidean version mis-ranked) because it collapses
+        # toward the full range for an edge-on view and toward ~0 for a
+        # head-on one. Gating on facing_cos rather than folding it into a
+        # blended score keeps each metric doing the job it's actually good at.
+        # If every candidate fails the gate (all views are marginal), the
+        # gate is skipped rather than demoting all of them, so far-fetched
+        # geometry never leaves a controller with zero search cameras.
+        # Demoted cameras are marked search_eligible=False — NOT reset to None —
+        # so main.py's Phase 1 skips real blob detection/search there (via
+        # search_eligible, not proj_hints), exactly like the "too few visible
+        # LEDs" branch above, EXCEPT proj_hints/vel_hints/radius_hints are left
+        # as the real, computed values rather than nulled out. That's
+        # deliberate, not an oversight: this controller's own tracker won't
+        # search this camera this frame, but if some OTHER controller has no
+        # prior at all this frame and is about to run a full-image cold
+        # brute-force search on this same camera, _build_blackout_images (in
+        # main.py) needs this controller's real predicted LED positions/radii
+        # here to black them out first — otherwise a demoted-but-still-real
+        # bright blob sits fully exposed for the cold controller's search to
+        # accidentally match as one of its own LEDs. That blackout is scoped
+        # tightly (just the predicted-LED neighborhoods, not the whole frame)
+        # and only matters for one frame at 30fps, so the cold controller
+        # still has the rest of the image plus every subsequent frame to
+        # reacquire — an acceptable trade against a false cross-controller
+        # match, which is not recoverable the same way. _build_blackout_images
+        # itself needs no changes for this: it already keys purely off
+        # proj_hints being non-None, and only runs at all for a controller
+        # with no prior anywhere this frame (the warm-cold case specifically —
+        # irrelevant, and never invoked, in the warm-warm case). A cold
+        # controller has no prediction on any camera, so none of this affects
+        # its own brute-force reacquisition (never gated by proj_hints or
+        # search_eligible at all).
+        #
+        # Candidacy here (membership in _all_cids, i.e. result[cid][ctrl_name] is
+        # not None) is gated ONLY on >=1 geometrically visible LED — a camera
+        # predicting too few LEDs to ever reach min_inliers downstream is no
+        # longer pre-excluded before this ranking runs. If such a camera still
+        # wins the cap (closest, passes the facing gate), it's kept as a real
+        # search candidate: main.py runs real blob detection and a real
+        # proximity/brute-force search on it, which is mathematically guaranteed
+        # to return None via pose_search.py's own _c_prox_min_inliers /
+        # _c_brute_min_inliers checks if the LED count is genuinely too low — so
+        # it can never inject a bad pose into fusion, and it contributes zero
+        # cam_solutions weight there, exactly like the "no candidate" case. What
+        # it gains over being pre-excluded: real detection, a real (if losing)
+        # search, and real visualization output for a camera whose actual image
+        # often turns out better than this geometric estimate predicts.
         if _max_warm_cams is not None:
             for ctrl_name in ctrl_names:
-                _scored = [
-                    (float(result[cid][ctrl_name][:, 3].sum()), cid)
-                    for cid in result
-                    if result[cid][ctrl_name] is not None
-                ]
-                if len(_scored) <= _max_warm_cams:
+                _all_cids = [cid for cid in result if result[cid][ctrl_name] is not None]
+                if _all_cids:
+                    logger.debug(
+                        f"[{ctrl_name}] warm-cam-cap candidates: " + "  ".join(
+                            f"cam{cid}(n={len(result[cid][ctrl_name])},"
+                            f"dist={_center_dist[(ctrl_name, cid)]:.3f}m,"
+                            f"facing={_center_facing[(ctrl_name, cid)]:.3f})"
+                            for cid in sorted(_all_cids, key=lambda c: _center_dist[(ctrl_name, c)])
+                        )
+                    )
+                if len(_all_cids) <= _max_warm_cams:
                     continue
-                _scored.sort(reverse=True)
-                for _, cid in _scored[_max_warm_cams:]:
-                    result[cid][ctrl_name]       = None
-                    vel_hints[cid][ctrl_name]    = 0.0
-                    radius_hints[cid][ctrl_name] = _base_r
+                _gated_cids = [
+                    cid for cid in _all_cids
+                    if _center_facing[(ctrl_name, cid)] >= _min_facing_cos_gate
+                ] or _all_cids  # safety net: don't starve the controller if every view is marginal
+                _kept_cids = {
+                    cid for _, cid in sorted((_center_dist[(ctrl_name, cid)], cid)
+                                              for cid in _gated_cids)[:_max_warm_cams]
+                }
+                for cid in _all_cids:
+                    if cid in _kept_cids:
+                        continue
+                    logger.debug(f"[{ctrl_name}] warm-cam-cap demoting cam{cid}")
+                    search_eligible[cid][ctrl_name] = False
 
-        return result, vel_hints, radius_hints
+        return result, vel_hints, radius_hints, search_eligible
 
     def solved_led_geometry(
         self,

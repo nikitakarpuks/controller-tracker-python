@@ -984,3 +984,67 @@ so, we must consider some serious changes in the code.
   Given the risk/effort gradient you yourself laid out: (1) warm-warm batching + dropping cross-controller claimed-blob exclusion for that path — biggest win, least new code, mostly a
   deletion plus widening the pool-batch key. (2) cold-warm blackout using the extrapolated (not confirmed) warm pose, reusing the existing expansion-radius logic. (3) cold-cold shared
   tier-round barrier with post-hoc hypothesis rejection — no dedup cache yet. Only revisit the seen_bijections-style cache for cold-cold if real sequences show it's a hot path.
+
+
+● Good catch — let me trace this precisely, because I think there's a real gap in what I implemented.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● You're right to flag this — I traced it and confirmed a real gap in what I implemented.
+
+  The problem: force_brute=True is set at two call sites in main.py, not one:
+  - main.py:585 — true cold-start, not ctrl_has_prior (no prior anywhere).
+  - main.py:633 — a controller that was warm this frame, whose cheap search just failed, falls back to cold re-detect + force_brute=True. This is exactly your "warm → lost → recover"
+  case.
+
+  My gate currently triggers on if force_brute: alone, so it doesn't distinguish these — yes, as implemented right now, a fresh warm-to-lost recovery would incorrectly need the 3-frame
+  streak too, which contradicts what I said the design would do.
+
+  The fix is precise, not a redesign: CameraTracker.prev_pose is already the exact signal that distinguishes them. _mark_all_lost (controller.py:767-786) only clears prev_pose to None
+  once consecutive_failures > tracking_lost_grace_frames (default grace=1) — so prev_pose is not None means "recently lost, still within retry grace, prior trusted enough to retry now,"
+  and prev_pose is None means "grace exhausted, genuinely cold." I should gate on force_brute and tracker.prev_pose is None, not force_brute alone.
+
+  Let me fix this now.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(~/PyCharmProjects/controller-tracker-python/src/controller.py)
+  ⎿  Added 20 lines, removed 10 lines
+      915              _confirm_frames = int(self._matching_cfg.get('cold_brute_force_confirm_frames', 3))
+      916              for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
+      917                  tracker = self.trackers[cid]
+      918 -                if force_brute:
+      919 -                    # Persistence gate: only a truly cold controller's cameras are
+      920 -                    # checked here (force_brute is never set for the warm
+      921 -                    # cheap-search-failure brute fallback below) — require
+      922 -                    # _confirm_frames CONSECUTIVE frames of >= min_inliers blobs
+      923 -                    # before paying for a full P3P/gate enumeration, since real
+      924 -                    # reacquired LEDs persist frame-to-frame while noise blobs
+      925 -                    # don't (e.g. blob counts 4,5,1 never trigger; 4,5,6 triggers
+      926 -                    # on the 3rd frame). Reset on success lives in
+      927 -                    # _fuse_and_finalize alongside consecutive_failures.
+      918 +                # force_brute=True covers TWO distinct cases (main.py:585 and
+      919 +                # main.py:633): a truly cold controller (no prior anywhere), and
+      920 +                # a controller that was warm THIS frame whose cheap search just
+      921 +                # failed, falling back to an immediate cold re-detect + brute
+      922 +                # attempt. Only the former should pay the persistence-streak
+      923 +                # cost below — a just-lost controller's prior is still trusted
+      924 +                # (that's the whole point of tracking_lost_grace_frames) and
+      925 +                # deserves an immediate recovery attempt, not an added
+      926 +                # multi-frame confirmation delay. _mark_all_lost only clears
+      927 +                # prev_pose once the grace period is exhausted, so
+      928 +                # prev_pose is None is exactly "truly cold" here; prev_pose is
+      929 +                # still set means "recently lost, within grace" — skip the gate.
+      930 +                if force_brute and tracker.prev_pose is None:
+      931 +                    # Persistence gate: require _confirm_frames CONSECUTIVE
+      932 +                    # frames of >= min_inliers blobs before paying for a full
+      933 +                    # P3P/gate enumeration, since real reacquired LEDs persist
+      934 +                    # frame-to-frame while noise blobs don't (e.g. blob counts
+      935 +                    # 4,5,1 never trigger; 4,5,6 triggers on the 3rd frame).
+      936 +                    # Reset on success lives in _fuse_and_finalize alongside
+      937 +                    # consecutive_failures.
+      938                      if len(av_blobs) >= tracker._pose_searcher._c_brute_min_inliers:
+      939                          tracker._consecutive_good_blob_frames += 1
+      940                      else:
+  ⎿  Allowed by auto mode classifier
+  ⎿  Interrupted · What should Claude do instead?
