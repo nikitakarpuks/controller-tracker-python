@@ -1,7 +1,7 @@
 data:
-#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
 #  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
-  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a"
+#  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a/a"
 
 #  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
 
@@ -72,7 +72,7 @@ blob_detection:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of its two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   min_threshold: 7                  # pixels >= this are included in a blob
   min_area: 2
@@ -167,9 +167,13 @@ matching:
   led_facing_angle_deg: 90.0      # emission half-angle; LEDs beyond this from camera axis are culled
   led_radius_mm: 3.0              # physical emitter radius; drives depth-scaled snap and size thresholds
   max_warm_search_cameras: 2      # cap on how many cameras a warm controller searches per frame —
-                                   # ranked by sum(facing_cos) over visible LEDs (theoretical visibility
-                                   # alone often includes a barely-useful grazing-angle 3rd/4th camera);
-                                   # bounds both blob-detection and pose-search task count per controller
+                                   # candidates with mean facing_cos below warm_cam_cap_min_facing_deg's
+                                   # cosine are excluded outright, survivors ranked by mean LED distance
+                                   # to camera (closer wins); bounds both blob-detection and pose-search
+                                   # task count per controller
+  warm_cam_cap_min_facing_deg: 80.0 # cameras whose mean LED-facing angle exceeds this are excluded from
+                                     # the warm-search cap ranking regardless of distance (a close but
+                                     # near-edge-on camera gives worse blobs than a farther square-on one)
 
   # --------------------------------------------------------------------------
   # Brute match
@@ -186,6 +190,14 @@ matching:
   reprojection_threshold: 2.5    # RANSAC inlier threshold
   min_inliers: 4
   min_inlier_fraction: null      # e.g. 0.6 — overrides min_inliers if set (fraction of visible LEDs)
+  cold_brute_force_confirm_frames: 3   # a cold controller's camera must show >= min_inliers
+                                        # blobs for this many CONSECUTIVE frames before brute-force
+                                        # is even attempted there — filters out transient noise
+                                        # blobs (e.g. 4,5,1 across 3 frames never triggers; 4,5,6
+                                        # triggers on frame 3) without wasting a full P3P/gate pass
+                                        # on a doomed attempt. Only applies to true cold-start
+                                        # (force_brute) reacquisition, not a warm controller's
+                                        # same-frame cheap-search-failure brute-force fallback.
   strong_match_error_px: 0.5
   min_vis_coverage: 0.7
   rng_seed: 42
@@ -236,6 +248,9 @@ matching:
   pose_prediction_weight_decay: 0.7  # exponential weight decay per frame (0→only last frame, 1→equal weights)
   pose_prediction_vel_ema_beta: 0.7  # EMA weight on newest velocity step (0=frozen, 1=no smoothing)
   pose_gap_velocity_warmstart_frames: 2
+  tracking_lost_grace_frames: 1      # consecutive lost frames a controller may warm-retry (via
+                                      # surviving pose_history) before prev_pose/pose_history are
+                                      # cleared and it must cold-start; 1 = exactly one retry
   # --------------------------------------------------------------------------
   # Pose validation
   # --------------------------------------------------------------------------
@@ -297,7 +312,7 @@ debug:
   debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
-  enabled: false  # set to false to skip Rerun entirely (no per-frame logging, no
+  enabled: true  # set to false to skip Rerun entirely (no per-frame logging, no
                  # viewer, no .rrd file) — for isolating tracking-only speed;
                  # save_recording below only controls whether an enabled
                  # session also gets written to disk, not whether it runs at all.

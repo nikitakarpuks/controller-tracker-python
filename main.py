@@ -177,7 +177,7 @@ def main():
         # elapsed time rather than assuming one frame = one uniform step.
         frame_ts_ns = int(img_path.stem)
 
-        proj_hints, vel_hints, radius_hints = tracking_system.get_predicted_led_projections_per_camera(frame_ts_ns)
+        proj_hints, vel_hints, radius_hints, search_eligible = tracking_system.get_predicted_led_projections_per_camera(frame_ts_ns)
         primary_cams       = tracking_system.get_designated_primary_cameras()
         ctrl_names_ordered = tracking_system.get_ctrl_processing_order()
         _mask_margin       = int(config["blob_detection"].get("blob_cross_mask_margin_px", 5))
@@ -310,25 +310,29 @@ def main():
 
         def _build_blackout_images(cold_ctrl_name, cam_ids):
             """Black out, per camera, the union of every *other* enabled
-            controller's expected LED neighborhoods (only where that other
-            controller is currently warm) before cold_ctrl_name runs
-            full-image cold detection there — reuses the exact predicted-LED
-            data and per-LED radius formula that other controller's own
-            hybrid-warm detection already computes for itself (proj_hints/
-            radius_hints, _compute_led_search_radii), so the excluded region
-            is identical to what the other controller's own search already
-            covers — no separate margin. Sourced from each other
-            controller's *extrapolated* prediction (proj_hints, computed
-            once at the top of this frame, before any detection or matching
-            runs) — no same-frame confirmed-result dependency, so this has
-            no ordering requirement between controllers, and works
+            controller's expected LED neighborhoods (wherever that other
+            controller has a real geometric prediction — proj_hints is not
+            None — regardless of whether it's actually searching that camera
+            itself this frame) before cold_ctrl_name runs full-image cold
+            detection there — reuses the exact predicted-LED data and
+            per-LED radius formula that other controller's own hybrid-warm
+            detection already computes for itself (proj_hints/radius_hints,
+            _compute_led_search_radii), so the excluded region is identical
+            to what the other controller's own search already covers (or
+            would have covered, for a camera the warm-cam-cap demoted but
+            didn't null out — see get_predicted_led_projections_per_camera's
+            search_eligible docstring) — no separate margin. Sourced from
+            each other controller's *extrapolated* prediction (proj_hints,
+            computed once at the top of this frame, before any detection or
+            matching runs) — no same-frame confirmed-result dependency, so
+            this has no ordering requirement between controllers, and works
             identically whether called from Phase 1's initial cold-start or
             Phase 2's mid-frame cold-redetect.
 
             Returns {cam_idx: image} — only for cameras actually modified; a
-            camera with no other controller warm on it is simply absent, so
-            callers fall through to cam_images[cam_idx] unchanged (zero
-            extra copy cost).
+            camera with no other controller's prediction on it at all is
+            simply absent, so callers fall through to cam_images[cam_idx]
+            unchanged (zero extra copy cost).
             """
             if not bool(_blob_cfg.get("cross_controller_blackout", True)):
                 return {}
@@ -381,7 +385,7 @@ def main():
             _cam_kwargs = {}
             _skipped_cams = []
             _ctrl_has_prior = any(
-                proj_hints.get(c, {}).get(ctrl_name) is not None
+                search_eligible.get(c, {}).get(ctrl_name, False)
                 for c in cameras if c in cam_images
             )
             ctrl_has_prior[ctrl_name] = _ctrl_has_prior
@@ -389,13 +393,19 @@ def main():
                 if cam_idx not in cam_images:
                     continue
                 _pred = proj_hints.get(cam_idx, {}).get(ctrl_name)
-                if _pred is None and _ctrl_has_prior:
+                if not search_eligible.get(cam_idx, {}).get(ctrl_name, False) and _ctrl_has_prior:
                     # Out of scope for this extrapolated view this frame — other
                     # cameras DO have a prior, so this isn't a cold-start; skip
                     # blob detection for this camera entirely (and, via
                     # _filter_cam's None/empty handling in TrackingSystem.update,
                     # pose search too) rather than paying for a cold/hybrid
                     # detection pass whose predicted LEDs are known unusable.
+                    # search_eligible (not proj_hints-is-None) is the source of
+                    # truth here: a camera the warm-cam-cap demoted still has a
+                    # real, non-None proj_hints entry (kept so
+                    # _build_blackout_images can use it below), but is not
+                    # itself searched — see get_predicted_led_projections_per_camera's
+                    # docstring.
                     per_ctrl_blobs[ctrl_name][cam_idx] = BlobResult.empty()
                     _skipped_cams.append(cam_idx)
                     continue
