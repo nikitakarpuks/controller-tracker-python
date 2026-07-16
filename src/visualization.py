@@ -973,10 +973,14 @@ class ControllerAnimatorRerun:
                         rr.log(f"{ctrl_path}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))
             else:
                 # Cases 1/2: never tracked or out of all cameras → collapse to invisible.
+                # leds (like mesh) is re-logged as a non-static Mesh3D every live
+                # frame (see the live branch below), so rr.Clear alone doesn't
+                # reliably hide it — same scale-to-zero trick as mesh instead.
                 rr.log(f"world/{ctrl_name}/mesh",
                        rr.Transform3D(mat3x3=np.eye(3, dtype=np.float32) * 1e-9))
-                for _sub in ("leds", "normals"):
-                    rr.log(f"world/{ctrl_name}/{_sub}", rr.Clear(recursive=False))
+                rr.log(f"world/{ctrl_name}/leds",
+                       rr.Transform3D(mat3x3=np.eye(3, dtype=np.float32) * 1e-9))
+                rr.log(f"world/{ctrl_name}/normals", rr.Clear(recursive=False))
                 for _ci in self._cameras:
                     for _sub in ("rays", "projected_leds", "led_ids", "errors", "error_values"):
                         rr.log(f"world/{ctrl_name}/camera_{_ci}/{_sub}", rr.Clear(recursive=False))

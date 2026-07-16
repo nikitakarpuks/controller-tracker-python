@@ -590,7 +590,6 @@ class PoseSearcher:
         self._c_brute_hungarian_px  = float(_cfg.get('hungarian_threshold_px',            5.0))
         self._c_brute_reproj_px     = _brute_reproj
         self._c_brute_min_inliers   = int(  _cfg.get('min_inliers',                      4))
-        self._c_brute_min_frac      = _cfg.get('min_inlier_fraction',               None) or None
         self._c_brute_strong_in     = int(  _cfg.get('strong_match_inliers',             7))
         self._c_brute_strong_err    = float(_cfg.get('strong_match_error_px',            1.5))
         self._c_brute_min_vis_cov   = float(_cfg.get('min_vis_coverage',                 0.75))
@@ -1792,13 +1791,8 @@ class PoseSearcher:
         if n_available < 4:
             return None
 
-        if self._c_brute_min_frac is not None:
-            fraction_floor     = int(np.ceil(self._c_brute_min_frac * n_available))
-            min_inliers_eff    = max(self._c_brute_min_inliers, fraction_floor)
-            strong_inliers_eff = min(self._c_brute_strong_in, fraction_floor)
-        else:
-            min_inliers_eff    = self._c_brute_min_inliers
-            strong_inliers_eff = self._c_brute_strong_in
+        min_inliers_eff    = self._c_brute_min_inliers
+        strong_inliers_eff = self._c_brute_strong_in
 
         _t0 = time.perf_counter()
         max_blob_depth = max(t[1] for t in self._c_brute_depth_tiers)
@@ -2541,7 +2535,6 @@ class PoseSearcher:
         hungarian_threshold_px: float = 5.0,  # pre-filter on the raw P3P hypothesis pose. Loose because P3P poses can be noisy; RANSAC does the real filtering after this
         reprojection_threshold: float = 1.5,  # passed to RANSAC, controls which blobs make it into the final assignment. This is now what the visualization reflects: all shown errors will be ≤ this
         min_inliers: int = 4,
-        min_inlier_fraction: Optional[float] = None,
         strong_match_inliers: int = 7,
         strong_match_error_px: float = 1.5,
         min_vis_coverage: float = 0.75,

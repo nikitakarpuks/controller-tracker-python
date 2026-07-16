@@ -72,7 +72,7 @@ blob_detection:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of its two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   min_threshold: 7                  # pixels >= this are included in a blob
   min_area: 2
@@ -189,7 +189,6 @@ matching:
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
   reprojection_threshold: 2.5    # RANSAC inlier threshold
   min_inliers: 4
-  min_inlier_fraction: null      # e.g. 0.6 — overrides min_inliers if set (fraction of visible LEDs)
   cold_brute_force_confirm_frames: 3   # a cold controller's camera must show >= min_inliers
                                         # blobs for this many CONSECUTIVE frames before brute-force
                                         # is even attempted there — filters out transient noise
@@ -312,7 +311,7 @@ debug:
   debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
-  enabled: true  # set to false to skip Rerun entirely (no per-frame logging, no
+  enabled: false  # set to false to skip Rerun entirely (no per-frame logging, no
                  # viewer, no .rrd file) — for isolating tracking-only speed;
                  # save_recording below only controls whether an enabled
                  # session also gets written to disk, not whether it runs at all.

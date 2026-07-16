@@ -225,6 +225,17 @@ def main():
             (comparatively small, ~300KB crop) IPC saved by not re-sending
             the image. Reverted; kept per-pair submission.
 
+            Per-pair does NOT mean one detect() call per pair, though: pairs
+            whose inputs are provably identical (same camera, no image
+            override, no established cold-path memory, same kwargs — see the
+            dedup grouping below) collapse to a single submitted task, with
+            its result copied to every other controller in the group. This is
+            distinct from the reverted grouping above — that merged two
+            *different* detect() calls into one serialized task; this skips
+            the second call entirely, since two simultaneously cold
+            controllers sharing a camera are running the exact same
+            computation, not independent work.
+
             cam_kwargs_per_ctrl: {ctrl_name: {cam_idx: {predicted_leds,
             local_search_radius_px, threshold_scale, velocity_px}}} — only
             predicted_leds is required per camera, the rest default to the
@@ -242,14 +253,61 @@ def main():
             img_path_arg = img_path if _visualize_save else None
             results_by_ctrl: dict = {c: {} for c in cam_kwargs_per_ctrl}
             ms_by_ctrl: dict = {c: {} for c in cam_kwargs_per_ctrl}
-            flat = [
-                (ctrl_name, cam_idx, kwargs)
-                for ctrl_name, cam_kwargs in cam_kwargs_per_ctrl.items()
-                for cam_idx, kwargs in cam_kwargs.items()
-            ]
 
             def _image_for(ctrl_name, cam_idx):
                 return (images_override or {}).get(ctrl_name, {}).get(cam_idx, cam_images[cam_idx])
+
+            # ── Dedup: two-or-more controllers sharing a camera whose detect()
+            # inputs are provably identical — no image override, no
+            # established cold-path EMA memory yet for either, and the same
+            # predicted_leds/radius/threshold/velocity kwargs (in practice
+            # this only ever groups controllers that are ALL truly cold on
+            # that camera this frame, since a warm controller's
+            # predicted_leds is always its own non-None projection) — get ONE
+            # detect() call instead of one per controller, with that single
+            # result copied to every member below. BlobDetector.detect is a
+            # pure function of (image, predicted_leds, radius,
+            # threshold_scale, velocity_px, memory); ctrl_label only affects
+            # a debug-canvas filename, so running it once per cold controller
+            # is pure duplicated computation, not independent work.
+            groups: dict = {}   # dedup_key -> [(ctrl_name, cam_idx, kwargs), ...]
+            for ctrl_name, cam_kwargs in cam_kwargs_per_ctrl.items():
+                for cam_idx, kwargs in cam_kwargs.items():
+                    _has_override = (images_override or {}).get(ctrl_name, {}).get(cam_idx) is not None
+                    _has_memory   = _cold_memory.get((cam_idx, ctrl_name)) is not None
+                    _has_prior    = kwargs.get("predicted_leds") is not None
+                    if _has_override or _has_memory or _has_prior:
+                        key = ("solo", ctrl_name, cam_idx)
+                    else:
+                        key = (
+                            "cold", cam_idx,
+                            kwargs.get("local_search_radius_px", 0.0),
+                            kwargs.get("threshold_scale", 1.0),
+                            kwargs.get("velocity_px", 0.0),
+                        )
+                    groups.setdefault(key, []).append((ctrl_name, cam_idx, kwargs))
+
+            # One task per group — its first member is the representative
+            # actually submitted below; every other member reuses that single
+            # result (see the fan-out after each result is collected).
+            flat = [members[0] for members in groups.values()]
+            _group_by_rep = {(members[0][0], members[0][1]): members for members in groups.values()}
+            _dupe_groups = [members for members in groups.values() if len(members) > 1]
+            if _dupe_groups:
+                logger.debug(
+                    "[blob-dedup] " + "  ".join(
+                        f"cam{members[0][1]}="
+                        f"[{', '.join(c.replace('_controller', '') for c, _, _ in members)}]"
+                        for members in _dupe_groups
+                    )
+                )
+
+            def _fan_out(ctrl_name, cam_idx, det_result, memory_out=None):
+                for _mc, _mcam, _ in _group_by_rep[(ctrl_name, cam_idx)][1:]:
+                    results_by_ctrl[_mc][_mcam] = det_result
+                    ms_by_ctrl[_mc][_mcam] = 0.0
+                    if memory_out is not None:
+                        _cold_memory[(_mcam, _mc)] = memory_out
 
             if pool is not None and blob_parallel:
                 from src.parallel_search import run_blob_detect
@@ -272,6 +330,7 @@ def main():
                     _cold_memory[(cam_idx, ctrl_name)] = memory_out
                     results_by_ctrl[ctrl_name][cam_idx] = (result, canvases)
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - t0_by_key[(ctrl_name, cam_idx)]) * 1000
+                    _fan_out(ctrl_name, cam_idx, (result, canvases), memory_out=memory_out)
             else:
                 for ctrl_name, cam_idx, kwargs in flat:
                     ctrl_label = ctrl_name.replace("_controller", "")
@@ -289,6 +348,7 @@ def main():
                     )
                     results_by_ctrl[ctrl_name][cam_idx] = det_result
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - _t0) * 1000
+                    _fan_out(ctrl_name, cam_idx, det_result)
             return results_by_ctrl, ms_by_ctrl
 
         def _run_blob_detect_batch(ctrl_name, cam_kwargs: dict, images_override: dict = None):
@@ -567,74 +627,138 @@ def main():
                     _fallback_ctrls.append(ctrl_name)
 
         _redetect_ms_total = 0.0
+        _true_cold_ctrls: list = []
         for ctrl_idx, ctrl_name in enumerate(ctrl_names_ordered):
             if ctrl_name not in _fallback_ctrls:
                 continue
             _exclude_claimed_blobs(ctrl_idx, ctrl_name)
 
-            t0 = time()
-            _redetect_s = 0.0
-
             if not ctrl_has_prior[ctrl_name]:
                 # True cold-start (frame 1, or a fully lost track): no camera
                 # had a prediction, so a cheap/proximity pass is guaranteed to
                 # fail (search_cheap has nothing to search against) and blobs
-                # are already cold from Phase 1 — skip straight to brute
-                # instead of paying for a doomed cheap pass plus an identical
-                # redundant re-detect of the same cold blobs.
+                # are already cold from Phase 1. Defer to the batched pass
+                # below instead of a sequential _update_ctrl(force_brute=True)
+                # call here, so every simultaneously-cold controller's tier
+                # rounds share one pool round-trip (see
+                # TrackingSystem.update_cold_batch) instead of each paying for
+                # its own full round-trip sequence one after another.
+                # get_ctrl_processing_order sorts every has-prior controller
+                # ahead of every no-prior one, so ctrl_names_ordered's cold
+                # controllers are always a contiguous suffix — nothing
+                # processed earlier in this loop can depend on a cold
+                # controller's result, so deferring is safe. The
+                # _exclude_claimed_blobs call above still runs as a cheap
+                # blob-level pre-filter against any controller already
+                # committed earlier in this same frame; the batch call below
+                # additionally passes every such committed solution as a
+                # fixed candidate to update_cold_batch's post-hoc conflict
+                # resolution, so a cold controller's brute search losing to
+                # (sharing a blob with, or geometrically occluding) an
+                # already-tracked warm controller is caught even when the
+                # cheap pre-filter alone wouldn't have excluded it — not just
+                # among cold-cold controllers themselves.
+                _true_cold_ctrls.append(ctrl_name)
+                continue
+
+            t0 = time()
+            _redetect_s = 0.0
+            sol = _update_ctrl(ctrl_name, allow_brute=False)
+
+            if sol is None:
+                # Every camera's cheap (proximity/prior_constrained) search failed —
+                # the warm-path per-LED ROIs were centered on an extrapolated pose
+                # that just proved untrustworthy, so brute-force against those SAME
+                # blobs has no better chance: a blob outside a wrong ROI was never
+                # detected at all. Re-detect this controller's blobs cold (full-image,
+                # no prior — same as frame 1) before falling back to brute, and add the
+                # cold-path (pass1/pass2) canvases to this frame's debug view alongside
+                # the failed warm-path ("local") one, instead of replacing it — seeing
+                # what the failed proximity attempt looked at is exactly what's needed
+                # to understand why it missed.
+                _cold_cams = [c for c in cameras if c in cam_images]
+                _warm_canvases = {
+                    cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
+                    for cam_idx in _cold_cams
+                }
+                _t_redetect0 = time()
+                _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
+                    ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
+                    images_override=_build_blackout_images(ctrl_name, _cold_cams),
+                )
+                # Extra blob-detection work triggered mid-Phase-2 — counts
+                # toward this controller's total blob time, not pose time
+                # (subtracted from elapsed_per_ctrl below).
+                _redetect_s = time() - _t_redetect0
+                blob_ms_per_ctrl[ctrl_name] = blob_ms_per_ctrl.get(ctrl_name, 0.0) + _redetect_s * 1000
+                _redetect_ms_total += _redetect_s * 1000
+                for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
+                    per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
+                    _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
+                    _merged_canvases.update(det_result_1 or {})
+                    if _merged_canvases:
+                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
+                    else:
+                        frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
+                _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
+                logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
+
+                _exclude_claimed_blobs(ctrl_idx, ctrl_name)
+                # Straight to brute — no pose_prior, same as a cold-start first
+                # frame. Retrying cheap search here would just fail again for the
+                # same reason it failed above: cheap depends on the same
+                # extrapolated pose that's already proven untrustworthy, cold
+                # blobs or not.
                 sol = _update_ctrl(ctrl_name, force_brute=True)
-            else:
-                sol = _update_ctrl(ctrl_name, allow_brute=False)
-
-                if sol is None:
-                    # Every camera's cheap (proximity/prior_constrained) search failed —
-                    # the warm-path per-LED ROIs were centered on an extrapolated pose
-                    # that just proved untrustworthy, so brute-force against those SAME
-                    # blobs has no better chance: a blob outside a wrong ROI was never
-                    # detected at all. Re-detect this controller's blobs cold (full-image,
-                    # no prior — same as frame 1) before falling back to brute, and add the
-                    # cold-path (pass1/pass2) canvases to this frame's debug view alongside
-                    # the failed warm-path ("local") one, instead of replacing it — seeing
-                    # what the failed proximity attempt looked at is exactly what's needed
-                    # to understand why it missed.
-                    _cold_cams = [c for c in cameras if c in cam_images]
-                    _warm_canvases = {
-                        cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
-                        for cam_idx in _cold_cams
-                    }
-                    _t_redetect0 = time()
-                    _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
-                        ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
-                        images_override=_build_blackout_images(ctrl_name, _cold_cams),
-                    )
-                    # Extra blob-detection work triggered mid-Phase-2 — counts
-                    # toward this controller's total blob time, not pose time
-                    # (subtracted from elapsed_per_ctrl below).
-                    _redetect_s = time() - _t_redetect0
-                    blob_ms_per_ctrl[ctrl_name] = blob_ms_per_ctrl.get(ctrl_name, 0.0) + _redetect_s * 1000
-                    _redetect_ms_total += _redetect_s * 1000
-                    for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
-                        per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
-                        _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
-                        _merged_canvases.update(det_result_1 or {})
-                        if _merged_canvases:
-                            frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
-                        else:
-                            frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
-                    _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
-                    logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
-
-                    _exclude_claimed_blobs(ctrl_idx, ctrl_name)
-                    # Straight to brute — no pose_prior, same as a cold-start first
-                    # frame. Retrying cheap search here would just fail again for the
-                    # same reason it failed above: cheap depends on the same
-                    # extrapolated pose that's already proven untrustworthy, cold
-                    # blobs or not.
-                    sol = _update_ctrl(ctrl_name, force_brute=True)
 
             elapsed_per_ctrl[ctrl_name] = (time() - t0) - _redetect_s
             _pose_phase_wall_s += elapsed_per_ctrl[ctrl_name]
             results[ctrl_name] = sol
+
+        # ── Cold-cold batch: every controller deferred above (true cold-start,
+        # no prior anywhere) shares one set of pool tier-rounds instead of the
+        # one-controller-at-a-time sequence the loop above used to run for
+        # each. Post-hoc conflict resolution (shared blobs / cross-occlusion
+        # between simultaneously-solved candidates, AND against every
+        # controller already committed earlier this same frame via
+        # committed_solutions) lives inside update_cold_batch — see
+        # TrackingSystem._resolve_cold_conflicts.
+        if _true_cold_ctrls:
+            _t_cold_batch0 = time()
+            _cold_results = tracking_system.update_cold_batch(
+                _true_cold_ctrls,
+                per_ctrl_observations={
+                    c: {cm: r.centroids for cm, r in per_ctrl_blobs[c].items()}
+                    for c in _true_cold_ctrls
+                },
+                per_ctrl_radii={
+                    c: {cm: r.radii for cm, r in per_ctrl_blobs[c].items()}
+                    for c in _true_cold_ctrls
+                },
+                per_ctrl_brightnesses={
+                    c: {cm: r.brightnesses for cm, r in per_ctrl_blobs[c].items()}
+                    for c in _true_cold_ctrls
+                },
+                frame_ts_ns=frame_ts_ns,
+                committed_solutions={
+                    c: results[c] for c in ctrl_names_ordered
+                    if c not in _true_cold_ctrls and results.get(c) is not None
+                },
+            )
+            _cold_batch_ms = (time() - _t_cold_batch0) * 1000
+            _pose_phase_wall_s += _cold_batch_ms / 1000
+            logger.debug(
+                f"[cold-batch] {len(_true_cold_ctrls)} controllers in one pool round: "
+                f"{_cold_batch_ms:.1f}ms  "
+                f"succeeded=[{', '.join(c for c in _true_cold_ctrls if _cold_results.get(c) is not None)}]"
+            )
+            for ctrl_name in _true_cold_ctrls:
+                sol = _cold_results.get(ctrl_name)
+                results[ctrl_name] = sol
+                # Display estimate only (even split of the shared batch time)
+                # — _pose_phase_wall_s above already holds the real combined
+                # wall-clock, same convention as the warm-batch split above.
+                elapsed_per_ctrl[ctrl_name] = _cold_batch_ms / 1000 / len(_true_cold_ctrls)
 
         blobs_frame = {ctrl: {cam: r.centroids for cam, r in cb.items()}
                       for ctrl, cb in per_ctrl_blobs.items()}
