@@ -7,7 +7,7 @@ from loguru import logger
 from typing import List, Tuple, Optional, Dict, Set
 
 from src._pnp import _project_points
-from src._visibility import _visible_mask
+from src._visibility import _visible_mask, _cross_occluded_mask
 from src.camera import Camera
 from src.debug_config import is_deep
 from src.transformations import Transform
@@ -1041,27 +1041,20 @@ class ControllerTracker:
             fixed_primary_cam=fixed_primary_cam, self_cal=self_cal,
         )
 
-    def _fuse_and_finalize(
+    def _compute_fused_solution(
         self,
         cam_solutions: List[dict],
         obs_src: Dict[int, np.ndarray],
-        claimed_blobs: Optional[Dict[int, Set[int]]],
-        frame_ts_ns: int,
         fixed_primary_cam: Optional[int] = None,
-        self_cal=None,
     ) -> Dict:
-        """Fuse every camera's independent solution into one controller pose,
-        register claimed blobs, feed self-calibration, and propagate the fused
-        pose into every camera tracker's state. Shared tail for both the
-        tier-round recovery path (update(), above) and the batched warm-warm
-        path (TrackingSystem.update_warm_batch()) — extracted so the ~140
-        lines of fusion/propagation logic aren't duplicated between them.
-
-        claimed_blobs=None skips claim registration entirely — used by the
-        warm-warm batched path, which deliberately does not track
-        cross-controller blob claims (two controllers assigning the same
-        blob is accepted there; each controller's own RANSAC/inlier scoring
-        absorbs it). cam_solutions must be non-empty.
+        """Fuse every camera's independent solution into one controller pose
+        and build the resulting solution dict — pure, no tracker-state
+        mutation, no claimed_blobs registration, no self-cal feed. Split out
+        of _fuse_and_finalize so a caller with several simultaneously-solved
+        candidates for DIFFERENT controllers (TrackingSystem.update_cold_batch)
+        can compare them — by solution["error"] and matched-pair counts — and
+        resolve cross-controller conflicts before committing any one of them
+        via _commit_fused_solution. cam_solutions must be non-empty.
         """
         from src.pose_search import fuse_camera_poses
 
@@ -1136,6 +1129,40 @@ class ControllerTracker:
         solution["aux_assignments"] = _other_assignments
         solution["aux_cameras"] = [(cid, len(pairs)) for cid, pairs in _other_assignments.items()]
 
+        return solution
+
+    def _commit_fused_solution(
+        self,
+        solution: Dict,
+        cam_solutions: List[dict],
+        obs_src: Dict[int, np.ndarray],
+        claimed_blobs: Optional[Dict[int, Set[int]]],
+        frame_ts_ns: int,
+        self_cal=None,
+    ) -> None:
+        """Side effects for a solution already chosen as the accepted result
+        for this controller this frame: designated-primary bookkeeping,
+        claimed-blob registration, self-cal feed, and propagation of the
+        fused pose into every camera tracker's state. Call only once a
+        solution has actually been accepted — for the plain single-candidate
+        case (ControllerTracker.update(), TrackingSystem.update_warm_batch)
+        that's unconditional (see _fuse_and_finalize below); for
+        TrackingSystem.update_cold_batch's multi-candidate case, only after
+        cross-controller conflict resolution has picked a winner.
+
+        claimed_blobs=None skips claim registration entirely — used by the
+        warm-warm and cold-cold batched paths, neither of which tracks
+        cross-controller blob claims this way (warm-warm: each controller's
+        own RANSAC/inlier scoring absorbs a shared blob; cold-cold: conflicts
+        are resolved explicitly by TrackingSystem._resolve_cold_conflicts
+        before this is ever called).
+        """
+        T_world_ctrl       = solution["T_world_ctrl"]
+        fused_err          = solution["error"]
+        primary_cam_id     = solution["primary_cam"]
+        anchor_assignment  = solution["assignment"]
+        _other_assignments = solution["aux_assignments"]
+
         # Reporting/self-cal anchor tracking (per-camera importance above is now the
         # reported signal; kept only for get_designated_primary_cameras()).
         self._designated_primary = primary_cam_id
@@ -1167,7 +1194,7 @@ class ControllerTracker:
                 self_cal.add_frame(
                     _rv_prim, _t_prim,
                     primary_error=fused_err,
-                    primary_inliers=len(anchor_solution["assignment"]),
+                    primary_inliers=len(anchor_assignment),
                     aux_observations=_sc_aux_obs,
                 )
 
@@ -1198,7 +1225,7 @@ class ControllerTracker:
             _tracker.last_good_pose = _tracker.prev_pose
             _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np, frame_ts_ns))
             _own_asgn = (
-                anchor_solution["assignment"] if _cid == primary_cam_id
+                anchor_assignment if _cid == primary_cam_id
                 else _other_assignments.get(_cid)
             )
             if _own_asgn is not None:
@@ -1210,6 +1237,26 @@ class ControllerTracker:
             _tracker._consecutive_good_blob_frames = 0
             _tracker.tracking_lost_last_frame = False
 
+    def _fuse_and_finalize(
+        self,
+        cam_solutions: List[dict],
+        obs_src: Dict[int, np.ndarray],
+        claimed_blobs: Optional[Dict[int, Set[int]]],
+        frame_ts_ns: int,
+        fixed_primary_cam: Optional[int] = None,
+        self_cal=None,
+    ) -> Dict:
+        """Fuse then immediately commit — thin wrapper preserving the
+        original combined behavior for the tier-round recovery path
+        (update(), above) and the batched warm-warm path
+        (TrackingSystem.update_warm_batch()). See _compute_fused_solution /
+        _commit_fused_solution for the split and why it exists."""
+        solution = self._compute_fused_solution(
+            cam_solutions, obs_src, fixed_primary_cam=fixed_primary_cam,
+        )
+        self._commit_fused_solution(
+            solution, cam_solutions, obs_src, claimed_blobs, frame_ts_ns, self_cal=self_cal,
+        )
         return solution
 
 
@@ -2056,3 +2103,353 @@ class TrackingSystem:
                 fixed_primary_cam=self._fixed_primary_cam, self_cal=self._self_cal,
             )
         return results
+
+    def update_cold_batch(
+        self,
+        ctrl_names: List[str],
+        per_ctrl_observations: Dict[str, Dict[int, np.ndarray]],
+        per_ctrl_radii: Optional[Dict[str, Dict[int, np.ndarray]]],
+        per_ctrl_brightnesses: Optional[Dict[str, Dict[int, np.ndarray]]],
+        frame_ts_ns: int,
+        committed_solutions: Optional[Dict[str, Dict]] = None,
+    ) -> Dict[str, Optional[Dict]]:
+        """Batched brute-force-only update for controllers that are ALL truly
+        cold this frame (every camera tracker's prev_pose is None — callers
+        must only pass controllers satisfying that; main.py guarantees it by
+        routing only ctrl_has_prior[name] is False controllers here). Submits
+        every (ctrl_name, cam_id) tier-round brute-force task across every
+        controller in ONE shared set of pool rounds, instead of the
+        one-controller-at-a-time sequence main.py's per-controller
+        _update_ctrl(force_brute=True) loop runs today — this is what lets
+        two simultaneously-cold controllers' brute recovery overlap. Mirrors
+        ControllerTracker.update()'s tier-round brute path (see there), with
+        two structural differences:
+
+          - The tier-widening stop condition ("any camera hit strong_found
+            this round -> stop widening") is evaluated per (ctrl_name, cid)
+            key via `not st.strong_found`, not per-controller-with-an-early-
+            break -- so one controller reaching strong_found on an early tier
+            does not truncate another controller's later tiers, and vice
+            versa. Both controllers' cameras simply share the same round of
+            pool.submit calls.
+
+          - Since no controller here has any prior pose or pose_history (by
+            definition -- see above), there is no claimed_blobs exclusion, no
+            reservation biasing, and no occluders_per_cam during the search
+            itself (same reasoning as _build_extrapolated_occluders: occlusion
+            needs a pose to project from, and none exists yet for any of
+            these controllers). Every candidate is computed independently and
+            only reconciled with the others AFTER all of them finish solving
+            -- see _resolve_cold_conflicts. Two cold controllers matching the
+            same blob, or landing in a mutually impossible (occluding)
+            configuration, are real possibilities here in a way they aren't
+            for update_warm_batch's warm priors, precisely because nothing
+            here excludes the other controller's candidate blobs/pose during
+            the search.
+
+        committed_solutions: {ctrl_name: solution} for controllers already
+        committed to tracker state THIS frame before update_cold_batch was
+        called -- i.e. every warm-processed controller (get_ctrl_processing_
+        order guarantees these always precede the cold suffix, so "already
+        committed" and "warm this frame" coincide in practice). These are
+        never returned or re-solved here; they're folded into
+        _resolve_cold_conflicts purely as FIXED candidates a cold candidate
+        can lose to but never beat -- closing the gap where a cold
+        controller's brute search could otherwise land on a pose that
+        shares a blob with, or geometrically occludes, an already-tracked
+        warm controller with nothing to catch it (unlike warm-warm, which
+        gets occlusion-awareness from _build_extrapolated_occluders before
+        the search even runs, and unlike cold-cold, which this method
+        already reconciles post-hoc). Omit or pass {} for no such check.
+
+        Returns {ctrl_name: solution_or_None}. None means either this
+        controller's brute search didn't produce a solution this frame (no
+        camera cleared the K-frame persistence gate, or none solved), or it
+        did solve but lost a same-frame conflict -- against another cold
+        controller's better-fit candidate, or against an already-committed
+        warm controller it can never outrank -- both cases are routed
+        through _mark_all_lost, identically to any other failed brute
+        search, so _consecutive_good_blob_frames is left untouched either
+        way (see the conflict-loser branch below for why that matters).
+        """
+        from src.parallel_search import run_brute_tier
+
+        _confirm_frames = int(self._matching_cfg.get('cold_brute_force_confirm_frames', 3))
+        states: Dict[Tuple[str, int], object] = {}
+        for ctrl_name in ctrl_names:
+            obs_src = per_ctrl_observations.get(ctrl_name) or {}
+            rad_src = (per_ctrl_radii or {}).get(ctrl_name) or {}
+            for cid, tracker in self.ctrl_trackers[ctrl_name].trackers.items():
+                obs_full = obs_src.get(cid)
+                if obs_full is None or len(obs_full) == 0:
+                    continue
+                # Persistence gate, verbatim logic from
+                # ControllerTracker.update() (controller.py:930-948, this
+                # file) -- unconditional here (not "force_brute and
+                # prev_pose is None") because every controller passed to
+                # update_cold_batch is already known cold by the caller's
+                # contract, so the gate always applies.
+                if len(obs_full) >= tracker._pose_searcher._c_brute_min_inliers:
+                    tracker._consecutive_good_blob_frames += 1
+                else:
+                    tracker._consecutive_good_blob_frames = 0
+                if tracker._consecutive_good_blob_frames < _confirm_frames:
+                    logger.debug(
+                        f"[{ctrl_name} | cam {cid}] cold brute-force gated (batch): "
+                        f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
+                        f"(n_blobs={len(obs_full)})"
+                    )
+                    continue
+                rad_full = rad_src.get(cid)
+                mask = np.ones(len(obs_full), dtype=bool)
+                states[(ctrl_name, cid)] = tracker._pose_searcher.new_brute_state(
+                    obs_full, pose_prior=None, other_cameras_blobs=None,
+                    blob_radii=rad_full, blob_mask=mask, occluders_per_cam=None,
+                )
+
+        if not states:
+            return {c: None for c in ctrl_names}
+
+        _any_ps = next(
+            (self.ctrl_trackers[k[0]].trackers[k[1]]._pose_searcher
+             for k, st in states.items() if st is not None),
+            None,
+        )
+        max_tiers = len(_any_ps._c_brute_depth_tiers) if _any_ps is not None else 0
+
+        if self._pool is not None:
+            for tier_idx in range(max_tiers):
+                remaining = [k for k, st in states.items() if st is not None and not st.strong_found]
+                if not remaining:
+                    break
+                logger.debug(f"[cold-batch] tier {tier_idx}: submitting {sorted(remaining)}")
+                futures = {k: self._pool.submit(run_brute_tier, k, states[k], tier_idx) for k in remaining}
+                for k, fut in futures.items():
+                    states[k] = fut.result()
+        else:
+            for tier_idx in range(max_tiers):
+                remaining = [k for k, st in states.items() if st is not None and not st.strong_found]
+                if not remaining:
+                    break
+                for ctrl_name, cid in remaining:
+                    self.ctrl_trackers[ctrl_name].trackers[cid]._pose_searcher.brute_search_tier(
+                        states[(ctrl_name, cid)], tier_idx)
+
+        cam_solutions_per_ctrl: Dict[str, list] = {c: [] for c in ctrl_names}
+        for (ctrl_name, cid), st in states.items():
+            if st is None:
+                continue
+            tracker = self.ctrl_trackers[ctrl_name].trackers[cid]
+            sol = tracker._pose_searcher.finalize_brute_state(st)
+            if sol is None:
+                continue
+            obs_full = (per_ctrl_observations.get(ctrl_name) or {})[cid]
+            rad_full = (per_ctrl_radii or {}).get(ctrl_name, {}).get(cid)
+            mask = np.ones(len(obs_full), dtype=bool)
+            sol = tracker.finalize_search(
+                sol, None, obs_full, blob_radii=rad_full, other_cameras_blobs=None,
+                blob_mask=mask, occluders_per_cam=None, allow_expensive_fallback=True,
+            )
+            if sol is not None:
+                cam_solutions_per_ctrl[ctrl_name].append(
+                    {"cam_id": cid, "tracker": tracker, "solution": sol}
+                )
+
+        candidates: Dict[str, Dict] = {}
+        cam_solutions_of: Dict[str, list] = {}
+        for ctrl_name in ctrl_names:
+            cam_solutions = cam_solutions_per_ctrl[ctrl_name]
+            if not cam_solutions:
+                self.ctrl_trackers[ctrl_name]._mark_all_lost()
+                continue
+            obs_src = per_ctrl_observations.get(ctrl_name) or {}
+            candidates[ctrl_name] = self.ctrl_trackers[ctrl_name]._compute_fused_solution(
+                cam_solutions, obs_src, fixed_primary_cam=self._fixed_primary_cam,
+            )
+            cam_solutions_of[ctrl_name] = cam_solutions
+
+        if not candidates:
+            return {c: None for c in ctrl_names}
+
+        _committed = committed_solutions or {}
+        _all_for_conflict_check = {**candidates, **_committed}
+        losers = self._resolve_cold_conflicts(
+            _all_for_conflict_check, fixed_names=set(_committed.keys()),
+        )
+
+        results: Dict[str, Optional[Dict]] = {}
+        for ctrl_name, solution in candidates.items():
+            if ctrl_name in losers:
+                # Same bookkeeping as any other failed brute search
+                # (_mark_all_lost, controller.py:767-789) -- deliberately NOT
+                # a fresh reset of _consecutive_good_blob_frames. This
+                # controller already cleared the K-frame gate above, before
+                # any brute enumeration even ran, so it does not need to
+                # re-accumulate _confirm_frames consecutive frames before
+                # retrying next frame -- only _mark_all_lost's own fields
+                # (consecutive_failures, tracking_lost_last_frame) change.
+                logger.info(
+                    f"[cold-batch] conflict: dropping {ctrl_name} "
+                    f"(err={solution['error']:.2f}px, lost to a lower-error candidate this frame)"
+                )
+                self.ctrl_trackers[ctrl_name]._mark_all_lost()
+                results[ctrl_name] = None
+                continue
+            obs_src = per_ctrl_observations.get(ctrl_name) or {}
+            self.ctrl_trackers[ctrl_name]._commit_fused_solution(
+                solution, cam_solutions_of[ctrl_name], obs_src,
+                claimed_blobs=None, frame_ts_ns=frame_ts_ns, self_cal=self._self_cal,
+            )
+            results[ctrl_name] = solution
+
+        for ctrl_name in ctrl_names:
+            results.setdefault(ctrl_name, None)
+        return results
+
+    def _resolve_cold_conflicts(
+        self, candidates: Dict[str, Dict], fixed_names: Optional[Set[str]] = None,
+    ) -> Set[str]:
+        """Detect and greedily resolve conflicts among simultaneously-solved
+        cold-start candidates (update_cold_batch, above) BEFORE any of them
+        is committed to tracker state.
+
+        fixed_names: candidates (typically already-committed warm controllers
+        passed in via update_cold_batch's committed_solutions) that must
+        never appear in the returned loser set -- their tracker state is
+        already committed and un-committing isn't supported, so they always
+        win any conflict they're part of. Processed before the normal greedy
+        pass below (see the loop that drains fixed_names first). Omit for the
+        pure cold-cold case -- behavior is then identical to before this
+        parameter existed.
+
+        Two candidates conflict if EITHER:
+          - shared blob: the same blob index, in the same camera, appears in
+            both candidates' matched pairs (primary `assignment` or
+            `aux_assignments`).
+          - cross-occlusion: one candidate's SOLVED pose (both here -- unlike
+            _build_extrapolated_occluders, which necessarily uses a
+            *predicted* pose since neither warm-warm controller has solved
+            yet when it runs) should, per _cross_occluded_mask, have blocked
+            one of the other candidate's matched LEDs from view in a camera
+            they both used. Checked in both directions.
+
+        Both conflict types are treated identically -- no special-casing, no
+        cheap-repair exception: any conflict of either kind drops the loser
+        outright. Winner selection is greedy: repeatedly take the remaining
+        candidate with the lowest fused reprojection error
+        (`solution["error"]`; ties broken by more total matched pairs across
+        assignment + aux_assignments), keep it, and drop every candidate
+        directly in conflict with it; repeat among what's left. This
+        correctly handles conflict components of 3+ controllers, not just
+        pairs -- a controller connected to the graph only through an
+        already-dropped neighbor is free to win in a later round.
+
+        Returns the set of ctrl_names to drop (losers). candidates values
+        must be solution dicts as produced by
+        ControllerTracker._compute_fused_solution (primary_cam, T_world_ctrl,
+        error, assignment, aux_assignments).
+        """
+        names = list(candidates.keys())
+        if len(names) < 2:
+            return set()
+
+        def _matched_pairs(sol: Dict, cid: int) -> List[Tuple[int, int]]:
+            if sol.get('primary_cam') == cid:
+                return sol.get('assignment') or []
+            return (sol.get('aux_assignments') or {}).get(cid) or []
+
+        def _matched_cams(sol: Dict) -> Set[int]:
+            cams = set((sol.get('aux_assignments') or {}).keys())
+            if sol.get('primary_cam') is not None:
+                cams.add(sol['primary_cam'])
+            return cams
+
+        _occlusion_on = bool(self._matching_cfg.get('cross_controller_occlusion', False))
+        _br          = float(self._matching_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+        _gate_margin = float(self._matching_cfg.get('cross_occlusion_gate_margin_px', 20.0))
+
+        conflicts: Dict[str, Set[str]] = {n: set() for n in names}
+        for i, a in enumerate(names):
+            sol_a = candidates[a]
+            for b in names[i + 1:]:
+                sol_b = candidates[b]
+                conflict = False
+
+                for cid in _matched_cams(sol_a) & _matched_cams(sol_b):
+                    idx_a = {blob for blob, _ in _matched_pairs(sol_a, cid)}
+                    idx_b = {blob for blob, _ in _matched_pairs(sol_b, cid)}
+                    if idx_a & idx_b:
+                        conflict = True
+                        break
+
+                if not conflict and _occlusion_on:
+                    for occluder, victim, sol_occ, sol_vic in ((a, b, sol_a, sol_b), (b, a, sol_b, sol_a)):
+                        tracker_vic = next(iter(self.ctrl_trackers[victim].trackers.values()))
+                        geom_occ    = next(iter(self.ctrl_trackers[occluder].trackers.values()))._geometry
+                        positions_vic = tracker_vic.model.positions
+                        for cid in _matched_cams(sol_vic):
+                            cam = self.cameras.get(cid)
+                            if cam is None or cam.T_world_cam is None:
+                                continue
+                            led_ids = [lid for _, lid in _matched_pairs(sol_vic, cid)]
+                            if not led_ids:
+                                continue
+                            T_cam_vic = cam.T_world_cam.inverse().compose(sol_vic['T_world_ctrl'])
+                            T_cam_occ = cam.T_world_cam.inverse().compose(sol_occ['T_world_ctrl'])
+                            focal_px = float(max(cam.camera_matrix[0, 0], cam.camera_matrix[1, 1]))
+                            occluded = _cross_occluded_mask(
+                                T_cam_vic.R.astype(np.float32), T_cam_vic.t.astype(np.float32),
+                                positions_vic,
+                                T_cam_occ.R.astype(np.float32), T_cam_occ.t.astype(np.float32),
+                                geom_occ, _br, _br, focal_px, _gate_margin,
+                                log_tag=f"[cold-conflict {occluder}->{victim} cam{cid}]",
+                            )
+                            if any(occluded[lid] for lid in led_ids):
+                                conflict = True
+                                break
+                        if conflict:
+                            break
+
+                if conflict:
+                    conflicts[a].add(b)
+                    conflicts[b].add(a)
+
+        if not any(conflicts.values()):
+            return set()
+
+        def _score(name: str) -> Tuple[float, int]:
+            sol = candidates[name]
+            total_pairs = len(sol.get('assignment') or []) + sum(
+                len(v) for v in (sol.get('aux_assignments') or {}).values()
+            )
+            return (sol['error'], -total_pairs)
+
+        remaining = set(names)
+        losers: Set[str] = set()
+
+        # Fixed candidates always win — drain them first, unconditionally,
+        # before the score-based greedy pass below ever runs. A candidate
+        # conflicting with a fixed one is dropped here regardless of its own
+        # error, and a fixed candidate is never itself added to losers —
+        # including in the (out of scope for this method to resolve, since
+        # neither side can be un-committed) case where two fixed candidates
+        # conflict with each other: that conflict is simply left unresolved
+        # rather than corrupting the loser set.
+        _fixed = set(fixed_names or ())
+        for fixed in _fixed & remaining:
+            if fixed not in remaining:
+                continue
+            remaining.discard(fixed)
+            for loser in conflicts[fixed] & remaining:
+                if loser in _fixed:
+                    continue
+                losers.add(loser)
+                remaining.discard(loser)
+
+        while remaining:
+            winner = min(remaining, key=_score)
+            remaining.discard(winner)
+            for loser in conflicts[winner] & remaining:
+                losers.add(loser)
+                remaining.discard(loser)
+        return losers
