@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import trimesh
@@ -73,6 +74,25 @@ CAMERA_COLORS = [
 
 def _camera_color(cam_idx: int) -> list:
     return CAMERA_COLORS[cam_idx % len(CAMERA_COLORS)]
+
+
+# Per-camera tracking overlay (rays/projected LEDs, both the primary-camera path
+# and the aux-camera loop in _log_frame) no longer color-codes by camera identity
+# or by a binary primary/aux label — fusion doesn't work that way anymore (every
+# solved camera contributes a continuous, confidence/√pairs-weighted share, see
+# _compute_fused_solution's camera_importance). Instead every contributing camera
+# uses this same dark-blue family, with brightness scaled by its actual fusion
+# weight this frame — a camera the fuse leaned on heavily reads bright, one that
+# barely contributed reads almost black. Floor keeps a near-zero-importance
+# camera dimly visible rather than invisible.
+_IMPORTANCE_BASE_COLOR = [40, 70, 190]   # dark blue
+_IMPORTANCE_BRIGHTNESS_FLOOR = 0.25      # brightness at importance=0.0
+
+
+def _importance_color(importance: Optional[float]) -> list:
+    imp = 1.0 if importance is None else max(0.0, min(1.0, float(importance)))
+    brightness = _IMPORTANCE_BRIGHTNESS_FLOOR + (1.0 - _IMPORTANCE_BRIGHTNESS_FLOOR) * imp
+    return [int(round(c * brightness)) for c in _IMPORTANCE_BASE_COLOR]
 
 
 # One distinct colour per controller index — used for blob contours.
@@ -609,6 +629,7 @@ class ControllerAnimatorRerun:
                   contours_per_ctrl: dict = None,
                   primary_cam_per_ctrl: dict = None,
                   aux_assignments_per_ctrl: dict = None,
+                  camera_importance_per_ctrl: dict = None,
                   frozen_T_world_ctrl_per_ctrl: dict = None,
                   blob_vis_frame: dict = None,
                   blob_vis_skipped: dict = None) -> None:
@@ -661,11 +682,15 @@ class ControllerAnimatorRerun:
         aux_assignments_frame = {
             n: (aux_assignments_per_ctrl or {}).get(n) for n in self._controllers_vis
         }
+        camera_importance_frame = {
+            n: (camera_importance_per_ctrl or {}).get(n) for n in self._controllers_vis
+        }
 
         self._log_frame(idx, T_world_ctrl_per_ctrl, assignments_frame,
                         blobs_per_ctrl=blobs_per_ctrl, contours_per_ctrl=contours_per_ctrl,
                         primary_cam_per_ctrl=primary_cams_frame,
                         aux_assignments_per_ctrl=aux_assignments_frame,
+                        camera_importance_per_ctrl=camera_importance_frame,
                         ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl)
 
         self._frame_count += 1
@@ -897,6 +922,7 @@ class ControllerAnimatorRerun:
                    contours_per_ctrl: dict = None,
                    primary_cam_per_ctrl: dict = None,
                    aux_assignments_per_ctrl: dict = None,
+                   camera_importance_per_ctrl: dict = None,
                    ghost_T_world_model_per_ctrl: dict = None):
 
         ray_radius            = self.vis_cfg.get("ray_radius",            0.0002)
@@ -999,6 +1025,8 @@ class ControllerAnimatorRerun:
             cam_path  = f"{ctrl_path}/camera_{primary_cam_idx}"
 
             camera = self._cameras[primary_cam_idx]
+            ctrl_importance = (camera_importance_per_ctrl or {}).get(ctrl_name) or {}
+            primary_color   = _importance_color(ctrl_importance.get(primary_cam_idx))
 
             # Primary camera frame pose (for projection and visibility)
             T_cam_ctrl  = camera.T_world_cam.inverse().compose(T_world_ctrl)
@@ -1128,7 +1156,7 @@ class ControllerAnimatorRerun:
             if self.vis_cfg.get("show_projected", True):
                 if all_proj_pts:
                     proj_colors = np.array(
-                        [[70, 130, 255] if lid in matched_lids else [230, 80, 50]
+                        [primary_color if lid in matched_lids else [230, 80, 50]
                          for lid in all_proj_lids], dtype=np.uint8)
                     proj_normal_cam  = np.array([0.0, 0.0, -1.0])
                     proj_normal_disp = camera.T_world_cam.R @ proj_normal_cam
@@ -1182,7 +1210,7 @@ class ControllerAnimatorRerun:
                         continue
                     if self.vis_cfg.get("show_rays", True):
                         ray_strips.append([pts_disp_real[lid].tolist(), lid_to_proj_pt[lid].tolist()])
-                        ray_colors_list.append([70, 130, 255])
+                        ray_colors_list.append(primary_color)
                     px, py, pz = pts_cam_real[lid]
                     if pz > 1e-6:
                         proj_flat_cam  = np.array([px / pz * error_z, py / pz * error_z, error_z])
@@ -1239,7 +1267,7 @@ class ControllerAnimatorRerun:
                 _T_aux_ctrl  = _aux_cam.T_world_cam.inverse().compose(T_world_ctrl)
                 _T_aux_model = _T_aux_ctrl.compose(T_ctrl_model)
                 _pts_aux_cam = _T_aux_model.apply(model_positions)
-                _aux_color   = _camera_color(_aux_ci)
+                _aux_color   = _importance_color(ctrl_importance.get(_aux_ci))
                 _aux_blobs_raw = (blobs_per_ctrl or {}).get(ctrl_name, {}).get(_aux_ci)
                 _aux_blobs_arr = (np.asarray(_aux_blobs_raw, dtype=np.float32)
                                   if _aux_blobs_raw is not None and len(_aux_blobs_raw) > 0 else None)

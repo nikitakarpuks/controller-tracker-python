@@ -973,9 +973,14 @@ so, we must consider some serious changes in the code.
   ⎿  Allowed by auto mode classifier
   ⎿  Interrupted · What should Claude do instead?
 
+For the remaining 5 corrupted keys with no config.yml entry (blob_size_min, blob_size_max, blob_size_score_w, blob_bright_score_w) plus the uncertain one
+(proximity_self._c_cs_snap_factor) — none currently change behavior if fixed (always used their hardcoded default either way). What should I do?
 
-
-
-  2 cases:
-  1) cold-warm cross occlusion check
-  2) visible/matched leds metric for brute match
+  1. Hardcode like led_radius_mm (Recommended)
+     Same treatment as led_radius_mm: drop the .get() call, keep each as a plain hardcoded constant at its current default value. No behavior change, removes dead config surface.
+  2. Fix the .get() key strings
+     Repair the string literals to the correct plain key names (e.g. 'blob_size_min') and add matching entries to config.yml so they become genuinely tunable. For
+     proximity_self._c_cs_snap_factor I'd need you to confirm the intended name first.
+  3. Leave as-is for now
+     Don't touch these 5 — just noted in the report, revisit later.
+  4. Type something.

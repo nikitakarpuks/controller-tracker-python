@@ -23,12 +23,10 @@ call — never a live CameraTracker, whose mutable tracking state (prev_pose,
 pose_history, ...) a worker has no way to keep in sync with anyway.
 """
 import multiprocessing
-import sys
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Optional, Tuple
 
 import cv2
-from loguru import logger
 
 from src.pose_search import PoseSearcher, BruteSearchState
 
@@ -74,26 +72,18 @@ def _pool_initializer(build_specs: Dict[Tuple[str, int], tuple],
     for cam_idx, blob_detection_cfg in blob_build_specs.items():
         _BLOB_DETECTORS[cam_idx] = BlobDetector(cam_idx, blob_detection_cfg)
 
-    # A spawned worker starts with fresh module globals — debug_config's mode/
-    # verbose flags and loguru's sink/format (both configured once in main.py's
-    # main(), which this worker never runs) need to be replicated here, or
-    # proximity_search/brute_search_tier's debug logging silently reverts to
-    # defaults (wrong format, wrong verbosity, targeted LED/blob debugging inert)
-    # even though the actual matching results are unaffected (verified: every
-    # debug_config-gated branch in pose_search.py is logging-only, never a
-    # decision).
+    # A spawned worker starts with fresh module globals — debug_config's
+    # continuous-frames/verbose/log-category flags and loguru's sink (both
+    # configured once in main.py's main(), which this worker never runs) need
+    # to be replicated here, or proximity_search/brute_search_tier's debug
+    # logging silently reverts to defaults (wrong verbosity, targeted LED/blob
+    # debugging inert) even though the actual matching results are unaffected
+    # (verified: every debug_config-gated branch in pose_search.py is
+    # logging-only, never a decision).
     if debug_cfg is not None:
         from src import debug_config
-        from src.debug_config import DebugMode
-        from loguru import logger
         debug_config.configure(**debug_cfg)
-        logger.remove()
-        if debug_cfg['mode'] == DebugMode.SEQUENTIAL:
-            logger.add(sys.stderr, level="INFO",
-                       format="<green>{time:HH:mm:ss}</green> | {message}")
-        else:
-            logger.add(sys.stderr, level="DEBUG",
-                       format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | {message}")
+        debug_config.setup_logging()
 
 
 def create_pool(max_workers: int, debug_cfg: Optional[dict] = None) -> ProcessPoolExecutor:

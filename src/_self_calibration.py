@@ -77,13 +77,13 @@ class SelfCalibrator:
             blobs_aux       : (N, 2) matched 2D detections in aux camera
         """
         if primary_error > self.min_primary_error:
-            logger.debug(f"[SelfCal] frame rejected: primary_error={primary_error:.3f} > {self.min_primary_error}")
+            logger.bind(cat="self_calibration").debug(f"[SelfCal] frame rejected: primary_error={primary_error:.3f} > {self.min_primary_error}")
             return False
         if primary_inliers < self.min_primary_inliers:
-            logger.debug(f"[SelfCal] frame rejected: inliers={primary_inliers} < {self.min_primary_inliers}")
+            logger.bind(cat="self_calibration").debug(f"[SelfCal] frame rejected: inliers={primary_inliers} < {self.min_primary_inliers}")
             return False
         if not aux_observations:
-            logger.debug("[SelfCal] frame rejected: no aux observations")
+            logger.bind(cat="self_calibration").debug("[SelfCal] frame rejected: no aux observations")
             return False
 
         accepted = False
@@ -102,9 +102,9 @@ class SelfCalibrator:
     # ------------------------------------------------------------------
     def run(self) -> Dict[int, dict]:
         """Optimise intrinsics on all accumulated observations, print and plot results."""
-        logger.info(f"[SelfCal] run(): {self._n_accepted} frames accepted across session")
+        logger.bind(cat="self_calibration").info(f"[SelfCal] run(): {self._n_accepted} frames accepted across session")
         for cid, obs in self._obs.items():
-            logger.info(f"[SelfCal]   cam{cid}: {len(obs)} observations")
+            logger.bind(cat="self_calibration").info(f"[SelfCal]   cam{cid}: {len(obs)} observations")
         new_results = {}
         plot_data: Dict[int, dict] = {}
 
@@ -198,7 +198,7 @@ class SelfCalibrator:
         opt_rms   = float(np.sqrt(np.mean(res_after ** 2)))
         _, _, updated = self._params_to_K_dc(result.x, base)
 
-        logger.info(
+        logger.bind(cat="self_calibration").info(
             f"[SelfCal] cam{cid}: {init_rms:.3f}px → {opt_rms:.3f}px  "
             f"frames={len(obs)}  converged={result.success}"
         )
@@ -288,7 +288,7 @@ class SelfCalibrator:
                     [cam.k1, cam.k2, cam.p1, cam.p2, cam.k3, cam.k4, cam.k5, cam.k6],
                     dtype=np.float32,
                 )
-            logger.info(f"[SelfCal] Applied updated intrinsics to cam{cid}")
+            logger.bind(cat="self_calibration").info(f"[SelfCal] Applied updated intrinsics to cam{cid}")
 
     # ------------------------------------------------------------------
     def _print_results(self, new_results: Dict[int, dict]):
@@ -357,4 +357,4 @@ class SelfCalibrator:
             out_path = self.plots_dir / f"self_cal_cam{cam_idx}.png"
             fig.savefig(out_path, dpi=150)
             plt.close(fig)
-            logger.info(f"[SelfCal] Plot saved → {out_path}")
+            logger.bind(cat="self_calibration").info(f"[SelfCal] Plot saved → {out_path}")

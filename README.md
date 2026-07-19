@@ -138,17 +138,11 @@ Used every frame when a prior pose exists. Projects previous LED positions with 
 
 ### Snap radius
 
-The snap radius is depth-scaled: `snap_px = focal × (led_radius_mm / 1000) / depth × proximity_snap_factor`. A blob is only a candidate if it is within this radius **and** its pixel size is consistent with the expected LED size at that depth.
+Each LED snaps to its nearest not-yet-used blob within a fixed pixel radius of its predicted projection — `snap_px = proximity_expansion_px`, no depth scaling, no LED-physical-size consistency check. (An earlier version gated eligibility on expected blob size from `led_radius_mm` + depth; that filter's config wiring was broken — the keys never matched anything in `config.yml` — and it has since been removed rather than fixed, so matching now relies solely on blob-detector output: centroid position and distance.)
 
 | param | what it controls | config value |
 |---|---|---|
-| `led_radius_mm` | physical LED emitter radius used to compute the expected blob size in pixels | 3.0 |
-| `proximity_snap_factor` | multiplier on the expected blob size to get the snap radius | 4.0 |
-| `blob_size_min_factor` | blob radius < expected × this → rejected as sub-pixel noise | 0.2 |
-| `blob_size_max_factor` | blob radius > expected × this → rejected as merged blob or noise | 4.0 |
-| `blob_size_score_weight` | px penalty per px of size mismatch added to the argmin score | 0.5 |
-| `proximity_argmin_max_dist_px` | hard distance cap for the greedy pass (ID-path uses the full depth-scaled snap radius) | 5.0 |
-| `blob_tracking_snap_px` | max pixel distance to carry a LED ID from the previous frame's blob to the current one | 25.0 |
+| `proximity_expansion_px` | snap radius: max pixel distance from a LED's predicted projection to its nearest candidate blob | 8.0 |
 
 ### Hungarian expansion
 
@@ -181,6 +175,6 @@ Activated when only 2–3 blobs are visible and a prior pose is available. Rotat
 
 All pairs must reproject within `reprojection_threshold` — too few matches to average away a wrong correspondence.
 
-Snap params (`led_radius_mm`, `proximity_snap_factor`, `blob_size_*`) are shared with proximity_match. The `reprojection_threshold` is shared with brute_match.
+The snap radius (`proximity_expansion_px`) is shared with proximity_match. The `reprojection_threshold` is shared with brute_match.
 
 ---
