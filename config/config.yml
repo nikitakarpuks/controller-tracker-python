@@ -1,10 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_only"
-#  root: "./data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
-#  root: "./data/datasets/single_ctrl/20260616/euroc_recording_20260616185839_ctrl/a/a"
-
-#  root: "./data/datasets/two_ctrl/controllers/9_moving_between_cameras/both/a"
-
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
@@ -65,15 +60,17 @@ controllers:
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
+geometry:
+  z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
+  z_frustum_bot_padding: 0.0055   # metres subtracted below the bottommost outer LED axial position
+  wall_thickness: 0.007           # frustum wall thickness in metres (R_fc_inner = R_fc - wall_thickness)
+
+
 blob_detection:
 
   # ── Common (both warm and cold paths) ────────────────────────────────────
-  # Building the annotated per-blob debug canvas (drawing every kept/rejected
-  # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
-  # so it's only computed when one of its two sinks actually wants it:
-  visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
-                           # this is what balloons recording file size
+  # visualize_save / visualize_rerun live under visualization: below, next to
+  # `enabled` — all viewer/debug-output toggles kept in one place.
   min_threshold: 7                  # pixels >= this are included in a blob
   min_area: 2
   max_area: 500
@@ -83,6 +80,12 @@ blob_detection:
   min_circularity_angle_factor: 0.2
   min_circularity_floor: 0.1
   required_threshold_factor: 2.0   # required_threshold = clip(pixel_threshold * factor, 255)
+  # threshold_scale (below) only reaches detection code inside
+  # _detect_blobs_local, which is only called when warm_strategy == "fit" —
+  # with warm_strategy: "hybrid" active, these two are computed every frame
+  # but have no effect. Kept, not removed, because they're fit-mode's own
+  # velocity relaxation knob and fit is being kept for later investigation
+  # (see warm_strategy below) — re-enabling "fit" makes them live again.
   velocity_threshold_k: 0.013          # scale = 1/(1 + k*v_px); lowers threshold at speed; 0 = disabled
   velocity_threshold_min_factor: 0.75  # floor: threshold never drops below this fraction of base
 
@@ -93,18 +96,6 @@ blob_detection:
                           # the union of predicted-LED search neighborhoods
                           # instead of the full frame
   pose_guided_thresholds:
-    # Formula: threshold = a * facing_cos / depth_m² + c * velocity_px + b
-    #   a  — scales the Lambertian + inverse-square physics term
-    #   c  — velocity coefficient (per px/frame of controller motion); 0 = no
-    #        effect, omit or leave at 0 until calibrated from calibration_csv
-    #        data (previously velocity was only handled by the separate
-    #        velocity_threshold_k/threshold_scale relaxation below, which is
-    #        now floor-limited at min_threshold and largely inert for this path)
-    #   b  — constant floor independent of geometry (noise baseline)
-    pixel_threshold:
-      a: 0.1
-      c: 0.0
-      b: 6.0
     max_area:
       # cos-free: area-vs-angle calibration data showed no reliable trend (noise
       # across all facing_cos values), unlike the clean inverse-square depth fit —
@@ -115,9 +106,23 @@ blob_detection:
       a: 1.2
       b: 40
       c: 0.5
-    min_area:
-      a: 0.05
-      b: -20.0
+
+#    # Formula: threshold = a * facing_cos / depth_m² + c * velocity_px + b
+#    #   a  — scales the Lambertian + inverse-square physics term
+#    #   c  — velocity coefficient (per px/frame of controller motion); 0 = no
+#    #        effect, omit or leave at 0 until calibrated from calibration_csv
+#    #        data (previously velocity was only handled by the separate
+#    #        velocity_threshold_k/threshold_scale relaxation below, which is
+#    #        now floor-limited at min_threshold and largely inert for this path)
+#    #   b  — constant floor independent of geometry (noise baseline)
+#    pixel_threshold:
+#      a: 0.1
+#      c: 0.0
+#      b: 6.0
+#
+#    min_area:
+#      a: 0.05
+#      b: -20.0
   local_search_depth_k: 0.0         # extra radius: r = base + k/depth_m (0 = fixed radius)
   blob_cross_mask_margin_px: 3      # extra px added to matched-blob radius when masking ctrl A from ctrl B
   cross_controller_blackout: true   # before a controller's full-image COLD detection, zero out every
@@ -141,11 +146,6 @@ blob_detection:
                                     # (already bounded by pass 1's own physics-based ceiling below) —
                                     # no separate config needed; see BlobDetector.detect for details
 
-geometry:
-  z_frustum_top_padding: 0.0045   # metres added above the topmost outer LED axial position
-  z_frustum_bot_padding: 0.0055   # metres subtracted below the bottommost outer LED axial position
-  wall_thickness: 0.007           # frustum wall thickness in metres (R_fc_inner = R_fc - wall_thickness)
-
 matching:
 
   # --------------------------------------------------------------------------
@@ -165,7 +165,6 @@ matching:
   # LED physical model
   # --------------------------------------------------------------------------
   led_facing_angle_deg: 90.0      # emission half-angle; LEDs beyond this from camera axis are culled
-  led_radius_mm: 3.0              # physical emitter radius; drives depth-scaled snap and size thresholds
   max_warm_search_cameras: 2      # cap on how many cameras a warm controller searches per frame —
                                    # candidates with mean facing_cos below warm_cam_cap_min_facing_deg's
                                    # cosine are excluded outright, survivors ranked by mean LED distance
@@ -208,12 +207,12 @@ matching:
   proximity_min_inliers: 4               # min inliers for proximity match — kept at the brute-force floor;
                                           # 3 is a zero-redundancy PnP fit (6 DOF, 2 eqns/point) whose error
                                           # can look deceptively perfect regardless of correctness
-  proximity_redundancy_ref: 6            # confidence ramps from 0 at the 3-point (zero-redundancy) PnP
-                                          # floor to full trust this many points beyond it; guards fusion
-                                          # weighting against under-constrained per-camera fits
+  proximity_redundancy_ref: 6            # extra inlier pairs beyond the 3-point minimal fit needed for full
+                                          # fusion-weight confidence: confidence_factor = clip((n_inliers-3)/this, 0, 1)
+                                          # — a 4-point fit (1 extra) is barely trusted, 9+ points (6 extra) is fully trusted
   proximity_reprojection_threshold: 2.5  # RANSAC threshold (tighter than brute — prior is already close)
   proximity_expansion_px: 5.0           # neighbourhood radius (px) per LED; velocity-scaled: gate = base + k * v_px
-  proximity_max_hypotheses: 128          # cap on valid hypothesis evaluations before best-so-far is accepted
+  proximity_max_hypotheses: 32          # cap on valid hypothesis evaluations before best-so-far is accepted
   proximity_none_penalty_px: 0.4        # px cost for the first unmatched LED
   proximity_none_penalty_factor: 1.5    # geometric growth per None level: k-th None costs penalty * factor^(k-1); 1.0 = flat (linear)
   proximity_strong_match_px: 0.5        # 0-None hypothesis below this error triggers early termination
@@ -229,16 +228,6 @@ matching:
   proximity_expansion_velocity_k: 0.3   # extra px per px/frame of estimated velocity
   proximity_expansion_uncertainty_k: 1.0  # extra px / n_history; largest at n=1 (2nd frame), decays as 1/n
   proximity_expansion_depth_k: 2.0        # extra px * m of depth; same pattern as local_search_depth_k — closer controller → bigger neigh
-  proximity_mutual_exclusion_px: 5.0  # Phase 3 radius: blobs within this of a later controller's projected
-                                        # LEDs (and closer to it) are reserved when only one controller has a pose
-  voronoi_max_dist_px: 100.0           # Phase 4 radius: when both controllers have poses, partition all blobs
-                                        # within this distance of either controller's LEDs (full Voronoi territory)
-
-  # --------------------------------------------------------------------------
-  # Multi-controller ordering
-  # --------------------------------------------------------------------------
-  first_controller: "right"            # "right" or "left": which controller runs first and claims blobs first
-                                        # when both controllers have equal tracking status (both tracked or both cold)
 
   # --------------------------------------------------------------------------
   # Pose prediction
@@ -278,23 +267,13 @@ matching:
   cross_occlusion_bounding_radius_m: 0.18  # controller body bounding sphere radius (tune manually)
   cross_occlusion_gate_margin_px: 20.0     # slack added to the 2D projection gate threshold
 
-  # --------------------------------------------------------------------------
-  # Primary camera selection
-  # --------------------------------------------------------------------------
-  fixed_primary_camera: null       # integer camera index to always use as primary, or null = auto-select
-
-  # --------------------------------------------------------------------------
-  # Camera handoff (ignored when fixed_primary_camera is set)
-  # --------------------------------------------------------------------------
-  camera_handoff: true             # promote aux camera to primary when it dominates for several frames
-  handoff_coverage_ratio: 1.2      # aux must have >= this * primary LED count
-  handoff_min_advantage: 2         # aux must have >= this many more LEDs than primary (absolute)
-  handoff_hysteresis_frames: 1     # must dominate for this many consecutive frames before switching
-
 self_calibration:
   enabled: false                  # set to true to enable online intrinsic calibration
-  primary_camera: 0               # camera used as 3D reference (its T_imu_cam is the anchor)
-  lock_primary: false             # prevent handoff away from primary_camera
+  primary_camera: 0               # camera used as 3D reference (its T_imu_cam is the anchor); when enabled,
+                                   # this camera is also pinned as the tracker's fixed primary camera every
+                                   # frame (no auto-select) — the self-cal feed only fires on frames where
+                                   # this exact camera produced the solve, so it needs to be an actual anchor,
+                                   # not just whichever camera happened to win auto-select that frame
   aux_cameras: [2]                # cameras to calibrate; null = all non-primary cameras
   optimize_params: [fx, fy, cx, cy]  # subset of: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6
   min_primary_error_px: 0.5       # only accept frames with primary PnP error below this
@@ -303,18 +282,56 @@ self_calibration:
 
 debug:
   calibration_csv: null # "./data/calib_warm_pass1.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
-  mode_active: true
+  assume_continuous_frames: true  # true = input is a real continuous capture (frame N+1 is ~one exposure
+                                    # after frame N) → the pose-continuity jump check on re-acquisition
+                                    # applies. false = input is a curated/isolated set of problem frames
+                                    # (e.g. harvested via split_to_folders below) with no temporal relation
+                                    # to each other → that check is skipped, since "did the pose jump
+                                    # implausibly far since last frame" is meaningless when there's no real
+                                    # "last frame". NOT console verbosity — that's entirely controlled by
+                                    # the log_* flags below, independent of this setting.
   split_to_folders: false
-  verbose_all: false              # log every P3P hypothesis (no LED/blob filter needed)
-  log_best: true                  # log each new best solution update
+
+  # --------------------------------------------------------------------------
+  # Log categories — each toggles one slice of console output. Every one of
+  # them false ⇒ nothing prints but the tqdm progress bar (warnings/errors are
+  # the one exception: those always print, regardless of these flags).
+  # --------------------------------------------------------------------------
+  log_startup: true              # startup line (mode/data root), calibration CSV open/close paths
+  log_frame_summary: true        # per-frame per-controller accept line (cam/err/matches/method), TRACKING LOST
+  log_timings: true              # blob-detect / pose-search / rerun timings, slow-frame notices,
+                                  # per-tier brute-force bench + P3P-call summaries
+  log_blob_detection: false      # blob-dedup grouping (controllers sharing a camera collapse to one detect call)
+  log_matching_decisions: false  # per-camera proximity/brute attempt, accept/reject, cold-start,
+                                  # cold brute-force gating streak, warm-cam-cap candidate/demotion
+  log_batch_orchestration: false # warm-batch/cold-batch round summaries, per-tier pool submissions
+  log_pose_fusion: false         # per-camera importance weights in joint multi-camera fusion
+  log_occlusion: false           # cross-controller occlusion masking, cold-cold conflict resolution
+  log_proximity_match: false     # proximity/prior-constrained match internals: pairs matched, RANSAC
+                                  # outcome, dropped/vis-dropped pairs, aux-camera snap, final accept
+  log_hypothesis_testing: false  # brute-force per-hypothesis funnel: target triple reached, P3P solution
+                                  # count, depth/gate/visibility checks (see triple filters below)
+  log_ransac: false              # brute-force per-hypothesis Hungarian/RANSAC/aux-validation/coverage
+                                  # stages and each new-best-solution update (see log_best below)
+  log_self_calibration: false    # self-calibration frame accept/reject, per-camera optimisation results
+
+  verbose_all: false              # within log_hypothesis_testing/log_ransac: log every hypothesis, ignore
+                                   # the LED/blob triple filter below
+  log_best: true                  # within log_ransac: log each new best solution update
   debug_led_ids: null # [4, 15, 17]            # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
   debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
 
 visualization:
-  enabled: false  # set to false to skip Rerun entirely (no per-frame logging, no
+  enabled: true  # set to false to skip Rerun entirely (no per-frame logging, no
                  # viewer, no .rrd file) — for isolating tracking-only speed;
                  # save_recording below only controls whether an enabled
                  # session also gets written to disk, not whether it runs at all.
+  # Building the annotated per-blob debug canvas (drawing every kept/rejected
+  # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
+  # so it's only computed when one of these two sinks actually wants it:
+  visualize_save:  false   # write canvases to ./visualization/blobs/*.png
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+                           # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
   fine_tune_alignment: false  # set to true to run alignment optimiser and print refined params

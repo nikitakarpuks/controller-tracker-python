@@ -1,5 +1,4 @@
 import csv
-import sys
 from pathlib import Path
 from shutil import copy
 from time import time
@@ -15,7 +14,6 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
                                _compute_led_search_radii)
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
-from src.debug_config import DebugMode
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
 from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
@@ -32,36 +30,38 @@ def main():
 
     config = load_yaml_config('./config/config.yml')
 
-    # ── Debug mode: auto-detect from the data path ─────────────────────────
-    # SEQUENTIAL: full sequential repo  → minimal logs, copy slow/lost frames
-    # DEEP:       tracking_lost or deep_search_required → verbose matching logs
     data_root = Path(config["data"]["root"])
 
     debug_cfg = config.get("debug", {})
 
-    mode = (DebugMode.DEEP
-            if config["debug"]["mode_active"]
-            else DebugMode.SEQUENTIAL)
+    continuous_frames = bool(debug_cfg.get("assume_continuous_frames", True))
 
     debug_config.configure(
-        mode           = mode,
+        continuous_frames = continuous_frames,
         verbose_all    = bool(debug_cfg.get("verbose_all", False)),
         log_best       = bool(debug_cfg.get("log_best", True)),
         debug_led_ids  = debug_cfg.get("debug_led_ids") or None,
         debug_blob_ids = debug_cfg.get("debug_blob_ids") or None,
+        log_categories = {
+            "startup":             bool(debug_cfg.get("log_startup", True)),
+            "frame_summary":       bool(debug_cfg.get("log_frame_summary", True)),
+            "timings":             bool(debug_cfg.get("log_timings", True)),
+            "blob_detection":      bool(debug_cfg.get("log_blob_detection", False)),
+            "matching_decisions":  bool(debug_cfg.get("log_matching_decisions", False)),
+            "batch_orchestration": bool(debug_cfg.get("log_batch_orchestration", False)),
+            "pose_fusion":         bool(debug_cfg.get("log_pose_fusion", False)),
+            "occlusion":           bool(debug_cfg.get("log_occlusion", False)),
+            "proximity_match":     bool(debug_cfg.get("log_proximity_match", False)),
+            "hypothesis_testing":  bool(debug_cfg.get("log_hypothesis_testing", False)),
+            "ransac":              bool(debug_cfg.get("log_ransac", False)),
+            "self_calibration":    bool(debug_cfg.get("log_self_calibration", False)),
+        },
     )
+    debug_config.setup_logging()
 
-    logger.remove()
-    if mode == DebugMode.SEQUENTIAL:
-        logger.add(sys.stderr, level="INFO",
-                   format="<green>{time:HH:mm:ss}</green> | {message}")
-    else:
-        logger.add(sys.stderr, level="DEBUG",
-                   format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | {message}")
+    logger.bind(cat="startup").info(f"continuous_frames={continuous_frames}  data={data_root}")
 
-    logger.info(f"mode={mode.value}  data={data_root}")
-
-    # ── Output directories (sequential mode only) ──────────────────────────
+    # ── Output directories (harvest problem frames from a continuous run) ──
     out_slow = out_tracking_lost = None
     if config["debug"]["split_to_folders"]:
         out_slow          = data_root / "deep_search_required"
@@ -162,7 +162,7 @@ def main():
         _csv_writer.writerow(["frame", "ctrl_name", "cam_idx",
                                "led_id", "depth_m", "facing_cos", "velocity_px",
                                "brightness", "area"])
-        logger.info(f"Calibration CSV → {_csv_path}")
+        logger.bind(cat="startup").info(f"Calibration CSV → {_csv_path}")
 
     _n_frames = count_images(config["data"])
     for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
@@ -199,8 +199,10 @@ def main():
         _base_r    = float(_match_cfg.get("proximity_expansion_px", 8.0))
         # Building the annotated debug canvas has a real per-frame cost, so only
         # pay for it when a sink (local save and/or Rerun logging) wants it.
-        _visualize_save    = bool(_blob_cfg.get("visualize_save", False))
-        _visualize_rerun   = bool(_blob_cfg.get("visualize_rerun", False))
+        # Lives under visualization: (not blob_detection:) alongside `enabled`
+        # for convenience — all the viewer/debug-output toggles in one place.
+        _visualize_save    = bool(config["visualization"].get("visualize_save", False))
+        _visualize_rerun   = bool(config["visualization"].get("visualize_rerun", False))
         _visualize_compute = _visualize_save or _visualize_rerun
 
         def _run_blob_detect_batch_multi(cam_kwargs_per_ctrl: dict, images_override: dict = None):
@@ -294,7 +296,7 @@ def main():
             _group_by_rep = {(members[0][0], members[0][1]): members for members in groups.values()}
             _dupe_groups = [members for members in groups.values() if len(members) > 1]
             if _dupe_groups:
-                logger.debug(
+                logger.bind(cat="blob_detection").debug(
                     "[blob-dedup] " + "  ".join(
                         f"cam{members[0][1]}="
                         f"[{', '.join(c.replace('_controller', '') for c, _, _ in members)}]"
@@ -518,7 +520,7 @@ def main():
                 _skip_str = "  ".join(f"cam{c}=skip(out-of-scope)" for c in _skipped_cams)
                 _warm_str = f"{_warm_str}  {_skip_str}" if _warm_str else _skip_str
             _mode_label = "warm detect" if ctrl_has_prior[ctrl_name] else "cold detect"
-            logger.info(f"[{ctrl_name}] {_mode_label}: {_warm_str}")
+            logger.bind(cat="timings").info(f"[{ctrl_name}] {_mode_label}: {_warm_str}")
 
         # ── Phase 2: track controllers in order, filtering matched blobs at the
         # centroid level (no image copy / pixel drawing needed) ─────────────────
@@ -611,7 +613,7 @@ def main():
             _pose_batch_ms = (time() - _t_pose_batch0) * 1000
             _pose_phase_wall_s += _pose_batch_ms / 1000
             _fallback_ctrls = []
-            logger.debug(
+            logger.bind(cat="batch_orchestration").debug(
                 f"[warm-batch] {len(ctrl_names_ordered)} controllers in one pool round: "
                 f"{_pose_batch_ms:.1f}ms  succeeded=[{', '.join(c for c in ctrl_names_ordered if _batch_results.get(c) is not None)}]"
             )
@@ -701,7 +703,7 @@ def main():
                     else:
                         frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
                 _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
-                logger.info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
+                logger.bind(cat="timings").info(f"[{ctrl_name}] cold re-detect (warm proximity lost): {_cold_str}")
 
                 _exclude_claimed_blobs(ctrl_idx, ctrl_name)
                 # Straight to brute — no pose_prior, same as a cold-start first
@@ -747,7 +749,7 @@ def main():
             )
             _cold_batch_ms = (time() - _t_cold_batch0) * 1000
             _pose_phase_wall_s += _cold_batch_ms / 1000
-            logger.debug(
+            logger.bind(cat="batch_orchestration").debug(
                 f"[cold-batch] {len(_true_cold_ctrls)} controllers in one pool round: "
                 f"{_cold_batch_ms:.1f}ms  "
                 f"succeeded=[{', '.join(c for c in _true_cold_ctrls if _cold_results.get(c) is not None)}]"
@@ -775,6 +777,7 @@ def main():
         assignments_frame_out     = {}
         primary_cams_frame_out    = {}
         aux_assignments_frame_out = {}
+        camera_importance_frame_out = {}
         frozen_T_world_ctrl_frame = {}
 
         for ctrl_name in enabled_ctrls:
@@ -789,6 +792,7 @@ def main():
                 assignments_frame_out[ctrl_name]     = sol["assignment"].copy()
                 primary_cams_frame_out[ctrl_name]    = primary_cam_idx
                 aux_assignments_frame_out[ctrl_name] = sol.get("aux_assignments")
+                camera_importance_frame_out[ctrl_name] = sol.get("camera_importance")
                 last_good_T_world[ctrl_name] = T_world_ctrl
                 frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
                 any_valid_pose[ctrl_name] = True
@@ -801,7 +805,8 @@ def main():
                     aux_str = f"  +{sol['aux_inliers']}aux"
                 else:
                     aux_str = ""
-                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  "
+                logger.bind(cat="frame_summary").info(
+                            f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  "
                             f"cam={primary_cam}  err={sol['error']:.2f}px  "
                             f"matches={len(sol['assignment'])}{aux_str}  "
                             f"method={sol.get('method', '?')}")
@@ -841,7 +846,7 @@ def main():
                 frozen_T_world_ctrl_frame[ctrl_name] = (
                     last_good if last_good is not None and total_blobs > 0 else None
                 )
-                logger.info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  TRACKING LOST")
+                logger.bind(cat="frame_summary").info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  TRACKING LOST")
 
         if animator is not None:
             _t_rerun0 = time()
@@ -853,11 +858,12 @@ def main():
                 contours_per_ctrl=contours_frame,
                 primary_cam_per_ctrl=primary_cams_frame_out,
                 aux_assignments_per_ctrl=aux_assignments_frame_out,
+                camera_importance_per_ctrl=camera_importance_frame_out,
                 frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
                 blob_vis_frame=(frame_blob_vis if _visualize_rerun else {}),
                 blob_vis_skipped=(skipped_cams_per_ctrl if _visualize_rerun else {}),
             )
-            logger.info(f"[{img_path.name}]  rerun log_frame: {(time() - _t_rerun0) * 1000:.1f}ms")
+            logger.bind(cat="timings").info(f"[{img_path.name}]  rerun log_frame: {(time() - _t_rerun0) * 1000:.1f}ms")
 
         # Built from the true batched wall-clock numbers (_blob_batch_ms,
         # _pose_phase_wall_s), not summed per-controller estimates — summing
@@ -869,13 +875,13 @@ def main():
         _total_frame_s = _blob_batch_ms / 1000 + _redetect_ms_total / 1000 + _pose_phase_wall_s
         if out_slow is not None and _total_frame_s > SLOW_MATCH_THRESHOLD_S:
             copy(img_path, out_slow / img_path.name)
-            logger.info(f"  → saved to deep_search_required (slow: {_total_frame_s:.1f}s)")
+            logger.bind(cat="timings").info(f"  → saved to deep_search_required (slow: {_total_frame_s:.1f}s)")
         if out_tracking_lost is not None and any(n not in T_world_ctrl_frame for n in enabled_ctrls):
             copy(img_path, out_tracking_lost / img_path.name)
 
     if _csv_file:
         _csv_file.close()
-        logger.info(f"Calibration CSV saved → {_csv_path}")
+        logger.bind(cat="startup").info(f"Calibration CSV saved → {_csv_path}")
 
     if tracking_system._self_cal is not None:
         tracking_system._self_cal.run()

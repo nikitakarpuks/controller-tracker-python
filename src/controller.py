@@ -9,7 +9,7 @@ from typing import List, Tuple, Optional, Dict, Set
 from src._pnp import _project_points
 from src._visibility import _visible_mask, _cross_occluded_mask
 from src.camera import Camera
-from src.debug_config import is_deep
+from src.debug_config import is_continuous_sequence
 from src.transformations import Transform
 from src._self_calibration import SelfCalibrator
 
@@ -110,12 +110,10 @@ def cheap_search_core(
     if blob_mask is not None:
         _avail_idx  = np.where(blob_mask)[0].astype(np.int32)
         blobs_prox  = blobs[_avail_idx]
-        radii_prox  = blob_radii[_avail_idx]  if blob_radii        is not None else None
         brts_prox   = blob_brightnesses[_avail_idx] if blob_brightnesses is not None else None
         n_available = len(blobs_prox)
     else:
         blobs_prox  = blobs
-        radii_prox  = blob_radii
         brts_prox   = blob_brightnesses
         n_available = n_blobs
 
@@ -194,11 +192,10 @@ def cheap_search_core(
         # ------------------------------------------------------------------
         if (solution is None and prev_assignment is not None
                 and 2 <= n_available <= 3):
-            logger.debug(f"[{pose_searcher._ctrl} | cam {pose_searcher._cam} | track] n_blobs={n_available} + prior → prior_constrained_match")
+            logger.bind(cat="matching_decisions").debug(f"[{pose_searcher._ctrl} | cam {pose_searcher._cam} | track] n_blobs={n_available} + prior → prior_constrained_match")
             solution = pose_searcher.constrained_search(
                 blobs_prox, predicted_pose,
                 prior_assignment=prev_assignment,
-                blob_radii=radii_prox,
                 other_cameras_blobs=other_cameras_blobs,
             )
             if solution is not None and blob_mask is not None:
@@ -573,10 +570,12 @@ class CameraTracker:
         _reacquiring = self.prev_pose is None or self.tracking_lost_last_frame
 
         # Cold-start / re-acquisition plausibility check: reject a candidate
-        # that's too far from the last known good pose. In deep-debug mode
-        # frames are non-consecutive, so this check is skipped — the controller can
-        # be anywhere.
-        if solution is not None and _reacquiring and self.last_good_pose is not None and not is_deep():
+        # that's too far from the last known good pose. Only valid when frames
+        # are a real temporal sequence — against a curated/isolated frame set
+        # (assume_continuous_frames: false) there's no real "last frame" to be
+        # near, so this check is skipped and the controller can be anywhere.
+        if (solution is not None and _reacquiring and self.last_good_pose is not None
+                and is_continuous_sequence()):
             rvec_lg, tvec_lg = self.last_good_pose
             if self._pose_jump_too_large(
                 solution["rvec"], solution["tvec"],
@@ -585,7 +584,7 @@ class CameraTracker:
                 max_angle_deg=60.0,
                 **_jump_kw,
             ):
-                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
+                logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
                 solution = None
 
         # ------------------------------------------------------------------
@@ -608,7 +607,6 @@ class CameraTracker:
                     _jump_prior = predicted_pose if predicted_pose is not None else self.prev_pose
                     brute = self.brute_match(blobs, pose_prior=_jump_prior,
                                              other_cameras_blobs=other_cameras_blobs,
-                                             blob_radii=blob_radii,
                                              blob_mask=blob_mask)
                     if brute is not None:
                         _near_prev = not self._pose_jump_too_large(
@@ -628,17 +626,16 @@ class CameraTracker:
         # Proximity found a solution but error is too high — try brute before giving up
         if (solution is not None and solution["error"] >= _accept_err_px
                 and allow_expensive_fallback and n_available >= 4):
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity err={solution['error']:.2f}px exceeds threshold, attempting brute recovery")
+            logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity err={solution['error']:.2f}px exceeds threshold, attempting brute recovery")
             brute = self.brute_match(blobs, pose_prior=self.prev_pose,
                                      other_cameras_blobs=other_cameras_blobs,
-                                     blob_radii=blob_radii,
                                      blob_mask=blob_mask)
             if brute is not None:
-                logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] brute recovery err={brute['error']:.2f}px")
+                logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] brute recovery err={brute['error']:.2f}px")
                 solution = brute
 
         if solution is not None and solution["error"] < _accept_err_px:
-            logger.debug(
+            logger.bind(cat="matching_decisions").debug(
                 f"[{ctrl_name} | cam {cam_idx} | track] accepted — method={solution.get('method','?')}  "
                 f"inliers={len(solution['assignment'])}  err={solution['error']:.2f}px"
             )
@@ -649,9 +646,9 @@ class CameraTracker:
             return solution
 
         if solution is not None:
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds {_accept_err_px:.1f}px threshold")
+            logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — err={solution['error']:.2f}px exceeds {_accept_err_px:.1f}px threshold")
         else:
-            logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
+            logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] rejected — no solution found")
         return None
 
     def search(self, blobs: np.ndarray, blob_radii: Optional[np.ndarray] = None,
@@ -681,17 +678,15 @@ class CameraTracker:
             ctrl_name = self.model.name.replace("_controller", "")
             if self.prev_pose is not None:
                 if allow_expensive_fallback and n_available >= 4:
-                    logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity → None, running brute fallback")
+                    logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] proximity → None, running brute fallback")
                     solution = self.brute_match(blobs, pose_prior=predicted_pose,
                                                 other_cameras_blobs=other_cameras_blobs,
-                                                blob_radii=blob_radii,
                                                 blob_mask=blob_mask,
                                                 occluders_per_cam=occluders_per_cam)
             else:
                 if n_available >= 4:
-                    logger.debug(f"[{ctrl_name} | cam {cam_idx} | track] no prev_pose → cold-start brute")
+                    logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] no prev_pose → cold-start brute")
                     solution = self.brute_match(blobs, other_cameras_blobs=other_cameras_blobs,
-                                                blob_radii=blob_radii,
                                                 blob_mask=blob_mask,
                                                 occluders_per_cam=occluders_per_cam)
 
@@ -940,7 +935,7 @@ class ControllerTracker:
                     else:
                         tracker._consecutive_good_blob_frames = 0
                     if tracker._consecutive_good_blob_frames < _confirm_frames:
-                        logger.debug(
+                        logger.bind(cat="matching_decisions").debug(
                             f"[{self.ctrl_name} | cam {cid}] cold brute-force gated: "
                             f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
                             f"(n_blobs={len(av_blobs)})"
@@ -949,12 +944,11 @@ class ControllerTracker:
                 if len(av_blobs) == 0:
                     continue
                 obs_full = obs_src[cid]
-                rad_full = rad_src.get(cid) if rad_src else None
                 mask = np.zeros(len(obs_full), dtype=bool)
                 mask[av_orig] = True
                 states[cid] = tracker._pose_searcher.new_brute_state(
                     obs_full, pose_prior=predicted_pose_by_cid.get(cid),
-                    other_cameras_blobs=None, blob_radii=rad_full,
+                    other_cameras_blobs=None,
                     blob_mask=mask, occluders_per_cam=occluders_per_cam,
                 )
             t_new_state = time.perf_counter() - _t_new_state_start
@@ -1025,7 +1019,7 @@ class ControllerTracker:
             "  pool_rt=[" + " ".join(f"cam{c}={ms:.1f}ms" for c, ms in sorted(_pool_rt_ms.items())) + "]"
             if _pool_rt_ms else ""
         )
-        logger.debug(
+        logger.bind(cat="timings").debug(
             f"[{self.ctrl_name}] update timing: cheap={t_cheap*1000:.1f}ms  "
             f"brute(new_state={t_new_state*1000:.1f}ms "
             f"tier_rounds={t_tier_rounds*1000:.1f}ms[{n_rounds} rounds] "
@@ -1112,7 +1106,7 @@ class ControllerTracker:
             f"cam{cid}={w / _w_total:.2f}" for cid, w in sorted(_raw_w.items())
         )
 
-        logger.debug(
+        logger.bind(cat="pose_fusion").debug(
             f"[{self.ctrl_name}] Joint fusion: {len(cam_solutions)} solved  "
             f"err={fused_err:.2f}px  lm={_t_fuse*1000:.1f}ms  "
             f"importance=[{_importance_str}]"
@@ -1120,8 +1114,19 @@ class ControllerTracker:
 
         solution = dict(anchor_solution)
         solution["primary_cam"]  = primary_cam_id
+        # Preserved for the self-cal feed below: the primary camera's own
+        # independent PnP solve, untainted by any other (possibly still
+        # uncalibrated) camera's contribution to the fused pose — see
+        # _commit_fused_solution's self-cal block.
+        solution["primary_T_world_ctrl"] = anchor_solution["T_world_ctrl"]
+        solution["primary_error"]        = anchor_solution["error"]
         solution["T_world_ctrl"] = T_world_ctrl
         solution["error"]        = fused_err
+        # Normalised per-camera fusion weight (sums to 1 across every solved
+        # camera) — the same values behind the "importance=[...]" debug line
+        # above, exposed here for consumers (e.g. visualization) that want to
+        # reflect actual per-camera contribution rather than a primary/aux label.
+        solution["camera_importance"] = {cid: w / _w_total for cid, w in _raw_w.items()}
         _other_assignments = {
             cs["cam_id"]: cs["solution"]["assignment"]
             for cs in cam_solutions if cs["cam_id"] != primary_cam_id
@@ -1158,7 +1163,6 @@ class ControllerTracker:
         before this is ever called).
         """
         T_world_ctrl       = solution["T_world_ctrl"]
-        fused_err          = solution["error"]
         primary_cam_id     = solution["primary_cam"]
         anchor_assignment  = solution["assignment"]
         _other_assignments = solution["aux_assignments"]
@@ -1174,9 +1178,19 @@ class ControllerTracker:
                     claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
 
         # ── Self-calibration feed ────────────────────────────────────────────────
+        # Uses the primary camera's own independent PnP solve (primary_T_world_ctrl/
+        # primary_error, set in _compute_fused_solution) as the 3D reference, NOT
+        # the fused T_world_ctrl above — the fused pose is a confidence-weighted
+        # blend across every solved camera, including the very aux cameras being
+        # calibrated here. Feeding that blend back in as "ground truth" would be
+        # circular: an aux camera's still-wrong intrinsics would leak into the
+        # reference used to correct it. SelfCalibrator's own docstring assumes an
+        # aux-camera-untainted primary solve; this is what actually provides one.
         if (self_cal is not None
                 and primary_cam_id == self_cal.primary_camera.camera_idx):
-            _T_cam_ctrl_anchor = self.cameras[primary_cam_id].T_world_cam.inverse().compose(T_world_ctrl)
+            _primary_T_world_ctrl = solution["primary_T_world_ctrl"]
+            _primary_err          = solution["primary_error"]
+            _T_cam_ctrl_anchor = self.cameras[primary_cam_id].T_world_cam.inverse().compose(_primary_T_world_ctrl)
             _R_prim = _T_cam_ctrl_anchor.R.astype(np.float32)
             _rv_prim, _ = cv2.Rodrigues(_R_prim)
             _t_prim = _T_cam_ctrl_anchor.t.astype(np.float32)
@@ -1193,7 +1207,7 @@ class ControllerTracker:
             if _sc_aux_obs:
                 self_cal.add_frame(
                     _rv_prim, _t_prim,
-                    primary_error=fused_err,
+                    primary_error=_primary_err,
                     primary_inliers=len(anchor_assignment),
                     aux_observations=_sc_aux_obs,
                 )
@@ -1293,11 +1307,12 @@ class TrackingSystem:
 
         self._matching_cfg: dict = matching_cfg or {}
 
-        # Resolve fixed primary camera: matching cfg wins, then self-cal lock_primary.
-        _fpc = self._matching_cfg.get("fixed_primary_camera")
-        if _fpc is None and _sc_primary_idx is not None and sc_cfg.get("lock_primary", True):
-            _fpc = _sc_primary_idx
-        self._fixed_primary_cam: Optional[int] = int(_fpc) if _fpc is not None else None
+        # Fixed primary camera exists only to serve self-calibration (it pins the
+        # 3D reference every frame feeds SelfCalibrator.add_frame from — see
+        # ControllerTracker._commit_fused_solution's self-cal block); with no
+        # self-calibration running, there's no reason to override the normal
+        # per-frame auto-select (most inlier pairs wins).
+        self._fixed_primary_cam: Optional[int] = _sc_primary_idx
 
         self.trackers: Dict[Tuple[str, int], CameraTracker] = {}
         self.ctrl_trackers: Dict[str, ControllerTracker]    = {}
@@ -1656,7 +1671,7 @@ class TrackingSystem:
             for ctrl_name in ctrl_names:
                 _all_cids = [cid for cid in result if result[cid][ctrl_name] is not None]
                 if _all_cids:
-                    logger.debug(
+                    logger.bind(cat="matching_decisions").debug(
                         f"[{ctrl_name}] warm-cam-cap candidates: " + "  ".join(
                             f"cam{cid}(n={len(result[cid][ctrl_name])},"
                             f"dist={_center_dist[(ctrl_name, cid)]:.3f}m,"
@@ -1677,7 +1692,7 @@ class TrackingSystem:
                 for cid in _all_cids:
                     if cid in _kept_cids:
                         continue
-                    logger.debug(f"[{ctrl_name}] warm-cam-cap demoting cam{cid}")
+                    logger.bind(cat="matching_decisions").debug(f"[{ctrl_name}] warm-cam-cap demoting cam{cid}")
                     search_eligible[cid][ctrl_name] = False
 
         return result, vel_hints, radius_hints, search_eligible
@@ -1719,7 +1734,6 @@ class TrackingSystem:
     def get_ctrl_processing_order(self) -> List[str]:
         """Return controller names in the same priority order used by update()."""
         ctrl_names = sorted({ctrl for ctrl, _ in self.trackers})
-        _first = self._matching_cfg.get('first_controller', None)
 
         def _has_prior(name: str) -> bool:
             return any(
@@ -1729,9 +1743,7 @@ class TrackingSystem:
             )
 
         def _order_key(name: str):
-            has_prior_rank = 0 if _has_prior(name) else 1
-            preferred_rank = (0 if name == f"{_first}_controller" else 1) if _first else 0
-            return (has_prior_rank, preferred_rank, name)
+            return (0 if _has_prior(name) else 1, name)
 
         return sorted(ctrl_names, key=_order_key)
 
@@ -1775,15 +1787,13 @@ class TrackingSystem:
         # Blob ownership: original observation indices claimed by earlier controllers.
         claimed_blobs: Dict[int, Set[int]] = {}
 
-        def _filter_cam(cam_id: int, obs_map: dict, rad_map: dict, brt_map: dict,
-                        extra_excluded: Optional[Set[int]] = None):
+        def _filter_cam(cam_id: int, obs_map: dict, rad_map: dict, brt_map: dict):
             """Return (filtered_blobs, filtered_radii, filtered_brts, orig_indices)
-            excluding claimed and reserved blobs. Returns (None,None,None,[]) if empty."""
+            excluding claimed blobs. Returns (None,None,None,[]) if empty."""
             obs = obs_map.get(cam_id)
             if obs is None or len(obs) == 0:
                 return None, None, None, []
-            claimed  = claimed_blobs.get(cam_id, set())
-            excluded = claimed if not extra_excluded else claimed | extra_excluded
+            excluded = claimed_blobs.get(cam_id, set())
             keep = [i for i in range(len(obs)) if i not in excluded]
             if not keep:
                 return None, None, None, []
@@ -1797,71 +1807,6 @@ class TrackingSystem:
 
         _cfg = self._matching_cfg
 
-        # Reservation sets: blobs that later controllers must not use (cross-controller Voronoi).
-        _reservations: Dict[str, Dict[int, Set[int]]] = {_cn: {} for _cn in ordered}
-
-        # ── Phase 3 / 4: Proximity mutual exclusion ───────────────────────────
-        if per_ctrl_observations is None and len(ordered) >= 2:
-            _reserve_px = float(_cfg.get(
-                'proximity_mutual_exclusion_px', _cfg.get('aux_snap_px', 15.0),
-            ))
-            _voronoi_px = float(_cfg.get('voronoi_max_dist_px', 100.0))
-
-            _ctrl_proj: Dict[str, Dict[int, Optional[np.ndarray]]] = {}
-            for _cn in ordered:
-                _ctrl_proj[_cn] = {}
-                for _cid, _cam in self.cameras.items():
-                    _trk = self.trackers.get((_cn, _cid))
-                    if _trk is None or _trk.prev_pose is None:
-                        _ctrl_proj[_cn][_cid] = None
-                        continue
-                    _rv, _tv = _trk.prev_pose
-                    _R, _ = cv2.Rodrigues(np.asarray(_rv, dtype=np.float32).reshape(3))
-                    _tv_np = np.asarray(_tv, dtype=np.float32).reshape(3)
-                    _pts_cam = (_R @ _trk.model.positions.T).T + _tv_np
-                    _vis = _pts_cam[:, 2] > 0.01
-                    if not _vis.any():
-                        _ctrl_proj[_cn][_cid] = None
-                        continue
-                    _ctrl_proj[_cn][_cid] = _project_points(
-                        _rv, _tv, _trk.model.positions[_vis],
-                        _cam.camera_matrix, _cam.dist_coeffs,
-                        is_fisheye=_cam.is_fisheye,
-                    )
-
-            for _i, _cn_i in enumerate(ordered[:-1]):
-                _proj_i = _ctrl_proj.get(_cn_i, {})
-                for _j in range(_i + 1, len(ordered)):
-                    _cn_j = ordered[_j]
-                    _proj_j = _ctrl_proj.get(_cn_j, {})
-                    for _cid, _obs in observations_per_camera.items():
-                        if _obs is None or len(_obs) == 0:
-                            continue
-                        _pj = _proj_j.get(_cid)
-                        if _pj is None or len(_pj) == 0:
-                            continue
-                        _d_j = np.linalg.norm(
-                            _obs[:, None, :] - _pj[None, :, :], axis=2
-                        ).min(axis=1)
-                        _pi = _proj_i.get(_cid)
-                        if _pi is not None and len(_pi) > 0:
-                            _d_i = np.linalg.norm(
-                                _obs[:, None, :] - _pi[None, :, :], axis=2
-                            ).min(axis=1)
-                            _near_either = (_d_j < _voronoi_px) | (_d_i < _voronoi_px)
-                            if not _near_either.any():
-                                continue
-                            _reserve_mask = _near_either & (_d_j < _d_i)
-                        else:
-                            _near_j = _d_j < _reserve_px
-                            if not _near_j.any():
-                                continue
-                            _reserve_mask = _near_j
-                        if not _reserve_mask.any():
-                            continue
-                        _res_set = _reservations[_cn_i].setdefault(_cid, set())
-                        _res_set.update(int(k) for k in np.where(_reserve_mask)[0])
-
         # ── Per-controller tracking ────────────────────────────────────────────
         for ctrl_name in ordered:
             if per_ctrl_observations is not None and ctrl_name in per_ctrl_observations:
@@ -1873,12 +1818,9 @@ class TrackingSystem:
                 _rad_src = radii_per_camera or {}
                 _brt_src = brightnesses_per_camera or {}
 
-            _ctrl_reservations = _reservations.get(ctrl_name, {})
             avail: Dict[int, tuple] = {}
             for cam_id in self.ctrl_trackers[ctrl_name].trackers:
-                _extra = _ctrl_reservations.get(cam_id) or None
-                fb, fr, fbt, keep = _filter_cam(cam_id, _obs_src, _rad_src, _brt_src,
-                                                 extra_excluded=_extra)
+                fb, fr, fbt, keep = _filter_cam(cam_id, _obs_src, _rad_src, _brt_src)
                 if fb is not None:
                     avail[cam_id] = (fb, fr, fbt, keep)
 
@@ -1985,7 +1927,7 @@ class TrackingSystem:
             occluders_by_ctrl[ctrl_name] = _occ_per_cam
 
         if occluders_by_ctrl:
-            logger.debug(
+            logger.bind(cat="occlusion").debug(
                 f"[warm-batch] extrapolated occluders built for: "
                 f"{list(occluders_by_ctrl.keys())}"
             )
@@ -2178,7 +2120,6 @@ class TrackingSystem:
         states: Dict[Tuple[str, int], object] = {}
         for ctrl_name in ctrl_names:
             obs_src = per_ctrl_observations.get(ctrl_name) or {}
-            rad_src = (per_ctrl_radii or {}).get(ctrl_name) or {}
             for cid, tracker in self.ctrl_trackers[ctrl_name].trackers.items():
                 obs_full = obs_src.get(cid)
                 if obs_full is None or len(obs_full) == 0:
@@ -2194,17 +2135,16 @@ class TrackingSystem:
                 else:
                     tracker._consecutive_good_blob_frames = 0
                 if tracker._consecutive_good_blob_frames < _confirm_frames:
-                    logger.debug(
+                    logger.bind(cat="matching_decisions").debug(
                         f"[{ctrl_name} | cam {cid}] cold brute-force gated (batch): "
                         f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
                         f"(n_blobs={len(obs_full)})"
                     )
                     continue
-                rad_full = rad_src.get(cid)
                 mask = np.ones(len(obs_full), dtype=bool)
                 states[(ctrl_name, cid)] = tracker._pose_searcher.new_brute_state(
                     obs_full, pose_prior=None, other_cameras_blobs=None,
-                    blob_radii=rad_full, blob_mask=mask, occluders_per_cam=None,
+                    blob_mask=mask, occluders_per_cam=None,
                 )
 
         if not states:
@@ -2222,7 +2162,7 @@ class TrackingSystem:
                 remaining = [k for k, st in states.items() if st is not None and not st.strong_found]
                 if not remaining:
                     break
-                logger.debug(f"[cold-batch] tier {tier_idx}: submitting {sorted(remaining)}")
+                logger.bind(cat="batch_orchestration").debug(f"[cold-batch] tier {tier_idx}: submitting {sorted(remaining)}")
                 futures = {k: self._pool.submit(run_brute_tier, k, states[k], tier_idx) for k in remaining}
                 for k, fut in futures.items():
                     states[k] = fut.result()
@@ -2288,7 +2228,7 @@ class TrackingSystem:
                 # re-accumulate _confirm_frames consecutive frames before
                 # retrying next frame -- only _mark_all_lost's own fields
                 # (consecutive_failures, tracking_lost_last_frame) change.
-                logger.info(
+                logger.bind(cat="occlusion").info(
                     f"[cold-batch] conflict: dropping {ctrl_name} "
                     f"(err={solution['error']:.2f}px, lost to a lower-error candidate this frame)"
                 )
