@@ -1,5 +1,6 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/single_ctrl/1_r_ctrl_all_basic_moves"
+#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/single_ctrl/4_r_ctrl_distance_table_occlusion_mateo"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/single_ctrl/5_right_ctrl_camera_xy_occlusions/a"
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
@@ -11,7 +12,9 @@ cameras:
 #  intrinsics_path: "./data/cameras/mateo_fresh_calib.json"
 #  intrinsics_path: "./data/cameras/backup/my_calibration.json"
 
-  intrinsics_path: "./data/cameras/custom_june_calib.json"
+  intrinsics_path: "./data/cameras/kb4_calib.json"
+#  intrinsics_path: "./data/cameras/kb4_calib.as_radtan8.json"
+
 
   extrinsics_convention: "T_cam0_camN"   # "T_imu_cam" or "T_cam0_camN"
 
@@ -178,12 +181,12 @@ matching:
   # Brute match
   # --------------------------------------------------------------------------
   depth_tiers:                    # (anchor_leds, total_leds [, "edge"]) hypotheses to enumerate
-    - [2, 3]
+#    - [2, 3]
 #    - [2, 4]
 #    - [2, 4, "edge"]
 #    - [3, 5]
 #    - [3, 5, "edge"]
-#    - [4, 6]
+    - [4, 6]
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
   reprojection_threshold: 2.5    # RANSAC inlier threshold
@@ -302,21 +305,26 @@ debug:
   log_timings: true              # blob-detect / pose-search / rerun timings, slow-frame notices,
                                   # per-tier brute-force bench + P3P-call summaries
   log_blob_detection: false      # blob-dedup grouping (controllers sharing a camera collapse to one detect call)
-  log_matching_decisions: false  # per-camera proximity/brute attempt, accept/reject, cold-start,
+  log_blob_diag: false           # per-call pool round-trip breakdown: dispatch latency / compute / return transit
+  log_matching_decisions: true  # per-camera proximity/brute attempt, accept/reject, cold-start,
                                   # cold brute-force gating streak, warm-cam-cap candidate/demotion
   log_batch_orchestration: false # warm-batch/cold-batch round summaries, per-tier pool submissions
   log_pose_fusion: false         # per-camera importance weights in joint multi-camera fusion
   log_occlusion: false           # cross-controller occlusion masking, cold-cold conflict resolution
-  log_proximity_match: false     # proximity/prior-constrained match internals: pairs matched, RANSAC
+  log_proximity_match: true     # proximity/prior-constrained match internals: pairs matched, RANSAC
                                   # outcome, dropped/vis-dropped pairs, aux-camera snap, final accept
-  log_hypothesis_testing: false  # brute-force per-hypothesis funnel: target triple reached, P3P solution
+  log_hypothesis_testing: true  # brute-force per-hypothesis funnel: target triple reached, P3P solution
                                   # count, depth/gate/visibility checks (see triple filters below)
-  log_ransac: false              # brute-force per-hypothesis Hungarian/RANSAC/aux-validation/coverage
+  log_ransac: true              # brute-force per-hypothesis Hungarian/RANSAC/aux-validation/coverage
                                   # stages and each new-best-solution update (see log_best below)
   log_self_calibration: false    # self-calibration frame accept/reject, per-camera optimisation results
 
-  verbose_all: false              # within log_hypothesis_testing/log_ransac: log every hypothesis, ignore
-                                   # the LED/blob triple filter below
+  log_all_triples: false          # within log_hypothesis_testing/log_ransac: log every brute-force
+                                  # hypothesis triple, ignoring the LED/blob triple filter below
+                                  # (very verbose -- one block of prints per triple tried)
+  log_all_proximity_hyps: true   # within log_proximity_match: log every candidate hypothesis tried
+                                  # in the None-branching search (one line per combo), not just the
+                                  # level/cap/early-stop/final-accept summary lines (very verbose)
   log_best: true                  # within log_ransac: log each new best solution update
   debug_led_ids: null # [4, 15, 17]            # e.g. [0, 14, 3]  — LED triple [anchor, l1, l2]
   debug_blob_ids: null # [0, 5, 4]          # e.g. [2, 5, 3]  — blob triple [b_anchor, b1, b2]
@@ -330,7 +338,7 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving

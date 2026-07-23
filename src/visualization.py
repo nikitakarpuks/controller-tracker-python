@@ -1,3 +1,4 @@
+import colorsys
 from pathlib import Path
 from typing import Optional
 
@@ -81,18 +82,25 @@ def _camera_color(cam_idx: int) -> list:
 # or by a binary primary/aux label — fusion doesn't work that way anymore (every
 # solved camera contributes a continuous, confidence/√pairs-weighted share, see
 # _compute_fused_solution's camera_importance). Instead every contributing camera
-# uses this same dark-blue family, with brightness scaled by its actual fusion
-# weight this frame — a camera the fuse leaned on heavily reads bright, one that
-# barely contributed reads almost black. Floor keeps a near-zero-importance
-# camera dimly visible rather than invisible.
-_IMPORTANCE_BASE_COLOR = [40, 70, 190]   # dark blue
-_IMPORTANCE_BRIGHTNESS_FLOOR = 0.25      # brightness at importance=0.0
+# is colored by a hue sweep keyed to its actual fusion weight this frame — blue
+# for a camera the fuse barely leaned on, gold for one it leaned on heavily.
+# Hue is a much easier channel to rank at a glance than brightness (two similar
+# brightnesses are hard to tell apart; two different hues aren't), and holding
+# saturation/value constant means even importance=0.0 stays clearly visible
+# instead of fading toward black.
+_IMPORTANCE_HUE_LOW     = 228 / 360   # blue,               importance = 0.0
+_IMPORTANCE_HUE_SPAN    = 177 / 360   # sweep toward gold via violet/magenta/red/orange —
+                                       # NOT through green/cyan (120-180°), which
+                                       # CAMERA_COLORS already uses for per-camera identity.
+_IMPORTANCE_SATURATION  = 0.85
+_IMPORTANCE_VALUE       = 0.95
 
 
 def _importance_color(importance: Optional[float]) -> list:
     imp = 1.0 if importance is None else max(0.0, min(1.0, float(importance)))
-    brightness = _IMPORTANCE_BRIGHTNESS_FLOOR + (1.0 - _IMPORTANCE_BRIGHTNESS_FLOOR) * imp
-    return [int(round(c * brightness)) for c in _IMPORTANCE_BASE_COLOR]
+    hue = (_IMPORTANCE_HUE_LOW + _IMPORTANCE_HUE_SPAN * imp) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, _IMPORTANCE_SATURATION, _IMPORTANCE_VALUE)
+    return [int(round(r * 255)), int(round(g * 255)), int(round(b * 255))]
 
 
 # One distinct colour per controller index — used for blob contours.
@@ -183,10 +191,10 @@ def compute_frustum_boundary(cam, z: float, edge_samples: int = 20):
         np.column_stack([np.zeros_like(t), (1.0 - t) * h]),     # left
     ], axis=0)
 
-    if getattr(cam, 'is_fisheye', False) and getattr(cam, 'rpmax', 0) > 0:
+    if getattr(cam, 'is_fisheye', False) and getattr(cam, 'rpmax_px', 0) > 0:
         # Only keep pixels within the valid fisheye radius so the outline stays convex.
         r_px = np.sqrt((edges_px[:, 0] - cam.cx)**2 + (edges_px[:, 1] - cam.cy)**2)
-        edges_px = edges_px[r_px <= cam.rpmax]
+        edges_px = edges_px[r_px <= cam.rpmax_px]
 
     if len(edges_px) == 0:
         return np.zeros((0, 3), dtype=np.float32)
