@@ -586,8 +586,7 @@ class PoseSearcher:
         self._c_brute_strong_err    = float(_cfg.get('strong_match_error_px',            1.5))
         self._c_brute_min_vis_cov   = float(_cfg.get('min_vis_coverage',                 0.75))
         self._c_brute_rng_seed      = _cfg.get('rng_seed',                              42)
-        self._c_brute_aux_reproj_px = float(_cfg.get('joint_aux_prefilter_px',
-                                                      _brute_reproj * 2.0))
+        self._c_brute_aux_reproj_px = float(_cfg.get('brute_aux_reprojection_threshold_px', 2.0))
 
         positions = model.positions.astype("float32")
         normals   = model.normals.astype("float32")
@@ -2236,19 +2235,23 @@ class PoseSearcher:
                                             f"matched_dists={_matched_dists.round(1).tolist()} "
                                             f"thresh={self._c_brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
                                         )
-                                    extra_inlier_count += _n_aux
-                                    aux_blob_denom     += min(len(_oblobs), len(_vis_ids_i))
                                     aux_cameras_current.append((_ocam.camera_idx, _n_aux))
                                     aux_assignments_current[_ocam.camera_idx] = [
                                         (int(_rows_i[_k]), int(_vis_ids_i[_cols_i[_k]]))
                                         for _k in range(len(_rows_i)) if _inlier_i[_k]
                                     ]
 
+                                    # Facing-weighted visibility/inlier sums -- computed before use so
+                                    # aux_blob_denom (precision side) can be weighted the same way
+                                    # led_cov (recall side) already is, instead of a flat LED count.
                                     _led_nrm_i = (_R_i @ normals[_vis_ids_i].T).T
                                     _vdirs_i   = -_led_cam_i / (np.linalg.norm(_led_cam_i, axis=1, keepdims=True) + 1e-9)
                                     _w_i       = np.clip((_led_nrm_i * _vdirs_i).sum(axis=1), 0.0, 1.0)
+                                    _aux_vis_weight_sum = float(_w_i.sum())
 
-                                    extra_vis_weight    += float(_w_i.sum())
+                                    extra_inlier_count += _n_aux
+                                    aux_blob_denom     += min(float(len(_oblobs)), _aux_vis_weight_sum)
+                                    extra_vis_weight    += _aux_vis_weight_sum
                                     extra_inlier_weight += float(_w_i[_cols_i[_inlier_i]].sum())
                             t_aux += time.perf_counter() - _t0
 
@@ -2284,13 +2287,16 @@ class PoseSearcher:
                             # Balanced F1-style coverage: harmonic mean of LED recall and blob
                             # precision. LED recall (weighted by cos θ) measures how many of the
                             # model-visible LEDs were matched. Blob precision measures how many of
-                            # the detected blobs the pose explains, with the denominator capped at
-                            # n_visible_leds so that blobs from the other controller or noise do
-                            # not unfairly penalise a correct pose. Both sides pool aux cameras.
+                            # the detected blobs the pose explains, weighted the same way (grazing-
+                            # angle LEDs are forgiven on both sides consistently), with the
+                            # denominator capped at the weighted-visible sum so that blobs from the
+                            # other controller or noise do not unfairly penalise a correct pose.
+                            # Both sides pool aux cameras.
                             led_cov  = (weighted_inlier_count / weighted_visible_count
                                         if weighted_visible_count > 0 else 1.0)
-                            _blob_denom = min(n_available, n_visible_leds) + aux_blob_denom
-                            blob_cov = ((n_inlier_blobs + extra_inlier_count) / _blob_denom
+                            _primary_inlier_weight = float(led_vis_weights[inlier_idx_in_vis].sum())
+                            _blob_denom = min(float(n_available), float(led_vis_weights.sum())) + aux_blob_denom
+                            blob_cov = ((_primary_inlier_weight + extra_inlier_weight) / _blob_denom
                                         if _blob_denom > 0 else 1.0)
                             balanced_coverage = (2.0 * led_cov * blob_cov / (led_cov + blob_cov)
                                                  if led_cov + blob_cov > 0.0 else 0.0)

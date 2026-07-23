@@ -181,12 +181,12 @@ matching:
   # Brute match
   # --------------------------------------------------------------------------
   depth_tiers:                    # (anchor_leds, total_leds [, "edge"]) hypotheses to enumerate
-#    - [2, 3]
+    - [2, 3]
 #    - [2, 4]
 #    - [2, 4, "edge"]
 #    - [3, 5]
 #    - [3, 5, "edge"]
-    - [4, 6]
+#    - [4, 6]
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
   reprojection_threshold: 2.5    # RANSAC inlier threshold
@@ -201,6 +201,11 @@ matching:
                                         # same-frame cheap-search-failure brute-force fallback.
   strong_match_error_px: 0.5
   min_vis_coverage: 0.7
+  brute_aux_reprojection_threshold_px: 2.0   # aux-camera Hungarian match threshold for cross-camera
+                                              # coverage gating (brute_search_tier's aux block); kept
+                                              # separate from joint_aux_prefilter_px (unrelated
+                                              # joint-LM/snap_camera mechanism) so the two can be
+                                              # tuned independently.
   rng_seed: 42
 
   # --------------------------------------------------------------------------
