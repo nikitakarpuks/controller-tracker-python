@@ -64,6 +64,21 @@ def mirror_primitives(prim_cfg: dict) -> dict:
     return p
 
 
+def _build_other_cameras_blobs(cameras: Dict[int, Camera], obs_src: Dict[int, np.ndarray],
+                                exclude_cid: int) -> List[Tuple]:
+    """Other-camera blob data for brute_search_tier's cross-camera coverage check
+    (PoseSearcher.new_brute_state's other_cameras_blobs param): every camera besides
+    exclude_cid that has real blob data this frame. Not filtered by any per-camera
+    persistence/confirm-frames gate -- that gate only decides whether to attempt a
+    brute search FROM a camera, not whether its raw blobs are valid aux evidence for
+    scoring another camera's candidates."""
+    return [
+        (cameras[ocid], obs_src[ocid], None)
+        for ocid in obs_src
+        if ocid != exclude_cid and obs_src[ocid] is not None and len(obs_src[ocid]) > 0
+    ]
+
+
 # =========================================================
 # 3. TRACKER (per camera + controller)
 # =========================================================
@@ -906,6 +921,9 @@ class ControllerTracker:
             # cancellation); stop widening the instant any camera hits strong_found
             # this round.
             states: Dict[int, object] = {}
+            _other_cams_by_cid: Dict[int, List[Tuple]] = {
+                cid: _build_other_cameras_blobs(self.cameras, obs_src, cid) for cid in avail
+            }
             _t_new_state_start = time.perf_counter()
             _confirm_frames = int(self._matching_cfg.get('cold_brute_force_confirm_frames', 3))
             for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
@@ -948,7 +966,7 @@ class ControllerTracker:
                 mask[av_orig] = True
                 states[cid] = tracker._pose_searcher.new_brute_state(
                     obs_full, pose_prior=predicted_pose_by_cid.get(cid),
-                    other_cameras_blobs=None,
+                    other_cameras_blobs=_other_cams_by_cid[cid],
                     blob_mask=mask, occluders_per_cam=occluders_per_cam,
                 )
             t_new_state = time.perf_counter() - _t_new_state_start
@@ -1007,7 +1025,7 @@ class ControllerTracker:
                 mask[av_orig] = True
                 sol = tracker.finalize_search(
                     sol, predicted_pose_by_cid.get(cid), obs_full,
-                    blob_radii=rad_full, other_cameras_blobs=None,
+                    blob_radii=rad_full, other_cameras_blobs=_other_cams_by_cid[cid],
                     blob_mask=mask, occluders_per_cam=occluders_per_cam,
                     allow_expensive_fallback=True,
                 )
@@ -2119,12 +2137,15 @@ class TrackingSystem:
 
         _confirm_frames = int(self._matching_cfg.get('cold_brute_force_confirm_frames', 3))
         states: Dict[Tuple[str, int], object] = {}
+        _other_cams_by_key: Dict[Tuple[str, int], List[Tuple]] = {}
         for ctrl_name in ctrl_names:
             obs_src = per_ctrl_observations.get(ctrl_name) or {}
             for cid, tracker in self.ctrl_trackers[ctrl_name].trackers.items():
                 obs_full = obs_src.get(cid)
                 if obs_full is None or len(obs_full) == 0:
                     continue
+                _other_cams_by_key[(ctrl_name, cid)] = _build_other_cameras_blobs(
+                    self.cameras, obs_src, cid)
                 # Persistence gate, verbatim logic from
                 # ControllerTracker.update() (controller.py:930-948, this
                 # file) -- unconditional here (not "force_brute and
@@ -2144,7 +2165,7 @@ class TrackingSystem:
                     continue
                 mask = np.ones(len(obs_full), dtype=bool)
                 states[(ctrl_name, cid)] = tracker._pose_searcher.new_brute_state(
-                    obs_full, pose_prior=None, other_cameras_blobs=None,
+                    obs_full, pose_prior=None, other_cameras_blobs=_other_cams_by_key[(ctrl_name, cid)],
                     blob_mask=mask, occluders_per_cam=None,
                 )
 
@@ -2188,7 +2209,8 @@ class TrackingSystem:
             rad_full = (per_ctrl_radii or {}).get(ctrl_name, {}).get(cid)
             mask = np.ones(len(obs_full), dtype=bool)
             sol = tracker.finalize_search(
-                sol, None, obs_full, blob_radii=rad_full, other_cameras_blobs=None,
+                sol, None, obs_full, blob_radii=rad_full,
+                other_cameras_blobs=_other_cams_by_key[(ctrl_name, cid)],
                 blob_mask=mask, occluders_per_cam=None, allow_expensive_fallback=True,
             )
             if sol is not None:
