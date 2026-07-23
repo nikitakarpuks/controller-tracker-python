@@ -772,7 +772,6 @@ class PoseSearcher:
         # score each by solvePnP reprojection error, pick the best.
         pairs      = []
         locked_obj = []
-        locked_img = []
         _locked_pose_dbg = None   # DEBUG: (rvec, tvec) from PnP on truly-locked pairs only
 
         if n_model_visible > 0 and len(blobs) > 0:
@@ -829,11 +828,7 @@ class PoseSearcher:
             )
 
             # Pre-undistort all blob positions once — reused across all hypothesis evaluations.
-            _blobs_inp = blobs.astype(np.float64).reshape(-1, 1, 2)
-            if self.camera.is_fisheye:
-                _blobs_norm = cv2.fisheye.undistortPoints(_blobs_inp, K.astype(np.float64), dc).reshape(-1, 2)
-            else:
-                _blobs_norm = cv2.undistortPoints(_blobs_inp.astype(np.float32), K, dc).reshape(-1, 2)
+            _blobs_norm = self.camera.undistort_points(blobs).astype(np.float32)
 
             # DEBUG: PnP on truly-locked pairs only, for pose-comparison logging below.
             # Not used for any downstream processing.
@@ -1207,10 +1202,10 @@ class PoseSearcher:
                                 continue
                             _o_r = self.model.positions[[l for _, l in _pairs_r]].astype(np.float32)
                             _i_r = blobs[[b for b, _ in _pairs_r]].astype(np.float32)
+                            _n_r_norm = _blobs_norm[[b for b, _ in _pairs_r]]
                             _ok_r, _rv_r, _tv_r, _idx_r = _ransac_pnp(
-                                _o_r, _i_r, K, dc, rvec_pred, tvec_pred,
+                                _o_r, _n_r_norm, float(K[0, 0]), rvec_pred, tvec_pred,
                                 reprojection_px=self._c_prox_reproj_px,
-                                is_fisheye=self.camera.is_fisheye,
                             )
                             if not _ok_r or _idx_r is None:
                                 logger.bind(cat="proximity_match").debug(
@@ -1266,7 +1261,6 @@ class PoseSearcher:
             for blob_c, led_id in locked_assignment + hyp_assignment:
                 pairs.append((blob_c, led_id))
                 locked_obj.append(self.model.positions[led_id])
-                locked_img.append(blobs[blob_c])
 
         logger.bind(cat="proximity_match").debug(
             f"[{self._ctrl} | cam {self._cam}] Proximity: {len(pairs)}/{len(blobs)} blobs matched "
@@ -1277,13 +1271,12 @@ class PoseSearcher:
             logger.bind(cat="proximity_match").debug(f"[{self._ctrl} | cam {self._cam}] Proximity: too few pairs ({len(pairs)} < {self._c_prox_min_inliers}) → None")
             return None
 
-        lo = np.array(locked_obj, dtype=np.float32)
-        li = np.array(locked_img, dtype=np.float32)
+        lo      = np.array(locked_obj, dtype=np.float32)
+        li_norm = _blobs_norm[[b for b, _ in pairs]]
 
         ok, rvec, tvec, ransac_idx = _ransac_pnp(
-            lo, li, K, dc, rvec_pred, tvec_pred,
+            lo, li_norm, float(K[0, 0]), rvec_pred, tvec_pred,
             reprojection_px=self._c_prox_reproj_px,
-            is_fisheye=self.camera.is_fisheye,
         )
 
         if not ok or ransac_idx is None:
@@ -2102,10 +2095,9 @@ class PoseSearcher:
                             _t0 = time.perf_counter()
                             # ── 5. RANSAC PnP refinement on inliers ───────────
                             ok_r, rvec_r, tvec_r, ransac_inliers = _ransac_pnp(
-                                positions[inlier_leds], blobs[inlier_blobs], K, dc,
+                                positions[inlier_leds], blobs_norm[inlier_blobs], float(K[0, 0]),
                                 rvec_h, tvec_h.reshape(3, 1),
                                 reprojection_px=self._c_brute_reproj_px,
-                                is_fisheye=self.camera.is_fisheye,
                             )
                             self._dbg(dbg_ransac, f"  sol {sol_i}: RANSAC ok={ok_r}, "
                                            f"inliers={len(ransac_inliers) if ok_r else 0}")

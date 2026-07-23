@@ -9,22 +9,24 @@ _DC_ZERO    = np.zeros(4, dtype=np.float64)
 
 def _ransac_pnp(
     obj_pts: np.ndarray,
-    img_pts: np.ndarray,
-    K, dc,
+    pts_norm: np.ndarray,
+    fx: float,
     rvec_init=None,
     tvec_init=None,
     reprojection_px: float = 2.0,
     iterations: int = 100,
     confidence: float = 0.99,
-    is_fisheye: bool = False,
 ) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    RANSAC PnP using undistorted normalised image coordinates.
+    RANSAC PnP over already-undistorted, normalised image coordinates.
 
     Ported from OpenHMD / Monado (ransac_pnp.cpp):
-      • Blob points are undistorted with the real calibration before being
-        handed to the solver, so the RANSAC loop never touches distortion
-        maths — faster and more numerically stable.
+      • Callers undistort blob points with the real calibration (via
+        Camera.undistort_points) before calling this function, so the RANSAC
+        loop never touches distortion maths — faster and more numerically
+        stable, and keeps a single, shared, correct undistortion path (see
+        Camera.undistort_points' kb4 bisection inverse) instead of this
+        function re-undistorting the same points via its own, separate call.
       • An identity K + zero distortion are passed to the solver to match
         the undistorted point space.
       • The reprojection threshold is converted from pixels to normalised
@@ -32,26 +34,22 @@ def _ransac_pnp(
       • SOLVEPNP_SQPNP is used as the minimal solver (non-iterative,
         closed-form — more robust than ITERATIVE LM inside RANSAC).
 
+    Parameters
+    ----------
+    obj_pts  : (N, 3) world points
+    pts_norm : (N, 2) already-undistorted normalised image coordinates
+               (Camera.undistort_points(pts2d), P=None)
+    fx       : camera's fx, used only to convert reprojection_px to normalised units
+
     Returns
     -------
     ok          : bool
     rvec        : (3, 1) float64 or None
     tvec        : (3, 1) float64 or None
-    inlier_idx  : 1-D int array indexing obj_pts/img_pts, or None
+    inlier_idx  : 1-D int array indexing obj_pts/pts_norm, or None
     """
     if len(obj_pts) < 4:
         return False, None, None, None
-
-    fx = float(K[0, 0])
-
-    # Undistort image points → normalised camera coordinates (K removed, distortion removed).
-    inp = img_pts.astype(np.float32).reshape(-1, 1, 2)
-    if is_fisheye:
-        pts_norm = cv2.fisheye.undistortPoints(
-            inp.astype(np.float64), K.astype(np.float64), dc,
-        ).reshape(-1, 2)
-    else:
-        pts_norm = cv2.undistortPoints(inp, K, dc).reshape(-1, 2)
 
     use_guess = rvec_init is not None and tvec_init is not None
     r0 = np.asarray(rvec_init, dtype=np.float64).reshape(3, 1) if use_guess else None
