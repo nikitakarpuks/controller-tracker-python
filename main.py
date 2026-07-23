@@ -38,7 +38,8 @@ def main():
 
     debug_config.configure(
         continuous_frames = continuous_frames,
-        verbose_all    = bool(debug_cfg.get("verbose_all", False)),
+        log_all_triples = bool(debug_cfg.get("log_all_triples", False)),
+        log_all_proximity_hyps = bool(debug_cfg.get("log_all_proximity_hyps", False)),
         log_best       = bool(debug_cfg.get("log_best", True)),
         debug_led_ids  = debug_cfg.get("debug_led_ids") or None,
         debug_blob_ids = debug_cfg.get("debug_blob_ids") or None,
@@ -47,6 +48,7 @@ def main():
             "frame_summary":       bool(debug_cfg.get("log_frame_summary", True)),
             "timings":             bool(debug_cfg.get("log_timings", True)),
             "blob_detection":      bool(debug_cfg.get("log_blob_detection", False)),
+            "blob_diag":           bool(debug_cfg.get("log_blob_diag", False)),
             "matching_decisions":  bool(debug_cfg.get("log_matching_decisions", False)),
             "batch_orchestration": bool(debug_cfg.get("log_batch_orchestration", False)),
             "pose_fusion":         bool(debug_cfg.get("log_pose_fusion", False)),
@@ -146,6 +148,10 @@ def main():
     # ── Tracking loop ──────────────────────────────────────────────────────
     any_valid_pose    = {n: False for n in enabled_ctrls}
     last_good_T_world = {n: None for n in enabled_ctrls}
+    # Consecutive lost frames per controller, for capping how long the ghost
+    # (frozen last-known pose) stays visible in the visualizer — see the
+    # tracking_lost_grace_frames use below.
+    lost_streak       = {n: 0 for n in enabled_ctrls}
     # Cold-path BlobDetector EMA-threshold memory, round-tripped explicitly through
     # run_blob_detect() rather than left as worker-resident state (a pool task isn't
     # pinned to the same worker every call) — keyed per (cam_idx, ctrl_name) so two
@@ -260,25 +266,45 @@ def main():
                 return (images_override or {}).get(ctrl_name, {}).get(cam_idx, cam_images[cam_idx])
 
             # ── Dedup: two-or-more controllers sharing a camera whose detect()
-            # inputs are provably identical — no image override, no
-            # established cold-path EMA memory yet for either, and the same
-            # predicted_leds/radius/threshold/velocity kwargs (in practice
-            # this only ever groups controllers that are ALL truly cold on
-            # that camera this frame, since a warm controller's
-            # predicted_leds is always its own non-None projection) — get ONE
-            # detect() call instead of one per controller, with that single
-            # result copied to every member below. BlobDetector.detect is a
-            # pure function of (image, predicted_leds, radius,
-            # threshold_scale, velocity_px, memory); ctrl_label only affects
-            # a debug-canvas filename, so running it once per cold controller
-            # is pure duplicated computation, not independent work.
+            # inputs are provably identical — no image override, the same
+            # predicted_leds/radius/threshold/velocity kwargs, and equal
+            # cold-path EMA memory (both empty/never-established, or both
+            # holding the same pixel_threshold/required_threshold/max_area/
+            # blob_count — which is what two controllers that have been
+            # deduped together since they went cold end up with, since
+            # BlobDetector.detect is a pure function of (image,
+            # predicted_leds, radius, threshold_scale, velocity_px, memory)
+            # and identical inputs produce identical memory going forward)
+            # — get ONE detect() call instead of one per controller, with
+            # that single result copied to every member below. ctrl_label
+            # only affects a debug-canvas filename.
+            #
+            # Comparing memory *by value* (not just "has any memory been
+            # established") matters: an earlier version treated any
+            # established memory as disqualifying, which meant two
+            # controllers that started cold-cold and got deduped on their
+            # first frame would permanently fall back to solo (duplicated)
+            # detection from their second cold frame onward, even though
+            # their fanned-out memory was still identical — silently
+            # doubling blob-detection cost for the rest of a cold-cold run.
+            # Only large_blobs is left out of the comparison below — it's
+            # write-only in BlobDetector (never read back via _mem), so it
+            # can't affect detect()'s output and including it would just
+            # risk an unnecessary split (or an elementwise-comparison error
+            # on the numpy contour arrays it holds).
+            def _mem_key(cam_idx, ctrl_name):
+                mem = _cold_memory.get((cam_idx, ctrl_name))
+                if not mem:
+                    return None
+                return (mem.get("pixel_threshold"), mem.get("required_threshold"),
+                        mem.get("max_area"), mem.get("blob_count"))
+
             groups: dict = {}   # dedup_key -> [(ctrl_name, cam_idx, kwargs), ...]
             for ctrl_name, cam_kwargs in cam_kwargs_per_ctrl.items():
                 for cam_idx, kwargs in cam_kwargs.items():
                     _has_override = (images_override or {}).get(ctrl_name, {}).get(cam_idx) is not None
-                    _has_memory   = _cold_memory.get((cam_idx, ctrl_name)) is not None
                     _has_prior    = kwargs.get("predicted_leds") is not None
-                    if _has_override or _has_memory or _has_prior:
+                    if _has_override or _has_prior:
                         key = ("solo", ctrl_name, cam_idx)
                     else:
                         key = (
@@ -286,6 +312,7 @@ def main():
                             kwargs.get("local_search_radius_px", 0.0),
                             kwargs.get("threshold_scale", 1.0),
                             kwargs.get("velocity_px", 0.0),
+                            _mem_key(cam_idx, ctrl_name),
                         )
                     groups.setdefault(key, []).append((ctrl_name, cam_idx, kwargs))
 
@@ -328,10 +355,23 @@ def main():
                         _cold_memory.get((cam_idx, ctrl_name)),
                     )
                 for (ctrl_name, cam_idx), fut in futures.items():
-                    result, canvases, memory_out = fut.result()
+                    result, canvases, memory_out, diag = fut.result()
+                    t_result = time()
                     _cold_memory[(cam_idx, ctrl_name)] = memory_out
                     results_by_ctrl[ctrl_name][cam_idx] = (result, canvases)
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - t0_by_key[(ctrl_name, cam_idx)]) * 1000
+                    if debug_config.log_enabled("blob_diag"):
+                        t_submit = t0_by_key[(ctrl_name, cam_idx)]
+                        t_worker_start, t_compute_start, t_compute_end = diag
+                        dispatch_ms = (t_worker_start - t_submit) * 1000
+                        compute_ms  = (t_compute_end - t_compute_start) * 1000
+                        return_ms   = (t_result - t_compute_end) * 1000
+                        total_ms    = (t_result - t_submit) * 1000
+                        logger.bind(cat="blob_diag").debug(
+                            f"[{ctrl_name} | cam {cam_idx}] blob diag: "
+                            f"dispatch={dispatch_ms:.2f}ms  compute={compute_ms:.2f}ms  "
+                            f"return={return_ms:.2f}ms  total={total_ms:.2f}ms"
+                        )
                     _fan_out(ctrl_name, cam_idx, (result, canvases), memory_out=memory_out)
             else:
                 for ctrl_name, cam_idx, kwargs in flat:
@@ -796,6 +836,7 @@ def main():
                 last_good_T_world[ctrl_name] = T_world_ctrl
                 frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
                 any_valid_pose[ctrl_name] = True
+                lost_streak[ctrl_name] = 0
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -840,11 +881,17 @@ def main():
                                 ])
             else:
                 # Case 3: had a prior good pose and cameras still see blobs →
-                # controller is between cameras or ambiguous; freeze last pose.
+                # controller is between cameras or ambiguous; freeze last pose,
+                # but only for up to tracking_lost_grace_frames consecutive
+                # lost frames — beyond that the track is really gone and the
+                # ghost must disappear rather than hang around indefinitely.
                 # Cases 1/2: never tracked or truly out of view → None (hidden).
+                lost_streak[ctrl_name] += 1
+                _grace = int(_match_cfg.get('tracking_lost_grace_frames', 1))
                 last_good = last_good_T_world[ctrl_name]
                 frozen_T_world_ctrl_frame[ctrl_name] = (
-                    last_good if last_good is not None and total_blobs > 0 else None
+                    last_good if last_good is not None and total_blobs > 0
+                    and lost_streak[ctrl_name] <= _grace else None
                 )
                 logger.bind(cat="frame_summary").info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  TRACKING LOST")
 

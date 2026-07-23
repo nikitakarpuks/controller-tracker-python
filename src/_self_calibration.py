@@ -27,6 +27,8 @@ import numpy as np
 from loguru import logger
 from scipy.optimize import least_squares
 
+from src.camera import kb4_rpmax
+
 
 _RADTAN8_PARAMS = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]
 _KB4_PARAMS     = ["fx", "fy", "cx", "cy", "k1", "k2", "k3", "k4"]
@@ -269,20 +271,9 @@ class SelfCalibrator:
                 cam.dist_coeffs = np.array(
                     [[cam.k1], [cam.k2], [cam.k3], [cam.k4]], dtype=np.float64
                 )
-                # Recompute rpmax in case k1-k4 changed.
-                def _drho(t, c=cam):
-                    return (1 + 3*c.k1*t**2 + 5*c.k2*t**4
-                              + 7*c.k3*t**6 + 9*c.k4*t**8)
-                if _drho(np.pi / 2) >= 0:
-                    _theta_max = np.pi / 2
-                else:
-                    _lo, _hi = 0.0, np.pi / 2
-                    for _ in range(60):
-                        _mid = (_lo + _hi) / 2
-                        if _drho(_mid) > 0: _lo = _mid
-                        else:               _hi = _mid
-                    _theta_max = _lo
-                cam.rpmax = float(_theta_max * 0.99 * (cam.fx + cam.fy) / 2)
+                # Recompute rpmax/rpmax_px in case k1-k4 changed.
+                cam.rpmax, cam.rpmax_px = kb4_rpmax(cam.k1, cam.k2, cam.k3, cam.k4,
+                                                     cam.fx, cam.fy)
             else:
                 cam.dist_coeffs = np.array(
                     [cam.k1, cam.k2, cam.p1, cam.p2, cam.k3, cam.k4, cam.k5, cam.k6],

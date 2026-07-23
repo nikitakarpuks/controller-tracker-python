@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from scipy.spatial import KDTree
 
 from src.geometry import _compute_geometry
-from src.debug_config import get_debug_triple, is_verbose_all, log_best, log_enabled
+from src.debug_config import get_debug_triple, log_all_proximity_hyps, log_all_triples, log_best, log_enabled
 from src._pnp import _ransac_pnp, _project_points, _check_z_range
 from src._visibility import _visible_mask, _cross_occluded_mask
 from src.transformations import Transform
@@ -997,7 +997,7 @@ class PoseSearcher:
                 _level_parents: list = []  # (key, combo, resid_map) — top-K from the previous None level
 
                 def _log_hyp(n_tried, combo_blobs, score, key, best_key):
-                    if log_enabled("proximity_match"):
+                    if log_enabled("proximity_match") and log_all_proximity_hyps():
                         _err_label = f"{self._c_prox_score_metric}_err"
                         _leds_fmt = "[" + ", ".join(
                             f"{int(vis_ids[hyp_k[i]])}:{'✓' if combo_blobs[i] is not None else 'None'}"
@@ -1023,7 +1023,7 @@ class PoseSearcher:
                 for _raw, combo_blobs in _zero_none_combos:
                     _t0 = time.perf_counter(); score, resid_map = _score_hyp(combo_blobs); _t_scoring += time.perf_counter() - _t0
                     key   = score  # none_cost == 0
-                    # _log_hyp(n_tried, combo_blobs, score, key, best_key)  # too verbose — stage-2 RANSAC rank-N logging below covers the top candidates
+                    _log_hyp(n_tried, combo_blobs, score, key, best_key)
                     if key < best_key:
                         best_key = key; best_none = 0; best_hyp_blobs = combo_blobs
                     _update_top_k(key, 0, combo_blobs)
@@ -1117,7 +1117,7 @@ class PoseSearcher:
                         for combo_blobs in _this_level:
                             _t0 = time.perf_counter(); score, resid_map = _score_hyp(combo_blobs); _t_scoring += time.perf_counter() - _t0
                             key   = score + none_cost
-                            # _log_hyp(n_tried, combo_blobs, score, key, best_key)  # too verbose — stage-2 RANSAC rank-N logging below covers the top candidates
+                            _log_hyp(n_tried, combo_blobs, score, key, best_key)
                             if key < best_key:
                                 best_key = key; best_none = n_none; best_hyp_blobs = combo_blobs
                             _update_top_k(key, n_none, combo_blobs)
@@ -1952,7 +1952,7 @@ class PoseSearcher:
                         # debug triple); l1/l2 and b1/b2 are matched as sets so
                         # their internal ordering doesn't matter.  This gives at
                         # most 2 prints per frame: one per b1↔b2 swap.
-                        dbg = is_verbose_all() or (
+                        dbg = log_all_triples() or (
                             debug_active and
                             (debug_led_set  is None or (
                                 int(led_ids[0]) == debug_led_anchor and

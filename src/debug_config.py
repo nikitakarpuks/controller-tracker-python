@@ -9,7 +9,7 @@ from loguru import logger
 # bar prints (warnings/errors are the one exception — those always print, see
 # _log_filter).
 _LOG_CATEGORIES = (
-    "startup", "frame_summary", "timings", "blob_detection",
+    "startup", "frame_summary", "timings", "blob_detection", "blob_diag",
     "matching_decisions", "batch_orchestration", "pose_fusion", "occlusion",
     "proximity_match", "hypothesis_testing", "ransac", "self_calibration",
 )
@@ -22,7 +22,8 @@ _LOG_CATEGORIES = (
 _continuous_frames: bool           = True
 _debug_led_ids:  Optional[List[int]] = None   # target LED triple [anchor, l1, l2]
 _debug_blob_ids: Optional[List[int]] = None   # target blob triple [b_anchor, b1, b2]
-_verbose_all:    bool                = False  # log every P3P hypothesis, not just the target triple
+_log_all_triples: bool               = False  # log every P3P hypothesis triple, not just the target one
+_log_all_proximity_hyps: bool        = False  # log every proximity-match candidate hypothesis tried
 _log_best:       bool                = True   # log each time a new best solution is found
 _log_categories: Dict[str, bool]     = {c: False for c in _LOG_CATEGORIES}
 
@@ -31,15 +32,18 @@ def configure(
     continuous_frames: bool = True,
     debug_led_ids:  Optional[List[int]] = None,
     debug_blob_ids: Optional[List[int]] = None,
-    verbose_all:    bool = False,
+    log_all_triples: bool = False,
+    log_all_proximity_hyps: bool = False,
     log_best:       bool = True,
     log_categories: Optional[Dict[str, bool]] = None,
 ) -> None:
-    global _continuous_frames, _debug_led_ids, _debug_blob_ids, _verbose_all, _log_best, _log_categories
+    global _continuous_frames, _debug_led_ids, _debug_blob_ids, _log_all_triples, \
+        _log_all_proximity_hyps, _log_best, _log_categories
     _continuous_frames = continuous_frames
     _debug_led_ids      = debug_led_ids
     _debug_blob_ids     = debug_blob_ids
-    _verbose_all        = verbose_all
+    _log_all_triples    = log_all_triples
+    _log_all_proximity_hyps = log_all_proximity_hyps
     _log_best           = log_best
     if log_categories is not None:
         _log_categories = {c: bool(log_categories.get(c, False)) for c in _LOG_CATEGORIES}
@@ -53,9 +57,16 @@ def is_continuous_sequence() -> bool:
     return _continuous_frames
 
 
-def is_verbose_all() -> bool:
-    """True → log every P3P hypothesis in brute_match (ignores LED/blob filter)."""
-    return _verbose_all
+def log_all_triples() -> bool:
+    """True → log every P3P hypothesis triple in brute_match (ignores LED/blob filter)."""
+    return _log_all_triples
+
+
+def log_all_proximity_hyps() -> bool:
+    """True → log every candidate hypothesis tried in proximity_match's None-branching
+    search (each combo's score), not just the level/cap/early-stop/final-accept summary
+    lines that log_proximity_match alone shows."""
+    return _log_all_proximity_hyps
 
 
 def log_best() -> bool:
@@ -85,7 +96,8 @@ def get_config() -> dict:
         'continuous_frames': _continuous_frames,
         'debug_led_ids':     _debug_led_ids,
         'debug_blob_ids':    _debug_blob_ids,
-        'verbose_all':       _verbose_all,
+        'log_all_triples':   _log_all_triples,
+        'log_all_proximity_hyps': _log_all_proximity_hyps,
         'log_best':          _log_best,
         'log_categories':    dict(_log_categories),
     }

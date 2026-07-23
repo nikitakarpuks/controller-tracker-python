@@ -1351,7 +1351,8 @@ class TrackingSystem:
         if self._blob_parallel_enabled:
             from src.parallel_search import register_blob_detector_spec
             for cam in cameras:
-                register_blob_detector_spec(cam.camera_idx, blob_detection_cfg)
+                register_blob_detector_spec(cam.camera_idx, blob_detection_cfg,
+                                             cam.width, cam.height)
 
         # ── Persistent process pool for parallel cheap-search / brute-tier dispatch,
         # and (when enabled) parallel blob detection ──────────────────────────────
@@ -2228,9 +2229,13 @@ class TrackingSystem:
                 # re-accumulate _confirm_frames consecutive frames before
                 # retrying next frame -- only _mark_all_lost's own fields
                 # (consecutive_failures, tracking_lost_last_frame) change.
+                _n_pairs = len(solution.get('assignment') or []) + sum(
+                    len(v) for v in (solution.get('aux_assignments') or {}).values()
+                )
                 logger.bind(cat="occlusion").info(
                     f"[cold-batch] conflict: dropping {ctrl_name} "
-                    f"(err={solution['error']:.2f}px, lost to a lower-error candidate this frame)"
+                    f"(err={solution['error']:.2f}px, n={_n_pairs}, "
+                    f"lost to a better inlier-discounted candidate this frame)"
                 )
                 self.ctrl_trackers[ctrl_name]._mark_all_lost()
                 results[ctrl_name] = None
@@ -2276,13 +2281,13 @@ class TrackingSystem:
         Both conflict types are treated identically -- no special-casing, no
         cheap-repair exception: any conflict of either kind drops the loser
         outright. Winner selection is greedy: repeatedly take the remaining
-        candidate with the lowest fused reprojection error
-        (`solution["error"]`; ties broken by more total matched pairs across
-        assignment + aux_assignments), keep it, and drop every candidate
-        directly in conflict with it; repeat among what's left. This
-        correctly handles conflict components of 3+ controllers, not just
-        pairs -- a controller connected to the graph only through an
-        already-dropped neighbor is free to win in a later round.
+        candidate with the lowest inlier-discounted error (see _score below;
+        ties broken by more total matched pairs across assignment +
+        aux_assignments), keep it, and drop every candidate directly in
+        conflict with it; repeat among what's left. This correctly handles
+        conflict components of 3+ controllers, not just pairs -- a controller
+        connected to the graph only through an already-dropped neighbor is
+        free to win in a later round.
 
         Returns the set of ctrl_names to drop (losers). candidates values
         must be solution dicts as produced by
@@ -2357,12 +2362,25 @@ class TrackingSystem:
         if not any(conflicts.values()):
             return set()
 
+        # A fit sitting right at the minimal-inlier floor has almost no spare
+        # degrees of freedom, so a near-zero residual there is not evidence of
+        # a correct match -- it's just what an under-constrained fit looks
+        # like (compare _redundancy_factor in pose_search.py's proximity
+        # path, same reasoning). Comparing raw error across candidates with
+        # very different inlier counts lets exactly that kind of fit
+        # outrank a genuinely well-constrained, higher-coverage, multi-camera
+        # one. Discount error linearly by how many multiples of the floor a
+        # candidate has: right at the floor -> no discount; 5x the floor ->
+        # error divided by 5.
+        _min_inliers = float(self._matching_cfg.get('min_inliers', 4))
+
         def _score(name: str) -> Tuple[float, int]:
             sol = candidates[name]
             total_pairs = len(sol.get('assignment') or []) + sum(
                 len(v) for v in (sol.get('aux_assignments') or {}).values()
             )
-            return (sol['error'], -total_pairs)
+            effective_error = sol['error'] * (_min_inliers / max(total_pairs, 1))
+            return (effective_error, -total_pairs)
 
         remaining = set(names)
         losers: Set[str] = set()

@@ -35,13 +35,17 @@ from src.pose_search import PoseSearcher, BruteSearchState
 # camera tracker before create_pool().
 _BUILD_SPECS: Dict[Tuple[str, int], tuple] = {}
 
-# Same idea for blob detection: {cam_idx: blob_detection_cfg}, populated via
-# register_blob_detector_spec() before create_pool().
-_BLOB_BUILD_SPECS: Dict[int, dict] = {}
+# Same idea for blob detection: {cam_idx: (blob_detection_cfg, width, height)},
+# populated via register_blob_detector_spec() before create_pool(). width/height
+# are the per-camera image resolution — used only to size the synthetic image
+# _warmup_task detects against, so the pool-startup warmup exercises cv2 on a
+# buffer the same shape as a real frame.
+_BLOB_BUILD_SPECS: Dict[int, tuple] = {}
 
 # Worker-side registries, built once per worker process by _pool_initializer.
 _POSE_SEARCHERS: Dict[Tuple[str, int], PoseSearcher] = {}
 _BLOB_DETECTORS: Dict[int, "BlobDetector"] = {}
+_BLOB_SHAPES: Dict[int, Tuple[int, int]] = {}   # cam_idx -> (height, width)
 
 
 def register_pose_searcher_spec(key: Tuple[str, int], camera, model,
@@ -52,15 +56,18 @@ def register_pose_searcher_spec(key: Tuple[str, int], camera, model,
     _BUILD_SPECS[key] = (camera, model, geometry_cfg, matching_cfg)
 
 
-def register_blob_detector_spec(cam_idx: int, blob_detection_cfg: dict) -> None:
+def register_blob_detector_spec(cam_idx: int, blob_detection_cfg: dict,
+                                 width: int, height: int) -> None:
     """Register the (picklable) construction args for one camera's BlobDetector.
     Call for every camera before create_pool() — each worker builds its own
-    BlobDetector from these specs once, at pool startup."""
-    _BLOB_BUILD_SPECS[cam_idx] = blob_detection_cfg
+    BlobDetector from these specs once, at pool startup. width/height (the
+    camera's real image resolution) are carried along purely so _warmup_task
+    can size its synthetic warmup image to match — see _BLOB_BUILD_SPECS."""
+    _BLOB_BUILD_SPECS[cam_idx] = (blob_detection_cfg, width, height)
 
 
 def _pool_initializer(build_specs: Dict[Tuple[str, int], tuple],
-                       blob_build_specs: Dict[int, dict],
+                       blob_build_specs: Dict[int, tuple],
                        debug_cfg: Optional[dict]) -> None:
     # Avoid OpenCV's own internal threading fighting the process-level parallelism —
     # each worker already IS the unit of parallelism, it shouldn't also fan out.
@@ -69,8 +76,9 @@ def _pool_initializer(build_specs: Dict[Tuple[str, int], tuple],
         _POSE_SEARCHERS[key] = PoseSearcher(camera, model, geometry_cfg, matching_cfg)
 
     from src.blob_detector import BlobDetector
-    for cam_idx, blob_detection_cfg in blob_build_specs.items():
+    for cam_idx, (blob_detection_cfg, width, height) in blob_build_specs.items():
         _BLOB_DETECTORS[cam_idx] = BlobDetector(cam_idx, blob_detection_cfg)
+        _BLOB_SHAPES[cam_idx]    = (height, width)
 
     # A spawned worker starts with fresh module globals — debug_config's
     # continuous-frames/verbose/log-category flags and loguru's sink (both
@@ -102,12 +110,36 @@ def create_pool(max_workers: int, debug_cfg: Optional[dict] = None) -> ProcessPo
 
 
 def _warmup_task() -> bool:
-    """No-op task. Submitting one per worker right after pool creation forces every
-    worker to actually spawn now (spawn's interpreter boot, re-importing numpy/
-    scipy/cv2, running _pool_initializer's PoseSearcher construction) instead of
+    """Submitted once per worker right after pool creation. Forces every worker to
+    actually spawn now (spawn's interpreter boot, re-importing numpy/scipy/cv2,
+    running _pool_initializer's PoseSearcher/BlobDetector construction) instead of
     lazily on the first real frame — ProcessPoolExecutor only starts a worker when
     there's a task for it, so without this the entire one-time startup cost lands on
-    whichever frame happens to submit the first task."""
+    whichever frame happens to submit the first task.
+
+    Also runs one real BlobDetector.detect() per registered camera against a
+    synthetic same-shaped image — measured that a freshly spawned worker's *first*
+    real detect() call is ~5-10x slower than its steady-state cost (~20ms vs ~2ms on
+    a 640x480 cold frame) even after the no-op-only warmup above: idle worker cores
+    haven't ramped up their CPU frequency yet, and the numpy/cv2 buffers detect()
+    touches are freshly allocated (first-touch page faults). Without this, that
+    one-time tax landed on frame 0 of every run. Resets bd._memory afterwards so the
+    synthetic image's fake pass-2 EMA stats don't leak into the first real frame's
+    detection."""
+    import numpy as np
+    for cam_idx, bd in _BLOB_DETECTORS.items():
+        shape = _BLOB_SHAPES.get(cam_idx)
+        if shape is None:
+            continue
+        height, width = shape
+        rng = np.random.default_rng(cam_idx)
+        image = np.zeros((height, width), dtype=np.uint8)
+        for _ in range(4):
+            cy = int(rng.integers(5, max(height - 5, 6)))
+            cx = int(rng.integers(5, max(width - 5, 6)))
+            image[max(cy - 2, 0):cy + 2, max(cx - 2, 0):cx + 2] = 200
+        bd.detect(image, ctrl_label="warmup")
+        bd._memory = {}
     return True
 
 
@@ -183,10 +215,20 @@ def run_blob_detect(
     no longer clobber each other's EMA state (a pre-existing quirk when this memory
     lived solely on a single shared per-camera BlobDetector instance).
 
-    Returns (BlobResult, canvases_dict, memory_out).
+    Returns (BlobResult, canvases_dict, memory_out, diag). diag = (t_worker_start,
+    t_compute_start, t_compute_end) — wall-clock (time.time(), synchronized with the
+    submitting process on the same machine) timestamps for the blob_diag round-trip
+    breakdown logged by _run_blob_detect_batch_multi in main.py: submitting process
+    measures its own t_submit right before pool.submit() and t_result right after
+    fut.result(), so (t_worker_start - t_submit) is dispatch latency (submit-side
+    pickle + IPC + worker unpickle + scheduling), (t_compute_end - t_compute_start)
+    is BlobDetector.detect()'s own cost, and the remainder is return-trip transit.
     """
+    import time as _time
+    t_worker_start = _time.time()
     bd = _BLOB_DETECTORS[cam_idx]
     bd._memory = memory_in if memory_in is not None else {}
+    t_compute_start = _time.time()
     result, canvases = bd.detect(
         image,
         ctrl_label=ctrl_label,
@@ -198,4 +240,5 @@ def run_blob_detect(
         img_path=img_path,
         frame_name=frame_name,
     )
-    return result, canvases, bd._memory
+    t_compute_end = _time.time()
+    return result, canvases, bd._memory, (t_worker_start, t_compute_start, t_compute_end)
