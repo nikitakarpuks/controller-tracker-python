@@ -1,6 +1,5 @@
 data:
-#  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/single_ctrl/4_r_ctrl_distance_table_occlusion_mateo"
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/single_ctrl/5_right_ctrl_camera_xy_occlusions/a"
+  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/4_MAIN_complex_moves_hand_ctrl_occlusions_occluded_spin"
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
@@ -12,8 +11,8 @@ cameras:
 #  intrinsics_path: "./data/cameras/mateo_fresh_calib.json"
 #  intrinsics_path: "./data/cameras/backup/my_calibration.json"
 
-  intrinsics_path: "./data/cameras/kb4_calib.json"
-#  intrinsics_path: "./data/cameras/kb4_calib.as_radtan8.json"
+  intrinsics_path: "./data/cameras/kb4_calib_data_tuned.json"
+#  intrinsics_path: "./data/cameras/kb4_calib.json"
 
 
   extrinsics_convention: "T_cam0_camN"   # "T_imu_cam" or "T_cam0_camN"
@@ -200,7 +199,7 @@ matching:
                                         # (force_brute) reacquisition, not a warm controller's
                                         # same-frame cheap-search-failure brute-force fallback.
   strong_match_error_px: 0.5
-  min_vis_coverage: 0.7
+  min_vis_coverage: 0.6
   brute_aux_reprojection_threshold_px: 2.0   # aux-camera Hungarian match threshold for cross-camera
                                               # coverage gating (brute_search_tier's aux block); kept
                                               # separate from joint_aux_prefilter_px (unrelated
@@ -227,6 +226,24 @@ matching:
   proximity_branch_k: 2                 # top-K hypotheses per None level to branch from at the next level
   proximity_none_branch_width: 4
   proximity_level0_max_hyp: 8
+  proximity_topk_max_pop: 8000           # safety cap on heap pops in the best-first fallback combo search
+                                          # (_bt_combos_topk) before giving up on this None level and moving
+                                          # to the next; sized from profiling two_ctrl/3_very_fast_moves_bad_vissibility:
+                                          # the two cases that actually paid off (got accepted) needed <=7093
+                                          # pops, while cases needing >17000 were rejected downstream anyway
+                                          # (severe ambiguity -- locked=0, 13+ candidate LEDs -- essentially
+                                          # never resolves via proximity match, brute-force gets there faster)
+  proximity_max_estimated_combos: 5000000  # gate checked BEFORE any combo search runs: raw (pre-collision-
+                                          # pruning) combo-space size estimate = comb(len(hyp_k), n_assigned)
+                                          # * geomean(hyp_sizes)^n_assigned, where n_assigned = len(hyp_k) -
+                                          # min_none_forced. Above this, proximity match is skipped entirely
+                                          # (return None -> falls through to brute-force, which already
+                                          # triggers automatically whenever proximity finds nothing) instead
+                                          # of paying for a doomed best-first search. Calibrated against
+                                          # two_ctrl/3_very_fast_moves_bad_vissibility: the real pathological
+                                          # case (13 LEDs, locked=0) estimates ~2.3B and never resolved via
+                                          # proximity anyway; known-good real cases (10-12 LEDs, moderate
+                                          # density) estimate <=1M, comfortably under this cap.
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_top_k_ransac: 3
   proximity_stage2_max_err_factor: 4.0  # skip stage-2 RANSAC rescoring when best ITERATIVE err > this × accept_error_px (too few points for RANSAC to rescue a fit that far off)
@@ -277,13 +294,13 @@ matching:
 
 self_calibration:
   enabled: false                  # set to true to enable online intrinsic calibration
-  primary_camera: 0               # camera used as 3D reference (its T_imu_cam is the anchor); when enabled,
+  primary_camera: 1               # camera used as 3D reference (its T_imu_cam is the anchor); when enabled,
                                    # this camera is also pinned as the tracker's fixed primary camera every
                                    # frame (no auto-select) — the self-cal feed only fires on frames where
                                    # this exact camera produced the solve, so it needs to be an actual anchor,
                                    # not just whichever camera happened to win auto-select that frame
-  aux_cameras: [2]                # cameras to calibrate; null = all non-primary cameras
-  optimize_params: [fx, fy, cx, cy]  # subset of: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6
+  aux_cameras: [3]                # cameras to calibrate; null = all non-primary cameras
+  optimize_params: [fx, fy, cx, cy, k1, k2, k3, k4]  # subset of: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6
   min_primary_error_px: 0.5       # only accept frames with primary PnP error below this
   min_primary_inliers: 4          # minimum PnP inliers for a frame to be accepted
   plots_dir: "./data/cameras/"    # directory where self_cal_cam{N}.png plots are saved
@@ -311,23 +328,23 @@ debug:
                                   # per-tier brute-force bench + P3P-call summaries
   log_blob_detection: false      # blob-dedup grouping (controllers sharing a camera collapse to one detect call)
   log_blob_diag: false           # per-call pool round-trip breakdown: dispatch latency / compute / return transit
-  log_matching_decisions: true  # per-camera proximity/brute attempt, accept/reject, cold-start,
+  log_matching_decisions: false  # per-camera proximity/brute attempt, accept/reject, cold-start,
                                   # cold brute-force gating streak, warm-cam-cap candidate/demotion
   log_batch_orchestration: false # warm-batch/cold-batch round summaries, per-tier pool submissions
   log_pose_fusion: false         # per-camera importance weights in joint multi-camera fusion
   log_occlusion: false           # cross-controller occlusion masking, cold-cold conflict resolution
-  log_proximity_match: true     # proximity/prior-constrained match internals: pairs matched, RANSAC
+  log_proximity_match: false     # proximity/prior-constrained match internals: pairs matched, RANSAC
                                   # outcome, dropped/vis-dropped pairs, aux-camera snap, final accept
-  log_hypothesis_testing: true  # brute-force per-hypothesis funnel: target triple reached, P3P solution
+  log_hypothesis_testing: false  # brute-force per-hypothesis funnel: target triple reached, P3P solution
                                   # count, depth/gate/visibility checks (see triple filters below)
-  log_ransac: true              # brute-force per-hypothesis Hungarian/RANSAC/aux-validation/coverage
+  log_ransac: false              # brute-force per-hypothesis Hungarian/RANSAC/aux-validation/coverage
                                   # stages and each new-best-solution update (see log_best below)
   log_self_calibration: false    # self-calibration frame accept/reject, per-camera optimisation results
 
   log_all_triples: false          # within log_hypothesis_testing/log_ransac: log every brute-force
                                   # hypothesis triple, ignoring the LED/blob triple filter below
                                   # (very verbose -- one block of prints per triple tried)
-  log_all_proximity_hyps: true   # within log_proximity_match: log every candidate hypothesis tried
+  log_all_proximity_hyps: false   # within log_proximity_match: log every candidate hypothesis tried
                                   # in the None-branching search (one line per combo), not just the
                                   # level/cap/early-stop/final-accept summary lines (very verbose)
   log_best: true                  # within log_ransac: log each new best solution update
@@ -343,7 +360,7 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving

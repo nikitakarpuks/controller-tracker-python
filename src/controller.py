@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from collections import deque
 from loguru import logger
-from typing import List, Tuple, Optional, Dict, Set
+from typing import List, Tuple, Optional, Dict, Set, FrozenSet
 
 from src._pnp import _project_points
 from src._visibility import _visible_mask, _cross_occluded_mask
@@ -589,7 +589,17 @@ class CameraTracker:
         # are a real temporal sequence — against a curated/isolated frame set
         # (assume_continuous_frames: false) there's no real "last frame" to be
         # near, so this check is skipped and the controller can be anywhere.
+        #
+        # Also only valid within the tracking_lost_grace_frames window: fixed
+        # distance/angle thresholds assume "last known good" was seen ~1 frame
+        # ago, which is only true right after loss. Once consecutive_failures
+        # exceeds the grace period, the controller is genuinely lost (see
+        # ControllerTracker._mark_all_lost, which clears prev_pose/pose_history
+        # at that same threshold) and may have had arbitrarily long — and thus
+        # arbitrarily far — to drift, so the check no longer applies.
+        _grace = int(_cfg.get('tracking_lost_grace_frames', 1))
         if (solution is not None and _reacquiring and self.last_good_pose is not None
+                and self.consecutive_failures <= _grace
                 and is_continuous_sequence()):
             rvec_lg, tvec_lg = self.last_good_pose
             if self._pose_jump_too_large(
@@ -2073,6 +2083,8 @@ class TrackingSystem:
         per_ctrl_brightnesses: Optional[Dict[str, Dict[int, np.ndarray]]],
         frame_ts_ns: int,
         committed_solutions: Optional[Dict[str, Dict]] = None,
+        committed_observations: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
+        committed_radii: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
     ) -> Dict[str, Optional[Dict]]:
         """Batched brute-force-only update for controllers that are ALL truly
         cold this frame (every camera tracker's prev_pose is None — callers
@@ -2122,6 +2134,21 @@ class TrackingSystem:
         gets occlusion-awareness from _build_extrapolated_occluders before
         the search even runs, and unlike cold-cold, which this method
         already reconciles post-hoc). Omit or pass {} for no such check.
+
+        committed_observations / committed_radii: {ctrl_name: {cam_id:
+        centroids/radii}} for the SAME already-committed controllers named
+        in committed_solutions -- their own per-controller blob arrays, in
+        the index space committed_solutions' assignment/aux_assignments blob
+        indices refer to. Required to check a committed candidate for a
+        genuine shared-blob conflict against these cold candidates: main.py
+        detects blobs per controller (each with its own warm/cold ROI), so a
+        committed controller's blob array is generally NOT the same array
+        (or index space) as any cold controller's here, and comparing raw
+        indices without this geometry would produce false-positive conflicts
+        purely from small indices coincidentally recurring in both
+        independent arrays (see _resolve_cold_conflicts' blob_geometry
+        docstring). Omit to skip the shared-blob check against committed
+        candidates entirely (cross-occlusion still applies).
 
         Returns {ctrl_name: solution_or_None}. None means either this
         controller's brute search didn't produce a solution this frame (no
@@ -2236,8 +2263,22 @@ class TrackingSystem:
 
         _committed = committed_solutions or {}
         _all_for_conflict_check = {**candidates, **_committed}
-        losers = self._resolve_cold_conflicts(
+        _blob_geometry: Dict[str, Dict[int, Tuple[np.ndarray, np.ndarray]]] = {}
+        for ctrl_name in ctrl_names:
+            _cents = per_ctrl_observations.get(ctrl_name) or {}
+            _radii = (per_ctrl_radii or {}).get(ctrl_name) or {}
+            _blob_geometry[ctrl_name] = {
+                cid: (_cents[cid], _radii[cid]) for cid in _cents if cid in _radii
+            }
+        for ctrl_name in _committed:
+            _cents = (committed_observations or {}).get(ctrl_name) or {}
+            _radii = (committed_radii or {}).get(ctrl_name) or {}
+            _blob_geometry[ctrl_name] = {
+                cid: (_cents[cid], _radii[cid]) for cid in _cents if cid in _radii
+            }
+        losers, loser_reason = self._resolve_cold_conflicts(
             _all_for_conflict_check, fixed_names=set(_committed.keys()),
+            blob_geometry=_blob_geometry,
         )
 
         results: Dict[str, Optional[Dict]] = {}
@@ -2256,8 +2297,8 @@ class TrackingSystem:
                 )
                 logger.bind(cat="occlusion").info(
                     f"[cold-batch] conflict: dropping {ctrl_name} "
-                    f"(err={solution['error']:.2f}px, n={_n_pairs}, "
-                    f"lost to a better inlier-discounted candidate this frame)"
+                    f"(err={solution['error']:.2f}px, n={_n_pairs}) — "
+                    f"{loser_reason.get(ctrl_name, 'lost to a better inlier-discounted candidate this frame')}"
                 )
                 self.ctrl_trackers[ctrl_name]._mark_all_lost()
                 results[ctrl_name] = None
@@ -2275,7 +2316,9 @@ class TrackingSystem:
 
     def _resolve_cold_conflicts(
         self, candidates: Dict[str, Dict], fixed_names: Optional[Set[str]] = None,
-    ) -> Set[str]:
+        blob_geometry: Optional[Dict[str, Dict[int, Tuple[np.ndarray, np.ndarray]]]] = None,
+        blob_match_margin_px: float = 5.0,
+    ) -> Tuple[Set[str], Dict[str, str]]:
         """Detect and greedily resolve conflicts among simultaneously-solved
         cold-start candidates (update_cold_batch, above) BEFORE any of them
         is committed to tracker state.
@@ -2289,10 +2332,39 @@ class TrackingSystem:
         pure cold-cold case -- behavior is then identical to before this
         parameter existed.
 
+        blob_geometry: {ctrl_name: {cam_id: (centroids, radii)}} -- each
+        controller's OWN per-camera blob arrays, in the same index space its
+        solution's `assignment`/`aux_assignments` blob indices refer to.
+        Required for the shared-blob check to mean anything: main.py runs
+        blob detection PER CONTROLLER (each controller's warm/cold ROI
+        differs), so ctrl_a's blob index 5 in cam0 and ctrl_b's blob index 5
+        in cam0 are, in general, indices into two completely independent
+        arrays -- not the same physical blob -- UNLESS that (controller,
+        camera) pair was deduped onto a single shared detect() call (see
+        _run_blob_detect_batch_multi's dedup grouping in main.py), which is
+        the only case where index equality alone would happen to be valid.
+        Comparing raw indices unconditionally (the original implementation)
+        produced false "shared blob" conflicts any time both candidates
+        simply had low indices in their own independent arrays -- e.g. two
+        7-blob candidates sharing indices [0..6] in cam0 even though not one
+        of those index pairs was the same physical blob. Passing
+        blob_geometry fixes this: a shared blob is now decided by whether
+        the two candidates' matched blobs' PIXEL POSITIONS actually overlap
+        (centroid distance below the sum of their radii + blob_match_margin_px),
+        mirroring the same-camera same-frame blob exclusion main.py already
+        does elsewhere (_exclude_claimed_blobs, main.py) for exactly this
+        reason. If blob_geometry is omitted, or a (ctrl_name, cam_id) pair is
+        missing from it, the shared-blob check is skipped for that pair
+        entirely (never flagged) rather than risk a false positive from
+        coincidentally-equal local indices -- cross-occlusion (below, pose-
+        geometry based, unaffected by this issue) remains the catch-all for
+        real cross-controller conflicts in that case.
+
         Two candidates conflict if EITHER:
-          - shared blob: the same blob index, in the same camera, appears in
-            both candidates' matched pairs (primary `assignment` or
-            `aux_assignments`).
+          - shared blob: their matched blobs' pixel centroids, in the same
+            camera, overlap within blob_match_margin_px (see blob_geometry
+            above) -- primary `assignment` or `aux_assignments` on either
+            side.
           - cross-occlusion: one candidate's SOLVED pose (both here -- unlike
             _build_extrapolated_occluders, which necessarily uses a
             *predicted* pose since neither warm-warm controller has solved
@@ -2311,14 +2383,18 @@ class TrackingSystem:
         connected to the graph only through an already-dropped neighbor is
         free to win in a later round.
 
-        Returns the set of ctrl_names to drop (losers). candidates values
-        must be solution dicts as produced by
+        Returns (losers, loser_reason): the set of ctrl_names to drop, and a
+        {ctrl_name: human-readable reason} map for every dropped name —
+        which winner it lost to and whether the conflict was a shared blob
+        (with camera + blob indices) or a cross-occlusion (with the
+        occluder/victim direction, camera, and specific LED ids blocked).
+        candidates values must be solution dicts as produced by
         ControllerTracker._compute_fused_solution (primary_cam, T_world_ctrl,
         error, assignment, aux_assignments).
         """
         names = list(candidates.keys())
         if len(names) < 2:
-            return set()
+            return set(), {}
 
         def _matched_pairs(sol: Dict, cid: int) -> List[Tuple[int, int]]:
             if sol.get('primary_cam') == cid:
@@ -2335,6 +2411,13 @@ class TrackingSystem:
         _br          = float(self._matching_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
         _gate_margin = float(self._matching_cfg.get('cross_occlusion_gate_margin_px', 20.0))
 
+        # Human-readable explanation for each conflicting pair, keyed by
+        # frozenset({a, b}) — filled in below as each conflict is found, so
+        # the drop-site log (update_cold_batch) can report exactly which
+        # blob(s) collided or which controller's body occluded which LED(s),
+        # instead of just "lost to a better candidate".
+        conflict_reason: Dict[FrozenSet[str], str] = {}
+
         conflicts: Dict[str, Set[str]] = {n: set() for n in names}
         for i, a in enumerate(names):
             sol_a = candidates[a]
@@ -2343,10 +2426,35 @@ class TrackingSystem:
                 conflict = False
 
                 for cid in _matched_cams(sol_a) & _matched_cams(sol_b):
-                    idx_a = {blob for blob, _ in _matched_pairs(sol_a, cid)}
-                    idx_b = {blob for blob, _ in _matched_pairs(sol_b, cid)}
-                    if idx_a & idx_b:
+                    pairs_a = _matched_pairs(sol_a, cid)
+                    pairs_b = _matched_pairs(sol_b, cid)
+                    if not pairs_a or not pairs_b:
+                        continue
+                    geo_a = (blob_geometry or {}).get(a, {}).get(cid)
+                    geo_b = (blob_geometry or {}).get(b, {}).get(cid)
+                    if geo_a is None or geo_b is None:
+                        # No blob geometry for this (ctrl, cam) pair -- can't
+                        # tell whether these two candidates' blob indices
+                        # refer to the same physical blob or just happen to
+                        # collide numerically in two independent per-
+                        # controller arrays (see docstring). Skip rather than
+                        # risk a false positive.
+                        continue
+                    cent_a, rad_a = geo_a
+                    cent_b, rad_b = geo_b
+                    idx_a = np.array([blob for blob, _ in pairs_a], dtype=int)
+                    idx_b = np.array([blob for blob, _ in pairs_b], dtype=int)
+                    pts_a, pts_b = cent_a[idx_a], cent_b[idx_b]
+                    rr_a,  rr_b  = rad_a[idx_a],  rad_b[idx_b]
+                    dists = np.linalg.norm(pts_a[:, None, :] - pts_b[None, :, :], axis=2)
+                    overlap = dists < (rr_a[:, None] + rr_b[None, :] + blob_match_margin_px)
+                    if overlap.any():
                         conflict = True
+                        _ia, _ib = np.where(overlap)
+                        conflict_reason[frozenset((a, b))] = (
+                            f"shared blob in cam{cid}: {a}#{int(idx_a[_ia[0]])} "
+                            f"~= {b}#{int(idx_b[_ib[0]])} (dist={dists[_ia[0], _ib[0]]:.1f}px)"
+                        )
                         break
 
                 if not conflict and _occlusion_on:
@@ -2371,8 +2479,13 @@ class TrackingSystem:
                                 geom_occ, _br, _br, focal_px, _gate_margin,
                                 log_tag=f"[cold-conflict {occluder}->{victim} cam{cid}]",
                             )
-                            if any(occluded[lid] for lid in led_ids):
+                            _hit_leds = [lid for lid in led_ids if occluded[lid]]
+                            if _hit_leds:
                                 conflict = True
+                                conflict_reason[frozenset((a, b))] = (
+                                    f"cross-occlusion: {occluder}'s body blocks {victim}'s "
+                                    f"LED(s) {sorted(_hit_leds)} in cam{cid}"
+                                )
                                 break
                         if conflict:
                             break
@@ -2382,7 +2495,7 @@ class TrackingSystem:
                     conflicts[b].add(a)
 
         if not any(conflicts.values()):
-            return set()
+            return set(), {}
 
         # A fit sitting right at the minimal-inlier floor has almost no spare
         # degrees of freedom, so a near-zero residual there is not evidence of
@@ -2406,6 +2519,7 @@ class TrackingSystem:
 
         remaining = set(names)
         losers: Set[str] = set()
+        loser_reason: Dict[str, str] = {}
 
         # Fixed candidates always win — drain them first, unconditionally,
         # before the score-based greedy pass below ever runs. A candidate
@@ -2424,6 +2538,8 @@ class TrackingSystem:
                 if loser in _fixed:
                     continue
                 losers.add(loser)
+                _reason = conflict_reason.get(frozenset((fixed, loser)), "unknown")
+                loser_reason[loser] = f"lost to already-committed {fixed} — {_reason}"
                 remaining.discard(loser)
 
         while remaining:
@@ -2431,5 +2547,9 @@ class TrackingSystem:
             remaining.discard(winner)
             for loser in conflicts[winner] & remaining:
                 losers.add(loser)
+                _reason = conflict_reason.get(frozenset((winner, loser)), "unknown")
+                loser_reason[loser] = (
+                    f"lost to {winner} (lower inlier-discounted error) — {_reason}"
+                )
                 remaining.discard(loser)
-        return losers
+        return losers, loser_reason
