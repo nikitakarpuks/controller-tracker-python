@@ -786,6 +786,16 @@ def main():
                     c: results[c] for c in ctrl_names_ordered
                     if c not in _true_cold_ctrls and results.get(c) is not None
                 },
+                committed_observations={
+                    c: {cm: r.centroids for cm, r in per_ctrl_blobs[c].items()}
+                    for c in ctrl_names_ordered
+                    if c not in _true_cold_ctrls and results.get(c) is not None
+                },
+                committed_radii={
+                    c: {cm: r.radii for cm, r in per_ctrl_blobs[c].items()}
+                    for c in ctrl_names_ordered
+                    if c not in _true_cold_ctrls and results.get(c) is not None
+                },
             )
             _cold_batch_ms = (time() - _t_cold_batch0) * 1000
             _pose_phase_wall_s += _cold_batch_ms / 1000

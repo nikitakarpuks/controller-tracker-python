@@ -1,3 +1,4 @@
+import heapq
 import math
 import time
 from dataclasses import dataclass, field
@@ -558,6 +559,8 @@ class PoseSearcher:
         self._c_prox_strong_match_px = float(_cfg.get('proximity_strong_match_px',        0.2))
         self._c_prox_branch_k       = int(  _cfg.get('proximity_branch_k',                3))
         self._c_prox_level0_max_hyp = int(  _cfg.get('proximity_level0_max_hyp',          16))
+        self._c_prox_topk_max_pop   = int(  _cfg.get('proximity_topk_max_pop',          8000))
+        self._c_prox_max_est_combos = int(  _cfg.get('proximity_max_estimated_combos', 5_000_000))
         self._c_prox_none_branch_w  = int(  _cfg.get('proximity_none_branch_width',        5))
         self._c_prox_score_metric   = str(  _cfg.get('proximity_score_metric',           'max'))
         self._c_prox_top_k_ransac        = int(  _cfg.get('proximity_top_k_ransac',           3))
@@ -826,6 +829,33 @@ class PoseSearcher:
                 + (f"  hyp_sizes={[len(candidates[k]) for k in hyp_k]}" if hyp_k else "")
             )
 
+            # Gate: skip proximity entirely when the raw (pre-collision-pruning) combo
+            # space is too large to be worth searching. Cheap, closed-form estimate —
+            # comb(len(hyp_k), n_assigned) * geomean(hyp_sizes)^n_assigned, where
+            # n_assigned = len(hyp_k) - min_none_forced is how many LEDs must get a
+            # real (non-None) blob at the hardest (first-tried) None level — computed
+            # with no enumeration, before any combo search runs. Locked=0 scenes with
+            # many dense, overlapping candidate LEDs essentially never resolve via
+            # proximity anyway (see proximity_max_estimated_combos in config.yml for
+            # the real data this was calibrated against); falling straight through to
+            # brute-force (which already fires automatically whenever no camera finds
+            # a proximity solution) is both correct and far cheaper than paying for a
+            # doomed best-first search.
+            if hyp_k:
+                _gate_avail_blobs = set(b for k in hyp_k for b in candidates[k]) - truly_locked_blobs
+                _gate_min_none    = max(0, len(hyp_k) - len(_gate_avail_blobs))
+                _gate_n_assigned  = len(hyp_k) - _gate_min_none
+                _gate_hyp_sizes   = [len(candidates[k]) for k in hyp_k]
+                _gate_geomean     = math.exp(sum(math.log(s) for s in _gate_hyp_sizes) / len(_gate_hyp_sizes))
+                _gate_estimate    = math.comb(len(hyp_k), _gate_n_assigned) * (_gate_geomean ** _gate_n_assigned)
+                if _gate_estimate > self._c_prox_max_est_combos:
+                    logger.bind(cat="proximity_match").debug(
+                        f"[{self._ctrl} | cam {self._cam}] Proximity: too ambiguous "
+                        f"(est_combos={_gate_estimate:,.0f} > {self._c_prox_max_est_combos:,}, "
+                        f"n_assigned={_gate_n_assigned}/{len(hyp_k)})  — deferring to brute-force"
+                    )
+                    return None
+
             # Pre-undistort all blob positions once — reused across all hypothesis evaluations.
             _blobs_norm = self.camera.undistort_points(blobs).astype(np.float32)
 
@@ -949,6 +979,77 @@ class PoseSearcher:
 
                     yield from _bt(0, n_none_target)
 
+                def _bt_combos_topk(n_none_target: int, k: int, max_pop: int):
+                    """Best-first search: yields up to `k` collision-free combos with
+                    exactly n_none_target Nones, in ascending raw-distance-sum order,
+                    without materializing the full combo space _bt_combos would.
+
+                    Assigning a candidate blob only ever adds a non-negative distance
+                    to the running sum, and assigning None adds nothing, so partial
+                    cost is monotonically non-decreasing along any path from the root.
+                    That means a min-heap over frontier states, always expanding the
+                    cheapest one, discovers complete combos in true global ascending
+                    order — the same guarantee Dijkstra/uniform-cost search relies on —
+                    without ever visiting a combo that couldn't beat the k already
+                    found. This is what lets a huge combo space (millions, when many
+                    LEDs are ambiguous) cost roughly O(k) instead of O(all combos).
+
+                    Two representations keep the per-pop cost down (profiling showed
+                    the naive frozenset/tuple version at 0.8-14us/pop, worse at larger
+                    heaps): `used` is a bitmask instead of a frozenset (O(1) union/test,
+                    no allocation), and the combo-so-far is a parent-pointer chain
+                    instead of a growing tuple — reconstructed into a real list only
+                    for the k combos actually yielded, instead of on every push.
+                    """
+                    _n = len(hyp_k)
+                    _counter = 0
+                    _used0 = 0
+                    for _b in truly_locked_blobs:
+                        _used0 |= (1 << _b)
+                    # heap item: (partial_cost, tie_break, index, used_bitmask, nones_left, path)
+                    # path is None (root) or (parent_path, value) — walked back into a
+                    # real combo list only when a leaf (i == _n) is popped.
+                    heap = [(0.0, 0, 0, _used0, n_none_target, None)]
+                    n_yielded = 0
+                    n_popped = 0
+                    while heap and n_yielded < k:
+                        if n_popped >= max_pop:
+                            logger.bind(cat="proximity_match").debug(
+                                f"[{self._ctrl} | cam {self._cam}] Proximity: top-k search "
+                                f"hit max_pop={max_pop} safety cap before finding {k} combos "
+                                f"(found {n_yielded})"
+                            )
+                            break
+                        cost, _, i, used, nones_left, path = heapq.heappop(heap)
+                        n_popped += 1
+                        if i == _n:
+                            combo = [None] * _n
+                            _idx = _n - 1
+                            _node = path
+                            while _node is not None:
+                                _parent, _val = _node
+                                combo[_idx] = _val
+                                _idx -= 1
+                                _node = _parent
+                            yield combo
+                            n_yielded += 1
+                            continue
+                        remaining = _n - i
+                        if nones_left < remaining:
+                            for _b in candidates[hyp_k[i]]:
+                                _bit = 1 << _b
+                                if not (used & _bit):
+                                    _counter += 1
+                                    heapq.heappush(heap, (
+                                        cost + float(dist_pred[hyp_k[i], _b]), _counter,
+                                        i + 1, used | _bit, nones_left, (path, _b)
+                                    ))
+                        if nones_left > 0:
+                            _counter += 1
+                            heapq.heappush(heap, (
+                                cost, _counter, i + 1, used, nones_left - 1, (path, None)
+                            ))
+
                 # Minimum None count forced by blob scarcity: if fewer distinct blobs
                 # are available than hyp LEDs, a full (0-None) assignment is impossible.
                 # Skip all levels below this minimum to avoid iterating only collisions.
@@ -963,22 +1064,29 @@ class PoseSearcher:
                 _zero_none_combos: list = []
                 if _min_none_forced == 0:
                     _t0 = time.perf_counter()
-                    # _bt_combos(0) prunes duplicate-blob branches during the search
-                    # itself, rather than generating the full Cartesian product of
-                    # candidate lists and filtering collisions after the fact — the
-                    # product can be huge when many LEDs share overlapping candidates.
-                    for _combo in _bt_combos(0):
-                        _raw = sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k)))
-                        _zero_none_combos.append((_raw, _combo))
+                    if self._c_prox_level0_max_hyp > 0:
+                        # Best-first search: yields combos already in ascending
+                        # raw-distance order, so we only ever pay for the top
+                        # level0_max_hyp of them instead of materializing every
+                        # collision-free combo up front (which can run into the
+                        # millions when many LEDs share overlapping candidates —
+                        # see _bt_combos_topk docstring for why this is exact).
+                        for _combo in _bt_combos_topk(0, self._c_prox_level0_max_hyp, self._c_prox_topk_max_pop):
+                            _raw = sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k)))
+                            _zero_none_combos.append((_raw, _combo))
+                        if len(_zero_none_combos) >= self._c_prox_level0_max_hyp:
+                            logger.bind(cat="proximity_match").debug(
+                                f"[{self._ctrl} | cam {self._cam}] Proximity: level-0 "
+                                f"best-first search kept top {self._c_prox_level0_max_hyp} "
+                                f"combos (search space not exhausted)"
+                            )
+                    else:
+                        # No cap configured: fall back to full enumeration.
+                        for _combo in _bt_combos(0):
+                            _raw = sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k)))
+                            _zero_none_combos.append((_raw, _combo))
+                        _zero_none_combos.sort(key=lambda x: x[0])
                     _t_collisions += time.perf_counter() - _t0
-                    _zero_none_combos.sort(key=lambda x: x[0])
-                    _zero_none_total = len(_zero_none_combos)
-                    if self._c_prox_level0_max_hyp > 0 and _zero_none_total > self._c_prox_level0_max_hyp:
-                        logger.bind(cat="proximity_match").debug(
-                            f"[{self._ctrl} | cam {self._cam}] Proximity: level-0 cap "
-                            f"kept {self._c_prox_level0_max_hyp}/{_zero_none_total} combos by raw distance"
-                        )
-                        _zero_none_combos = _zero_none_combos[:self._c_prox_level0_max_hyp]
                 _had_zero_none_candidates = len(_zero_none_combos) > 0
                 # Nones at the base level are unavoidable and carry no penalty;
                 # only extras above it are penalised.
@@ -1074,29 +1182,31 @@ class PoseSearcher:
                                         _seen_ck.add(_ck); _this_level.append(_child)
                         else:
                             # Fallback: no parents (no prior level produced any scored
-                            # combo, e.g. blob scarcity forces Nones from the start) —
-                            # backtracking enumerates only collision-free combos, so no
-                            # collision post-filter is needed. Still cap like level 0:
-                            # sort by raw pixel distance and keep only the best-by-distance
-                            # combos before paying for solvePnP on any of them.
+                            # combo, e.g. blob scarcity forces Nones from the start).
+                            # Best-first search over the same collision-free combo tree
+                            # _bt_combos enumerates, but expanding cheapest-partial-cost
+                            # first via a min-heap — see _bt_combos_topk docstring for why
+                            # this yields the true top level0_max_hyp combos without
+                            # visiting the full space (which can run into the millions).
                             _t0 = time.perf_counter()
-                            _fallback_combos = [
-                                (sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k))
-                                     if _combo[i] is not None), _combo)
-                                for _combo in _bt_combos(n_none)
-                            ]
+                            if self._c_prox_level0_max_hyp > 0:
+                                _this_level = list(_bt_combos_topk(n_none, self._c_prox_level0_max_hyp, self._c_prox_topk_max_pop))
+                                if len(_this_level) >= self._c_prox_level0_max_hyp:
+                                    logger.bind(cat="proximity_match").debug(
+                                        f"[{self._ctrl} | cam {self._cam}] Proximity: fallback "
+                                        f"{n_none}-None best-first search kept top "
+                                        f"{self._c_prox_level0_max_hyp} combos (search space not exhausted)"
+                                    )
+                            else:
+                                # No cap configured: fall back to full enumeration.
+                                _fallback_combos = [
+                                    (sum(dist_pred[hyp_k[i], _combo[i]] for i in range(len(hyp_k))
+                                         if _combo[i] is not None), _combo)
+                                    for _combo in _bt_combos(n_none)
+                                ]
+                                _fallback_combos.sort(key=lambda x: x[0])
+                                _this_level = [_combo for _, _combo in _fallback_combos]
                             _t_collisions += time.perf_counter() - _t0
-                            _fallback_combos.sort(key=lambda x: x[0])
-                            _fallback_total = len(_fallback_combos)
-                            if (self._c_prox_level0_max_hyp > 0 and
-                                    _fallback_total > self._c_prox_level0_max_hyp):
-                                logger.bind(cat="proximity_match").debug(
-                                    f"[{self._ctrl} | cam {self._cam}] Proximity: fallback "
-                                    f"{n_none}-None cap kept {self._c_prox_level0_max_hyp}/{_fallback_total} "
-                                    f"combos by raw distance"
-                                )
-                                _fallback_combos = _fallback_combos[:self._c_prox_level0_max_hyp]
-                            _this_level = [_combo for _, _combo in _fallback_combos]
 
                         if not _this_level:
                             if _used_fallback:
