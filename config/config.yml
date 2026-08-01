@@ -1,10 +1,30 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/4_MAIN_complex_moves_hand_ctrl_occlusions_occluded_spin"
+  root: "C:/Users/nikita.karpuks/PycharmProjects/controller-tracker-python/data/euroc_recording_20260729173447_still_easy/euroc_recording_20260729173447_still_easy/mav0"
+  layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
+                           # side-by-side into a single wide image per frame (uses
+                           # img_width/total_cameras_number below to slice per camera).
+                           # "per_camera_folders" = one subfolder per camera under root,
+                           # each holding the same number of images; frames are paired
+                           # by sorted position within each folder (filenames need not
+                           # match across folders). Uses camera_folder_pattern /
+                           # images_subdir below instead of img_width/total_cameras_number.
+  camera_folder_pattern: "cam{idx}"  # only used when layout is "per_camera_folders";
+                                      # {idx} is replaced with the camera index
+  images_subdir: "data"  # only used when layout is "per_camera_folders"; optional subfolder
+                      # inside each camera folder holding the images, e.g. "data" for an
+                      # EuRoC-style root/cam0/data/*.png layout; "" if images sit directly
+                      # in the camera folder
   img_width: 2560
   img_height: 481
   has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  frame_range:
+    lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
+                 # (each camera folder in "per_camera_folders" layout); null = start
+                 # from the first image
+    upper: 100  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+                 # processes images at sorted positions 100..199 only.
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -324,7 +344,7 @@ debug:
   # --------------------------------------------------------------------------
   log_startup: true              # startup line (mode/data root), calibration CSV open/close paths
   log_frame_summary: true        # per-frame per-controller accept line (cam/err/matches/method), TRACKING LOST
-  log_timings: true              # blob-detect / pose-search / rerun timings, slow-frame notices,
+  log_timings: false              # blob-detect / pose-search / rerun timings, slow-frame notices,
                                   # per-tier brute-force bench + P3P-call summaries
   log_blob_detection: false      # blob-dedup grouping (controllers sharing a camera collapse to one detect call)
   log_blob_diag: false           # per-call pool round-trip breakdown: dispatch latency / compute / return transit
@@ -332,7 +352,7 @@ debug:
                                   # cold brute-force gating streak, warm-cam-cap candidate/demotion
   log_batch_orchestration: false # warm-batch/cold-batch round summaries, per-tier pool submissions
   log_pose_fusion: false         # per-camera importance weights in joint multi-camera fusion
-  log_occlusion: false           # cross-controller occlusion masking, cold-cold conflict resolution
+  log_occlusion: true           # cross-controller occlusion masking, cold-cold conflict resolution
   log_proximity_match: false     # proximity/prior-constrained match internals: pairs matched, RANSAC
                                   # outcome, dropped/vis-dropped pairs, aux-camera snap, final accept
   log_hypothesis_testing: false  # brute-force per-hypothesis funnel: target triple reached, P3P solution
