@@ -7,6 +7,7 @@ import numpy as np
 import rerun as rr
 
 from loguru import logger
+from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
 from src import debug_config
@@ -169,6 +170,15 @@ def main():
                                "led_id", "depth_m", "facing_cos", "velocity_px",
                                "brightness", "area"])
         logger.bind(cat="startup").info(f"Calibration CSV → {_csv_path}")
+
+    _pose_csv_path = debug_cfg.get("pose_csv")
+    _pose_csv_file = _pose_csv_writer = None
+    if _pose_csv_path:
+        Path(_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        _pose_csv_file = open(_pose_csv_path, "w", newline="")
+        _pose_csv_writer = csv.writer(_pose_csv_file)
+        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz"])
+        logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
 
     _n_frames = count_images(config["data"])
     for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
@@ -847,6 +857,13 @@ def main():
                 frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
                 any_valid_pose[ctrl_name] = True
                 lost_streak[ctrl_name] = 0
+                if _pose_csv_writer:
+                    _qx, _qy, _qz, _qw = Rotation.from_matrix(T_world_ctrl.R).as_quat()
+                    _pose_csv_writer.writerow([
+                        int(img_path.stem), ctrl_name,
+                        f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
+                        f"{T_world_ctrl.t[0]:.6f}", f"{T_world_ctrl.t[1]:.6f}", f"{T_world_ctrl.t[2]:.6f}",
+                    ])
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -939,6 +956,10 @@ def main():
     if _csv_file:
         _csv_file.close()
         logger.bind(cat="startup").info(f"Calibration CSV saved → {_csv_path}")
+
+    if _pose_csv_file:
+        _pose_csv_file.close()
+        logger.bind(cat="startup").info(f"Pose CSV saved → {_pose_csv_path}")
 
     if tracking_system._self_cal is not None:
         tracking_system._self_cal.run()
