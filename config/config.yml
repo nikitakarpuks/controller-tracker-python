@@ -16,14 +16,14 @@ data:
                       # in the camera folder
   img_width: 2560
   img_height: 481
-  has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
+  has_technical_row: false  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
     lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 100  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 1000  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 cameras:
@@ -219,6 +219,17 @@ matching:
                                         # (force_brute) reacquisition, not a warm controller's
                                         # same-frame cheap-search-failure brute-force fallback.
   strong_match_error_px: 0.5
+  score_error_floor_px: 0.5   # _inlier_discounted_error's error floor, used when comparing
+                              # competing candidates (_resolve_cold_conflicts across
+                              # controllers, _select_best_cam_solution across one
+                              # controller's own cameras): errors below this are clamped
+                              # to it before the inlier-count discount, so a difference
+                              # like 0.06px vs 0.09px (blob-centroid noise, not a real
+                              # quality signal) never outranks a candidate with genuinely
+                              # more corroborating total_pairs -- only a difference that
+                              # survives above this floor still decides the score.
+                              # Defaults to strong_match_error_px's value but is kept
+                              # independently tunable (omit to just track that value).
   min_vis_coverage: 0.6
   brute_aux_reprojection_threshold_px: 2.0   # aux-camera Hungarian match threshold for cross-camera
                                               # coverage gating (brute_search_tier's aux block); kept
@@ -311,6 +322,15 @@ matching:
   cross_controller_occlusion: true        # mask LEDs of controller B that are occluded by controller A's body
   cross_occlusion_bounding_radius_m: 0.18  # controller body bounding sphere radius (tune manually)
   cross_occlusion_gate_margin_px: 20.0     # slack added to the 2D projection gate threshold
+  min_controller_center_distance_m: 0.05   # hard floor on distance between any two controllers'
+                                            # fused pose centers (world frame); two rigid controllers
+                                            # cannot occupy the same space. Deliberately smaller than
+                                            # cross_occlusion_bounding_radius_m*2 (0.36m) -- that value
+                                            # is a conservative bound meant to gate an expensive raycast,
+                                            # not a literal collision radius; this check should only
+                                            # fire on genuine degenerate/merged poses (near-zero
+                                            # separation), not on controllers legitimately held close
+                                            # together (e.g. clapping motion).
 
 self_calibration:
   enabled: false                  # set to true to enable online intrinsic calibration
@@ -327,6 +347,7 @@ self_calibration:
 
 debug:
   calibration_csv: null # "./data/calib_warm_pass1.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
+  pose_csv: "C:/Users/nikita.karpuks/AppData/Local/Temp/claude/C--Users-nikita-karpuks-PycharmProjects-controller-tracker-python/9dd7a3f4-c7a7-4f9f-a822-cef25d9dda09/scratchpad/pose_log.csv"  # null = disabled; per-accepted-frame (timestamp_ns, ctrl_name, quat, position) for IMU-sync cross-correlation
   assume_continuous_frames: true  # true = input is a real continuous capture (frame N+1 is ~one exposure
                                     # after frame N) → the pose-continuity jump check on re-acquisition
                                     # applies. false = input is a curated/isolated set of problem frames
@@ -380,7 +401,7 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
