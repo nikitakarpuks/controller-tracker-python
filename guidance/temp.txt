@@ -984,3 +984,47 @@ For the remaining 5 corrupted keys with no config.yml entry (blob_size_min, blob
   3. Leave as-is for now
      Don't touch these 5 — just noted in the report, revisit later.
   4. Type something.
+
+
+
+
+
+
+
+
+  ● I have everything needed for a concrete plan now — got their actual sample data files, so this isn't guesswork.
+
+  What I confirmed
+
+  imu_data.txt format: t_ns, wx, wy, wz, ax, ay, az — this is the same layout as our own mav0/imu*/data.csv, just without the header row. Their imu_freq: 200 in
+  the default config even matches our controller IMU rate exactly (measured ~199–200Hz in Stage 1).
+
+  mocap_data.txt format: t_seconds, px, py, pz, qx, qy, qz, qw — quaternion in XYZW order, matching what we already use everywhere in our own pipeline. OptiTrack's
+  Time column (seconds-from-take-start) is already in this exact convention.
+
+  estimator_config.yaml wants imu_noise: [acc_white_noise, acc_bias_walk, gyr_white_noise, gyr_bias_walk] — this is precisely the Noise/BiasUncertainty data
+  already sitting in our controller JSON's InertialSensors and already parsed into ControllerImuAxisCalib.noise_std/.bias_uncertainty in src/imu_data.py. For
+  mocap_trans_noise/mocap_rot_noise we don't have a spec for our OptiTrack rig, but the takefiles folder has a real number to start from: Calibration Exceptional
+  (MeanErr 0.575 mm) — close to their own default (0.2mm), so a reasonable starting point rather than a blind guess.
+
+  Concrete steps
+
+  1. Get the repo somewhere outside this project (a sibling folder, not inside controller-tracker-python — keeps it the "separate process" you want). I could only
+  reach it via curl with a browser user-agent (plain git clone against the anon.4open.science URL fails, and my WebFetch tool got 403'd without a UA) — easiest is
+  for you to open https://anonymous.4open.science/r/mocap2gt in a normal browser and download it there, since I can't run a real browser session. If you'd rather I
+  mirror the files via the same curl approach that just worked, say so and I'll pull the whole tree.
+  2. Build via Docker (confirmed from their actual Dockerfile — Ubuntu 20.04 + Eigen 3.4 + yaml-cpp 0.8.0 + Ceres 1.14.0 built from source, so Docker avoids
+  setting all that up natively on Windows):
+  docker build -f ./Dockerfile -t run_mocap2gt:v0.1 .
+  docker run -it --name test_mocap2gt -v $(pwd):/mocap2gt run_mocap2gt:v0.1
+  cd /mocap2gt && mkdir -p build && cd build && cmake .. && make -j$(nproc)
+  3. Sanity-run their bundled sample first (GTEstimator on resource/estimator_test_data/*) before touching our data — confirms the build works.
+  4. Pick one device to start with. I'd suggest the headset: OptiTrack already tracks a "Headset" rigid body, we already have raw imu0 (real onboard timestamps, no
+  controller-clock-offset ambiguity to worry about), and a successful calibration here directly lets us validate Stage 2's VIO composition. Controllers (imu1/imu2
+  vs. OptiTrack's ControllerLeft/ControllerRight) can follow the same recipe once this works once.
+  5. Write a small standalone conversion script (this is fine — it's a format translator, not integration) that reads mav0/imu0/data.csv and the OptiTrack
+  rigidbody CSV for "Headset" and writes them out as imu_data.txt/mocap_data.txt in the formats above. I can write this now if you want.
+  6. Run GTEstimator on the converted data, producing mocap2gt_calib.yaml (the spatial extrinsic + time offset) and mocap2gt_traj.txt (refined ground truth).
+  7. Load the outputs back into our pipeline as plain data — same pattern as everything else (VIO, OptiTrack CSVs): just files we read, no code dependency.
+
+  Want me to write the conversion script (step 5) now, or do you want to get the build working first?
