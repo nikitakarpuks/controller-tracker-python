@@ -18,13 +18,20 @@ data:
   img_height: 481
   has_technical_row: false  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
-  selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1] #, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
     lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 1000  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 2000  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
+
+imu:
+  enabled: true   # Stage 3: fold controller gyro into pose prediction + run the
+                  # gravity-alignment diagnostic (log-only). Requires
+                  # <data.root>/imu1/data.csv (left) and imu2/data.csv (right) in
+                  # EuRoC format; falls back to pure vision-history prediction
+                  # (with a startup warning) if a file is missing.
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
@@ -401,7 +408,7 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
