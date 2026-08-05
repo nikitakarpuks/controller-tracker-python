@@ -1028,3 +1028,76 @@ For the remaining 5 corrupted keys with no config.yml entry (blob_size_min, blob
   7. Load the outputs back into our pipeline as plain data — same pattern as everything else (VIO, OptiTrack CSVs): just files we read, no code dependency.
 
   Want me to write the conversion script (step 5) now, or do you want to get the build working first?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ● Summary
+
+  Problem: static ambient lights (e.g. a lamp with LED-sized split sections) get confused with controller LEDs during cold search, producing wrong pose solves when
+  a controller is out of view.
+
+  Design that emerged, three layers:
+
+  1. Per-frame motion-residual scorer — derotate each blob's position using headset rotation (from VIO), compare to actual motion; residual near zero → static →
+  staticness score s.
+  2. Persistence via survey windows — since a lamp's bearing depends on headset rotation not translation, bucket headset viewing direction into a coarse grid
+  (keyframe-style). Trigger a full-frame "survey" pass only when entering a stale/unsurveyed cell, decoupled from controller cold-start's
+  cold_brute_force_confirm_frames gate and using isolated detection state so it doesn't perturb _pass2_memory's EMA/percentile calibration. Confidence accumulates
+  per cell, decays if unconfirmed, downweighted for edge-of-FOV observations near the fisheye model's rpmax boundary.
+  3. Soft-weighting, never hard mask — s enters as: shrunk P3P gate tolerance + deprioritized triple ordering (brute), inflated RANSAC inlier residual (the layer
+  that actually stops a lamp-only solution from confirming), and added Hungarian assignment cost (proximity). Always finite, so a controller genuinely resting near
+  a lamp is still recoverable.
+
+  Open, unresolved from earlier: whether the LEDs support any temporal/strobe coding — would be a cheaper, orthogonal signal if hardware supports it.
+
+  Implementation plan
+
+  Phase 0 — resolve the gaps below before writing code; several change the design.
+
+  Phase 1 — per-blob motion tracking + residual scorer
+  New lightweight blob tracker (frame-to-frame nearest-neighbor association of all detected blobs, independent of controller identity) + fisheye-correct derotation
+  (undistort → rotate → redistort, using the real KB4 model, not a pinhole linear approximation — matters given the large k1 already on record) using per-frame
+  rotation from imu_data.py/camera.py. Output: a staticness array aligned to each camera's detected blobs, no matching changes yet.
+
+  Phase 2 — survey window / persistence map
+  View-direction bucket grid per camera, staleness-triggered survey windows, isolated detection state, confidence accumulation feeding a queryable distractor map
+  (reprojectable into any frame from current headset pose).
+
+  Phase 3 — wire into matching
+  Merge Phase 1 (instant) + Phase 2 (prior) into one effective s per blob. Thread it through pose_search.py the same way occluders_per_cam was threaded through for
+  cross-controller occlusion — a per-call dict built on the main process, passed to brute_search/proximity_search. Config-gated, opt-in master switch.
+
+  Phase 4 — validation
+  Repro sequence(s) with the lamp-confusion failure, regression check that lamp-free sequences are unaffected (s≈0 everywhere), threshold tuning (gate shrink,
+  residual inflation, Hungarian penalty, cell size, refresh horizon, decay rate) against real data.
+
+  What we're lacking
+
+  1. Fisheye-correct derotation implementation — the formula I gave earlier was a pinhole approximation; needs the actual undistort/project functions from
+  camera.py. Haven't confirmed those are cleanly reusable here.
+  2. VIO rotation accuracy/timing — haven't verified imu_data.py gives per-frame, camera-timestamp-synced rotation deltas accurate enough that residual noise stays
+  well below real controller motion. If the noise floor is too high, the classifier won't discriminate.
+  3. Repro/eval data — do you already have a recording that reproduces this exact failure? Ideally with mocap ground truth (you have an optitrack-export pipeline)
+  so thresholds get tuned against real numbers, not guesses.
+  4. Cross-session persistence — fixed room/rig where a saved distractor map carries value across runs, or ad hoc environments where in-memory-only,
+  rebuild-per-run is fine? Determines whether Phase 2 needs a serialization format at all.
+  5. Multiprocessing plumbing — matching runs through a ProcessPoolExecutor; distractor scores need to reach worker PoseSearcher instances the same
+  snapshot-per-dispatch way occluders_per_cam does, meaning the map is up to one frame stale in workers. Fine given how slowly the environment changes, but worth
+  confirming that's acceptable rather than assumed.
+  6. Strobe/temporal LED coding — still unanswered; settling this could cheapen or partly bypass Phases 1-2.
+  7. Definition of done — what's the bar for Phase 4: zero false-accepts on the repro sequence, or a specific inlier-rate/latency target?
+
+  (3), (4), and (6) are the ones that actually change scope — worth answering those first.
