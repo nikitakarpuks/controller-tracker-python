@@ -18,7 +18,7 @@ data:
   img_height: 481
   has_technical_row: false  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
-  selected_cameras: [0, 1] #, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
+  selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
     lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
