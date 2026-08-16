@@ -12,6 +12,7 @@ from src.camera import Camera
 from src.debug_config import is_continuous_sequence
 from src.transformations import Transform
 from src._self_calibration import SelfCalibrator
+from src.imu_data import integrate_gyro_segment
 
 
 # =========================================================
@@ -83,6 +84,62 @@ def _build_other_cameras_blobs(cameras: Dict[int, Camera], obs_src: Dict[int, np
 # 3. TRACKER (per camera + controller)
 # =========================================================
 
+def _gyro_rel_R_for(gyro_data: Optional[tuple], pose_history, frame_ts_ns: int):
+    """gyro_data: (t_gyro, gyro_body) for one controller, already calibrated,
+    axis-corrected into body frame, and clock-offset-corrected into the vision
+    timestamp domain (see main.py) -- or None if no IMU data was loaded for this
+    controller/run. Returns the (3,3) rel-rotation integrate_gyro_segment
+    computes over [pose_history[0]'s timestamp, frame_ts_ns], or None (no gyro
+    data, no pose history yet, or frame_ts_ns outside the gyro's covered range)."""
+    if gyro_data is None or not pose_history:
+        return None
+    ts0 = int(pose_history[0][2])
+    return integrate_gyro_segment(gyro_data[0], gyro_data[1], ts0, frame_ts_ns)
+
+
+# Stage 3 gravity-alignment diagnostic (thaytan's OpenHMD dev-diary technique):
+# log-only for now, see the plan notes on why this isn't wired to reject anything
+# yet -- not confident enough in the false-positive rate on this data to let it
+# force brute-force retries on a shared, critical path.
+_GRAVITY_LOW_DYNAMICS_TOL_MS2 = 2.0   # |accel| within this of 9.81 m/s^2 => trust it as a gravity reference
+_GRAVITY_DISAGREEMENT_DEG     = 20.0  # log a warning above this angle between two consecutive low-dynamics readings
+
+
+def _log_gravity_consistency(ctrl_name: str, R_now: np.ndarray, ts_now: int,
+                              R_prev: Optional[np.ndarray], ts_prev: Optional[int],
+                              accel_data: Optional[tuple]) -> None:
+    """Compares the accelerometer-implied 'down' direction (rotated into the
+    controller's fused frame via R_now) against the same quantity computed at
+    the previous accepted frame (R_prev) -- both gated on the accelerometer
+    reading being close to 9.81 m/s^2 at that instant (i.e. probably not
+    contaminated by real linear acceleration). A large disagreement between two
+    low-dynamics readings means at least one of the two orientations is
+    probably wrong. Doesn't need a true world-frame reference: the camera rig
+    only drifts slowly relative to gravity frame-to-frame, so "previous
+    accepted frame" is a good enough proxy over one ~16ms gap."""
+    if accel_data is None or R_prev is None or ts_prev is None:
+        return
+    t_accel, accel_body = accel_data
+    if ts_now < t_accel[0] or ts_now > t_accel[-1] or ts_prev < t_accel[0] or ts_prev > t_accel[-1]:
+        return
+
+    a_now  = np.array([np.interp(ts_now,  t_accel, accel_body[:, i]) for i in range(3)])
+    a_prev = np.array([np.interp(ts_prev, t_accel, accel_body[:, i]) for i in range(3)])
+    if abs(np.linalg.norm(a_now) - 9.81) > _GRAVITY_LOW_DYNAMICS_TOL_MS2:
+        return
+    if abs(np.linalg.norm(a_prev) - 9.81) > _GRAVITY_LOW_DYNAMICS_TOL_MS2:
+        return
+
+    g_now  = R_now  @ (a_now  / np.linalg.norm(a_now))
+    g_prev = R_prev @ (a_prev / np.linalg.norm(a_prev))
+    cos_angle = np.clip(float(g_now @ g_prev), -1.0, 1.0)
+    angle_deg = np.degrees(np.arccos(cos_angle))
+    if angle_deg > _GRAVITY_DISAGREEMENT_DEG:
+        logger.bind(cat="matching_decisions").warning(
+            f"[{ctrl_name}] gravity-direction check: {angle_deg:.1f}° disagreement between "
+            f"consecutive low-dynamics accel readings (diagnostic only, not rejecting)")
+
+
 def cheap_search_core(
     pose_searcher,
     prior: dict,
@@ -103,10 +160,12 @@ def cheap_search_core(
     tracking state can't be shared with a worker (fork only gives it a stale
     snapshot), so the caller must pass that state in explicitly instead.
 
-    prior: {'prev_pose', 'prev_prev_pose', 'pose_history', 'vel_ema', 'prev_assignment'}
-    — the same fields CameraTracker.search_cheap() reads from self. 'pose_history'
-    entries are (rvec, tvec, ts_ns); 'vel_ema' is a position-per-second rate, not a
-    raw step — see CameraTracker._predict_pose's docstring.
+    prior: {'prev_pose', 'prev_prev_pose', 'pose_history', 'vel_ema', 'prev_assignment',
+    'gyro_rel_R'} — the same fields CameraTracker.search_cheap() reads from self.
+    'pose_history' entries are (rvec, tvec, ts_ns); 'vel_ema' is a position-per-second
+    rate, not a raw step; 'gyro_rel_R' is an optional (3,3) body-frame relative
+    rotation from measured gyro (see _gyro_rel_R_for) that overrides rotation
+    prediction — see CameraTracker._predict_pose's docstring.
 
     frame_ts_ns: the current frame's real capture timestamp (nanoseconds, parsed
     from the frame's filename in main.py) — _predict_pose extrapolates against
@@ -140,6 +199,7 @@ def cheap_search_core(
     pose_history    = prior.get('pose_history')
     vel_ema         = prior.get('vel_ema')
     prev_assignment = prior.get('prev_assignment')
+    gyro_rel_R      = prior.get('gyro_rel_R')
 
     # Normalise prev_pose shapes (idempotent — canonicalises (3,1) rvec and (3,) tvec)
     if prev_pose is not None:
@@ -160,6 +220,7 @@ def cheap_search_core(
         frame_ts_ns,
         weight_decay=float(_cfg.get("pose_prediction_weight_decay", 0.7)),
         vel_ema_rate=vel_ema,
+        gyro_rel_R=gyro_rel_R,
     )
 
     # Velocity-scaled search gates: expand proximity radius proportionally to speed.
@@ -386,6 +447,7 @@ class CameraTracker:
         target_ts_ns: int,
         weight_decay: float = 0.7,
         vel_ema_rate: Optional[np.ndarray] = None,
+        gyro_rel_R: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Predict pose at `target_ts_ns` from pose history.
 
@@ -398,7 +460,22 @@ class CameraTracker:
         vel_ema_rate: if provided, a position-per-second rate (EMA-smoothed)
                  that overrides translation prediction:
                  pose_history[0].tvec + vel_ema_rate * dt_target.
-                 Rotation prediction is always derived from pose history.
+
+        gyro_rel_R: if provided, a (3,3) body-frame relative rotation integrated
+                 directly from measured controller gyro over
+                 [pose_history[0]'s timestamp, target_ts_ns] (see
+                 src/imu_data.integrate_gyro_segment / _gyro_rel_R_for). REPLACES
+                 rotation prediction entirely — R_pred = R_0 @ gyro_rel_R — for
+                 every branch below (n==1 constant / n==2 fractional / n>=3
+                 linear-fit rotation logic is skipped whenever this is given).
+                 It uses measured angular velocity through the real gap instead
+                 of extrapolating 2-3 old vision poses, which assumes roughly
+                 constant angular velocity — exactly the assumption fast hand
+                 motion breaks. Translation prediction is untouched either way:
+                 accelerometer-based position prediction needs gravity/bias
+                 separated from real motion, which isn't safe to do without a
+                 real filter (see Stage 4 plan) — Stage 3 only takes the
+                 gyro/rotation half of the win.
 
         n=0 → None (no information)
         n=1 → constant position (same pose) — vel_ema_rate is provably always
@@ -423,10 +500,16 @@ class CameraTracker:
         if n == 0:
             return None
 
+        R_0, _ = cv2.Rodrigues(np.asarray(pose_history[0][0], np.float32).reshape(3, 1))
+
         if n == 1:
+            tvec_pred = np.asarray(pose_history[0][1], np.float32).reshape(3)
+            if gyro_rel_R is not None:
+                rvec_pred, _ = cv2.Rodrigues((R_0 @ gyro_rel_R).astype(np.float32))
+                return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred
             return (
                 np.asarray(pose_history[0][0], np.float32).reshape(3, 1),
-                np.asarray(pose_history[0][1], np.float32).reshape(3),
+                tvec_pred,
             )
 
         ts0 = int(pose_history[0][2])
@@ -439,7 +522,6 @@ class CameraTracker:
             tvec_pred = None  # filled in by the branch below
 
         if n == 2:
-            rvec_n   = np.asarray(pose_history[0][0], np.float32).reshape(3, 1)
             tvec_n   = np.asarray(pose_history[0][1], np.float64).reshape(3)
             rvec_nm1 = np.asarray(pose_history[1][0], np.float32).reshape(3, 1)
             tvec_nm1 = np.asarray(pose_history[1][1], np.float64).reshape(3)
@@ -453,15 +535,18 @@ class CameraTracker:
             if tvec_pred is None:
                 tvec_pred = (tvec_n + (tvec_n - tvec_nm1) * frac).astype(np.float32)
 
-            R_n,   _ = cv2.Rodrigues(rvec_n)
+            if gyro_rel_R is not None:
+                rvec_pred, _ = cv2.Rodrigues((R_0 @ gyro_rel_R).astype(np.float32))
+                return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
+
             R_nm1, _ = cv2.Rodrigues(rvec_nm1)
             # Fractional rotation: scale the relative-rotation Rodrigues vector by
             # frac (small-angle-safe "fraction of a rotation") instead of always
             # applying the full historical step once more regardless of gap size.
-            rvec_rel, _ = cv2.Rodrigues((R_n @ R_nm1.T).astype(np.float32))
+            rvec_rel, _ = cv2.Rodrigues((R_0 @ R_nm1.T).astype(np.float32))
             rvec_rel_scaled = (rvec_rel.reshape(3) * frac).astype(np.float32)
             R_rel_scaled, _ = cv2.Rodrigues(rvec_rel_scaled.reshape(3, 1))
-            R_pred = R_rel_scaled @ R_n
+            R_pred = R_rel_scaled @ R_0
             rvec_pred, _ = cv2.Rodrigues(R_pred.astype(np.float32))
 
             return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
@@ -483,11 +568,14 @@ class CameraTracker:
             for ax in range(3):
                 tvec_pred[ax] = np.polyval(np.polyfit(t_pts, tvecs[:, ax], deg=1, w=weights), _t_eval)
 
+        if gyro_rel_R is not None:
+            rvec_pred, _ = cv2.Rodrigues((R_0 @ gyro_rel_R).astype(np.float32))
+            return rvec_pred.reshape(3, 1).astype(np.float32), tvec_pred.reshape(3)
+
         # Rotation: linear fit in the tangent space of R_0 (most recent rotation).
         # rel_rvecs[i] = log(R_0^T @ R_i) — rotation from current pose back to the i-th
         # historical pose, expressed as a Rodrigues vector. These are always small-angle
         # deltas and avoid the ±π discontinuity of fitting absolute Rodrigues components.
-        R_0, _ = cv2.Rodrigues(np.asarray(pose_history[0][0], np.float32).reshape(3, 1))
         rel_rvecs = np.zeros((n, 3), dtype=np.float64)  # rel_rvecs[0] = [0,0,0] by definition
         for i in range(1, n):
             R_i, _ = cv2.Rodrigues(np.asarray(pose_history[i][0], np.float32).reshape(3, 1))
@@ -512,6 +600,7 @@ class CameraTracker:
                       other_cameras_blobs: Optional[List] = None,
                       blob_mask: Optional[np.ndarray] = None,
                       occluders_per_cam: Optional[Dict] = None,
+                      gyro_rel_R: Optional[np.ndarray] = None,
                       ) -> Tuple[Optional[Dict], Optional[Tuple[np.ndarray, np.ndarray]]]:
         """Proximity + prior_constrained only — no brute-force. Reads self state (does
         not commit). Returns (solution_or_None, predicted_pose).
@@ -522,6 +611,11 @@ class CameraTracker:
         doing cross-camera recovery should treat both cases identically: proceed to
         brute-force with pose_prior=predicted_pose (None for cold-start, matching
         today's unprimed cold-start brute call).
+
+        gyro_rel_R: optional (3,3) body-frame relative rotation from measured
+        controller gyro (see _gyro_rel_R_for) — caller computes this (it needs
+        ctrl_name to pick the right IMU stream, which this per-camera object
+        doesn't know) and passes it straight through to _predict_pose.
         """
         prior = {
             'prev_pose':       self.prev_pose,
@@ -529,6 +623,7 @@ class CameraTracker:
             'pose_history':    self.pose_history,
             'vel_ema':         self.vel_ema,
             'prev_assignment': self.prev_assignment,
+            'gyro_rel_R':      gyro_rel_R,
         }
         solution, predicted_pose, norm_prev, norm_prev_prev = cheap_search_core(
             self._pose_searcher, prior, self._matching_cfg,
@@ -775,7 +870,9 @@ class ControllerTracker:
 
     def __init__(self, ctrl_name: str, cameras: Dict[int, "Camera"],
                  trackers: Dict[int, CameraTracker],
-                 matching_cfg: Optional[dict] = None):
+                 matching_cfg: Optional[dict] = None,
+                 gyro_data: Optional[tuple] = None,
+                 accel_data: Optional[tuple] = None):
         self.ctrl_name        = ctrl_name
         self.cameras          = cameras
         self.trackers         = trackers           # {cam_id: CameraTracker}
@@ -783,6 +880,16 @@ class ControllerTracker:
         # Informational only (reporting/self-cal anchor from the last successful frame) —
         # every camera searches independently every frame, so this no longer gates work.
         self._designated_primary: Optional[int]  = None
+
+        # Stage 3 IMU integration: (t_ns, values) arrays for this controller's own
+        # gyro/accel, already calibrated + axis-corrected + clock-offset-corrected
+        # into the vision timestamp domain (see main.py) — or None if unavailable.
+        self._gyro_data  = gyro_data
+        self._accel_data = accel_data
+        # Gravity-consistency diagnostic state (see _log_gravity_consistency):
+        # the fused T_world_ctrl.R / timestamp from the last accepted frame.
+        self._last_gravity_check_R: Optional[np.ndarray] = None
+        self._last_gravity_check_ts: Optional[int] = None
 
     def _mark_all_lost(self) -> None:
         """Record a failed frame on every camera-tracker and, once the
@@ -885,6 +992,7 @@ class ControllerTracker:
                         'pose_history':    tracker.pose_history,
                         'vel_ema':         tracker.vel_ema,
                         'prev_assignment': tracker.prev_assignment,
+                        'gyro_rel_R':      _gyro_rel_R_for(self._gyro_data, tracker.pose_history, frame_ts_ns),
                     }
                     _futures[cid] = pool.submit(
                         run_cheap_search, (self.ctrl_name, cid), self._matching_cfg, prior,
@@ -901,6 +1009,7 @@ class ControllerTracker:
                         obs_full, frame_ts_ns, blob_radii=rad_full, blob_brightnesses=brt_full,
                         other_cameras_blobs=None, blob_mask=mask,
                         occluders_per_cam=occluders_per_cam,
+                        gyro_rel_R=_gyro_rel_R_for(self._gyro_data, tracker.pose_history, frame_ts_ns),
                     )
 
             for cid, tracker, obs_full, rad_full, brt_full, mask, av_orig in _cheap_specs:
@@ -1159,8 +1268,32 @@ class ControllerTracker:
             cs["cam_id"]: cs["solution"]["assignment"]
             for cs in cam_solutions if cs["cam_id"] != primary_cam_id
         }
-        solution["aux_assignments"] = _other_assignments
-        solution["aux_cameras"] = [(cid, len(pairs)) for cid, pairs in _other_assignments.items()]
+        if _other_assignments:
+            # Multiple cameras independently solved and were fused here -- each
+            # OTHER camera's own primary assignment becomes this candidate's
+            # aux evidence for that camera (blob-index-level, and strictly
+            # richer than anything the anchor camera's own search separately
+            # found via other_cameras_blobs).
+            solution["aux_assignments"] = _other_assignments
+            solution["aux_cameras"] = [(cid, len(pairs)) for cid, pairs in _other_assignments.items()]
+        else:
+            # Only the anchor camera contributed (e.g. update_cold_batch's
+            # single-camera-winner selection, _select_best_cam_solution) --
+            # fall back to the anchor's OWN brute-search aux-camera validation
+            # (PoseSearcher.brute_search_tier's "6.7", scored against
+            # other_cameras_blobs), the only real cross-camera evidence that
+            # exists in this case. Explicitly defaulted (not just left as
+            # whatever dict(anchor_solution) copied above) because anchor_
+            # solution may not carry these keys at all (e.g. a synthetic/
+            # non-brute solution dict) -- unconditionally overwriting with
+            # {} / [] (the previous behaviour) silently discarded real
+            # evidence when it *was* present, making every single-camera-
+            # winner candidate report zero aux corroboration downstream
+            # (_resolve_cold_conflicts' shared-blob/aux-projection checks and
+            # _score/_fmt) regardless of what that camera's own search
+            # actually found.
+            solution["aux_assignments"] = anchor_solution.get("aux_assignments") or {}
+            solution["aux_cameras"] = anchor_solution.get("aux_cameras") or []
 
         return solution
 
@@ -1279,6 +1412,15 @@ class ControllerTracker:
             _tracker._consecutive_good_blob_frames = 0
             _tracker.tracking_lost_last_frame = False
 
+        # Stage 3 gravity-alignment diagnostic (log-only, see _log_gravity_consistency).
+        _log_gravity_consistency(
+            self.ctrl_name, T_world_ctrl.R, frame_ts_ns,
+            self._last_gravity_check_R, self._last_gravity_check_ts,
+            self._accel_data,
+        )
+        self._last_gravity_check_R  = T_world_ctrl.R
+        self._last_gravity_check_ts = frame_ts_ns
+
     def _fuse_and_finalize(
         self,
         cam_solutions: List[dict],
@@ -1302,6 +1444,60 @@ class ControllerTracker:
         return solution
 
 
+def _inlier_discounted_error(error: float, total_pairs: int, min_inliers: float,
+                              error_floor: float = 0.0) -> float:
+    """A fit sitting right at the minimal-inlier floor has almost no spare degrees
+    of freedom, so a near-zero residual there is not evidence of a correct match --
+    it's just what an under-constrained fit looks like. Discount error linearly by
+    how many multiples of the floor a candidate has: right at the floor -> no
+    discount; 5x the floor -> error divided by 5. Shared by
+    TrackingSystem._resolve_cold_conflicts (cross-controller candidates) and
+    _select_best_cam_solution (one controller's own competing per-camera candidates).
+
+    error_floor: sub-pixel reprojection-error differences are blob-centroid
+    detection noise, not a real quality signal -- a 0.06px candidate is not
+    meaningfully "better" than a 0.09px one, but the plain multiplicative
+    discount above would still let that noise-level gap outrank a candidate
+    with genuinely more corroborating evidence (more total_pairs). Clamping
+    error to this floor before discounting means only a genuine, above-floor
+    difference (one candidate is an actually worse fit, not just noisier)
+    can move the score; two comparably-good fits are decided by total_pairs
+    alone. 0.0 (default) preserves the original uncapped behavior -- callers
+    pass a real floor (typically config's score_error_floor_px) explicitly."""
+    return max(error, error_floor) * (min_inliers / max(total_pairs, 1))
+
+
+def _select_best_cam_solution(cam_solutions: List[dict], min_inliers: float,
+                               error_floor: float = 0.0) -> List[dict]:
+    """When a controller's cameras each independently produced their own cold-start
+    candidate this frame, pick exactly one winner by cross-camera-validated support
+    (this camera's own primary inliers + aux_inliers -- already reprojected into
+    every OTHER camera and matched against ITS raw blobs as part of this camera's
+    own brute search; see PoseSearcher.brute_search_tier's "Aux-camera validation"
+    step) and discard the rest, rather than joint-LM-blending every camera's own
+    correspondences into one pose. A candidate built on a contaminated
+    correspondence (e.g. two controllers' searches colliding on the same blob) will
+    generically show weak aux support here, since its wrong 3D pose won't
+    coincidentally explain another camera's real blob layout -- same failure mode
+    TrackingSystem._resolve_cold_conflicts guards against across controllers,
+    applied here across one controller's own cameras, before cross-controller
+    resolution ever runs.
+
+    error_floor: see _inlier_discounted_error.
+
+    Returns cam_solutions unchanged if there's nothing to choose between.
+    """
+    if len(cam_solutions) <= 1:
+        return cam_solutions
+
+    def _score(cs: dict) -> float:
+        sol = cs["solution"]
+        total_pairs = len(sol.get("assignment") or []) + int(sol.get("aux_inliers") or 0)
+        return _inlier_discounted_error(sol["error"], total_pairs, min_inliers, error_floor)
+
+    return [min(cam_solutions, key=_score)]
+
+
 # =========================================================
 # 3. SYSTEM (multi-controller, multi-camera)
 # =========================================================
@@ -1311,9 +1507,17 @@ class TrackingSystem:
                  matching_cfg: dict = None, geometry_cfg: dict = None,
                  geometry_cfg_per_ctrl: dict = None,
                  self_calibration_cfg: dict = None,
-                 blob_detection_cfg: dict = None):
+                 blob_detection_cfg: dict = None,
+                 gyro_data: Optional[Dict[str, tuple]] = None,
+                 accel_data: Optional[Dict[str, tuple]] = None):
 
         self.cameras: Dict[int, Camera] = {cam.camera_idx: cam for cam in cameras}
+
+        # Stage 3 IMU integration: {ctrl_name: (t_ns, values)}, already calibrated +
+        # axis-corrected + clock-offset-corrected (see main.py) — or None/missing
+        # entries when unavailable, in which case gyro/gravity-check logic no-ops.
+        self._gyro_data:  Dict[str, tuple] = gyro_data or {}
+        self._accel_data: Dict[str, tuple] = accel_data or {}
 
         # Self-calibration: optionally apply saved extrinsics before tracker creation
         # so every tracker's T_world_cam starts with the correct (calibrated) value.
@@ -1365,6 +1569,8 @@ class TrackingSystem:
                     register_pose_searcher_spec(key, cam, ctrl, geo, matching_cfg)
             self.ctrl_trackers[ctrl.name] = ControllerTracker(
                 ctrl.name, self.cameras, ctrl_cam_trackers, matching_cfg=matching_cfg,
+                gyro_data=self._gyro_data.get(ctrl.name),
+                accel_data=self._accel_data.get(ctrl.name),
             )
 
         # Independent of parallel_search_enabled — lets blob-detection parallelism be
@@ -2028,6 +2234,7 @@ class TrackingSystem:
                     'pose_history':    tracker.pose_history,
                     'vel_ema':         tracker.vel_ema,
                     'prev_assignment': tracker.prev_assignment,
+                    'gyro_rel_R':      _gyro_rel_R_for(self._gyro_data.get(ctrl_name), tracker.pose_history, frame_ts_ns),
                 }
                 futures[(ctrl_name, cid)] = self._pool.submit(
                     run_cheap_search, (ctrl_name, cid), self._matching_cfg, prior,
@@ -2046,6 +2253,7 @@ class TrackingSystem:
                 (ctrl_name, cid): tracker.search_cheap(
                     obs, frame_ts_ns, blob_radii=rad, blob_brightnesses=brt,
                     occluders_per_cam=occluders_by_ctrl.get(_other_ctrl(ctrl_name)),
+                    gyro_rel_R=_gyro_rel_R_for(self._gyro_data.get(ctrl_name), tracker.pose_history, frame_ts_ns),
                 )
                 for ctrl_name, cid, tracker, obs, rad, brt in specs
             }
@@ -2245,6 +2453,9 @@ class TrackingSystem:
                     {"cam_id": cid, "tracker": tracker, "solution": sol}
                 )
 
+        _min_inliers = float(self._matching_cfg.get('min_inliers', 4))
+        _error_floor = float(self._matching_cfg.get(
+            'score_error_floor_px', self._matching_cfg.get('strong_match_error_px', 0.5)))
         candidates: Dict[str, Dict] = {}
         cam_solutions_of: Dict[str, list] = {}
         for ctrl_name in ctrl_names:
@@ -2252,6 +2463,14 @@ class TrackingSystem:
             if not cam_solutions:
                 self.ctrl_trackers[ctrl_name]._mark_all_lost()
                 continue
+            # Cold-cold candidates never excluded each other's blobs during search
+            # (see this method's docstring) -- two of THIS controller's own cameras
+            # can each independently land on their own self-consistent-looking pose,
+            # one of them built on a blob that actually belongs to another
+            # controller. Blindly joint-fusing both would let the contaminated one
+            # poison the result (see _select_best_cam_solution); pick a single
+            # cross-camera-validated winner instead of blending.
+            cam_solutions = _select_best_cam_solution(cam_solutions, _min_inliers, _error_floor)
             obs_src = per_ctrl_observations.get(ctrl_name) or {}
             candidates[ctrl_name] = self.ctrl_trackers[ctrl_name]._compute_fused_solution(
                 cam_solutions, obs_src, fixed_primary_cam=self._fixed_primary_cam,
@@ -2292,12 +2511,8 @@ class TrackingSystem:
                 # re-accumulate _confirm_frames consecutive frames before
                 # retrying next frame -- only _mark_all_lost's own fields
                 # (consecutive_failures, tracking_lost_last_frame) change.
-                _n_pairs = len(solution.get('assignment') or []) + sum(
-                    len(v) for v in (solution.get('aux_assignments') or {}).values()
-                )
                 logger.bind(cat="occlusion").info(
-                    f"[cold-batch] conflict: dropping {ctrl_name} "
-                    f"(err={solution['error']:.2f}px, n={_n_pairs}) — "
+                    f"[cold-batch] conflict: dropping {ctrl_name} — "
                     f"{loser_reason.get(ctrl_name, 'lost to a better inlier-discounted candidate this frame')}"
                 )
                 self.ctrl_trackers[ctrl_name]._mark_all_lost()
@@ -2360,7 +2575,12 @@ class TrackingSystem:
         geometry based, unaffected by this issue) remains the catch-all for
         real cross-controller conflicts in that case.
 
-        Two candidates conflict if EITHER:
+        Two candidates conflict if ANY of:
+          - physical overlap: their fused T_world_ctrl centers are closer
+            than min_controller_center_distance_m -- two rigid controllers
+            cannot occupy overlapping 3D space. Camera-agnostic: catches a
+            bad candidate even when it shares no registered camera with the
+            other at all. Always checked, regardless of _occlusion_on.
           - shared blob: their matched blobs' pixel centroids, in the same
             camera, overlap within blob_match_margin_px (see blob_geometry
             above) -- primary `assignment` or `aux_assignments` on either
@@ -2371,9 +2591,16 @@ class TrackingSystem:
             yet when it runs) should, per _cross_occluded_mask, have blocked
             one of the other candidate's matched LEDs from view in a camera
             they both used. Checked in both directions.
+          - aux-projection collision: one candidate's solved pose, reprojected
+            into a camera where the OTHER candidate has a registered match
+            (primary or aux), lands on that other candidate's actual claimed
+            blobs there -- checked even if the projecting candidate's own
+            search never registered that camera as one of its own matches
+            (unlike the shared-blob check, which requires both sides to have
+            already matched the same camera). Checked in both directions.
 
-        Both conflict types are treated identically -- no special-casing, no
-        cheap-repair exception: any conflict of either kind drops the loser
+        All conflict types are treated identically -- no special-casing, no
+        cheap-repair exception: any conflict of any kind drops the loser
         outright. Winner selection is greedy: repeatedly take the remaining
         candidate with the lowest inlier-discounted error (see _score below;
         ties broken by more total matched pairs across assignment +
@@ -2381,13 +2608,16 @@ class TrackingSystem:
         conflict with it; repeat among what's left. This correctly handles
         conflict components of 3+ controllers, not just pairs -- a controller
         connected to the graph only through an already-dropped neighbor is
-        free to win in a later round.
+        free to win in a later round. Note this scoring is what actually
+        resolves an aux-projection collision or physical overlap in practice:
+        the candidate with more total corroborated inliers (primary + aux)
+        and lower combined error wins, so a locally-good-but-uncorroborated
+        fit loses to a well-corroborated one without any extra logic.
 
         Returns (losers, loser_reason): the set of ctrl_names to drop, and a
         {ctrl_name: human-readable reason} map for every dropped name —
-        which winner it lost to and whether the conflict was a shared blob
-        (with camera + blob indices) or a cross-occlusion (with the
-        occluder/victim direction, camera, and specific LED ids blocked).
+        which winner it lost to and which of the four conflict types fired
+        (with camera + blob/LED indices where applicable).
         candidates values must be solution dicts as produced by
         ControllerTracker._compute_fused_solution (primary_cam, T_world_ctrl,
         error, assignment, aux_assignments).
@@ -2407,9 +2637,10 @@ class TrackingSystem:
                 cams.add(sol['primary_cam'])
             return cams
 
-        _occlusion_on = bool(self._matching_cfg.get('cross_controller_occlusion', False))
-        _br          = float(self._matching_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
-        _gate_margin = float(self._matching_cfg.get('cross_occlusion_gate_margin_px', 20.0))
+        _occlusion_on    = bool(self._matching_cfg.get('cross_controller_occlusion', False))
+        _br              = float(self._matching_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
+        _gate_margin     = float(self._matching_cfg.get('cross_occlusion_gate_margin_px', 20.0))
+        _min_center_dist = float(self._matching_cfg.get('min_controller_center_distance_m', 0.05))
 
         # Human-readable explanation for each conflicting pair, keyed by
         # frozenset({a, b}) — filled in below as each conflict is found, so
@@ -2425,7 +2656,22 @@ class TrackingSystem:
                 sol_b = candidates[b]
                 conflict = False
 
-                for cid in _matched_cams(sol_a) & _matched_cams(sol_b):
+                # Two rigid controllers cannot occupy overlapping 3D space --
+                # camera-agnostic, so it catches a bad candidate even when it
+                # shares no registered camera with the other (e.g. two cold
+                # cameras solved for two different controllers but both
+                # actually recovered the same physical controller's pose).
+                if _min_center_dist > 0.0:
+                    center_dist = float(np.linalg.norm(
+                        sol_a['T_world_ctrl'].t - sol_b['T_world_ctrl'].t))
+                    if center_dist < _min_center_dist:
+                        conflict = True
+                        conflict_reason[frozenset((a, b))] = (
+                            f"physical overlap: centers {center_dist * 100:.1f}cm apart "
+                            f"(min {_min_center_dist * 100:.1f}cm)"
+                        )
+
+                for cid in (_matched_cams(sol_a) & _matched_cams(sol_b)) if not conflict else ():
                     pairs_a = _matched_pairs(sol_a, cid)
                     pairs_b = _matched_pairs(sol_b, cid)
                     if not pairs_a or not pairs_b:
@@ -2490,6 +2736,62 @@ class TrackingSystem:
                         if conflict:
                             break
 
+                # One candidate's solved pose, reprojected into a camera where
+                # the OTHER candidate has a registered match (primary or aux),
+                # lands on that other candidate's actual claimed blobs -- a
+                # direct physical-collision signal that doesn't depend on
+                # `proj`'s own search having registered an aux hit in that
+                # camera itself (unlike the shared-blob check above, which
+                # only fires when BOTH sides already matched the same
+                # camera). Resolution still goes through the same
+                # inlier-discounted `_score` below, so whichever candidate
+                # has more total corroborated inliers (primary + aux) and
+                # lower combined error naturally wins.
+                if not conflict and _occlusion_on:
+                    for proj_name, proj_sol, main_name, main_sol in (
+                        (a, sol_a, b, sol_b), (b, sol_b, a, sol_a),
+                    ):
+                        tracker_proj = next(iter(self.ctrl_trackers[proj_name].trackers.values()))
+                        for cid in _matched_cams(main_sol):
+                            main_pairs = _matched_pairs(main_sol, cid)
+                            if not main_pairs:
+                                continue
+                            cam = self.cameras.get(cid)
+                            geo_main = (blob_geometry or {}).get(main_name, {}).get(cid)
+                            if cam is None or cam.T_world_cam is None or geo_main is None:
+                                continue
+                            cent_main, rad_main = geo_main
+                            idx_main = np.array([blob for blob, _ in main_pairs], dtype=int)
+                            pts_main, rr_main = cent_main[idx_main], rad_main[idx_main]
+
+                            T_ci = cam.T_world_cam.inverse().compose(proj_sol['T_world_ctrl'])
+                            R_p, t_p = T_ci.R.astype(np.float32), T_ci.t.astype(np.float32)
+                            vis_ids = np.where(_visible_mask(
+                                R_p, t_p, tracker_proj.model.positions, tracker_proj.model.normals,
+                                tracker_proj._geometry, cam_K=cam.camera_matrix, cam_dc=cam.dist_coeffs,
+                                cam_w=cam.width, cam_h=cam.height, cam_rpmax=cam.rpmax,
+                                cam_is_fisheye=cam.is_fisheye,
+                            ) >= 1.0)[0]
+                            if len(vis_ids) == 0:
+                                continue
+                            proj_pts = _project_points(
+                                cv2.Rodrigues(R_p)[0], t_p, tracker_proj.model.positions[vis_ids],
+                                cam.camera_matrix, cam.dist_coeffs, is_fisheye=cam.is_fisheye,
+                            )
+                            dists = np.linalg.norm(proj_pts[:, None, :] - pts_main[None, :, :], axis=2)
+                            overlap = dists < (rr_main[None, :] + blob_match_margin_px)
+                            if overlap.any():
+                                conflict = True
+                                _iv, _im = np.where(overlap)
+                                conflict_reason[frozenset((a, b))] = (
+                                    f"aux-projection collision in cam{cid}: {proj_name}'s LED"
+                                    f"{int(vis_ids[_iv[0]])} projects onto {main_name}'s claimed "
+                                    f"blob #{int(idx_main[_im[0]])} (dist={dists[_iv[0], _im[0]]:.1f}px)"
+                                )
+                                break
+                        if conflict:
+                            break
+
                 if conflict:
                     conflicts[a].add(b)
                     conflicts[b].add(a)
@@ -2507,15 +2809,42 @@ class TrackingSystem:
         # one. Discount error linearly by how many multiples of the floor a
         # candidate has: right at the floor -> no discount; 5x the floor ->
         # error divided by 5.
+        #
+        # error_floor additionally clamps the error itself before that
+        # discount: two candidates at 0.06px and 0.09px are not distinguishable
+        # fits -- that gap is blob-centroid detection noise, not evidence one
+        # pose is really better -- so letting the discount formula's raw
+        # multiplicative ratio decide between them would let sub-pixel noise
+        # outrank a candidate with genuinely more corroborating total_pairs.
+        # Clamping both to this floor first means only a genuine, above-floor
+        # error difference can still decide the score; two comparably-good
+        # fits fall through to being decided by total_pairs alone.
         _min_inliers = float(self._matching_cfg.get('min_inliers', 4))
+        _error_floor = float(self._matching_cfg.get(
+            'score_error_floor_px', self._matching_cfg.get('strong_match_error_px', 0.5)))
 
         def _score(name: str) -> Tuple[float, int]:
             sol = candidates[name]
             total_pairs = len(sol.get('assignment') or []) + sum(
                 len(v) for v in (sol.get('aux_assignments') or {}).values()
             )
-            effective_error = sol['error'] * (_min_inliers / max(total_pairs, 1))
+            effective_error = _inlier_discounted_error(sol['error'], total_pairs, _min_inliers, _error_floor)
             return (effective_error, -total_pairs)
+
+        def _fmt(name: str) -> str:
+            """Human-readable evidence summary for one side of a conflict --
+            raw error, primary vs. aux inlier counts, and the same
+            inlier-discounted score _score/the greedy loop actually decide
+            on, so the log line at the drop site (update_cold_batch) shows
+            exactly why the winner outranked the loser, not just that it did."""
+            sol = candidates[name]
+            n_primary = len(sol.get('assignment') or [])
+            n_aux = sum(len(v) for v in (sol.get('aux_assignments') or {}).values())
+            effective_error, _ = _score(name)
+            return (
+                f"err={sol['error']:.2f}px primary={n_primary} aux={n_aux} "
+                f"total={n_primary + n_aux} score={effective_error:.3f}"
+            )
 
         remaining = set(names)
         losers: Set[str] = set()
@@ -2539,7 +2868,11 @@ class TrackingSystem:
                     continue
                 losers.add(loser)
                 _reason = conflict_reason.get(frozenset((fixed, loser)), "unknown")
-                loser_reason[loser] = f"lost to already-committed {fixed} — {_reason}"
+                loser_reason[loser] = (
+                    f"lost to already-committed {fixed} | "
+                    f"winner[{fixed}]: {_fmt(fixed)} | loser[{loser}]: {_fmt(loser)} | "
+                    f"reason: {_reason}"
+                )
                 remaining.discard(loser)
 
         while remaining:
@@ -2549,7 +2882,9 @@ class TrackingSystem:
                 losers.add(loser)
                 _reason = conflict_reason.get(frozenset((winner, loser)), "unknown")
                 loser_reason[loser] = (
-                    f"lost to {winner} (lower inlier-discounted error) — {_reason}"
+                    f"lost to {winner} | "
+                    f"winner[{winner}]: {_fmt(winner)} | loser[{loser}]: {_fmt(loser)} | "
+                    f"reason: {_reason}"
                 )
                 remaining.discard(loser)
         return losers, loser_reason
