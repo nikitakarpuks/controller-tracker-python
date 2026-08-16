@@ -984,3 +984,120 @@ For the remaining 5 corrupted keys with no config.yml entry (blob_size_min, blob
   3. Leave as-is for now
      Don't touch these 5 — just noted in the report, revisit later.
   4. Type something.
+
+
+
+
+
+
+
+
+  ● I have everything needed for a concrete plan now — got their actual sample data files, so this isn't guesswork.
+
+  What I confirmed
+
+  imu_data.txt format: t_ns, wx, wy, wz, ax, ay, az — this is the same layout as our own mav0/imu*/data.csv, just without the header row. Their imu_freq: 200 in
+  the default config even matches our controller IMU rate exactly (measured ~199–200Hz in Stage 1).
+
+  mocap_data.txt format: t_seconds, px, py, pz, qx, qy, qz, qw — quaternion in XYZW order, matching what we already use everywhere in our own pipeline. OptiTrack's
+  Time column (seconds-from-take-start) is already in this exact convention.
+
+  estimator_config.yaml wants imu_noise: [acc_white_noise, acc_bias_walk, gyr_white_noise, gyr_bias_walk] — this is precisely the Noise/BiasUncertainty data
+  already sitting in our controller JSON's InertialSensors and already parsed into ControllerImuAxisCalib.noise_std/.bias_uncertainty in src/imu_data.py. For
+  mocap_trans_noise/mocap_rot_noise we don't have a spec for our OptiTrack rig, but the takefiles folder has a real number to start from: Calibration Exceptional
+  (MeanErr 0.575 mm) — close to their own default (0.2mm), so a reasonable starting point rather than a blind guess.
+
+  Concrete steps
+
+  1. Get the repo somewhere outside this project (a sibling folder, not inside controller-tracker-python — keeps it the "separate process" you want). I could only
+  reach it via curl with a browser user-agent (plain git clone against the anon.4open.science URL fails, and my WebFetch tool got 403'd without a UA) — easiest is
+  for you to open https://anonymous.4open.science/r/mocap2gt in a normal browser and download it there, since I can't run a real browser session. If you'd rather I
+  mirror the files via the same curl approach that just worked, say so and I'll pull the whole tree.
+  2. Build via Docker (confirmed from their actual Dockerfile — Ubuntu 20.04 + Eigen 3.4 + yaml-cpp 0.8.0 + Ceres 1.14.0 built from source, so Docker avoids
+  setting all that up natively on Windows):
+  docker build -f ./Dockerfile -t run_mocap2gt:v0.1 .
+  docker run -it --name test_mocap2gt -v $(pwd):/mocap2gt run_mocap2gt:v0.1
+  cd /mocap2gt && mkdir -p build && cd build && cmake .. && make -j$(nproc)
+  3. Sanity-run their bundled sample first (GTEstimator on resource/estimator_test_data/*) before touching our data — confirms the build works.
+  4. Pick one device to start with. I'd suggest the headset: OptiTrack already tracks a "Headset" rigid body, we already have raw imu0 (real onboard timestamps, no
+  controller-clock-offset ambiguity to worry about), and a successful calibration here directly lets us validate Stage 2's VIO composition. Controllers (imu1/imu2
+  vs. OptiTrack's ControllerLeft/ControllerRight) can follow the same recipe once this works once.
+  5. Write a small standalone conversion script (this is fine — it's a format translator, not integration) that reads mav0/imu0/data.csv and the OptiTrack
+  rigidbody CSV for "Headset" and writes them out as imu_data.txt/mocap_data.txt in the formats above. I can write this now if you want.
+  6. Run GTEstimator on the converted data, producing mocap2gt_calib.yaml (the spatial extrinsic + time offset) and mocap2gt_traj.txt (refined ground truth).
+  7. Load the outputs back into our pipeline as plain data — same pattern as everything else (VIO, OptiTrack CSVs): just files we read, no code dependency.
+
+  Want me to write the conversion script (step 5) now, or do you want to get the build working first?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ● Summary
+
+  Problem: static ambient lights (e.g. a lamp with LED-sized split sections) get confused with controller LEDs during cold search, producing wrong pose solves when
+  a controller is out of view.
+
+  Design that emerged, three layers:
+
+  1. Per-frame motion-residual scorer — derotate each blob's position using headset rotation (from VIO), compare to actual motion; residual near zero → static →
+  staticness score s.
+  2. Persistence via survey windows — since a lamp's bearing depends on headset rotation not translation, bucket headset viewing direction into a coarse grid
+  (keyframe-style). Trigger a full-frame "survey" pass only when entering a stale/unsurveyed cell, decoupled from controller cold-start's
+  cold_brute_force_confirm_frames gate and using isolated detection state so it doesn't perturb _pass2_memory's EMA/percentile calibration. Confidence accumulates
+  per cell, decays if unconfirmed, downweighted for edge-of-FOV observations near the fisheye model's rpmax boundary.
+  3. Soft-weighting, never hard mask — s enters as: shrunk P3P gate tolerance + deprioritized triple ordering (brute), inflated RANSAC inlier residual (the layer
+  that actually stops a lamp-only solution from confirming), and added Hungarian assignment cost (proximity). Always finite, so a controller genuinely resting near
+  a lamp is still recoverable.
+
+  Open, unresolved from earlier: whether the LEDs support any temporal/strobe coding — would be a cheaper, orthogonal signal if hardware supports it.
+
+  Implementation plan
+
+  Phase 0 — resolve the gaps below before writing code; several change the design.
+
+  Phase 1 — per-blob motion tracking + residual scorer
+  New lightweight blob tracker (frame-to-frame nearest-neighbor association of all detected blobs, independent of controller identity) + fisheye-correct derotation
+  (undistort → rotate → redistort, using the real KB4 model, not a pinhole linear approximation — matters given the large k1 already on record) using per-frame
+  rotation from imu_data.py/camera.py. Output: a staticness array aligned to each camera's detected blobs, no matching changes yet.
+
+  Phase 2 — survey window / persistence map
+  View-direction bucket grid per camera, staleness-triggered survey windows, isolated detection state, confidence accumulation feeding a queryable distractor map
+  (reprojectable into any frame from current headset pose).
+
+  Phase 3 — wire into matching
+  Merge Phase 1 (instant) + Phase 2 (prior) into one effective s per blob. Thread it through pose_search.py the same way occluders_per_cam was threaded through for
+  cross-controller occlusion — a per-call dict built on the main process, passed to brute_search/proximity_search. Config-gated, opt-in master switch.
+
+  Phase 4 — validation
+  Repro sequence(s) with the lamp-confusion failure, regression check that lamp-free sequences are unaffected (s≈0 everywhere), threshold tuning (gate shrink,
+  residual inflation, Hungarian penalty, cell size, refresh horizon, decay rate) against real data.
+
+  What we're lacking
+
+  1. Fisheye-correct derotation implementation — the formula I gave earlier was a pinhole approximation; needs the actual undistort/project functions from
+  camera.py. Haven't confirmed those are cleanly reusable here.
+  2. VIO rotation accuracy/timing — haven't verified imu_data.py gives per-frame, camera-timestamp-synced rotation deltas accurate enough that residual noise stays
+  well below real controller motion. If the noise floor is too high, the classifier won't discriminate.
+  3. Repro/eval data — do you already have a recording that reproduces this exact failure? Ideally with mocap ground truth (you have an optitrack-export pipeline)
+  so thresholds get tuned against real numbers, not guesses.
+  4. Cross-session persistence — fixed room/rig where a saved distractor map carries value across runs, or ad hoc environments where in-memory-only,
+  rebuild-per-run is fine? Determines whether Phase 2 needs a serialization format at all.
+  5. Multiprocessing plumbing — matching runs through a ProcessPoolExecutor; distractor scores need to reach worker PoseSearcher instances the same
+  snapshot-per-dispatch way occluders_per_cam does, meaning the map is up to one frame stale in workers. Fine given how slowly the environment changes, but worth
+  confirming that's acceptable rather than assumed.
+  6. Strobe/temporal LED coding — still unanswered; settling this could cheapen or partly bypass Phases 1-2.
+  7. Definition of done — what's the bar for Phase 4: zero false-accepts on the repro sequence, or a specific inlier-rate/latency target?
+
+  (3), (4), and (6) are the ones that actually change scope — worth answering those first.

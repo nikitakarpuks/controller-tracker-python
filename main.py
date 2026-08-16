@@ -7,6 +7,7 @@ import numpy as np
 import rerun as rr
 
 from loguru import logger
+from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
 from src import debug_config
@@ -14,6 +15,7 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
                                _compute_led_search_radii)
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
+from src.imu_data import load_and_calibrate_controller_imu
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
 from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
@@ -107,6 +109,39 @@ def main():
                 geo["handle_primitives"] = mirror_primitives(right_prim)
         geo_cfg_per_ctrl[ctrl_key] = geo
 
+    # ── IMU (Stage 3): load + calibrate controller gyro/accel for pose prediction
+    # and the gravity-alignment diagnostic ───────────────────────────────────────
+    # Confirmed mapping (mentor + Stage 1 cross-correlation validation, this
+    # recording only): imu1.csv = left controller, imu2.csv = right controller.
+    # flip_y @ T_rt.R.T is the axis transform Stage 1 empirically resolved (see
+    # src/imu_data.py's module docstring — T_rt's own direction is undocumented
+    # in the calibration file). Per-controller lag is Stage 1's measured
+    # controller<->camera clock offset on THIS recording (imu_vision_sync_check.py)
+    # — a single-clip estimate, re-measure if this ever runs against different data.
+    imu_cfg = config.get("imu", {})
+    gyro_data:  dict = {}
+    accel_data: dict = {}
+    if imu_cfg.get("enabled", False):
+        _mav0_root = Path(config["data"]["root"])
+        _IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
+                      "right_controller": ("imu2/data.csv", -7_000_000)}
+        for ctrl_key, (imu_rel_path, lag_ns) in _IMU_FILES.items():
+            if ctrl_key not in enabled_ctrls:
+                continue
+            imu_path = _mav0_root / imu_rel_path
+            if not imu_path.exists():
+                logger.bind(cat="startup").warning(
+                    f"[{ctrl_key}] IMU file not found ({imu_path}) — gyro prediction "
+                    f"and gravity-check diagnostic disabled for this controller")
+                continue
+            t_imu, gyro_body, accel_body = load_and_calibrate_controller_imu(
+                imu_path, load_json_config(config["controllers"][ctrl_key]["config_path"]), lag_ns=lag_ns,
+            )
+            gyro_data[ctrl_key]  = (t_imu, gyro_body)
+            accel_data[ctrl_key] = (t_imu, accel_body)
+
+            logger.bind(cat="startup").info(f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name}")
+
     tracking_system = TrackingSystem(
         list(enabled_ctrls.values()), list(cameras.values()),
         matching_cfg=config.get("matching", {}),
@@ -114,6 +149,8 @@ def main():
         geometry_cfg_per_ctrl=geo_cfg_per_ctrl,
         self_calibration_cfg=config.get("self_calibration", {}),
         blob_detection_cfg=config["blob_detection"],
+        gyro_data=gyro_data,
+        accel_data=accel_data,
     )
     pool          = tracking_system.get_pool()
     blob_parallel = tracking_system.blob_parallel_enabled
@@ -169,6 +206,15 @@ def main():
                                "led_id", "depth_m", "facing_cos", "velocity_px",
                                "brightness", "area"])
         logger.bind(cat="startup").info(f"Calibration CSV → {_csv_path}")
+
+    _pose_csv_path = debug_cfg.get("pose_csv")
+    _pose_csv_file = _pose_csv_writer = None
+    if _pose_csv_path:
+        Path(_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        _pose_csv_file = open(_pose_csv_path, "w", newline="")
+        _pose_csv_writer = csv.writer(_pose_csv_file)
+        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz"])
+        logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
 
     _n_frames = count_images(config["data"])
     for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
@@ -847,6 +893,13 @@ def main():
                 frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
                 any_valid_pose[ctrl_name] = True
                 lost_streak[ctrl_name] = 0
+                if _pose_csv_writer:
+                    _qx, _qy, _qz, _qw = Rotation.from_matrix(T_world_ctrl.R).as_quat()
+                    _pose_csv_writer.writerow([
+                        int(img_path.stem), ctrl_name,
+                        f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
+                        f"{T_world_ctrl.t[0]:.6f}", f"{T_world_ctrl.t[1]:.6f}", f"{T_world_ctrl.t[2]:.6f}",
+                    ])
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -939,6 +992,10 @@ def main():
     if _csv_file:
         _csv_file.close()
         logger.bind(cat="startup").info(f"Calibration CSV saved → {_csv_path}")
+
+    if _pose_csv_file:
+        _pose_csv_file.close()
+        logger.bind(cat="startup").info(f"Pose CSV saved → {_pose_csv_path}")
 
     if tracking_system._self_cal is not None:
         tracking_system._self_cal.run()
