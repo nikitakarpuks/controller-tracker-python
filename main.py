@@ -15,9 +15,10 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
                                _compute_led_search_radii)
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
-from src.imu_data import load_and_calibrate_controller_imu
+from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
+from src.transformations import Transform
 from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
                                fine_tune_alignment, load_trimesh)
 
@@ -87,13 +88,16 @@ def main():
     ctrl_leds        = {}   # {ctrl_name: [ControllerLED, ...]}
     ctrl_geom        = {}   # {ctrl_name: (positions_model, normals_model, T_model_ctrl)}
     geo_cfg_per_ctrl = {}   # {ctrl_name: geometry_cfg dict with handle_primitives}
+    ctrl_json_cfg    = {}   # {ctrl_name: loaded controller calibration JSON (leds + InertialSensors)}
     right_ctrl_cfg   = config["controllers"]["right_controller"]
 
     for ctrl_key in ["right_controller", "left_controller"]:
         ctrl_cfg = config["controllers"].get(ctrl_key, {})
         if not ctrl_cfg.get("enabled", False):
             continue
-        leds = create_leds_from_config(load_json_config(ctrl_cfg["config_path"]))
+        json_cfg = load_json_config(ctrl_cfg["config_path"])
+        ctrl_json_cfg[ctrl_key] = json_cfg
+        leds = create_leds_from_config(json_cfg)
         ctrl_leds[ctrl_key]    = leds
         enabled_ctrls[ctrl_key] = ControllerModel(leds, ctrl_key)
 
@@ -215,6 +219,49 @@ def main():
         _pose_csv_writer = csv.writer(_pose_csv_file)
         _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz"])
         logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
+
+    # ── basalt_controller_mocap_calib input: one T_Ih_Ic(t) log per controller ──
+    # T_world_ctrl is already T_Ih_ref (headset-IMU <- LED reference frame): LED
+    # Position/Normal in each controller's config JSON, and the InertialSensors
+    # Rt entries' near-zero translation, are all given relative to that same
+    # reference frame, whose origin is defined to sit exactly at the (Id=Undefined)
+    # gyro's physical location -- so T_world_ctrl.t is already the IMU's position,
+    # no correction needed. Rt's rotation, however, is NOT near-identity: it
+    # reorients the reference frame's axes onto the gyro chip's own native sensor
+    # axes (the frame real onboard accel/gyro samples are actually reported in).
+    # Composing that in gives the true T_Ih_Ic this file is meant to hold.
+    #
+    # Rt.R is documented (src/imu_data.py module docstring) as converting a raw
+    # vector from reference axes into gyro axes: v_gyro = Rt.R @ v_ref. Under this
+    # project's T_A_B = "pose of B in A" convention, that makes T_ref_gyro.R =
+    # Rt.R.T, so T_Ih_Ic = T_world_ctrl.compose(Transform(Rt.R.T, 0)).
+    # UNVERIFIED: Rt's stored direction was never pinned down empirically (see
+    # imu_data.py docstring) -- this transpose is the derived hypothesis, not a
+    # confirmed fact. Flip algorithm_log_rt_transpose to false and re-check if
+    # basalt_mocap_time_sync against the raw (untouched) imu*.csv doesn't
+    # converge cleanly once real data is available.
+    _algo_log_dir = debug_cfg.get("algorithm_log_dir")
+    _algo_log_rt_transpose = bool(debug_cfg.get("algorithm_log_rt_transpose", True))
+    _algo_log_writers = {}   # {ctrl_name: csv.writer}
+    _algo_log_files   = {}   # {ctrl_name: file handle}
+    _algo_log_T_ref_ic = {}  # {ctrl_name: Transform}  ref-frame -> controller-IMU
+    if _algo_log_dir:
+        _algo_log_path = Path(_algo_log_dir)
+        _algo_log_path.mkdir(parents=True, exist_ok=True)
+        for ctrl_name in enabled_ctrls:
+            imu_calib = create_imu_calib_from_config(ctrl_json_cfg[ctrl_name])
+            R_rt = imu_calib.gyro.T_rt.R
+            R_ref_ic = R_rt.T if _algo_log_rt_transpose else R_rt
+            _algo_log_T_ref_ic[ctrl_name] = Transform(R_ref_ic, np.zeros(3))
+
+            f = open(_algo_log_path / f"{ctrl_name}_algorithm_log.csv", "w", newline="")
+            w = csv.writer(f)
+            w.writerow(["#timestamp_ns", "p_x", "p_y", "p_z", "q_w", "q_x", "q_y", "q_z"])
+            _algo_log_files[ctrl_name]   = f
+            _algo_log_writers[ctrl_name] = w
+        logger.bind(cat="startup").info(
+            f"Algorithm-log CSVs → {_algo_log_path}/<ctrl_name>_algorithm_log.csv "
+            f"(Rt transpose={_algo_log_rt_transpose}, unverified — see comment above)")
 
     _n_frames = count_images(config["data"])
     for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
@@ -900,6 +947,14 @@ def main():
                         f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
                         f"{T_world_ctrl.t[0]:.6f}", f"{T_world_ctrl.t[1]:.6f}", f"{T_world_ctrl.t[2]:.6f}",
                     ])
+                if ctrl_name in _algo_log_writers:
+                    T_Ih_Ic = T_world_ctrl.compose(_algo_log_T_ref_ic[ctrl_name])
+                    _aqx, _aqy, _aqz, _aqw = Rotation.from_matrix(T_Ih_Ic.R).as_quat()
+                    _algo_log_writers[ctrl_name].writerow([
+                        frame_ts_ns,
+                        f"{T_Ih_Ic.t[0]:.6f}", f"{T_Ih_Ic.t[1]:.6f}", f"{T_Ih_Ic.t[2]:.6f}",
+                        f"{_aqw:.8f}", f"{_aqx:.8f}", f"{_aqy:.8f}", f"{_aqz:.8f}",
+                    ])
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -996,6 +1051,11 @@ def main():
     if _pose_csv_file:
         _pose_csv_file.close()
         logger.bind(cat="startup").info(f"Pose CSV saved → {_pose_csv_path}")
+
+    for f in _algo_log_files.values():
+        f.close()
+    if _algo_log_files:
+        logger.bind(cat="startup").info(f"Algorithm-log CSVs saved → {_algo_log_dir}")
 
     if tracking_system._self_cal is not None:
         tracking_system._self_cal.run()
