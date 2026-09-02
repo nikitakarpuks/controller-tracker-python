@@ -154,6 +154,253 @@ def integrate_gyro_segment(t_gyro: np.ndarray, gyro_body: np.ndarray,
     return R_rel.as_matrix()
 
 
+def gyro_preint_residual(t_gyro: np.ndarray, gyro_body: np.ndarray, ts0, ts1: int,
+                          R0: np.ndarray, R1: np.ndarray, bias0: np.ndarray = None,
+                          bias1: np.ndarray = None, bias_random_walk_std: np.ndarray = None):
+    """Gyro preintegration factor for one reference-node gap [ts0, ts1] --
+    r_gyro(k) = Log(DeltaR_gyro(ts0,ts1)^-1 . (R0^-1 R1)) -- wraps the
+    already-validated integrate_gyro_segment as a residual generator between
+    consecutive REFERENCE-NODE timestamps (e.g. vision-frame cadence) rather
+    than per-sample.
+
+    R0/R1 (3,3): two orientations in a common, non-rotating reference frame
+    at ts0/ts1 -- gyro measures angular velocity in an inertial frame, so
+    these must NOT be headset-relative vision poses (those rotate with the
+    headset -- see src/mocap_data.world_pose, which is what removes that).
+    They must also share gyro_body's own frame (controller LED/body frame,
+    see load_and_calibrate_controller_imu) -- i.e. the UN-bridged world-frame
+    vision pose, not compare_vision_mocap.py's mocap-accel-IMU-frame bridge
+    output.
+
+    bias0 (3,) is subtracted from gyro_body before integration -- a
+    first-order correction, exact under the same constant-bias-over-the-
+    segment assumption integrate_gyro_segment's midpoint rule already makes
+    about gyro noise. Defaults to zero (no bias correction/optimization yet).
+
+    If bias1 and bias_random_walk_std (3,) are both given, also returns the
+    bias random-walk residual r_bias = (bias1-bias0)/bias_random_walk_std/
+    sqrt(dt) -- the other half of a standard IMU preintegration factor;
+    unused until per-node bias states exist (joint batch solve).
+
+    Returns (r_gyro (3,) rad or None, dt_s or None, r_bias (3,) or None) --
+    None for r_gyro/dt if the segment falls outside gyro coverage or is
+    degenerate (see integrate_gyro_segment)."""
+    if bias0 is None:
+        bias0 = np.zeros(3)
+    R_gyro = integrate_gyro_segment(t_gyro, gyro_body - bias0, ts0, ts1)
+    if R_gyro is None:
+        return None, None, None
+    R_vision_rel = R0.T @ R1
+    r_gyro = Rotation.from_matrix(R_gyro.T @ R_vision_rel).as_rotvec()
+    dt = (ts1 - ts0) / 1e9
+    r_bias = None
+    if bias1 is not None and bias_random_walk_std is not None:
+        r_bias = (bias1 - bias0) / bias_random_walk_std / np.sqrt(dt)
+    return r_gyro, dt, r_bias
+
+
+def _lever_arm_correction(ts: np.ndarray, t_gyro: np.ndarray, gyro_body: np.ndarray,
+                           r: np.ndarray) -> np.ndarray:
+    """Per-sample body-frame correction (N,3) subtracted from a raw accel reading to
+    recover the acceleration of the body origin vision tracks, given the
+    accelerometer's lever arm r (3,) from that origin (rigid-body kinematics --
+    see accel_lever_arm_solve.py's module docstring for the derivation this
+    mirrors, and Finding: 2026-09-02 lever-arm confirmation in
+    visualization/controller_calibration_for_basalt/README.md for where r itself
+    comes from):
+
+        correction(t) = alpha(t) x r + omega(t) x (omega(t) x r)
+
+    omega(t) is gyro_body interpolated onto ts (same np.interp approach the
+    caller already uses for accel samples). alpha(t) (angular acceleration) is
+    its numerical derivative: 3-point central difference at interior ts, one-
+    sided at the two endpoints -- ts is typically only a handful of samples
+    spanning one vision-frame gap (~15-30ms), so a higher-order scheme isn't
+    worth the complexity."""
+    omega = np.empty((len(ts), 3), dtype=np.float64)
+    for i in range(3):
+        omega[:, i] = np.interp(ts, t_gyro, gyro_body[:, i])
+
+    ts_s = ts.astype(np.float64) / 1e9
+    alpha = np.empty_like(omega)
+    alpha[0] = (omega[1] - omega[0]) / (ts_s[1] - ts_s[0])
+    alpha[-1] = (omega[-1] - omega[-2]) / (ts_s[-1] - ts_s[-2])
+    if len(ts) > 2:
+        alpha[1:-1] = (omega[2:] - omega[:-2]) / (ts_s[2:] - ts_s[:-2])[:, None]
+
+    r_b = np.broadcast_to(r, omega.shape)
+    return np.cross(alpha, r_b) + np.cross(omega, np.cross(omega, r_b))
+
+
+def integrate_accel_segment(t_accel: np.ndarray, accel_body: np.ndarray, ts0, ts1: int,
+                             R0: np.ndarray, R1: np.ndarray, g_world: np.ndarray,
+                             t_gyro: np.ndarray = None, gyro_body: np.ndarray = None,
+                             r: np.ndarray = None):
+    """World-frame velocity change (Delta_v, m/s) over [ts0, ts1] from raw
+    (mix+bias corrected, body-frame) accel samples.
+
+    LEVER ARM: pass t_gyro/gyro_body (the same controller's calibrated gyro
+    stream) and r (3,) -- the accelerometer's body-frame offset from the body
+    origin vision tracks, e.g. accel.Rt composed with gyro.Rt^-1's translation,
+    see _lever_arm_correction's docstring -- to correct for the accelerometer
+    NOT being co-located with that origin. r=None (default) keeps the original
+    LEVER-ARM-FREE behavior (accelerometer assumed co-located) -- Step 3's
+    sign/convention sanity check was deliberately run this way first, before
+    lever-arm complexity was introduced, so a bug wouldn't get misattributed;
+    now that the lever arm is confirmed (see module docstring reference above),
+    callers should pass it.
+
+    a_world(t) = R(t) @ (accel_body(t) - lever_arm_correction(t)) + g_world,
+    trapezoidal-integrated over [ts0, ts1] (same midpoint-rule spirit as
+    integrate_gyro_segment). R(t) is SLERP-interpolated between the two known
+    endpoint orientations R0 (at ts0) and R1 (at ts1) -- adequate for the short
+    (single vision-frame-gap) windows this is used over (Step 1 found ~2-3deg
+    median inter-frame rotation on this recording).
+
+    Returns delta_v (3,) world frame, or None if ts0 is None, the window is
+    degenerate (ts1 <= ts0), or it falls outside [t_accel[0], t_accel[-1]]
+    (no extrapolation -- same policy as integrate_gyro_segment)."""
+    if ts0 is None or ts1 <= ts0:
+        return None
+    if ts0 < t_accel[0] or ts1 > t_accel[-1]:
+        return None
+
+    mid_mask = (t_accel > ts0) & (t_accel < ts1)
+    ts = np.concatenate(([ts0], t_accel[mid_mask], [ts1])).astype(np.int64)
+    acc = np.empty((len(ts), 3), dtype=np.float64)
+    for i in range(3):
+        acc[:, i] = np.interp(ts, t_accel, accel_body[:, i])
+    if r is not None:
+        acc = acc - _lever_arm_correction(ts, t_gyro, gyro_body, r)
+
+    frac = (ts - ts0) / (ts1 - ts0)
+    slerp = Slerp([0.0, 1.0], Rotation.from_matrix(np.stack([R0, R1])))
+    R_t = slerp(frac).as_matrix()
+
+    a_world = np.einsum("nij,nj->ni", R_t, acc) + g_world
+    dv = np.zeros(3)
+    for i in range(len(ts) - 1):
+        dt = (ts[i + 1] - ts[i]) / 1e9
+        dv += 0.5 * (a_world[i] + a_world[i + 1]) * dt
+    return dv
+
+
+def integrate_accel_to_position(t_accel: np.ndarray, accel_body: np.ndarray, ts0, ts1: int,
+                                 R0: np.ndarray, R1: np.ndarray, v0: np.ndarray, g_world: np.ndarray,
+                                 t_gyro: np.ndarray = None, gyro_body: np.ndarray = None,
+                                 r: np.ndarray = None):
+    """SHORT-HORIZON forward integration: given a known velocity v0 at ts0,
+    double-trapezoidal-integrates raw accel over [ts0, ts1] to predict the
+    world-frame position change Delta_p (m) -- the actual "propagate with
+    accel between vision frames, then let vision correct" use this data is
+    for, as opposed to integrate_accel_segment's Delta_v (used there only for
+    a sign/correlation sanity check). The distinction matters: over a SHORT
+    window (single vision-frame gap, ~15-30ms here) integration SHRINKS a
+    calibration error by ~dt^2 rather than amplifying it -- e.g. a 2.8 m/s^2
+    gravity error integrated twice over 15ms is only ~0.3mm, well under
+    vision's own ~3-5mm noise floor -- unlike a a_center_world estimate
+    built by DIFFERENTIATING vision position (Step 3 sub-stage 2's approach),
+    where the same 15-30ms window AMPLIFIES mm-level position noise into
+    several m/s^2. So this function does not need a precisely-calibrated
+    lever arm/bias/gravity to be useful; a rough estimate suffices.
+
+    LEVER ARM: same t_gyro/gyro_body/r convention as integrate_accel_segment
+    (see its docstring and _lever_arm_correction) -- r=None keeps the
+    original LEVER-ARM-FREE behavior; g_world here should come from a
+    low-motion-frame bootstrap (or similar), not the whole-recording average
+    that sub-stage 1 found biased by the omitted lever arm.
+
+    Same SLERP-interpolated-rotation approach as integrate_accel_segment.
+
+    Returns delta_p (3,) world frame, or None under the same conditions
+    integrate_accel_segment returns None for."""
+    if ts0 is None or ts1 <= ts0:
+        return None
+    if ts0 < t_accel[0] or ts1 > t_accel[-1]:
+        return None
+
+    mid_mask = (t_accel > ts0) & (t_accel < ts1)
+    ts = np.concatenate(([ts0], t_accel[mid_mask], [ts1])).astype(np.int64)
+    acc = np.empty((len(ts), 3), dtype=np.float64)
+    for i in range(3):
+        acc[:, i] = np.interp(ts, t_accel, accel_body[:, i])
+    if r is not None:
+        acc = acc - _lever_arm_correction(ts, t_gyro, gyro_body, r)
+
+    frac = (ts - ts0) / (ts1 - ts0)
+    slerp = Slerp([0.0, 1.0], Rotation.from_matrix(np.stack([R0, R1])))
+    R_t = slerp(frac).as_matrix()
+
+    a_world = np.einsum("nij,nj->ni", R_t, acc) + g_world
+    v = np.empty((len(ts), 3), dtype=np.float64)
+    v[0] = v0
+    dp = np.zeros(3)
+    for i in range(len(ts) - 1):
+        dt = (ts[i + 1] - ts[i]) / 1e9
+        v[i + 1] = v[i] + 0.5 * (a_world[i] + a_world[i + 1]) * dt
+        dp += 0.5 * (v[i] + v[i + 1]) * dt
+    return dp
+
+
+def accel_preint_residual(t_accel: np.ndarray, accel_body: np.ndarray, ts0, ts1: int,
+                           R0: np.ndarray, R1: np.ndarray, p0: np.ndarray, p1: np.ndarray,
+                           v0: np.ndarray, v1: np.ndarray, g_world: np.ndarray,
+                           bias0: np.ndarray = None, bias1: np.ndarray = None,
+                           bias_random_walk_std: np.ndarray = None,
+                           t_gyro: np.ndarray = None, gyro_body: np.ndarray = None,
+                           r: np.ndarray = None):
+    """Accel preintegration factor for one reference-node gap [ts0, ts1] --
+    the accel counterpart to gyro_preint_residual (Step 4: joint batch solve
+    with per-node bias states). Gives TWO residuals instead of one, since
+    accel constrains both velocity and (via v0) position:
+
+        r_vel(k) = integrate_accel_segment(ts0,ts1) - (v1 - v0)
+        r_pos(k) = integrate_accel_to_position(ts0,ts1, v0=v0) - (p1 - p0)
+
+    r_pos is what actually ties the free velocity state v0 to the world-frame
+    vision positions p0/p1 -- r_vel alone would leave v0 unconstrained by
+    anything but the bias random-walk/anchor terms.
+
+    bias0 (3,) is subtracted from accel_body before integration -- same
+    first-order-correction convention as gyro_preint_residual's bias0.
+    Defaults to zero (no bias correction).
+
+    LEVER ARM: t_gyro/gyro_body/r are forwarded as-is to integrate_accel_
+    segment/integrate_accel_to_position -- see their docstrings and
+    _lever_arm_correction. r should be a FIXED, known constant (this
+    project's factory-JSON-derived accel/gyro lever arm -- confirmed
+    2026-09-02, see visualization/controller_calibration_for_basalt/
+    README.md finding 5), not a per-node unknown for this solve to estimate:
+    it's a static hardware property, unlike bias, which genuinely drifts and
+    is what this joint solve's per-node states are for. r=None keeps the
+    original lever-arm-free behavior.
+
+    If bias1 and bias_random_walk_std (3,) are both given, also returns the
+    bias random-walk residual r_bias = (bias1-bias0)/bias_random_walk_std/
+    sqrt(dt) -- identical formula to gyro_preint_residual's, applied to the
+    accel bias chain instead.
+
+    Returns (r_vel (3,) m/s or None, r_pos (3,) m or None, dt_s or None,
+    r_bias (3,) or None) -- None for r_vel/r_pos/dt if the segment falls
+    outside accel coverage or is degenerate (see integrate_accel_segment)."""
+    if bias0 is None:
+        bias0 = np.zeros(3)
+    accel_corrected = accel_body - bias0
+    dv = integrate_accel_segment(t_accel, accel_corrected, ts0, ts1, R0, R1, g_world,
+                                  t_gyro=t_gyro, gyro_body=gyro_body, r=r)
+    if dv is None:
+        return None, None, None, None
+    dp = integrate_accel_to_position(t_accel, accel_corrected, ts0, ts1, R0, R1, v0, g_world,
+                                      t_gyro=t_gyro, gyro_body=gyro_body, r=r)
+    r_vel = dv - (v1 - v0)
+    r_pos = dp - (p1 - p0)
+    dt = (ts1 - ts0) / 1e9
+    r_bias = None
+    if bias1 is not None and bias_random_walk_std is not None:
+        r_bias = (bias1 - bias0) / bias_random_walk_std / np.sqrt(dt)
+    return r_vel, r_pos, dt, r_bias
+
+
 def load_T_imu_cam(cfg, camera_idx: int = 0) -> Transform:
     """cfg: an already-loaded camera calibration JSON (see load_json_config).
     Reads cfg['value0']['T_imu_cam'][camera_idx] directly -- unlike src/camera.py's
