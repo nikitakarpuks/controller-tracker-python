@@ -151,6 +151,22 @@ class DeviceMocap:
         return R[0], pos[0]
 
 
+def world_pose(device: DeviceMocap, query_ts_ns: int):
+    """T_world_deviceImu(query_ts_ns) -- device's own IMU pose expressed in the
+    shared mocap-world frame, i.e. device.pose_at's marker pose chained through
+    T_imu_marker the same way relative_pose does, but WITHOUT cancelling the
+    world frame against a second device. Needed for world-frame fusion (T_world_
+    ctrl_vision = world_pose(headset, t).compose(T_headsetImu_ctrl_vision)) --
+    relative_pose alone can't provide this since its whole point is that the
+    world frame cancels out. Returns a Transform, or None if device has no
+    mocap coverage at this timestamp (see DeviceMocap.pose_at)."""
+    m = device.pose_at(query_ts_ns)
+    if m is None:
+        return None
+    T_world_marker = Transform(*m)
+    return T_world_marker.compose(device.T_imu_marker.inverse())
+
+
 def relative_pose(headset: DeviceMocap, device: DeviceMocap, query_ts_ns: int):
     """Ground-truth T_headsetImu_deviceImu(query_ts_ns) -- device pose expressed
     in the headset-IMU frame, chained through each device's own T_imu_marker so

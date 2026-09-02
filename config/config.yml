@@ -28,10 +28,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 2500  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 2765  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 3000  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 imu:
