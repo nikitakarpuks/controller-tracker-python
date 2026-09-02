@@ -24,13 +24,17 @@ state (see plan's "Scope for this pass (v1)").
 
 rot_delta (added 2026-09-02, see visualization/controller_calibration_for_basalt/
 README.md findings 7-8): an axis-angle CORRECTION on top of _DIAG_FLIP
-(diag(1,-1,-1), a precise 180deg flip about X), which REPLACES the
-_Y_FLIP @ Rt.R^(±1) sensor-frame->body-frame transform load_and_calibrate_
-controller_imu normally applies. Cross-session diagnostic testing found that
-transform (whatever this project's Rt-based convention actually resolves to)
-produces gyro/accel residuals 34-150 sigma out even with bias and lever arm
-otherwise correctly modeled, while swapping in _DIAG_FLIP directly cut
-r_gyro by 53-76% -- but not to zero, and asymmetrically between controllers
+(diag(1,-1,-1), a precise 180deg flip about X) -- load_and_calibrate_
+controller_imu now applies _DIAG_FLIP too (as of this same date), but this
+script still can't just call it directly: rot_delta needs to solve for a
+correction ON TOP of _DIAG_FLIP, so it needs the raw, pre-axis-transform
+stream to apply that correction to, not load_and_calibrate_controller_imu's
+already-fixed output. Cross-session diagnostic testing found the OLD
+_Y_FLIP @ Rt.R^(±1) transform (superseded, see src/imu_data.py's module
+docstring) produced gyro/accel residuals 34-150 sigma out even with bias
+and lever arm otherwise correctly modeled, while swapping in _DIAG_FLIP
+directly cut r_gyro by 53-76% -- but not to zero, and asymmetrically between
+controllers
 (left improves far more than right) -- so this is a single SHARED (same
 rotation applied to both accel and gyro, per the "one physical chip package,
 one mounting orientation" hypothesis _DIAG_FLIP's own discovery suggests)
@@ -126,11 +130,12 @@ _MIN_SIGMA = 1e-9  # floor so a zero/missing factory noise/uncertainty field can
 # scale to begin with.
 _SIGMA_SCALE = 100.0
 
-# Replaces load_and_calibrate_controller_imu's _Y_FLIP @ Rt.R^(±1) sensor->body transform
-# entirely -- see module docstring's rot_delta section and README findings 7-8. A precise
-# 180deg flip about X (X unchanged, Y/Z reversed) is physically unremarkable: a chip mounted
-# with two axes reversed relative to the device's logical convention is a common, deliberate
-# PCB-layout choice, not a bug.
+# Same transform load_and_calibrate_controller_imu now applies too (as of 2026-09-02),
+# superseding its old per-sensor _Y_FLIP @ Rt.R^(±1) -- see module docstring's rot_delta
+# section and README findings 7-8 for why this script still can't just call that function
+# directly. A precise 180deg flip about X (X unchanged, Y/Z reversed) is physically
+# unremarkable: a chip mounted with two axes reversed relative to the device's logical
+# convention is a common, deliberate PCB-layout choice, not a bug.
 _DIAG_FLIP = np.diag([1.0, -1.0, -1.0])
 # rot_delta's anchor sigma: NOT derived from any factory field (the factory JSON has no
 # per-axis mounting-rotation uncertainty to reuse, unlike bias_uncertainty) -- an engineering
@@ -345,8 +350,9 @@ def main():
         imu_calib = create_imu_calib_from_config(ctrl_json_cfg)
 
         # Mix+bias corrected but NOT axis-transformed (unlike load_and_calibrate_controller_imu,
-        # which bakes in _Y_FLIP @ Rt.R^(±1) -- see module docstring's rot_delta section for why
-        # that's no longer used directly: the axis transform is now solved for, via rot_delta).
+        # which now bakes in _DIAG_FLIP -- see module docstring's rot_delta section for why
+        # that's still not called directly here: the axis transform is solved for, via
+        # rot_delta, as a correction on top of _DIAG_FLIP).
         t_raw, gyro_raw, accel_raw = load_imu_csv(imu_path)
         t_raw = t_raw + lag_ns
         gyro_raw_corr = imu_calib.gyro.correct(gyro_raw.astype(np.float64))

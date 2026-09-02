@@ -370,12 +370,132 @@ comparing against whatever Basalt produces:
    the gap here. More likely explanation: the residual is already down to
    ~0.28-0.55σ after the axis fix, so there's little unexplained signal left
    demanding a large bias correction -- the solver isn't being capped, it's
-   just not finding a reason to move bias further. Axis-convention question
-   effectively closed; solve convergence and the bias-magnitude gap remain
-   open, though the gap's likely explanation is now reasonably well
-   understood rather than a mystery.
+   just not finding a reason to move bias further.
 
-8. **The existing `prior_basalt_output_controller_*.yaml` files' high
-   cost/gradient values** may be the same phenomenon already showing up in an
-   earlier Basalt run — worth checking whether that run used a bias/lever-arm
-   model or not, and whether its residual pattern matches what's described above.
+   CONFIRMED WITH A DIRECT OBSERVABILITY TEST (2026-09-02): does this
+   window's data actively REJECT a mocap2gt-scale (~0.2 m/s²) bias, or is it
+   just invisible to it? Cheap, no-solver test: evaluate residual_fn at x0
+   (baseline RMS 0.3223 left / 0.6003 right) vs. the same point with b_a
+   forced to a CONSTANT 0.2 m/s² along each of 6 directions (±x/±y/±z).
+   Result: RMS barely moves at all (0.3222-0.3228 left, 0.6001-0.6008
+   right -- differences in the 4th decimal place, 1.00x ratio every time).
+   **The data doesn't reject a mocap2gt-scale bias -- it's essentially free
+   to add, confirming this is a genuine observability gap, not the prior
+   capping anything and not a sign the true bias is actually ~0.**
+
+   MECHANISM (more precise than "window too short"): each gap here is only
+   ~15-20ms. integrate_accel_to_position's own docstring already documents
+   why short-horizon integration is deliberately robust to calibration
+   error -- a 0.2 m/s² bias integrated TWICE over 15ms works out to a
+   sub-millimeter position perturbation, and a single-integration velocity
+   perturbation of only ~0.004 m/s per gap -- both tiny next to sensor noise
+   and real inter-frame motion. This is a property of each constraint's GAP
+   LENGTH, not the window's total length: a longer window (more nodes)
+   would NOT by itself fix this, because every individual r_vel/r_pos
+   constraint still only "sees" bias over its own ~15-20ms slice, no matter
+   how many such slices are chained together. What mocap2gt does
+   differently, structurally: it fits ONE smooth trajectory model against
+   the WHOLE recording, so a bias has to stay consistent with predicting
+   motion correctly across thousands of gaps simultaneously against one
+   shared trajectory -- this solver's independent per-gap velocity states
+   have no such long-baseline anchor forcing consistency. This is exactly
+   what the peer's original recommendation (a proper sliding-window/online
+   filter, not an isolated short batch) was pointing at from the start --
+   now with a concrete mechanism, not just an appeal to authority. Axis-
+   convention question closed; solve convergence and the bias-magnitude gap
+   remain open, but the gap's mechanism is now well understood, not guessed.
+
+8. **PROPAGATED to the shared loader (2026-09-02)** -- everything above was,
+   until now, confined to `bias_estimation_check.py`'s own local reimplementation
+   of the raw-IMU load. `load_and_calibrate_controller_imu` in `src/imu_data.py`
+   -- the canonical loader `main.py`'s LIVE tracking (`imu.enabled`) and every
+   other diagnostic script (`gyro_preint_check.py`, `accel_short_horizon_check.py`,
+   `accel_sign_check.py`, `accel_occlusion_check.py`, `accel_jerk_check.py`,
+   `motion_dynamics_check.py`, `orientation_gravity_correction_check.py`,
+   `compare_vision_mocap.py`, etc. all call -- was still silently using the OLD,
+   now-confirmed-wrong per-sensor `_Y_FLIP @ Rt.R^(±1)` transform this whole time.
+
+   Before changing shared, live-tracking-affecting code, re-verified decisively:
+   that module's own docstring claimed the old transform was independently
+   validated (gyro: ranked #1 of 16 transpose x sign-flip candidates via
+   cross-correlation against vision, imu_vision_sync_check.py; accel:
+   gravity-direction self-consistency, imu_accel_exhaustive_search.py) -- a
+   real, direct conflict with this session's diag(1,-1,-1) finding that needed
+   resolving, not assuming away. Ran a decisive, ROTATION-sensitive (not
+   magnitude-only) re-check over the FULL recording (2509/2610 gyro-vs-vision
+   rotation-error samples, left/right, 8 candidate transforms): diag(1,-1,-1)
+   alone wins by nearly an order of magnitude -- median error 0.342°/0.510°,
+   vs. 2.644°/2.480° for the old documented "best" transform, vs. 2.5-4.8° for
+   every other candidate tried (both Rt directions alone, various flip x Rt
+   combinations, identity). Neither imu_vision_sync_check.py nor
+   imu_accel_exhaustive_search.py were ever committed (lost scratch scripts,
+   confirmed via git log), so it's unknown which recording that original
+   validation ran against -- but exactly like the lag_ns constant (finding 6),
+   the most likely explanation is it was validated on an older recording and,
+   unlike lag_ns, does NOT hold up on static_dark.
+
+   `load_and_calibrate_controller_imu` now applies `_DIAG_FLIP` directly (same
+   transform for both gyro and accel, no Rt rotation involved at all) --
+   verified end-to-end to reproduce the exact 0.342°/0.510° result. The old
+   `_Y_FLIP`/`_gyro_body_transform`/`_accel_body_transform` are gone (only
+   caller was this function). `bias_estimation_check.py` still can't call this
+   function directly -- rot_delta needs the raw, pre-transform stream to solve
+   a correction on top of `_DIAG_FLIP` -- but its comments now describe the
+   current (not superseded) state accurately. src/imu_data.py's module
+   docstring rewritten to document this supersession and the evidence, rather
+   than silently dropping the old (now-wrong) claim.
+
+9. **`algorithm_log_rt_transpose` RESOLVED (2026-09-02) -- was never going to
+   converge either way.** main.py's `basalt_controller_mocap_calib` input
+   (`debug.algorithm_log_dir`) computed R_ref_ic (reference-frame ->
+   controller-IMU rotation, needed for T_Ih_Ic) from the controller config's
+   InertialSensors `Rt`, with an unverified transpose direction (`Rt.R` vs
+   `Rt.R.T`) gated by this flag. Checked directly: `_DIAG_FLIP` -- what
+   `load_and_calibrate_controller_imu` uses for gyro_body, which by
+   construction IS gyro data expressed in this same reference frame, so it's
+   exactly what R_ref_ic needs -- is `~137-139°` away from BOTH `Rt.R` and
+   `Rt.R.T` for both controllers. Neither transpose direction was ever going
+   to be right; this is the SAME ~140° mismatch found independently twice
+   elsewhere in this investigation (finding 5's peer LED-BA-vs-Rt comparison,
+   and finding 7's decisive full-recording check) -- a third independent
+   confirmation that Rt's rotation component just isn't the sensor<->
+   reference-frame relationship for this hardware; only its translation
+   (used for the lever arm) is. Fixed: `_algo_log_T_ref_ic` now uses
+   `_DIAG_FLIP` directly, no Rt involved, no transpose ambiguity.
+   `algorithm_log_rt_transpose` removed from `config.yml`/`main.py` --
+   the ambiguity it gated no longer exists. Verified end-to-end: ran main.py
+   with `debug.algorithm_log_dir` set (50-frame smoke test), confirmed clean
+   output with no crash, then regenerated the full 2765-frame `pose_log`/
+   `led_detections` CSVs the smoke test had temporarily overwritten (verified
+   byte-identical to the pre-smoke-test backup afterward).
+
+10. **`prior_basalt_output_controller_*.yaml` cost/gradient CHECKED, not a
+    modeling bug (2026-09-02).** This file is mocap2gt output (finding 5's
+    corrected attribution) -- it fits its own marker<->IMU transform (T_M_I)
+    from scratch, purely from raw IMU + mocap, NEVER touching this project's
+    factory `Rt`/axis-convention question at all. So the ~140°/`_DIAG_FLIP`
+    bug findings 5/7/9 uncovered can't be why mocap2gt's right-controller fit
+    is worse (cost 3.12e6 vs left's 1.01e6, ~3x; gradient 1.05e5 vs 8.65e3,
+    ~12x) -- that's a different mechanism entirely.
+
+    Checked directly against this recording's own mocap quality reports
+    (`mocap_filtered/{ctrlleft,ctrlright}/mocap_quality_{pre,post}_refit_*.txt`,
+    not previously read): right controller's marker tracking is genuinely
+    noisier than left's, independent of anything IMU/vision-related.
+    Post-refit (what's actually loaded): right has **10 flagged pose jumps**
+    with physically-impossible instantaneous angular rates (4560-18141°/s --
+    clearly marker-occlusion/reacquisition glitches) vs left's **zero**; one
+    lands at t≈30.9s, within the full recording's span mocap2gt would fit
+    over (outside the first-~46s window this project's own vision/bias
+    diagnostics use, so it doesn't affect THIS project's own joint solve).
+    Right's max per-marker error is 16.13mm vs left's 3.85mm (4x). Pre-refit
+    numbers are independently worse across the board too (46.6% of frames
+    flagged vs left's 38.0%; p99 error 0.145m vs 0.086m; max 0.824m vs
+    0.205m) -- not a refit artifact, right's raw marker tracking on this
+    specific recording is measurably noisier from the start. Consistent with
+    every other "right fits worse than left" signal in this investigation
+    (this project's own axis-check: 0.510° vs left's 0.342°, ~1.5x; the
+    joint solve: 0.552σ vs left's 0.280σ, ~2x; the peer's own peak angular
+    rate: 852°/s vs left's 692°/s). **CONCLUSION: a real, recording-specific
+    mocap data-quality difference, not a modeling bug in mocap2gt, this
+    project's residual, or the peer's LED-BA tool.** CLOSED.

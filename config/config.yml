@@ -421,12 +421,10 @@ debug:
                                       # debug.calibration_csv's cam_idx column already uses.
   algorithm_log_dir: null   # e.g. "./data/algorithm_log"  # dir to write <ctrl_name>_algorithm_log.csv
                              # (basalt_controller_mocap_calib --algorithm-log-csv input: per-frame
-                             # T_Ih_Ic(t), one file per enabled controller)
-  algorithm_log_rt_transpose: true   # UNVERIFIED hypothesis for the controller config's InertialSensors
-                                       # Rt rotation direction — see the comment above
-                                       # _algo_log_T_ref_ic in main.py. Flip to false and re-check via
-                                       # basalt_mocap_time_sync against raw imu*.csv if calibration
-                                       # doesn't converge.
+                             # T_Ih_Ic(t), one file per enabled controller). Rotation uses
+                             # src.imu_data._DIAG_FLIP (resolved 2026-09-02 -- see the comment above
+                             # _algo_log_T_ref_ic in main.py); the old algorithm_log_rt_transpose
+                             # option is gone, that ambiguity no longer exists.
   mocap_log_dir: null   # e.g. "./data/mocap_gt"  # dir to write <ctrl_name>_mocap_gt.csv (one row per
                          # processed frame, T_headsetImu_ctrlImu(t) ground truth from mocap.enabled's
                          # loaded trajectories — see src/mocap_data.py); requires mocap.enabled: true and
