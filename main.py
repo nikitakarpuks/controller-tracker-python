@@ -16,6 +16,8 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config
+from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
+                            relative_pose, DRIFT_CHECK_VARIANT
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
 from src.transformations import Transform
@@ -146,6 +148,50 @@ def main():
 
             logger.bind(cat="startup").info(f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name}")
 
+    # ── Mocap ground truth (see src/mocap_data.py + the imu/mocap organization
+    # discussion): per-device filtered/aligned trajectories live under
+    # mocap_filtered/, a SIBLING of mav0/ (not inside it) at the recording root.
+    # headset is loaded unconditionally when enabled -- every controller's
+    # ground truth is expressed relative to it (see relative_pose), independent
+    # of which controllers happen to be enabled this run.
+    mocap_cfg = config.get("mocap", {})
+    device_mocap: dict = {}   # {"headset": DeviceMocap, ctrl_key: DeviceMocap, ...}
+    if mocap_cfg.get("enabled", False):
+        _recording_root    = Path(config["data"]["root"]).parent
+        _MOCAP_DISK_NAMES  = {"headset": "headset", "left_controller": "ctrlleft", "right_controller": "ctrlright"}
+        _mocap_device_cfg  = {"headset": config["cameras"],
+                               "left_controller":  config["controllers"]["left_controller"],
+                               "right_controller": config["controllers"]["right_controller"]}
+        for device_key in ["headset", *enabled_ctrls]:
+            _dev_cfg    = _mocap_device_cfg[device_key]
+            calib_path  = _dev_cfg.get("mocap_calib_path")
+            offset_override_ns = _dev_cfg.get("mocap_fine_offset_override_ns")
+            device_dir  = _recording_root / "mocap_filtered" / _MOCAP_DISK_NAMES[device_key]
+            data_path   = device_dir / "data.csv"
+            drift_path  = device_dir / "drift_check" / DRIFT_CHECK_VARIANT / "drift_check.json"
+            # drift_path is only required when no manual override is configured --
+            # an override lets a device be used before its drift_check has even
+            # been run (see config.yml's mocap_fine_offset_override_ns comment).
+            if not calib_path or not data_path.exists() or (offset_override_ns is None and not drift_path.exists()):
+                logger.bind(cat="startup").warning(
+                    f"[{device_key}] mocap data/calibration incomplete ({device_dir}) — "
+                    f"mocap ground truth disabled for this device")
+                continue
+            t_mocap, position, quat_xyzw = load_mocap_csv(data_path)
+            if offset_override_ns is not None:
+                fine_offset_ns = float(offset_override_ns)
+                _offset_source = "config override"
+            else:
+                fine_offset_ns = load_mocap_fine_offset_ns(drift_path)
+                _offset_source = f"{DRIFT_CHECK_VARIANT}/drift_check.json"
+            T_imu_marker = load_T_imu_marker(calib_path)
+            _max_gap_ns  = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
+            device_mocap[device_key] = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
+                                                    max_interp_gap_ns=_max_gap_ns)
+            logger.bind(cat="startup").info(
+                f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
+                f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source})")
+
     tracking_system = TrackingSystem(
         list(enabled_ctrls.values()), list(cameras.values()),
         matching_cfg=config.get("matching", {}),
@@ -217,8 +263,23 @@ def main():
         Path(_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
         _pose_csv_file = open(_pose_csv_path, "w", newline="")
         _pose_csv_writer = csv.writer(_pose_csv_file)
-        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz"])
+        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz", "reproj_err_px", "inlier_count"])
         logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
+
+    # ── Raw per-LED 2D observations (pre-PnP-solve point data) -- unlike pose_csv
+    # above (already-solved 6-DOF pose) or calibration_csv (primary-camera-only),
+    # this is every LED actually matched THIS frame across ALL cameras that
+    # contributed to the accepted solve -- what a bundle-adjustment-style external
+    # tool needs and can't recover by working backward from a solved pose.
+    _led_csv_path = debug_cfg.get("led_detections_csv")
+    _led_csv_file = _led_csv_writer = None
+    if _led_csv_path:
+        Path(_led_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        _led_csv_file = open(_led_csv_path, "w", newline="")
+        _led_csv_writer = csv.writer(_led_csv_file)
+        _led_csv_writer.writerow(["timestamp_ns", "camera_id", "ctrl_name", "led_id", "pixel_x", "pixel_y",
+                                   "blob_radius_px", "brightness"])
+        logger.bind(cat="startup").info(f"LED-detections CSV → {_led_csv_path}")
 
     # ── basalt_controller_mocap_calib input: one T_Ih_Ic(t) log per controller ──
     # T_world_ctrl is already T_Ih_ref (headset-IMU <- LED reference frame): LED
@@ -263,6 +324,29 @@ def main():
             f"Algorithm-log CSVs → {_algo_log_path}/<ctrl_name>_algorithm_log.csv "
             f"(Rt transpose={_algo_log_rt_transpose}, unverified — see comment above)")
 
+    # ── Mocap ground-truth export: one T_headsetImu_ctrlImu(t) log per
+    # controller with both its own and the headset's mocap loaded (see
+    # src/mocap_data.py.relative_pose) -- written every processed frame,
+    # independent of whether vision tracking accepted a pose that frame, since
+    # it's derived purely from mocap.
+    _mocap_log_dir     = debug_cfg.get("mocap_log_dir")
+    _mocap_log_writers = {}   # {ctrl_name: csv.writer}
+    _mocap_log_files   = {}   # {ctrl_name: file handle}
+    if _mocap_log_dir and "headset" in device_mocap:
+        _mocap_log_path = Path(_mocap_log_dir)
+        _mocap_log_path.mkdir(parents=True, exist_ok=True)
+        for ctrl_name in enabled_ctrls:
+            if ctrl_name not in device_mocap:
+                continue
+            f = open(_mocap_log_path / f"{ctrl_name}_mocap_gt.csv", "w", newline="")
+            w = csv.writer(f)
+            w.writerow(["#timestamp_ns", "p_x", "p_y", "p_z", "q_w", "q_x", "q_y", "q_z"])
+            _mocap_log_files[ctrl_name]   = f
+            _mocap_log_writers[ctrl_name] = w
+        if _mocap_log_writers:
+            logger.bind(cat="startup").info(
+                f"Mocap ground-truth CSVs → {_mocap_log_path}/<ctrl_name>_mocap_gt.csv")
+
     _n_frames = count_images(config["data"])
     for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
         img_path, cam_images = batch[0][0], batch[0][1]
@@ -275,6 +359,17 @@ def main():
         # substantially different gaps), so pose extrapolation uses this exact
         # elapsed time rather than assuming one frame = one uniform step.
         frame_ts_ns = int(img_path.stem)
+
+        for ctrl_name, _mocap_writer in _mocap_log_writers.items():
+            T_gt = relative_pose(device_mocap["headset"], device_mocap[ctrl_name], frame_ts_ns)
+            if T_gt is None:
+                continue
+            _gqx, _gqy, _gqz, _gqw = Rotation.from_matrix(T_gt.R).as_quat()
+            _mocap_writer.writerow([
+                frame_ts_ns,
+                f"{T_gt.t[0]:.6f}", f"{T_gt.t[1]:.6f}", f"{T_gt.t[2]:.6f}",
+                f"{_gqw:.8f}", f"{_gqx:.8f}", f"{_gqy:.8f}", f"{_gqz:.8f}",
+            ])
 
         proj_hints, vel_hints, radius_hints, search_eligible = tracking_system.get_predicted_led_projections_per_camera(frame_ts_ns)
         primary_cams       = tracking_system.get_designated_primary_cameras()
@@ -946,6 +1041,7 @@ def main():
                         int(img_path.stem), ctrl_name,
                         f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
                         f"{T_world_ctrl.t[0]:.6f}", f"{T_world_ctrl.t[1]:.6f}", f"{T_world_ctrl.t[2]:.6f}",
+                        f"{sol['error']:.4f}", len(sol["assignment"]),
                     ])
                 if ctrl_name in _algo_log_writers:
                     T_Ih_Ic = T_world_ctrl.compose(_algo_log_T_ref_ic[ctrl_name])
@@ -955,6 +1051,26 @@ def main():
                         f"{T_Ih_Ic.t[0]:.6f}", f"{T_Ih_Ic.t[1]:.6f}", f"{T_Ih_Ic.t[2]:.6f}",
                         f"{_aqw:.8f}", f"{_aqx:.8f}", f"{_aqy:.8f}", f"{_aqz:.8f}",
                     ])
+                if _led_csv_writer:
+                    # (cam_idx, matched_pairs) for every camera that actually contributed
+                    # to this frame's accepted solve -- primary plus every aux camera,
+                    # not just primary (unlike calibration_csv above).
+                    _cams_matched = [(primary_cam_idx, sol["assignment"])]
+                    for _aux_cam_idx, _aux_pairs in (sol.get("aux_assignments") or {}).items():
+                        if _aux_pairs:
+                            _cams_matched.append((_aux_cam_idx, _aux_pairs))
+                    for _cam_idx, _pairs in _cams_matched:
+                        _cam_result = per_ctrl_blobs[ctrl_name].get(_cam_idx)
+                        if _cam_result is None:
+                            continue
+                        for _blob_idx, _led_id in _pairs:
+                            _px, _py = _cam_result.centroids[_blob_idx]
+                            _led_csv_writer.writerow([
+                                frame_ts_ns, _cam_idx, ctrl_name, _led_id,
+                                f"{_px:.3f}", f"{_py:.3f}",
+                                f"{float(_cam_result.radii[_blob_idx]):.3f}",
+                                f"{float(_cam_result.brightnesses[_blob_idx]):.1f}",
+                            ])
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -1052,10 +1168,19 @@ def main():
         _pose_csv_file.close()
         logger.bind(cat="startup").info(f"Pose CSV saved → {_pose_csv_path}")
 
+    if _led_csv_file:
+        _led_csv_file.close()
+        logger.bind(cat="startup").info(f"LED-detections CSV saved → {_led_csv_path}")
+
     for f in _algo_log_files.values():
         f.close()
     if _algo_log_files:
         logger.bind(cat="startup").info(f"Algorithm-log CSVs saved → {_algo_log_dir}")
+
+    for f in _mocap_log_files.values():
+        f.close()
+    if _mocap_log_files:
+        logger.bind(cat="startup").info(f"Mocap ground-truth CSVs saved → {_mocap_log_dir}")
 
     if tracking_system._self_cal is not None:
         tracking_system._self_cal.run()
