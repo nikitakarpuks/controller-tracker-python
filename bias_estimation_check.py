@@ -101,7 +101,8 @@ from scipy.spatial.transform import Rotation
 from accel_short_horizon_check import low_motion_bootstrap_g_world
 from accel_sign_check import _MAX_PAIR_DT_S, world_vision_poses
 from compare_vision_mocap import load_pose_csv, load_device_mocap
-from src.imu_data import accel_preint_residual, create_imu_calib_from_config, gyro_preint_residual, load_imu_csv
+from src.imu_data import (accel_preint_residual, create_imu_calib_from_config, gyro_preint_residual, load_imu_csv,
+                           slice_imu_to_window)
 from src.load_config import load_json_config, load_yaml_config
 
 _IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
@@ -144,24 +145,6 @@ _DIAG_FLIP = np.diag([1.0, -1.0, -1.0])
 # that a single global 3-DOF parameter -- already well-constrained by ~15*(n-1) residuals --
 # doesn't wander to something unphysical if the solve degenerates.
 _ROT_ANCHOR_SIGMA_RAD = np.radians(5.0)
-
-
-def _slice_imu_to_window(t: np.ndarray, data: np.ndarray, ts_lo: int, ts_hi: int, pad_ns: int = 200_000_000):
-    """(t_slice, data_slice) restricted to roughly [ts_lo-pad_ns, ts_hi+pad_ns], via
-    searchsorted (t is already sorted ascending -- true for load_and_calibrate_
-    controller_imu's output). Performance fix, not a math change: integrate_gyro_
-    segment/integrate_accel_segment/integrate_accel_to_position each mask/interpolate
-    over the WHOLE array passed in, independent of how short [ts0, ts1] actually is --
-    fine for a single call (existing Step 1/3 scripts), but the residual function here
-    is called ~(9*window_size + 1) times per solver iteration (finite-difference
-    Jacobian), so leaving those O(full recording length) instead of O(window span)
-    turned a 30-node smoke test into a many-minutes run. pad_ns keeps enough margin
-    that every gap's mid-sample interpolation still has real samples on both sides."""
-    lo = max(t[0], ts_lo - pad_ns)
-    hi = min(t[-1], ts_hi + pad_ns)
-    i0 = int(np.searchsorted(t, lo, side="left"))
-    i1 = int(np.searchsorted(t, hi, side="right"))
-    return t[i0:i1], data[i0:i1]
 
 
 def _seed_velocities(ts_window, world_poses, max_seed_speed=10.0):
@@ -402,11 +385,11 @@ def main():
         v_seed = _seed_velocities(ts_window, world_poses)
         x0 = np.concatenate([v_seed.ravel(), np.zeros(3 * n), np.zeros(3 * n), np.zeros(3)])
 
-        # Sliced to the window's own time span (see _slice_imu_to_window's docstring for
+        # Sliced to the window's own time span (see slice_imu_to_window's docstring for
         # why this matters for solve speed, not just memory). Raw-corrected, not yet
         # axis-transformed -- see _build_residual_fn's docstring.
-        t_gyro_w, gyro_raw_corr_w = _slice_imu_to_window(t_gyro, gyro_raw_corr, ts_window[0], ts_window[-1])
-        t_accel_w, accel_raw_corr_w = _slice_imu_to_window(t_accel, accel_raw_corr, ts_window[0], ts_window[-1])
+        t_gyro_w, gyro_raw_corr_w = slice_imu_to_window(t_gyro, gyro_raw_corr, ts_window[0], ts_window[-1])
+        t_accel_w, accel_raw_corr_w = slice_imu_to_window(t_accel, accel_raw_corr, ts_window[0], ts_window[-1])
 
         residual_fn, unpack, _ = _build_residual_fn(
             ts_window, world_poses, t_gyro_w, gyro_raw_corr_w, t_accel_w, accel_raw_corr_w, g_world,
