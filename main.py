@@ -15,7 +15,7 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
                                _compute_led_search_radii)
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
-from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config
+from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
                             relative_pose, DRIFT_CHECK_VARIANT
 from src.load_config import load_yaml_config, load_json_config
@@ -287,22 +287,26 @@ def main():
     # Rt entries' near-zero translation, are all given relative to that same
     # reference frame, whose origin is defined to sit exactly at the (Id=Undefined)
     # gyro's physical location -- so T_world_ctrl.t is already the IMU's position,
-    # no correction needed. Rt's rotation, however, is NOT near-identity: it
-    # reorients the reference frame's axes onto the gyro chip's own native sensor
-    # axes (the frame real onboard accel/gyro samples are actually reported in).
-    # Composing that in gives the true T_Ih_Ic this file is meant to hold.
+    # no correction needed. What's needed for T_Ih_Ic's ROTATION is R_ref_ic: the
+    # rotation taking a vector expressed in the controller-IMU's own native sensor
+    # axes into reference-frame axes (T_Ih_Ic = T_world_ctrl.compose(Transform(
+    # R_ref_ic, 0))).
     #
-    # Rt.R is documented (src/imu_data.py module docstring) as converting a raw
-    # vector from reference axes into gyro axes: v_gyro = Rt.R @ v_ref. Under this
-    # project's T_A_B = "pose of B in A" convention, that makes T_ref_gyro.R =
-    # Rt.R.T, so T_Ih_Ic = T_world_ctrl.compose(Transform(Rt.R.T, 0)).
-    # UNVERIFIED: Rt's stored direction was never pinned down empirically (see
-    # imu_data.py docstring) -- this transpose is the derived hypothesis, not a
-    # confirmed fact. Flip algorithm_log_rt_transpose to false and re-check if
-    # basalt_mocap_time_sync against the raw (untouched) imu*.csv doesn't
-    # converge cleanly once real data is available.
+    # RESOLVED 2026-09-02 (previously computed from the controller config's
+    # InertialSensors Rt, with an UNVERIFIED transpose direction -- see git
+    # history for that version): R_ref_ic is exactly _DIAG_FLIP, the same
+    # sensor-frame->body-frame transform load_and_calibrate_controller_imu now
+    # applies to raw gyro/accel samples to land them in this same reference
+    # frame (see src/imu_data.py's module docstring) -- gyro_body IS gyro data
+    # expressed in reference-frame axes, by construction, so the same transform
+    # is what T_Ih_Ic's rotation needs too. Confirmed Rt's rotation is NOT the
+    # right quantity for this either direction: both Rt.R and Rt.R.T are
+    # ~137-139° away from _DIAG_FLIP (both controllers) -- the same ~140°
+    # mismatch found independently twice elsewhere in this investigation (see
+    # visualization/controller_calibration_for_basalt/README.md findings 5/7).
+    # Rt's rotation just isn't the sensor<->reference-frame axis relationship
+    # for this hardware; only its TRANSLATION (used for the lever arm) is.
     _algo_log_dir = debug_cfg.get("algorithm_log_dir")
-    _algo_log_rt_transpose = bool(debug_cfg.get("algorithm_log_rt_transpose", True))
     _algo_log_writers = {}   # {ctrl_name: csv.writer}
     _algo_log_files   = {}   # {ctrl_name: file handle}
     _algo_log_T_ref_ic = {}  # {ctrl_name: Transform}  ref-frame -> controller-IMU
@@ -310,10 +314,7 @@ def main():
         _algo_log_path = Path(_algo_log_dir)
         _algo_log_path.mkdir(parents=True, exist_ok=True)
         for ctrl_name in enabled_ctrls:
-            imu_calib = create_imu_calib_from_config(ctrl_json_cfg[ctrl_name])
-            R_rt = imu_calib.gyro.T_rt.R
-            R_ref_ic = R_rt.T if _algo_log_rt_transpose else R_rt
-            _algo_log_T_ref_ic[ctrl_name] = Transform(R_ref_ic, np.zeros(3))
+            _algo_log_T_ref_ic[ctrl_name] = Transform(_DIAG_FLIP, np.zeros(3))
 
             f = open(_algo_log_path / f"{ctrl_name}_algorithm_log.csv", "w", newline="")
             w = csv.writer(f)
@@ -321,8 +322,7 @@ def main():
             _algo_log_files[ctrl_name]   = f
             _algo_log_writers[ctrl_name] = w
         logger.bind(cat="startup").info(
-            f"Algorithm-log CSVs → {_algo_log_path}/<ctrl_name>_algorithm_log.csv "
-            f"(Rt transpose={_algo_log_rt_transpose}, unverified — see comment above)")
+            f"Algorithm-log CSVs → {_algo_log_path}/<ctrl_name>_algorithm_log.csv")
 
     # ── Mocap ground-truth export: one T_headsetImu_ctrlImu(t) log per
     # controller with both its own and the headset's mocap loaded (see

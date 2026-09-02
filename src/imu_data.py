@@ -25,28 +25,41 @@ mirror of Monado main; gitlab.freedesktop.org itself blocks automated fetches):
     in pose composition. Kept un-composed here (T_rt) for the same reason;
     direction (body->imu vs imu->body) still isn't documented in the file itself.
 
-Axis transform (sensor frame -> controller body/LED frame), resolved empirically,
-NOT from documentation -- and NOT the same for gyro and accel, despite both
-living on the same physical ICM20602 package:
+Axis transform (sensor frame -> controller body/LED frame): a single, SHARED
+transform for gyro and accel -- both live on the same physical chip package,
+same mounting -- diag(1,-1,-1), a precise 180deg flip about X (X unchanged,
+Y/Z reversed). Physically unremarkable: a chip mounted with two axes reversed
+relative to the device's logical convention is a common, deliberate PCB-layout
+choice, not a bug.
+
+SUPERSEDED (2026-09-02) an earlier, per-sensor-DISTINCT transform this
+docstring used to document:
   - gyro:  R_body_gyro  = diag(1,-1,1) @ T_rt.R.T   (transpose)
   - accel: R_body_accel = diag(1,-1,1) @ T_rt.R      (no transpose)
-  Both use the same (1,-1,1) Y-flip (consistent with a documented WMR-internal
-  Y-down vs. consumer/OpenXR Y-up convention difference), but the accelerometer
-  needs T_rt AS-IS while the gyro needs its transpose -- confirmed by two
-  independent checks, not assumed:
-    * gyro: cross-correlated against vision-derived controller angular velocity
-      (imu_vision_sync_check.py) -- transpose+flip ranked #1 of all 16
-      transpose x sign-flip combinations.
-    * accel: gravity-direction self-consistency across world-composed
-      orientation (imu_accel_exhaustive_search.py) -- assuming accel used the
-      SAME transform as gyro ranked #15 of 16 (nearly the worst option); the
-      actual best (no-transpose) was 4-5x more self-consistent. The remaining
-      sign ambiguity in that method (a candidate and its exact negation score
-      identically) was resolved against imu0's own gravity direction (imu0
-      needs no transform at all -- see below), which matched the no-transpose
-      +Y-flip candidate unambiguously (dot +0.74 vs -0.74 for both controllers).
-  Do not assume this generalizes to other controller hardware/calibration
-  files without re-running both checks.
+That version was itself validated by two independent checks (gyro:
+cross-correlated against vision-derived angular velocity via
+imu_vision_sync_check.py, ranked #1 of 16 transpose x sign-flip candidates;
+accel: gravity-direction self-consistency via imu_accel_exhaustive_search.py)
+-- but on euroc_recording_20260826173103_static_dark specifically, a decisive
+re-check (full-recording gyro-vs-vision rotation error, not just a handful of
+frames: 2509/2610 samples, left/right) found diag(1,-1,-1) alone gives median
+0.342°/0.510° error, roughly 8x better than the old per-sensor transform's
+2.644°/2.480° and better than every other transpose/flip combination tried.
+Neither imu_vision_sync_check.py nor imu_accel_exhaustive_search.py were ever
+committed to this repo (lost scratch scripts, confirmed via git log), so it's
+unknown which recording that original validation ran against -- but given
+this project's lag_ns constant was separately confirmed (git archaeology) to
+have been measured on a DIFFERENT, older recording
+(euroc_recording_20260729173447_still_easy) and only turned out to still be
+correct for static_dark by luck, the far more likely explanation here is that
+the old per-sensor transform was validated against that same older recording
+and, unlike lag_ns, does NOT hold up on static_dark. Cross-validated
+independently three ways in visualization/controller_calibration_for_basalt/
+README.md findings 5-7 (a separate Claude session's vision+mocap bundle-
+adjustment chain, that session's fresh EPnP-only reproduction, and this
+project's own joint bias+rotation solve in bias_estimation_check.py).
+Do not assume diag(1,-1,-1) generalizes to other controller hardware/
+calibration files or recordings without re-running this check.
 
 imu0 (the HMD's own IMU) needs NO axis transform at all -- it IS the reference
 frame T_imu_cam/VIO are already expressed against, unlike the controllers
@@ -471,27 +484,21 @@ def create_imu_calib_from_config(cfg, entry_index: int = 1) -> ControllerImuCali
     )
 
 
-# Empirically-resolved sensor-frame -> body-frame transforms -- see module
-# docstring for how each was determined and why they're NOT the same despite
-# sharing one physical chip. _Y_FLIP is common to both; the transpose is not.
-_Y_FLIP = np.diag([1.0, -1.0, 1.0])
-
-
-def _gyro_body_transform(R_rt: np.ndarray) -> np.ndarray:
-    return _Y_FLIP @ R_rt.T
-
-
-def _accel_body_transform(R_rt: np.ndarray) -> np.ndarray:
-    return _Y_FLIP @ R_rt
+# Sensor-frame -> body-frame transform, SAME for gyro and accel (both live on the
+# same physical chip package, same mounting) -- a precise 180deg flip about X (X
+# unchanged, Y/Z reversed). Superseded the old per-sensor-distinct _Y_FLIP @
+# Rt.R^(±1) transform this module's docstring used to document (see docstring's
+# "SUPERSEDED" note for the full story and the decisive full-recording evidence).
+_DIAG_FLIP = np.diag([1.0, -1.0, -1.0])
 
 
 def load_and_calibrate_controller_imu(imu_path, controller_cfg: dict, lag_ns: int = 0,
                                        entry_index: int = 1):
-    """Load one controller's raw imu*.csv and apply the full Stage 1/3 correction
-    chain: mix+bias calibration, the empirically-resolved (and per-sensor-distinct
-    -- see module docstring) axis transform, and an optional clock-offset
-    correction (lag_ns, added to the raw timestamps -- e.g. Stage 1's measured
-    controller<->camera offset).
+    """Load one controller's raw imu*.csv and apply the full correction chain:
+    mix+bias calibration, the confirmed sensor->body axis transform (_DIAG_FLIP
+    -- see module docstring), and an optional clock-offset correction (lag_ns,
+    added to the raw timestamps -- e.g. Stage 1's measured controller<->camera
+    offset).
 
     Single source for this chain -- main.py and visualize_imu.py both call this
     rather than each keeping their own copy of the transform logic.
@@ -502,9 +509,9 @@ def load_and_calibrate_controller_imu(imu_path, controller_cfg: dict, lag_ns: in
     calib = create_imu_calib_from_config(controller_cfg, entry_index=entry_index)
 
     gyro_corr = calib.gyro.correct(gyro_raw.astype(np.float64))
-    gyro_body = (_gyro_body_transform(calib.gyro.T_rt.R) @ gyro_corr.T).T
+    gyro_body = (_DIAG_FLIP @ gyro_corr.T).T
 
     accel_corr = calib.accel.correct(accel_raw.astype(np.float64))
-    accel_body = (_accel_body_transform(calib.accel.T_rt.R) @ accel_corr.T).T
+    accel_body = (_DIAG_FLIP @ accel_corr.T).T
 
     return t_imu + lag_ns, gyro_body, accel_body
