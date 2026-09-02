@@ -1,5 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/PyCharmProjects/controller-tracker-python/data/datasets/two_ctrl/controllers/9_moving_between_cameras/right_slow"
+  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173103_static_dark/mav0"
   layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
                            # side-by-side into a single wide image per frame (uses
                            # img_width/total_cameras_number below to slice per camera).
@@ -9,7 +9,15 @@ data:
                            # match across folders). Uses camera_folder_pattern /
                            # images_subdir below instead of img_width/total_cameras_number.
   camera_folder_pattern: "cam{idx}"  # only used when layout is "per_camera_folders";
-                                      # {idx} is replaced with the camera index
+                                      # {idx} is replaced with the camera index (after
+                                      # controller_cam_start_index below is applied)
+  controller_cam_start_index: 4  # on-disk folder offset for controller cameras: recordings that
+                                  # also capture SLAM data pack SLAM cams in cam0..cam{N-1} and
+                                  # controller-tracking cams in cam{N}..cam{2N-1}; this pipeline
+                                  # only ever tracks controllers, so selected_cameras/calibration/
+                                  # etc. all keep 0-based internal indexing and only the folder
+                                  # lookup is shifted (cam{idx} -> cam{idx + this}). 0 = controller
+                                  # folders already start at cam0 (no offset).
   images_subdir: "data"  # only used when layout is "per_camera_folders"; optional subfolder
                       # inside each camera folder holding the images, e.g. "data" for an
                       # EuRoC-style root/cam0/data/*.png layout; "" if images sit directly
@@ -23,31 +31,67 @@ data:
     lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 2000  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 2765  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 imu:
-  enabled: true   # Stage 3: fold controller gyro into pose prediction + run the
-                  # gravity-alignment diagnostic (log-only). Requires
+  enabled: false  # off while the real IMU+vision fusion filter is being built separately
+                  # (offline, against pose_csv + raw imu*.csv + mocap) -- keep live tracking
+                  # on pure vision + linear extrapolation until the new filter is validated,
+                  # rather than run both prediction mechanisms at once. Stage 3: fold
+                  # controller gyro into pose prediction + run the gravity-alignment
+                  # diagnostic (log-only). Requires
                   # <data.root>/imu1/data.csv (left) and imu2/data.csv (right) in
                   # EuRoC format; falls back to pure vision-history prediction
                   # (with a startup warning) if a file is missing.
+
+mocap:
+  enabled: true  # load per-device mocap ground truth (see src/mocap_data.py) from
+                  # <data.root's parent>/mocap_filtered/{headset,ctrlleft,ctrlright}/
+                  # (sibling to mav0/, not inside it) -- requires each enabled
+                  # device's mocap_calib_path below to be set; falls back to no
+                  # ground truth (with a startup warning) if a device's files are
+                  # missing. Only used for debug.mocap_log_dir's export for now.
+  max_interp_gap_ms: 30.0  # a query timestamp whose two bracketing real mocap samples are
+                  # farther apart than this is treated as "no ground truth here" (returns
+                  # None) rather than interpolated across -- guards against gaps left by
+                  # motive_to_gt.py DROPPING (not blanking) N/A/high-error/implausible-jump
+                  # frames, which can leave much larger gaps than the nominal ~8.3ms mocap
+                  # cadence during real marker occlusion (158ms gaps confirmed on real data).
 
 cameras:
 #  intrinsics_path: "./data/cameras/mateosss.reverbg2v1.kleineinzeigen.bslt.json"
 #  intrinsics_path: "./data/cameras/mateo_fresh_calib.json"
 #  intrinsics_path: "./data/cameras/backup/my_calibration.json"
 
-#  intrinsics_path: "./data/cameras/backup/kb4_calib_data_tuned.json"
-  intrinsics_path: "./data/cameras/kalibr_generated.json"
+  intrinsics_path: "./data/cameras/calibration_basalt.json"
+#  intrinsics_path: "./data/cameras/kalibr_generated.json"
 
+  mocap_calib_path: "/home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/mocap_calibration_headset.json" # headset's
+                          # T_imu_marker (mocap-marker <-> headset-IMU extrinsic); only value0.T_imu_marker
+                          # is read, see src/mocap_data.py's module docstring for why. Required when
+                          # mocap.enabled is true (headset mocap is the ground-truth reference every
+                          # controller's mocap gets composed relative to).
+  mocap_fine_offset_override_ns: null # e.g. 138900000 -- overrides the fine (sub-second) IMU<->mocap time
+                          # offset this device's drift_check/1chunk/drift_check.json would otherwise supply
+                          # (see src/mocap_data.py's module docstring on coarse vs fine). null = use the file.
 
-  extrinsics_convention: "T_cam0_camN"   # "T_imu_cam" or "T_cam0_camN"
+  extrinsics_convention: "T_imu_cam"   # "T_imu_cam" or "T_cam0_camN"
 
 controllers:
   right_controller:
     enabled: true
     config_path: "./data/controllers/right_controller_A85K6081930636R.json"
+    mocap_calib_path: "/home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_right_calib.json" # see cameras.mocap_calib_path above
+    mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
+    mocap_bridge_path: "./data/mocap_calib/controller_right_mocap_bridge_basalt01.json" # compare_vision_mocap.py's
+                          # empirically-fit LED-reference-frame -> mocap accelerometer-IMU-frame bridge
+                          # (see src/mocap_data.load_mocap_bridge). Deliberately NOT derived from this
+                          # controller's factory InertialSensors Rt -- see compare_vision_mocap.py's module
+                          # docstring for why that path was tried and found off by several mm/degrees. If
+                          # this file exists it's loaded and used directly (no fitting); if the path is set
+                          # but the file is missing, the next compare_vision_mocap.py run fits it fresh and
+                          # writes it here; null = always fit fresh, never cached.
     mesh_alignment:
       translation: # in meters
         x: 0.19610239
@@ -84,8 +128,12 @@ controllers:
           half_length: 0.037
           color: [255, 55, 55]
   left_controller:
-    enabled: false
+    enabled: true  # temporarily on for compare_vision_mocap.py (needs both controllers for the
+                   # inter-controller relative-pose check -- see that script's module docstring)
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
+    mocap_calib_path: "/home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_left_calib.json" # see cameras.mocap_calib_path above
+    mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
+    mocap_bridge_path: "./data/mocap_calib/controller_left_mocap_bridge_basalt01.json" # see right_controller.mocap_bridge_path above
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
 
@@ -354,6 +402,23 @@ self_calibration:
 
 debug:
   calibration_csv: null # "./data/calib_warm_pass1.csv"   # path to write threshold calibration data, e.g. "./data/calib_thresholds.csv"
+  pose_csv: "./data/pose_log_2765frames.csv"   # null = disabled; per-accepted-frame (timestamp_ns, ctrl_name, quat, position)
+                                      # in vision's own T_world_ctrl -- temporarily on for compare_vision_mocap.py
+  led_detections_csv: "./data/led_detections_2765frames.csv" # null = disabled; per-accepted-frame, per-camera,
+                                      # per-LED RAW 2D observations (timestamp_ns, camera_id, ctrl_name, led_id,
+                                      # pixel_x, pixel_y, blob_radius_px, brightness) -- the pre-PnP-solve
+                                      # point-level data a bundle-adjustment-style external tool (e.g. Basalt)
+                                      # needs and can't recover by working backward from pose_csv's already-solved
+                                      # 6-DOF pose. One row per LED actually matched THIS frame, across ALL
+                                      # cameras that contributed to the accepted solve (primary via sol["assignment"]
+                                      # + every aux camera via sol["aux_assignments"][cam_idx]), not just the
+                                      # primary camera -- unlike debug.calibration_csv above, which is primary-only.
+                                      # led_id is the resolved LED identity (tracking_system's post-match assignment),
+                                      # not a raw per-frame blob index, so a given LED's 2D track can be followed
+                                      # across frames. camera_id is the internal 0-based index (matches
+                                      # data.selected_cameras / the cam{idx} on-disk folder before
+                                      # data.controller_cam_start_index is applied), same convention
+                                      # debug.calibration_csv's cam_idx column already uses.
   algorithm_log_dir: null   # e.g. "./data/algorithm_log"  # dir to write <ctrl_name>_algorithm_log.csv
                              # (basalt_controller_mocap_calib --algorithm-log-csv input: per-frame
                              # T_Ih_Ic(t), one file per enabled controller)
@@ -362,6 +427,10 @@ debug:
                                        # _algo_log_T_ref_ic in main.py. Flip to false and re-check via
                                        # basalt_mocap_time_sync against raw imu*.csv if calibration
                                        # doesn't converge.
+  mocap_log_dir: null   # e.g. "./data/mocap_gt"  # dir to write <ctrl_name>_mocap_gt.csv (one row per
+                         # processed frame, T_headsetImu_ctrlImu(t) ground truth from mocap.enabled's
+                         # loaded trajectories — see src/mocap_data.py); requires mocap.enabled: true and
+                         # both the headset's and that controller's mocap_calib_path set
   assume_continuous_frames: true  # true = input is a real continuous capture (frame N+1 is ~one exposure
                                     # after frame N) → the pose-continuity jump check on re-acquisition
                                     # applies. false = input is a curated/isolated set of problem frames
