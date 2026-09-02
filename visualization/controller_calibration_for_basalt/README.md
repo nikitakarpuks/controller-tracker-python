@@ -499,3 +499,64 @@ comparing against whatever Basalt produces:
     rate: 852°/s vs left's 692°/s). **CONCLUSION: a real, recording-specific
     mocap data-quality difference, not a modeling bug in mocap2gt, this
     project's residual, or the peer's LED-BA tool.** CLOSED.
+
+11. **REAL-OCCLUSION-GAP VALIDATION (2026-09-02) -- the decisive test, using
+    actual tracking-loss gaps instead of synthetic short ones.** Every prior
+    bias test in this investigation (findings 4, 7's observability check)
+    used adjacent-vision-frame gaps (~15-20ms), where a bias error shrinks
+    to a sub-mm effect purely from short integration horizon (see
+    `integrate_accel_to_position`'s own docstring) -- not evidence bias is
+    unimportant generally, just unobservable at THAT horizon. This project's
+    own recording has real tracking-loss gaps (occlusion / out of camera
+    view) -- `static_dark`'s `_MAX_PAIR_DT_S=0.15s` threshold finds 7 on
+    left_controller (155ms-1076ms) and 6 on right_controller (155-766ms),
+    spanning the whole ~46s tracked window. These are 10-70x longer than
+    the gaps everything else in this investigation used -- exactly the
+    horizon where bias-induced drift (dt² for position, dt for velocity)
+    should actually become visible, if it's real.
+
+    Method: BLIND dead-reckoning through each real gap [t0,t1] -- v0 from a
+    backward finite difference (only data available in real time), R1
+    predicted via gyro alone (`R0 @ integrate_gyro_segment`), p1 predicted
+    via accel double-integration using the GYRO-PREDICTED R1 (not vision's
+    true R1) as the SLERP endpoint -- genuinely no peeking at the ground
+    truth during the gap, unlike the original short-gap residual checks
+    (which legitimately use both true endpoints to isolate accel error).
+    Compared against vision's actual recovered pose at t1, and against the
+    same naive constant-velocity baseline Step 3's Finding 4 used. Tested 7
+    bias candidates: zero, and mocap2gt-scale (0.2 m/s² accel / 0.011 rad/s
+    gyro) along each of ±x/±y/±z.
+
+    HEADLINE RESULT -- directly reverses Step 3's original finding: Step 3
+    found accel dead-reckoning LOST to naive constant-velocity 53-67% of the
+    time (bias assumed zero, pre-any-of-this-session's-fixes). On these 13
+    real occlusion gaps, with the axis-convention fix + lever arm now in
+    place (bias still fixed at zero), accel dead-reckoning **BEATS naive
+    constant-velocity 9/13 times (69%)** -- right_controller 6/6 (100%),
+    left_controller 3/7 (43%). This session's fixes turned accel prediction
+    from a net loser into a net winner on real, substantial occlusion gaps.
+
+    BIAS'S ROLE, CONFIRMED ON REAL DATA (not just short-gap residuals):
+    rotation error (0.5-7° across all 13 gaps) varies by <1° across every
+    bias candidate tested. Position win/loss verdict against naive is
+    **completely unanimous across all 7 bias candidates in 11/13 gaps**
+    (either all 7 beat naive or all 7 lose) -- the 2 exceptions are
+    razor-thin, sub-centimeter flips around the naive baseline, noise-level,
+    not a real bias effect. Bias choice, even at mocap2gt's cited scale in
+    any tested direction, essentially never changes whether dead-reckoning
+    succeeds on a given real gap. This reconfirms finding 7's observability
+    conclusion on genuinely long, real gaps, not just an artifact of the
+    short synthetic ones -- bias is not the lever for THIS project's
+    dead-reckoning-through-occlusion use case on this recording.
+
+    ONE REAL OUTLIER, not a bias issue: the single longest gap (1076ms,
+    left_controller, t=43.18s) loses badly to naive for every bias
+    candidate (~2.0-2.1m error vs naive's 0.74m) -- unanimous across all 7
+    candidates just like the wins, so not bias-related. Most likely the
+    SLERP-based orientation-interpolation model (designed for ~15-30ms
+    gaps, per its own docstring) or the single backward-finite-difference
+    v0 estimate breaking down over a full second, or genuinely complex real
+    motion during that specific occlusion. Worth a closer look if this
+    recording's occlusion-gap performance needs to be robust to >1s losses,
+    but does not change the overall 69% win-rate conclusion or the
+    bias-doesn't-matter conclusion.
