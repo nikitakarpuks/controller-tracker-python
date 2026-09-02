@@ -15,6 +15,7 @@ rerun-sdk==0.31.1
 
 tqdm==4.67.3
 loguru==0.7.3
+plotly==7.0.0  # visualize_mocap_offset.py's interactive HTML report
 
 pandas==3.0.3
 

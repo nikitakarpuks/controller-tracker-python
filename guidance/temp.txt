@@ -1101,3 +1101,187 @@ For the remaining 5 corrupted keys with no config.yml entry (blob_size_min, blob
   7. Definition of done — what's the bar for Phase 4: zero false-accepts on the repro sequence, or a specific inlier-rate/latency target?
 
   (3), (4), and (6) are the ones that actually change scope — worth answering those first.
+
+
+
+
+
+  Yes — state, process model, and both calibration files are ready. Here's the build order, going from most-trusted/lowest-risk pieces to the newest/riskiest one, with each step validated
+  in isolation before it gets combined with anything else. That last part matters: in a joint optimizer, one factor's bug can get silently absorbed by another, so nothing goes into the
+  combined solve until it's checked standalone.
+
+  One design point to nail down before step 1, since it affects everything downstream: controller mocap must stay out of the fusion's inputs entirely. Headset mocap is the trusted
+  world-frame anchor (per our decision), but controller mocap is the validation signal — if it ever leaked into the fusion as a measurement, "compare fused output to mocap" would become
+  circular. I'll keep that boundary explicit in the code, not just in my head.
+
+  Step 0 — World-frame conversion for the vision measurement
+
+  Build T_world_ctrl_vision(t) = T_world_headsetIMU_mocap(t) · T_headsetIMU_ctrl_vision(t), using headset mocap (composed through its T_imu_marker, same as relative_pose() already does)
+  and the PnP solves from pose_log_2765frames.csv. New code, but small.
+
+  Test: compare this against controller mocap (held out, used only here for validation) — it should reproduce the same ~3.4mm/1.41° (left) and ~4.9mm/1.44° (right) residual we already
+  established all session via relative_pose(). Not a new result — a regression check that the new frame-conversion code is bug-free, since it's mathematically the same composition through
+  a different path.
+
+  Step 1 — Gyro preintegration factor
+
+  Wrap the already-validated integrate_gyro_segment as a residual generator between consecutive vision-frame timestamps (not per-sample) — r_gyro(k) = Log(ΔR_gyro(t_k,t_{k+1})^-1 ·
+  (q_k^-1 q_{k+1})), plus the bias random-walk term.
+
+  Test: using Step 0's world-frame vision orientations as fixed reference nodes (no optimization yet), plot the distribution of r_gyro(k) across the recording, and a time-series overlay
+  of gyro-predicted vs. vision-measured Δorientation per gap. Same cross-correlation spirit as this session's axis-validation checks, just at frame cadence instead of raw-sample cadence.
+
+  Step 2 — Vision/PnP term with certainty weighting
+
+  Reproj-error weighting alone (we found this session) barely correlates with true accuracy — so this step should also check inlier count's correlation the same way, since that's the
+  other half of the "PnP certainty" idea and untested so far.
+
+  Test: plot weight vs. reproj_err_px and weight vs. inlier count separately, confirm the combined weighting is smooth (no degenerate/exploding weights), and check whether inlier count
+  actually predicts residual better than reprojection error did.
+
+  Step 3 — Accel term (the hard, novel piece — do this in isolation, not combined yet)
+
+  Two sub-stages, deliberately split:
+
+  1. Sign/convention sanity check first, before any lever-arm complexity: with lever arm assumed zero, does gravity-corrected accel roughly track vision-derived velocity change over short
+     windows? This isolates "did we get the basic physics/sign conventions right" from "did the lever-arm estimation converge," so a bug doesn't get misattributed.
+  2. Small standalone lever-arm/bias/gravity solve, with position/orientation states fixed at vision+gyro values from Steps 0-1 — just solve for r, b_a, g_world.
+
+  Test: does r converge to something with plausible ~85mm magnitude (a sanity check against the factory number's magnitude, not a source of truth for it — we know its direction is
+  unreliable, but the distance itself was independently corroborated). An unstable or wildly-off-magnitude result here means stop and debug before touching the full joint solve.
+
+  Step 4 — Full joint batch optimization
+
+  Combine all four residual families, solve over the whole trajectory.
+
+  Test/visualize: the real validation — compare the fused trajectory against controller mocap (still held out) and specifically against the existing pure-vision-vs-mocap baseline
+  (3.4-4.9mm/1.4°) to see if fusion actually improves on it. Concretely: (a) residual histogram, fused vs. pure-vision baseline, side by side; (b) a position-over-time overlay
+  (vision-only / fused / mocap) — I'd use Rerun for this rather than matplotlib, since it's this project's native tool for exactly this kind of 3D+time inspection and
+  recording.rrd/ControllerAnimatorRerun already exist; (c) zoom into a known occlusion/"TRACKING LOST" window specifically, since that's where fusion should visibly earn its keep versus a
+  gap in pure vision.
+
+  Step 5 — Convergence sanity
+
+  Batch NLS can land in local minima, especially with r/g_world as free unknowns. Rerun the Step 4 solve from a couple of different initializations and confirm they converge to the same
+  answer before trusting it.
+
+  Want me to start on Step 0?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+● Here's the full updated plan, walked through — I'll explain each piece in plain terms since there's a lot of new vocabulary in play.
+
+  ---
+
+  The big picture
+
+  Step 3 showed that predicting a controller's position from accelerometer data alone (double-integrating acceleration into velocity into position) loses to just assuming "it kept moving
+  at the same speed" — even over a single frame gap, with no lost tracking. The reason, confirmed independently by the CV1 developer you talked to: your accelerometer has a small unknown
+  offset error (bias) baked into every reading, and integrating that error twice compounds it badly. His system only gets useful accelerometer prediction after it estimates that bias
+  continuously, refining it every time vision gives a correction. You currently assume bias = 0 always. This plan builds the missing piece: solve for the bias instead of assuming it's
+  zero.
+
+  How the solve works, conceptually
+
+  This is going to be one big optimization problem, solved with scipy.optimize.least_squares (a nonlinear least-squares solver — same tool your project already uses elsewhere, in
+  src/_self_calibration.py and src/pose_search.py, so this isn't a new dependency or a new pattern for the codebase).
+
+  Think of it like this: you have a sequence of "checkpoints" in time — one per accepted vision frame (a "node" or "keyframe"). At each checkpoint you trust vision's answer for where the
+  controller is and how it's oriented (position p_k, orientation R_k) — those stay fixed, not solved for, in this first version. What you don't know at each checkpoint is:
+  - how fast it was moving (velocity v_k) — vision doesn't tell you this directly, only position
+  - what the accelerometer's bias was at that moment (b_a_k)
+  - what the gyroscope's bias was at that moment (b_g_k)
+
+  Those three unknowns, at every checkpoint, are what the solver is allowed to adjust. For a window of N checkpoints that's 9*N numbers to solve for (3 for velocity + 3 for accel bias + 3
+  for gyro bias, times N).
+
+  The residuals — the "rules" the solver has to satisfy
+
+  A residual is just "here's a quantity that should be zero if everything is consistent; the solver's job is to make all of them as close to zero as possible, together." Six kinds, all
+  between consecutive checkpoints k and k+1:
+
+  1. Gyro rotation check. Integrate the gyro (with its current bias guess subtracted off) between two checkpoints — does the resulting rotation match what vision measured? This one
+     already exists in your code (gyro_preint_residual) — it just wasn't being fed a free bias before, only a fixed zero.
+  2. Accel velocity check (new). Integrate the accelerometer (with its bias guess subtracted) between two checkpoints — does the resulting change in velocity match v_{k+1} - v_k?
+  3. Accel position check (new). Using the velocity at checkpoint k, double-integrate the accelerometer forward — does the predicted position change match what vision actually measured
+     between the two checkpoints? This is the residual that actually pins velocity down to something real, since velocity itself isn't directly observed.
+  4. Gyro bias shouldn't jump around. Bias should drift slowly, not swing wildly frame to frame — this is a "random walk" penalty: it costs the solver more to change bias by a lot between
+     consecutive checkpoints than by a little. Already built into gyro_preint_residual.
+  5. Accel bias shouldn't jump around either (new) — same idea, mirrored for accel.
+  6. Bias anchor (new — this is fix #1) — explained below.
+
+  Fix 1: the bias anchor (why it's needed)
+
+  Here's a subtlety that the reference code from Beyley (the sensor-fusion developer) exposed, that the plan was missing: residuals 4 and 5 only constrain bias to change slowly between
+  checkpoints — they say nothing about what the starting value should be. Imagine every single bias value in the whole window shifted up by the same constant amount: residuals 4 and 5
+  wouldn't notice at all, because they only look at differences between consecutive checkpoints, which stay the same. This is called a gauge freedom — a direction the solver can drift in
+  for free, with nothing pulling it back, which makes the solve numerically unstable or gives you an answer that's "correct up to an unknown offset," which is useless.
+
+  Beyley's code fixes this by pinning the very first checkpoint's bias toward a known reference value (their device's factory calibration). We're doing the same: residual 6 pins b_a and
+  b_g at the first checkpoint in the window toward zero — which is the right target here specifically because your accelerometer/gyro data already has the factory bias correction applied
+  upstream (in load_and_calibrate_controller_imu), so what this solve calls "bias" is really "how far off is the factory calibration," and zero is the honest prior guess for that.
+
+  Fix 2: better velocity seeding
+
+  Before the solver can improve anything, it needs a starting guess (x0) to start from. For bias, zero is a fine starting guess. For velocity, the original plan just used "position
+  difference between adjacent frames ÷ time" — reasonable, but Beyley's code does something a bit more careful that's worth copying:
+  - It searches outward for the nearest other checkpoint that has a usable measurement, rather than assuming the very next one always does (this matters more once frames can be
+    skipped/rejected — in this v1 every checkpoint is a good vision frame, so it reduces to the same thing, but writing it the general way now means it won't quietly break later).
+  - It clamps any seed velocity above 10 m/s (a controller basically never legitimately moves that fast) back down to zero, rather than trusting it. Reasoning, in his words: a
+    good-but-imperfect seed still steers the solver in roughly the right direction, but a wildly wrong seed can send the solver somewhere it never recovers from — so "zero" is a safer
+    fallback than "probably garbage."
+
+  What actually gets built
+
+  - src/imu_data.py: one new function, accel_preint_residual, that packages up residuals 2 and 3 the same way the existing gyro_preint_residual already packages up residual 1. It reuses
+    integrate_accel_segment/integrate_accel_to_position, which don't need to change.
+  - New file bias_estimation_check.py (repo root, matching how gyro_preint_check.py and the other Step-N scripts are laid out): loads the static_dark recording (chosen because — per
+  - It clamps any seed velocity above 10 m/s (a controller basically never legitimately moves that fast) back down to zero, rather than trusting it. Reasoning, in his words: a
+    good-but-imperfect seed still steers the solver in roughly the right direction, but a wildly wrong seed can send the solver somewhere it never recovers from — so "zero" is a safer
+    fallback than "probably garbage."
+
+  What actually gets built
+
+  - src/imu_data.py: one new function, accel_preint_residual, that packages up residuals 2 and 3 the same way the existing gyro_preint_residual already packages up residual 1. It reuses
+    integrate_accel_segment/integrate_accel_to_position, which don't need to change.
+  - New file bias_estimation_check.py (repo root, matching how gyro_preint_check.py and the other Step-N scripts are laid out): loads the static_dark recording (chosen because — per
+    Finding 7 — its vision orientation is trustworthy, unlike static_hard's), builds the residual function, runs the solve, and plots the recovered bias curves over time plus before/after
+    error numbers.
+  - Outputs land in visualization/step4/, matching the step1/, step3/ convention already in place.
+
+  How we'll know it worked
+
+  1. Run it on a small window first (a few hundred frames, not the whole 2765-frame recording — the full recording is ~25,000 unknowns, too big for a first pass). Sanity check: is the
+     recovered bias smooth over time, and roughly the size the factory calibration's own BiasUncertainty field suggests? (If it's jagged or huge, something's wrong — same trap Finding 2
+     fell into earlier.)
+  2. The real test: take Finding 4's original comparison (accel-predicted vs. naive constant-velocity, both vs. vision) and re-run it using the newly estimated bias instead of the old
+     fixed zero. Finding 4's baseline was accel losing 53-67% of the time — if this works, that number should improve.
+  3. Only if step 2 shows a real improvement, scale up to the full recording (using jac_sparsity to keep the solve tractable at that size) and re-check the occlusion-gap results from
+     Finding 5 too.
+
+  ---
+
+  Plan file is saved at /home/nikitakarpuks/.claude/plans/quizzical-doodling-duckling.md. Let me know when you want to start building it, or if any part of this still feels unclear and
+  you'd like more explanation before we touch code.
+
+
+
+The background validation run got killed (not something I did — likely the session or a limit stopped it) before finishing. It did get through setup and sparsity detection successfully:
+  80-node window, sparsity detection took 39s and found the expected sparse structure (0.44% density — matches the block-tridiagonal pattern, and the density dropping vs. the 30-node
+  run's 1.17% confirms the bandwidth-independent-of-window-size behavior I noted in memory). It just never got to report solve results before being killed.
+
+  Want me to relaunch it, or hold off for now?

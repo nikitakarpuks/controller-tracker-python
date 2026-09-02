@@ -32,9 +32,21 @@ def _apply_frame_range(paths: list, cfg) -> list:
     return paths[frame_range.get("lower"):frame_range.get("upper")]
 
 
+def camera_folder_index(cfg, cam_idx: int) -> int:
+    """Maps an internal camera index (0-based; what selected_cameras, calibration
+    lookups etc. use everywhere else in the pipeline) to the on-disk folder index.
+
+    Needed for recordings that pack SLAM cameras in cam0..cam{N-1} and
+    controller-tracking cameras in cam{N}..cam{2N-1} on disk: this pipeline only
+    ever tracks controllers, so it keeps 0-based internal indexing throughout and
+    shifts just the folder lookup via data.controller_cam_start_index (0 = no
+    offset, i.e. controller folders already start at cam0)."""
+    return cam_idx + cfg.get("controller_cam_start_index", 0)
+
+
 def _camera_dir(cfg, cam_idx) -> Path:
     root_dir = Path(cfg["root"])
-    folder = cfg.get("camera_folder_pattern", "cam{idx}").format(idx=cam_idx)
+    folder = cfg.get("camera_folder_pattern", "cam{idx}").format(idx=camera_folder_index(cfg, cam_idx))
     images_subdir = cfg.get("images_subdir", "")
     return root_dir / folder / images_subdir if images_subdir else root_dir / folder
 

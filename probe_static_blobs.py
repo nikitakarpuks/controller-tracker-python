@@ -77,7 +77,7 @@ from src.blob_detector import BlobDetector
 from src.camera import Camera
 from src.imu_data import load_T_imu_cam, load_vio_csv, interpolate_vio, load_and_calibrate_controller_imu
 from src.load_config import load_yaml_config, load_json_config
-from src.preprocess_data import get_data
+from src.preprocess_data import get_data, camera_folder_index
 
 # See DEROTATION MATH above for why this specific file, not
 # config["cameras"]["intrinsics_path"], is the source of R_imu_cam.
@@ -105,7 +105,7 @@ def _list_frame_timestamps(data_cfg: dict, cam_idx: int) -> list:
     recording already encodes as nanosecond timestamps. Only handles that
     one layout; config.yml's active recording uses it."""
     folder = (Path(data_cfg["root"])
-              / data_cfg.get("camera_folder_pattern", "cam{idx}").format(idx=cam_idx)
+              / data_cfg.get("camera_folder_pattern", "cam{idx}").format(idx=camera_folder_index(data_cfg, cam_idx))
               / data_cfg.get("images_subdir", ""))
     paths = sorted(folder.glob("*.png"))
     fr = data_cfg.get("frame_range") or {}
