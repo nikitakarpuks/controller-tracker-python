@@ -291,6 +291,12 @@ matching:
                                               # separate from joint_aux_prefilter_px (unrelated
                                               # joint-LM/snap_camera mechanism) so the two can be
                                               # tuned independently.
+  brute_redundancy_ref: 6   # same "extra inlier pairs beyond the 3-point minimal fit needed for
+                             # full redundancy trust" idea as proximity_redundancy_ref below, but
+                             # its own independent knob -- brute-force's committed solution's
+                             # confidence uses this against n_ransac_verified (pure RANSAC-survivor
+                             # count, pre post-RANSAC-recovery/pre-aux-pooling), not proximity's own
+                             # tuning value, so retuning one search mode never silently moves the other.
   rng_seed: 42
 
   # --------------------------------------------------------------------------

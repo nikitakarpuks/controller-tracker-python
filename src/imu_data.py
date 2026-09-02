@@ -355,6 +355,56 @@ def integrate_accel_to_position(t_accel: np.ndarray, accel_body: np.ndarray, ts0
     return dp
 
 
+def slice_imu_to_window(t: np.ndarray, data: np.ndarray, ts_lo: int, ts_hi: int, pad_ns: int = 200_000_000):
+    """(t_slice, data_slice) restricted to roughly [ts_lo-pad_ns, ts_hi+pad_ns], via
+    searchsorted (t is already sorted ascending -- true for load_and_calibrate_
+    controller_imu's output). Performance fix, not a math change: integrate_gyro_
+    segment/integrate_accel_segment/integrate_accel_to_position each mask/interpolate
+    over the WHOLE array passed in, independent of how short [ts0, ts1] actually is --
+    fine for a single call, but expensive when called many times per short window
+    (bias_estimation_check.py's solver Jacobian; PoseFusionFilter.predict, called every
+    frame against the full-recording-length live gyro/accel arrays once wired into
+    live tracking -- found in code review, see src/pose_fusion.py). pad_ns keeps
+    enough margin that every gap's mid-sample interpolation still has real samples on
+    both sides. Single shared copy -- was previously duplicated in
+    bias_estimation_check.py, which now imports this instead."""
+    lo = max(t[0], ts_lo - pad_ns)
+    hi = min(t[-1], ts_hi + pad_ns)
+    i0 = int(np.searchsorted(t, lo, side="left"))
+    i1 = int(np.searchsorted(t, hi, side="right"))
+    return t[i0:i1], data[i0:i1]
+
+
+def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
+                        ts0, ts1, R0, p0, v0):
+    """Single-endpoint BLIND dead-reckoning prediction at ts1, given a known state
+    (R0, p0, v0) at ts0 -- no peeking at any ground truth at ts1. Collapses
+    visualize_position_orientation.py's _dead_reckon_gap (validated against 13 real
+    tracking-loss gaps, see visualization/controller_calibration_for_basalt/README.md
+    finding 11) to just the final point, for callers (e.g. PoseFusionFilter.predict,
+    src/pose_fusion.py) that only need the endpoint, not a dense intermediate curve.
+    Bias fixed at 0 throughout (this session's own validated finding -- bias choice
+    doesn't measurably change real dead-reckoning outcomes on this hardware).
+
+    Callers with long-lived, full-recording-length t_gyro/t_accel arrays (anything
+    called repeatedly against a short [ts0, ts1] window, e.g. PoseFusionFilter.predict)
+    should pre-slice via slice_imu_to_window first -- this function itself does not,
+    since single-call use sites (offline scripts) don't need it and slicing has its
+    own (small) overhead.
+
+    Returns (R1 (3,3), p1 (3,)), or None if gyro/accel coverage doesn't span
+    [ts0, ts1] (see integrate_gyro_segment/integrate_accel_to_position)."""
+    R_gyro = integrate_gyro_segment(t_gyro, gyro_body, ts0, ts1)
+    if R_gyro is None:
+        return None
+    R1 = R0 @ R_gyro
+    dp = integrate_accel_to_position(t_accel, accel_body, ts0, ts1, R0, R1, v0, g_world,
+                                      t_gyro=t_gyro, gyro_body=gyro_body, r=lever_arm)
+    if dp is None:
+        return None
+    return R1, p0 + dp
+
+
 def accel_preint_residual(t_accel: np.ndarray, accel_body: np.ndarray, ts0, ts1: int,
                            R0: np.ndarray, R1: np.ndarray, p0: np.ndarray, p1: np.ndarray,
                            v0: np.ndarray, v1: np.ndarray, g_world: np.ndarray,
@@ -515,3 +565,46 @@ def load_and_calibrate_controller_imu(imu_path, controller_cfg: dict, lag_ns: in
     accel_body = (_DIAG_FLIP @ accel_corr.T).T
 
     return t_imu + lag_ns, gyro_body, accel_body
+
+
+# "Near-stationary" gate for a low-motion-frame gravity bootstrap -- shared canonical
+# constant (found duplicated as a re-typed magic number in 2 places in code review:
+# accel_short_horizon_check.py's own module-level copy, which now imports this instead,
+# and this same file's LiveGravityEstimator, below).
+LOW_OMEGA_THRESH_RAD_S = 0.5
+
+
+class LiveGravityEstimator:
+    """Online counterpart to accel_short_horizon_check.low_motion_bootstrap_g_world
+    (repo root) for LIVE operation, which has no pre-recorded pose log to run the
+    batch version against -- "world frame" here is a fixed-but-not-gravity-aligned
+    per-session camera-calibration extrinsic (Camera.T_world_cam), so g_world (gravity
+    expressed in it) is a genuine per-session unknown, exactly the same problem the
+    offline scripts solve with a full pose log. Same low-motion gate (|gyro| <=
+    omega_thresh) and formula (-mean(R_world_ctrl @ accel_sample)) as the batch
+    version, accumulated incrementally on every accepted commit instead of over a
+    whole pre-recorded recording -- chosen over a fixed startup calibration window
+    because it converges whenever the first ~20 low-motion frames occur, anywhere in
+    the session, rather than requiring the user to hold still at boot specifically."""
+
+    def __init__(self, omega_thresh: float = LOW_OMEGA_THRESH_RAD_S, min_samples: int = 20):
+        self._sum = np.zeros(3, dtype=np.float64)
+        self._n = 0
+        self._omega_thresh = omega_thresh
+        self._min_samples = min_samples
+
+    def observe(self, R_world_ctrl: np.ndarray, gyro_sample: np.ndarray, accel_sample: np.ndarray) -> None:
+        if np.linalg.norm(gyro_sample) > self._omega_thresh:
+            return
+        self._sum += R_world_ctrl @ accel_sample
+        self._n += 1
+
+    @property
+    def g_world(self):
+        if self._n < self._min_samples:
+            return None
+        return -self._sum / self._n
+
+    @property
+    def n_samples(self) -> int:
+        return self._n

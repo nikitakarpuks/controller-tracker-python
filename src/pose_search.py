@@ -590,6 +590,9 @@ class PoseSearcher:
         self._c_brute_min_vis_cov   = float(_cfg.get('min_vis_coverage',                 0.75))
         self._c_brute_rng_seed      = _cfg.get('rng_seed',                              42)
         self._c_brute_aux_reproj_px = float(_cfg.get('brute_aux_reprojection_threshold_px', 2.0))
+        # Own knob (not proximity's proximity_redundancy_ref) -- see the confidence-formula
+        # comment in brute_search_tier for why brute needs an independent reference scale.
+        self._c_brute_redundancy_ref = float(_cfg.get('brute_redundancy_ref',              6.0))
 
         positions = model.positions.astype("float32")
         normals   = model.normals.astype("float32")
@@ -2257,6 +2260,15 @@ class PoseSearcher:
                             t_vis_recheck += time.perf_counter() - _t0
                             if len(inlier_blobs) < min_inliers_eff:
                                 continue
+                            # Pure RANSAC-survivor count, captured before post-RANSAC blob
+                            # recovery (6.5) and aux-camera pooling (6.7) below both add
+                            # weaker, non-RANSAC-verified evidence into inlier_blobs/
+                            # n_inlier_total -- this is brute-force's analog to proximity_
+                            # search/constrained_search's len(final_pairs), used below for
+                            # the confidence formula's redundancy term (found in code review:
+                            # n_inlier_total pools in threshold-only-matched evidence, which
+                            # would otherwise overstate how well-constrained the fit is).
+                            n_ransac_verified = len(inlier_blobs)
 
                             vis_ids_r = np.where(vis_mask_r)[0]
 
@@ -2457,6 +2469,46 @@ class PoseSearcher:
                                            f"is_better={is_better}")
 
                             if is_better:
+                                # confidence: matches proximity_search/constrained_search's own
+                                # err_factor * redundancy_factor convention (see those methods),
+                                # substituting balanced_coverage (this search mode's own
+                                # LED-visible-vs-detected quality signal, computed just above) for
+                                # their ransac_inlier_ratio term -- brute-force has no equivalent
+                                # RANSAC-survival-ratio concept, but balanced_coverage plays the
+                                # same "how much do we trust the raw correspondence set" role, and
+                                # is arguably more informative here. Previously this dict had no
+                                # confidence field at all, so fuse_camera_poses/_compute_fused_
+                                # solution's `.get("confidence", 1.0)` silently treated every
+                                # brute-recovered frame as maximally trustworthy -- found in
+                                # exploration for the pose-fusion filter work, since its
+                                # measurement-noise weighting needs this to distinguish a fresh
+                                # cold recovery from a well-corroborated warm track.
+                                #
+                                # err_factor/redundancy_factor deliberately use brute-specific
+                                # constants (_c_brute_strong_err, _c_brute_redundancy_ref), not
+                                # proximity's own _c_prox_* knobs -- brute-force P3P reprojection
+                                # error sits in a structurally different (larger) range than warm
+                                # proximity tracking error, and coupling brute's confidence scale to
+                                # proximity's own tuning knob would silently move both together
+                                # (found in code review). redundancy uses n_ransac_verified (pure
+                                # RANSAC survivors, pre-recovery/pre-aux-pooling), not n_inlier_total,
+                                # for the same reason final_pairs is RANSAC-only in the other tiers --
+                                # threshold-only-matched recovered/aux blobs are real corroborating
+                                # evidence (still pooled into is_better's own ranking above) but
+                                # shouldn't count as full redundancy the way a verified inlier does.
+                                #
+                                # balanced_coverage is rescaled off its own accept gate
+                                # (_c_brute_min_vis_cov) rather than used raw: every solution
+                                # reaching this point already cleared that gate, so its raw range is
+                                # compressed to [gate, 1.0] and would barely vary; this restores full
+                                # [0, 1] dynamic range for the confidence signal specifically, without
+                                # changing the accept/reject gate itself (also found in code review).
+                                _coverage_term = min(1.0, max(0.0, balanced_coverage - self._c_brute_min_vis_cov)
+                                                     / max(1.0 - self._c_brute_min_vis_cov, 1e-6))
+                                _err_factor        = min(1.0, self._c_brute_strong_err / max(err, 1e-6))
+                                _redundancy_factor = min(1.0, max(0.0, n_ransac_verified - 3)
+                                                          / max(self._c_brute_redundancy_ref, 1e-6))
+                                _confidence = _coverage_term * _err_factor * _redundancy_factor
                                 state.best_solution = {
                                     "rvec":             rvec_r,
                                     "tvec":             tvec_r,
@@ -2467,6 +2519,10 @@ class PoseSearcher:
                                     "error":            err,
                                     "assignment":       list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
                                     "method":           "p3p_systematic",
+                                    "confidence":       _confidence,
+                                    "led_cov":          led_cov,
+                                    "blob_cov":         blob_cov,
+                                    "balanced_coverage": balanced_coverage,
                                 }
                                 state.best_inliers       = n_inlier_blobs
                                 state.best_inliers_total = n_inlier_total
