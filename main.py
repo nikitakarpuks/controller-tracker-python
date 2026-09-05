@@ -1,4 +1,5 @@
 import csv
+import sys
 from pathlib import Path
 from shutil import copy
 from time import time
@@ -34,7 +35,8 @@ def main():
     # causes rrb.EyeControls3D() to crash with 0xC0000005 ACCESS_VIOLATION.
     rr.init("controller_animator", spawn=False)
 
-    config = load_yaml_config('./config/config.yml')
+    config_path = sys.argv[1] if len(sys.argv) > 1 else './config/config.yml'
+    config = load_yaml_config(config_path)
 
     data_root = Path(config["data"]["root"])
 
@@ -1061,6 +1063,12 @@ def main():
         fusion_debug_frame          = {}
         fusion_imu_path_frame       = {}
         fusion_forced_cold_start_frame = {}
+        # {ctrl_name: bool} -- True iff THIS frame's T_world_ctrl_frame entry (when
+        # present) is the fusion filter's own IMU-only prediction rather than a
+        # real accepted vision update this frame (full occlusion, or a fusion-
+        # rejected candidate -- see the two population sites below). Feeds the
+        # cross-controller collision check right after this loop.
+        pose_is_imu_only_frame: dict = {}
 
         for ctrl_name in enabled_ctrls:
             sol = results.get(ctrl_name)
@@ -1085,6 +1093,7 @@ def main():
                 _forced_cold_start_this_frame = bool(sol.get("fusion_forced_cold_start"))
                 if not _forced_cold_start_this_frame:
                     T_world_ctrl_frame[ctrl_name]        = T_world_ctrl
+                    pose_is_imu_only_frame[ctrl_name]    = not sol.get("fusion_accepted", True)
                 # Always populated (cheap -- same Transform object, no copy), not just
                 # under _pose_fusion_debug: the rerun 3D view's own LED-projection/
                 # error overlay needs vision's own pose too (see _log_frame), any time
@@ -1241,6 +1250,7 @@ def main():
                 _imu_T = tracking_system.ctrl_trackers[ctrl_name].imu_only_predicted_pose(frame_ts_ns)
                 if _imu_T is not None:
                     T_world_ctrl_frame[ctrl_name] = _imu_T
+                    pose_is_imu_only_frame[ctrl_name] = True
                 frozen_T_world_ctrl_frame[ctrl_name] = None
                 logger.bind(cat="frame_summary").info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  TRACKING LOST")
                 # No sol at all this frame -- _commit_fused_solution never ran, so it
@@ -1255,6 +1265,47 @@ def main():
                         fusion_debug_frame[ctrl_name] = _dbg
                     if _path is not None:
                         fusion_imu_path_frame[ctrl_name] = _path
+
+        # ── Cross-controller collision check ────────────────────────────────────
+        # Two controllers are separate rigid bodies and cannot physically share a
+        # tracked origin. A controller with NO real vision this frame (full
+        # occlusion, or a fusion-rejected candidate -- pose_is_imu_only_frame
+        # covers both) is just coasting on the fusion filter's own dead-reckoned
+        # belief; if that belief has drifted onto a DIFFERENT controller's actual
+        # vision-confirmed position this frame, showing both is exactly the
+        # interpenetrating-rigid-bodies display the user flagged. Only fires when
+        # exactly one side is vision-backed this frame -- two simultaneously-
+        # coasting controllers overlapping isn't resolved here (neither side is
+        # more trustworthy than the other, see config.yml's own comment on this
+        # key). The disproven IMU-only side is hidden this frame (same as
+        # tracking-lost) and force-reset so it doesn't just coast right back into
+        # the same collision next frame.
+        _collision_dist_m = float(config.get("fusion", {}).get("imu_vision_collision_dist_m", 0.05))
+        _ctrl_list = list(T_world_ctrl_frame.keys())
+        for _i, _name_a in enumerate(_ctrl_list):
+            for _name_b in _ctrl_list[_i + 1:]:
+                if _name_a not in T_world_ctrl_frame or _name_b not in T_world_ctrl_frame:
+                    continue  # one of the pair was already dropped by an earlier pair this frame
+                _a_imu = pose_is_imu_only_frame.get(_name_a, False)
+                _b_imu = pose_is_imu_only_frame.get(_name_b, False)
+                if _a_imu == _b_imu:
+                    continue  # both vision-backed (fine) or both coasting (no trustworthy side)
+                _imu_name, _vision_name = (_name_a, _name_b) if _a_imu else (_name_b, _name_a)
+                _dist_m = float(np.linalg.norm(
+                    T_world_ctrl_frame[_imu_name].t - T_world_ctrl_frame[_vision_name].t))
+                if _dist_m < _collision_dist_m:
+                    logger.bind(cat="matching_decisions").info(
+                        f"[{img_path.name}] COLLISION: [{_imu_name}]'s IMU-only prediction "
+                        f"({_dist_m * 1000:.1f}mm from [{_vision_name}]'s vision-confirmed pose, "
+                        f"threshold={_collision_dist_m * 1000:.0f}mm) -- dropping [{_imu_name}] this frame"
+                    )
+                    T_world_ctrl_frame.pop(_imu_name, None)
+                    frozen_T_world_ctrl_frame[_imu_name] = None
+                    vision_T_world_ctrl_frame.pop(_imu_name, None)
+                    tracking_system.ctrl_trackers[_imu_name].force_cold_start(
+                        reason=f"collided with [{_vision_name}]'s vision-confirmed pose "
+                               f"({_dist_m * 1000:.1f}mm apart)"
+                    )
 
         if animator is not None:
             _t_rerun0 = time()

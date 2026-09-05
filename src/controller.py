@@ -1017,6 +1017,30 @@ class ControllerTracker:
         actually budgeted for."""
         return self._last_imu_only_pose
 
+    def force_cold_start(self, reason: str = "") -> None:
+        """Immediately clear this controller's fusion-filter state and every
+        camera's warm-start prior -- the same reset shape as
+        should_force_cold_start's own escape hatch (_commit_fused_solution)
+        or a grace-exhausted vision loss (_mark_all_lost), but for a caller
+        that has independently decided this controller's CURRENT belief is
+        provably wrong and must not be reported or warm-started from again.
+
+        Used by main.py's cross-controller collision check: an IMU-only
+        prediction (no real vision this frame) that lands on top of a
+        DIFFERENT controller's actual vision-confirmed position this frame is
+        proof that prediction is wrong (two rigid controllers cannot share a
+        tracked origin) -- resetting here means the very next frame starts a
+        genuine cold re-detect instead of continuing to coast from (and
+        potentially re-warm-start off) the disproven position."""
+        if self._fusion_filter is not None:
+            self._fusion_filter.reset()
+        for _tracker in self.trackers.values():
+            _tracker.clear_prior()
+        self._imu_only_propagated_frames = 0
+        self._last_imu_only_pose = None
+        if reason:
+            logger.bind(cat="matching_decisions").info(f"[{self.ctrl_name}] FORCE COLD-START: {reason}")
+
     def debug_fusion_state(self, frame_ts_ns: int):
         """Pose-fusion debug snapshot + dense IMU path for a frame where this
         controller had NO vision solution at all (cam_solutions empty this
@@ -1614,10 +1638,19 @@ class ControllerTracker:
         # own docstring (__init__) for why that's the right trigger and what
         # it's used for.
         self._ever_tracked = True
-        # Vision found something again -- this loss streak (if any) is over;
-        # the next one gets its own fresh IMU-only-propagation budget.
-        self._imu_only_propagated_frames = 0
-        self._last_imu_only_pose = None
+        # NOTE: the IMU-only-coast budget (_imu_only_propagated_frames/
+        # _last_imu_only_pose) is deliberately NOT reset here -- see the
+        # `if accepted:` block below, where it's reset only once the fusion
+        # filter actually accepts this frame's candidate as plausible. It used
+        # to reset unconditionally right here, keyed off "some camera found a
+        # geometric fit" rather than "the filter trusts what it found" -- for
+        # HeuristicPoseFusionFilter in particular (no hard gating -- see its
+        # own module docstring) a wildly implausible candidate (identity swap,
+        # degenerate low-point fit) still reaches this method every time vision
+        # hallucinates one, silently re-arming a fresh 4-frame coasting budget
+        # each time and preventing a genuinely lost controller from ever being
+        # declared cold again (found investigating a report of a controller
+        # "freezing" in place well past when tracking should have gone lost).
 
         primary_cam_id     = solution["primary_cam"]
         anchor_assignment  = solution["assignment"]
@@ -1737,6 +1770,14 @@ class ControllerTracker:
         # solution (e.g. only anchor on vision when confidence is high, not
         # unconditionally on every accept) before revisiting.
         self._propagate_pose_history(T_world_ctrl, frame_ts_ns)
+        if accepted:
+            # Vision produced a candidate the filter actually trusts -- this loss
+            # streak (if any) is genuinely over; the next one gets its own fresh
+            # IMU-only-propagation budget. See this method's own docstring above
+            # for why this must be gated on `accepted`, not merely "reaching this
+            # method" (an implausible/rejected candidate must NOT re-arm this).
+            self._imu_only_propagated_frames = 0
+            self._last_imu_only_pose = None
         for _cid, _tracker in self.trackers.items():
             # Assignment/failure bookkeeping reflects trust in the vision candidate
             # itself, not just "we have a pose to report" (that's the propagation
@@ -2898,6 +2939,23 @@ class TrackingSystem:
                 )
 
         if not states:
+            # No camera of any controller here even cleared the confirm-frames gate
+            # (or had any blobs at all) -- nothing to run brute-force against, but
+            # every controller still needs its own _mark_all_lost bookkeeping this
+            # frame (consecutive_failures, prev_pose/pose_history grace-expiry, and
+            # crucially should_force_cold_start's elapsed-time/consecutive-rejects
+            # check on the fusion filter). The early return below used to skip this
+            # entirely, silently freezing should_force_cold_start's clock: a
+            # controller that ran dry on blobs for a stretch (a real occlusion, or
+            # this recording's "static_dark" low light) never got its fusion filter
+            # reset, so it kept coasting on a contaminated pre-loss prediction
+            # indefinitely instead of ever being re-declared cold (found
+            # investigating a report of a controller "freezing" in place well past
+            # when tracking should have gone lost -- the OTHER call sites of
+            # _mark_all_lost below this one, for a controller that DOES clear the
+            # gate but then fails to solve, were never affected).
+            for ctrl_name in ctrl_names:
+                self.ctrl_trackers[ctrl_name]._mark_all_lost(frame_ts_ns)
             return {c: None for c in ctrl_names}
 
         _any_ps = next(

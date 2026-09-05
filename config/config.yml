@@ -28,10 +28,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 2700  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: null  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 2800  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: null  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -63,8 +63,8 @@ fusion_heuristic:
   # error_px below, this recording's own n_inliers distribution is
   # essentially the same for both (frames 0-1000, data/vision_pose_log.csv:
   # left p50=15/p90=19, right p50=15/p90=19).
-  vision_weight_weak_inliers: 6       # just above matching.min_inliers (4) -- a solve that barely
-  vision_weight_strong_inliers: 12    # cleared pose_search's own floor still gets SOME credit rather
+  vision_weight_weak_inliers: 5       # just above matching.min_inliers (4) -- a solve that barely
+  vision_weight_strong_inliers: 8    # cleared pose_search's own floor still gets SOME credit rather
                                       # than none. strong=18 sits at both controllers' own ~p75-p90.
 
   # error_px axis: this frame's own mean reprojection error (solution["error"],
@@ -96,6 +96,23 @@ fusion_heuristic:
   # FUSED debug lines); 60deg similarly well above normal rotation innovation.
   implausible_jump_pos_m: 0.3
   implausible_jump_rot_deg: 60.0
+
+  # Long-gap damping (see HeuristicPoseFusionFilter._gap_scale_factors) -- scales
+  # w_vision down and w_smooth up as the elapsed gap since the last accepted
+  # update (dt_s) grows, on top of the inlier/error ramps above. Added after a
+  # real jump on this recording: a frame landing right after two rejected
+  # frames (dt=66.6ms) had a weak match (n_inliers=6) but a deceptively clean
+  # error=0.05px, earning vision_share=0.40 (tied with IMU) and producing a
+  # ~115mm single-step jump vs. the ~3-7mm/frame typical of stable tracking --
+  # the inlier/error ramps alone have no notion of how long the IMU side has
+  # been dead-reckoning unconstrained. Below gap_dt_normal_s this is a no-op
+  # (both scales are 1.0); linearly ramps to the floor/boost values below by
+  # gap_dt_full_s. First-cut defaults, not yet validated against a wider
+  # sample of this recording's own gap distribution.
+  gap_dt_normal_s: 0.04         # same cadence cutoff as PoseFusionFilter's _WARM_FRAME_DT_CUTOFF_S
+  gap_dt_full_s: 0.15           # full damping applies at/above this elapsed gap
+  gap_vision_weight_floor: 0.3  # w_vision multiplier at/beyond gap_dt_full_s (1.0 = no damping)
+  gap_smooth_weight_boost: 2.5  # w_smooth multiplier at/beyond gap_dt_full_s (1.0 = no boost)
 
   # Per-controller overrides -- see HeuristicPoseFusionFilter._hc_get.
   # Any key from fusion_heuristic: above can be overridden here per
@@ -134,6 +151,23 @@ fusion:
                   # types; everything else in fusion: below is kalman-only.
   max_coast_s: 0.3                    # force cold-start once this long has elapsed with no accepted update
   max_consecutive_rejects: 5          # force cold-start after this many implausible-in-a-row rejections
+  imu_vision_collision_dist_m: 0.05   # cross-controller check, read by main.py directly (not either filter
+                                       # class) -- two controllers are separate rigid bodies and cannot
+                                       # physically share a tracked origin. If a controller with NO real vision
+                                       # this frame (full occlusion, or a fusion-rejected candidate -- either
+                                       # way its displayed pose is the filter's own IMU-only prediction) ends
+                                       # up within this distance of a DIFFERENT controller that DOES have a
+                                       # real accepted vision update this frame, the IMU-only one is dropped
+                                       # (hidden, same as tracking-lost) and its fusion filter/camera priors
+                                       # are force-reset, rather than showing two interpenetrating controller
+                                       # meshes. Only fires when exactly one side is vision-backed -- two
+                                       # simultaneously-coasting controllers overlapping isn't resolved here
+                                       # (neither side is more trustworthy). 0.05m is well under any real
+                                       # controller-to-controller separation seen in this recording's own
+                                       # motion, comfortably above the ~1-3cm seen in this project's own
+                                       # documented identity-swap cases (see fusion_heuristic's implausible_
+                                       # jump_pos_m comment) -- tune per-recording if controllers legitimately
+                                       # come this close together (e.g. a two-handed grip).
   process_noise_pos_m_per_s: 0.6      # error-covariance growth rate, position -- sized to this recording's
                                        # real p90 frame-to-frame speed (data/vision_pose_log.csv: right
                                        # p50=0.34 p90=0.56 p99=0.83 m/s, left p50=0.30 p90=0.48 p99=0.58 m/s).
