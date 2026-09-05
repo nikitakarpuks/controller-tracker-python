@@ -8,6 +8,7 @@ import cv2
 import rerun as rr
 import rerun.blueprint as rrb
 from loguru import logger
+from scipy.spatial.transform import Rotation
 
 from src.transformations import Transform
 from src._visibility import _visible_mask, _cross_occluded_mask
@@ -433,16 +434,21 @@ class ControllerAnimatorRerun:
     def __init__(self, mesh_path: str,
                  controllers_vis: dict,
                  vis_cfg: dict = None,
-                 matching_cfg: dict = None):
+                 matching_cfg: dict = None,
+                 pose_fusion_debug_enabled: bool = False):
         """
         controllers_vis: {ctrl_name: {"positions": np.ndarray,   # model-frame LED positions
                                       "normals":   np.ndarray,   # model-frame LED normals
                                       "T_model_ctrl": Transform, # controller→model transform
                                       "side": "right"|"left"}}   # informational only
+        pose_fusion_debug_enabled: adds a "Pose Fusion" tab (see _build_blueprint)
+                                    and enables _log_frame's corresponding logging —
+                                    config/config.yml visualization.pose_fusion_debug.enabled.
         """
         self.vis_cfg         = vis_cfg if vis_cfg is not None else dict(VIS_CONFIG)
         self._matching_cfg   = matching_cfg or {}
         self._controllers_vis = controllers_vis
+        self._pose_fusion_debug_enabled = pose_fusion_debug_enabled
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
         raw_mesh = load_trimesh(mesh_path)
@@ -527,6 +533,64 @@ class ControllerAnimatorRerun:
             row_shares=[10, 1],
         ))
 
+        # ── Pose Fusion tabs (visualization.pose_fusion_debug.enabled) ──────
+        # Deliberately few, curated tabs, not one row per logged scalar (the
+        # first cut -- 15 metrics x 2 controllers in one grid, then even 8
+        # separate tabs -- was still too much; trimmed down after the user
+        # actually looked at it). Position/orientation stay their own tabs
+        # (the actual output signal); every filter-internal worth tuning
+        # against (gate, trust, uncertainty, gain) is ONE "Filter Internals"
+        # tab -- labeled generically, NOT "Kalman", because fusion.filter_type
+        # selects between PoseFusionFilter (kalman, real gate/uncertainty) and
+        # HeuristicPoseFusionFilter (no gate/uncertainty -- those two rows read
+        # empty; "gain" is repurposed to show its vision-blend weight share
+        # instead, see HeuristicPoseFusionFilter.try_update's debug field
+        # reuse) -- both write the SAME debug_snapshot() field names so this
+        # tab needs no per-filter-type branching, just an honest title.
+        # Raw innovation is dropped from the curated view (d² already IS a
+        # normalized function of it -- redundant for a tuning pass) but stays
+        # logged (see _log_pose_fusion_debug) for anyone who wants to drag it
+        # into a view by hand. Status (is it stuck / what just happened)
+        # stays separate -- a different kind of question from "how do I
+        # retune this." Within a tab, one TimeSeriesView per (row,
+        # controller); a view's origin pulls in every scalar logged under it
+        # as one chart, e.g. pose_fusion/{ctrl}/pos/x/{vision,fused,imu} all
+        # land on one chart -- same grouping convention visualize_imu.py's
+        # build_blueprint uses.
+        if self._pose_fusion_debug_enabled:
+            _pf_groups = [
+                ("Fusion · Position",    [("Position X (m)", "pos/x"), ("Position Y (m)", "pos/y"),
+                                           ("Position Z (m)", "pos/z")]),
+                ("Fusion · Orientation", [("Roll (deg)", "rot/roll"), ("Pitch (deg)", "rot/pitch"),
+                                           ("Yaw (deg)", "rot/yaw")]),
+                ("Fusion · Filter Internals", [
+                    ("Mahalanobis d² vs threshold (kalman only -- empty for heuristic)", "gate"),
+                    ("Confidence / Comfort / Trust score / Trust", "quality"),
+                    ("Position σ (m) (kalman only -- empty for heuristic)", "uncertainty/pos_sigma_m"),
+                    ("Rotation σ (deg) (kalman only -- empty for heuristic)", "uncertainty/rot_sigma_deg"),
+                    ("Blend weight: kalman gain OR heuristic vision-share (pos / rot)", "kalman_gain"),
+                ]),
+                ("Fusion · Status",      [("Consecutive rejects", "consecutive_rejects"),
+                                           ("Accepted (1) / forced cold-start (spike)", "flags")]),
+            ]
+            for group_name, rows in _pf_groups:
+                pf_views: list = []
+                for title, sub in rows:
+                    for cl, ctrl_name in zip(ctrl_labels, self._controllers_vis):
+                        pf_views.append(rrb.TimeSeriesView(
+                            name=f"{title} / {cl}",
+                            origin=f"pose_fusion/{ctrl_name}/{sub}",
+                        ))
+                grid = rrb.Grid(*pf_views, grid_columns=len(ctrl_labels))
+                if group_name == "Fusion · Status":
+                    # Outcome/event log lives with the accept/reject flags it explains.
+                    views.append(rrb.Vertical(
+                        grid, rrb.TextLogView(name="Fusion outcome", origin="pose_fusion_log"),
+                        name=group_name, row_shares=[10, 1],
+                    ))
+                else:
+                    views.append(rrb.Vertical(grid, name=group_name))
+
         return rrb.Blueprint(
             rrb.Tabs(*views),
             collapse_panels=False,
@@ -584,6 +648,9 @@ class ControllerAnimatorRerun:
 
         self._log_static_cameras(cameras)
 
+        if self._pose_fusion_debug_enabled:
+            self._log_pose_fusion_series_style()
+
         # Static mesh per controller.
         if self.vis_cfg.get("show_mesh", True):
             for ctrl_name in self._controllers_vis:
@@ -640,7 +707,11 @@ class ControllerAnimatorRerun:
                   camera_importance_per_ctrl: dict = None,
                   frozen_T_world_ctrl_per_ctrl: dict = None,
                   blob_vis_frame: dict = None,
-                  blob_vis_skipped: dict = None) -> None:
+                  blob_vis_skipped: dict = None,
+                  vision_T_world_ctrl_per_ctrl: dict = None,
+                  fusion_debug_per_ctrl: dict = None,
+                  fusion_imu_path_per_ctrl: dict = None,
+                  fusion_forced_cold_start_per_ctrl: dict = None) -> None:
         """
         Log a single frame to rerun. Call once per tracked frame, in
         increasing idx order, right after that frame's tracking result is
@@ -663,11 +734,29 @@ class ControllerAnimatorRerun:
                                             whatever was last logged, which can
                                             otherwise silently freeze for hundreds of
                                             frames and look like a stuck cold scan.
+            vision_T_world_ctrl_per_ctrl:   {ctrl_name: pose}, the RAW vision solve
+                                            before any fusion correction — only
+                                            meaningful (non-empty) when
+                                            visualization.pose_fusion_debug.enabled.
+            fusion_debug_per_ctrl:         {ctrl_name: PoseFusionFilter.debug_snapshot()
+                                            dict} for this frame, see src/pose_fusion.py.
+            fusion_imu_path_per_ctrl:       {ctrl_name: (ts, positions, rotations)} dense
+                                            dead-reckoned curve since the filter's last
+                                            accepted update, see PoseFusionFilter.predict_dense.
+            fusion_forced_cold_start_per_ctrl: {ctrl_name: True} present only on a frame
+                                            where the persistent-reject escape hatch fired.
         """
         rr.set_time("frame", sequence=idx)
 
         if blob_vis_frame or blob_vis_skipped:
             self._log_blob_debug(blob_vis_frame or {}, blob_vis_skipped or {})
+
+        if self._pose_fusion_debug_enabled and (fusion_debug_per_ctrl or vision_T_world_ctrl_per_ctrl):
+            self._log_pose_fusion_debug(
+                vision_T_world_ctrl_per_ctrl or {}, T_world_ctrl_per_ctrl,
+                fusion_debug_per_ctrl or {}, fusion_imu_path_per_ctrl or {},
+                fusion_forced_cold_start_per_ctrl or {},
+            )
 
         # Build ghost world-frame transforms for case-3 lost frames.
         ghost_T_world_model_per_ctrl: dict = {}
@@ -699,7 +788,8 @@ class ControllerAnimatorRerun:
                         primary_cam_per_ctrl=primary_cams_frame,
                         aux_assignments_per_ctrl=aux_assignments_frame,
                         camera_importance_per_ctrl=camera_importance_frame,
-                        ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl)
+                        ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl,
+                        vision_T_world_ctrl_per_ctrl=vision_T_world_ctrl_per_ctrl)
 
         self._frame_count += 1
 
@@ -922,6 +1012,176 @@ class ControllerAnimatorRerun:
                 rr.log(f"{ctrl_path}/blob_ids", rr.Clear(recursive=False))
 
     # ------------------------------------------------------------------
+    # Pose-fusion debug tool (visualization.pose_fusion_debug.enabled) —
+    # vision-vs-fused-vs-IMU-predicted position/orientation, dense IMU-
+    # predicted trajectory, and PoseFusionFilter's internal Kalman/trust
+    # state, so the algorithm's weights/gates can be tuned by eye.
+    # ------------------------------------------------------------------
+
+    # vision/fused/imu series styling -- deliberately distinct hues (found by
+    # the user: rerun's auto-assigned per-entity colors were too close to tell
+    # apart) and shapes. vision and fused are both POINTS, not lines -- each is
+    # a discrete per-frame value (a measurement, a corrected estimate), and a
+    # connected line between them implies a continuous process that isn't
+    # there; imu is the one genuinely continuous quantity here (dead-reckoned
+    # integration) and stays a line. No separate "reset marker" entity --
+    # imu's OWN value at a real correction (gated_accept) IS fused, exactly
+    # (see _log_pose_fusion_debug), so fused's own point already marks that
+    # instant; a second entity duplicating the same number was redundant
+    # (found by the user).
+    # vision was previously one shared gold/yellow for both controllers -- the
+    # user couldn't tell left/right apart in either the pose_fusion charts or
+    # the 3D world vision_pose marker. Now per-controller: lime for
+    # left_controller, red for right_controller (CSS lime/red; falls back to
+    # the old gold for any other controller name, e.g. a future third one).
+    _PF_COLOR_VISION_LEFT  = [0, 255, 0]    # lime -- left_controller's vision pose
+    _PF_COLOR_VISION_RIGHT = [255, 0, 0]    # red -- right_controller's vision pose
+    _PF_COLOR_VISION       = [255, 196, 0]  # gold -- fallback for any other controller name
+    _PF_COLOR_FUSED     = [42, 120, 214]   # blue -- matches this project's left_controller/accent hue
+    _PF_COLOR_IMU       = [124, 92, 214]   # violet -- matches world/{ctrl}/imu_predicted_path below
+    _PF_POS_ROT_SUBPATHS = ("pos/x", "pos/y", "pos/z", "rot/roll", "rot/pitch", "rot/yaw")
+
+    def _pf_color_vision(self, ctrl_name: str) -> list:
+        if ctrl_name == "left_controller":
+            return self._PF_COLOR_VISION_LEFT
+        if ctrl_name == "right_controller":
+            return self._PF_COLOR_VISION_RIGHT
+        return self._PF_COLOR_VISION
+
+    def _log_pose_fusion_series_style(self) -> None:
+        """Static (one-time) series styling for every vision/fused/imu trio
+        -- must be logged before/independent of any per-frame data so the
+        style applies from the first real point, not just once rerun happens
+        to see all three labels. Called once from begin()."""
+        for ctrl_name in self._controllers_vis:
+            base = f"pose_fusion/{ctrl_name}"
+            for sub in self._PF_POS_ROT_SUBPATHS:
+                rr.log(f"{base}/{sub}/vision", rr.SeriesPoints(
+                    colors=[self._pf_color_vision(ctrl_name)], names=["vision"], markers=["circle"]), static=True)
+                rr.log(f"{base}/{sub}/fused", rr.SeriesPoints(
+                    colors=[self._PF_COLOR_FUSED], names=["fused"], markers=["circle"]), static=True)
+                rr.log(f"{base}/{sub}/imu", rr.SeriesLines(
+                    colors=[self._PF_COLOR_IMU], names=["imu"], widths=[2.0]), static=True)
+
+    @staticmethod
+    def _log_scalar(path: str, value) -> None:
+        """No-op for None (a field a given try_update() branch doesn't
+        produce, e.g. Kalman gain on a reject) -- logging nothing for this
+        frame leaves a real gap in the chart rather than a misleading 0."""
+        if value is not None:
+            rr.log(path, rr.Scalars(float(value)))
+
+    def _log_pose_fusion_debug(self, vision_T_world_ctrl_per_ctrl: dict,
+                                fused_T_world_ctrl_per_ctrl: dict,
+                                fusion_debug_per_ctrl: dict,
+                                fusion_imu_path_per_ctrl: dict,
+                                fusion_forced_cold_start_per_ctrl: dict) -> None:
+        for ctrl_name in self._controllers_vis:
+            base = f"pose_fusion/{ctrl_name}"
+            imu_path = fusion_imu_path_per_ctrl.get(ctrl_name)  # dense curve for the 3D view below
+
+            # ── Position/orientation: vision vs. fused vs. IMU-only-predicted ──
+            # Spec (from the user): let t_k be a real correction (gated_accept).
+            # Across (t_k-1, t_k) there is no correction -- imu free-runs,
+            # drifting on its own. AT t_k, imu itself resets and starts the
+            # next arc from fused -- not "close to fused," exactly fused, so
+            # there's no ambiguity about where the new arc begins (an earlier
+            # version used the PRE-correction prediction here instead, which
+            # never actually equals fused -- found by the user: that read as
+            # imu continuing its old trajectory rather than restarting).
+            # imu_path's own endpoint -- freshest, refreshed every frame this
+            # method runs, whether from _commit_fused_solution (vision
+            # present) or ControllerTracker.debug_fusion_state (a real full-
+            # occlusion gap, no vision at all) -- covers every frame EXCEPT
+            # the exact instant of a correction itself, where predict_dense's
+            # window is degenerate (last_update_ts_ns just became THIS frame).
+            # That one frame uses fused directly. Neither on bootstrap/
+            # fail_open: fused there IS the raw (possibly wrong) vision
+            # candidate with no correction having happened at all, and
+            # relabeling it as IMU is the bug that made IMU look like it
+            # "drifted toward" a known-wrong vision match (found earlier) --
+            # a genuine gap is the honest answer there, not a guess.
+            dbg = fusion_debug_per_ctrl.get(ctrl_name)
+            outcome = dbg.get("outcome") if dbg is not None else None
+            fused_T = fused_T_world_ctrl_per_ctrl.get(ctrl_name)
+            p_imu = R_imu = None
+            if imu_path is not None:
+                _ts, _p, _R = imu_path
+                if len(_ts):
+                    p_imu, R_imu = _p[-1], _R[-1]
+            if p_imu is None and outcome == "gated_accept" and fused_T is not None:
+                p_imu, R_imu = fused_T.t, fused_T.R
+            imu_T = Transform(R_imu, p_imu) if p_imu is not None else None
+
+            for label, T in (("vision", vision_T_world_ctrl_per_ctrl.get(ctrl_name)),
+                              ("fused",  fused_T),
+                              ("imu",    imu_T)):
+                if T is None:
+                    # Explicit break, not a silent skip -- rerun's TimeSeriesView draws
+                    # a straight connecting line across simply-missing timestamps
+                    # regardless of the series (found by the user: it made vision look
+                    # like it kept reporting through a real tracking-lost stretch, and
+                    # would do the same for fused/imu wherever THEY have no value this
+                    # frame -- e.g. fused during a full occlusion, imu on a bootstrap/
+                    # fail_open). NaN breaks it, the same trick this project's own
+                    # hand-authored SVG charts already use for a real data gap. Applied
+                    # uniformly to all three now, not just vision.
+                    for _sub in self._PF_POS_ROT_SUBPATHS:
+                        self._log_scalar(f"{base}/{_sub}/{label}", float("nan"))
+                    continue
+                self._log_scalar(f"{base}/pos/x/{label}", T.t[0])
+                self._log_scalar(f"{base}/pos/y/{label}", T.t[1])
+                self._log_scalar(f"{base}/pos/z/{label}", T.t[2])
+                _roll, _pitch, _yaw = Rotation.from_matrix(T.R).as_euler("xyz", degrees=True)
+                self._log_scalar(f"{base}/rot/roll/{label}",  _roll)
+                self._log_scalar(f"{base}/rot/pitch/{label}", _pitch)
+                self._log_scalar(f"{base}/rot/yaw/{label}",   _yaw)
+
+            # ── Dense IMU-predicted path (3D world view) — redrawn every frame,
+            # so during a reject streak it visibly grows from the same anchor
+            # each frame rather than resetting (see PoseFusionFilter.predict_dense).
+            if imu_path is not None and len(imu_path[0]) >= 2:
+                rr.log(f"world/{ctrl_name}/imu_predicted_path",
+                       rr.LineStrips3D([imu_path[1]], colors=[[124, 92, 214]], radii=0.0006))
+            else:
+                rr.log(f"world/{ctrl_name}/imu_predicted_path", rr.Clear(recursive=False))
+
+            # ── Raw vision position marker (3D world view) — the mesh itself
+            # already shows the FUSED pose; this is the pre-fusion candidate.
+            v_T = vision_T_world_ctrl_per_ctrl.get(ctrl_name)
+            if v_T is not None:
+                rr.log(f"world/{ctrl_name}/vision_pose",
+                       rr.Points3D([v_T.t], colors=[self._pf_color_vision(ctrl_name)], radii=0.004))
+            else:
+                rr.log(f"world/{ctrl_name}/vision_pose", rr.Clear(recursive=False))
+
+            # ── PoseFusionFilter internal state ─────────────────────────────
+            if dbg is not None:
+                self._log_scalar(f"{base}/gate/d2",        dbg.get("d2"))
+                self._log_scalar(f"{base}/gate/threshold",  dbg.get("gate"))
+                self._log_scalar(f"{base}/quality/confidence",  dbg.get("confidence"))
+                self._log_scalar(f"{base}/quality/comfort",     dbg.get("comfort"))
+                self._log_scalar(f"{base}/quality/trust_score", dbg.get("trust_score"))
+                self._log_scalar(f"{base}/quality/trust",       dbg.get("trust"))
+                self._log_scalar(f"{base}/uncertainty/pos_sigma_m",   dbg.get("pos_sigma_m"))
+                self._log_scalar(f"{base}/uncertainty/rot_sigma_deg", dbg.get("rot_sigma_deg"))
+                self._log_scalar(f"{base}/uncertainty/vel_sigma_m_s", dbg.get("vel_sigma_m_s"))
+                self._log_scalar(f"{base}/innovation/pos_m",   dbg.get("pos_innov_m"))
+                self._log_scalar(f"{base}/innovation/rot_deg", dbg.get("rot_innov_deg"))
+                self._log_scalar(f"{base}/kalman_gain/pos", dbg.get("kalman_gain_pos"))
+                self._log_scalar(f"{base}/kalman_gain/rot", dbg.get("kalman_gain_rot"))
+                self._log_scalar(f"{base}/consecutive_rejects", dbg.get("consecutive_rejects"))
+                _outcome = dbg.get("outcome")
+                _accepted = _outcome in ("bootstrap", "fail_open", "gated_accept")
+                self._log_scalar(f"{base}/flags/accepted", 1.0 if _accepted else 0.0)
+                if _outcome is not None:
+                    rr.log("pose_fusion_log", rr.TextLog(f"[{ctrl_name}] {_outcome}"))
+            if fusion_forced_cold_start_per_ctrl.get(ctrl_name):
+                self._log_scalar(f"{base}/flags/forced_cold_start", 1.0)
+                rr.log("pose_fusion_log",
+                       rr.TextLog(f"[{ctrl_name}] FORCED COLD START (persistent-reject escape hatch)"))
+
+    # ------------------------------------------------------------------
     # Per-frame logging
     # ------------------------------------------------------------------
 
@@ -931,7 +1191,8 @@ class ControllerAnimatorRerun:
                    primary_cam_per_ctrl: dict = None,
                    aux_assignments_per_ctrl: dict = None,
                    camera_importance_per_ctrl: dict = None,
-                   ghost_T_world_model_per_ctrl: dict = None):
+                   ghost_T_world_model_per_ctrl: dict = None,
+                   vision_T_world_ctrl_per_ctrl: dict = None):
 
         ray_radius            = self.vis_cfg.get("ray_radius",            0.0002)
         led_disk_radius       = self.vis_cfg.get("led_disk_radius",       0.003)
@@ -1041,6 +1302,14 @@ class ControllerAnimatorRerun:
             T_cam_model = T_cam_ctrl.compose(T_ctrl_model)
             R_cam = T_cam_model.R
             t_cam = T_cam_model.t
+
+            # Vision's own (pre-fusion) pose -- needed anywhere a blob<->LED
+            # assignment (always computed relative to vision's own candidate, never
+            # the fused/reported one) gets reprojected for an error comparison; see
+            # the primary- and aux-camera error blocks below. Falls back to
+            # T_world_ctrl when unavailable (fusion disabled, or the debug flag
+            # off) -- they're the same pose there anyway, so this is a no-op then.
+            T_world_ctrl_vision = (vision_T_world_ctrl_per_ctrl or {}).get(ctrl_name, T_world_ctrl)
 
             # World frame model pose (for 3D display)
             T_world_model = T_world_ctrl.compose(T_ctrl_model)
@@ -1207,9 +1476,31 @@ class ControllerAnimatorRerun:
             tvec_ctrl    = T_cam_ctrl.t.astype(np.float32)
             ctrl_positions = cs["ctrl_positions"]
             if assignment and pts_plane_disp is not None:
+                # assignment is ALWAYS the raw vision solve's own blob<->LED pairing
+                # (sol["assignment"], computed relative to that candidate's own pose)
+                # -- reprojecting it against the FUSED/reported T_world_ctrl instead
+                # of vision's own pose meant that, on any rejected frame (T_world_ctrl
+                # is then the filter's different IMU-only prediction), this "error"
+                # was really just measuring the gap between two different poses, not
+                # a real reprojection error (>200px, "wrong blob-ids-projections" --
+                # found by the user; a known, previously-deferred limitation from
+                # Phase 4 review). T_world_ctrl_vision (set above) is vision's own
+                # pose for exactly this comparison.
+                T_cam_ctrl_vision = camera.T_world_cam.inverse().compose(T_world_ctrl_vision)
+                rvec_ctrl_vision, _ = cv2.Rodrigues(T_cam_ctrl_vision.R.astype(np.float32))
+                tvec_ctrl_vision = T_cam_ctrl_vision.t.astype(np.float32)
+                # LED positions under vision's own pose -- the error RAY's endpoint
+                # (proj_flat_cam below) must be projected here, not via pts_cam_real
+                # (the reported/fused pose): same bug class as proj_matched above,
+                # but this one was left unfixed on the ray geometry itself (found by
+                # the user: "for rerun errors are indeed fixed, but the error rays
+                # are still wrong, they are huge" -- the numeric error_values were
+                # already correct, only the drawn line endpoint wasn't).
+                T_cam_model_vision = T_cam_ctrl_vision.compose(T_ctrl_model)
+                pts_cam_vision = (T_cam_model_vision.R @ model_positions.T).T + T_cam_model_vision.t
                 matched_lids_ord = [lid for _, lid in assignment]
                 proj_matched, _ = camera.project_points(
-                    ctrl_positions[matched_lids_ord], rvec_ctrl, tvec_ctrl,
+                    ctrl_positions[matched_lids_ord], rvec_ctrl_vision, tvec_ctrl_vision,
                 )
                 proj_matched = proj_matched.reshape(-1, 2)
 
@@ -1219,7 +1510,7 @@ class ControllerAnimatorRerun:
                     if self.vis_cfg.get("show_rays", True):
                         ray_strips.append([pts_disp_real[lid].tolist(), lid_to_proj_pt[lid].tolist()])
                         ray_colors_list.append(primary_color)
-                    px, py, pz = pts_cam_real[lid]
+                    px, py, pz = pts_cam_vision[lid]
                     if pz > 1e-6:
                         proj_flat_cam  = np.array([px / pz * error_z, py / pz * error_z, error_z])
                         proj_flat_disp = _w(proj_flat_cam)
@@ -1336,8 +1627,19 @@ class ControllerAnimatorRerun:
                 _aux_error_z     = frustum_z - error_z_offset
 
                 if _aux_blobs_arr is not None:
-                    _rv_aux, _ = cv2.Rodrigues(_T_aux_ctrl.R.astype(np.float32))
-                    _tv_aux    = _T_aux_ctrl.t.astype(np.float32).reshape(3, 1)
+                    # Same fix as the primary camera above: _aux_pairs is vision's own
+                    # blob<->LED pairing, so the reprojection-error comparison needs
+                    # vision's own pose, not the fused/reported one they can diverge
+                    # from on a rejected frame (found by the user: >200px "errors"
+                    # that were really just measuring two different poses' gap).
+                    _T_aux_ctrl_vision = _aux_cam.T_world_cam.inverse().compose(T_world_ctrl_vision)
+                    _rv_aux, _ = cv2.Rodrigues(_T_aux_ctrl_vision.R.astype(np.float32))
+                    _tv_aux    = _T_aux_ctrl_vision.t.astype(np.float32).reshape(3, 1)
+                    # LED positions under vision's own pose -- same as pts_cam_vision
+                    # above, the error RAY's endpoint (_proj_flat_cam below) must use
+                    # this, not _pts_aux_cam (the reported/fused pose).
+                    _T_aux_model_vision = _T_aux_ctrl_vision.compose(T_ctrl_model)
+                    _pts_aux_cam_vision = _T_aux_model_vision.apply(model_positions)
                     _aux_lids_ord = [_lid for _, _lid in _aux_pairs]
                     _proj_px_aux, _ = _aux_cam.project_points(
                         ctrl_positions[_aux_lids_ord], _rv_aux, _tv_aux,
@@ -1350,7 +1652,7 @@ class ControllerAnimatorRerun:
                         if self.vis_cfg.get("show_rays", True):
                             _aux_ray_strips.append(
                                 [pts_disp_real[_lid].tolist(), _aux_lid_to_proj[_lid].tolist()])
-                        _lp = _pts_aux_cam[_lid]
+                        _lp = _pts_aux_cam_vision[_lid]
                         if _lp[2] > 1e-6 and self.vis_cfg.get("show_errors", True):
                             _bu, _bv = float(_aux_blobs_arr[_blob_j, 0]), float(_aux_blobs_arr[_blob_j, 1])
                             _b_norm = _aux_cam.undistort_points(

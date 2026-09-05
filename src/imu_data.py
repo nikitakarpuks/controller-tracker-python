@@ -378,10 +378,11 @@ def slice_imu_to_window(t: np.ndarray, data: np.ndarray, ts_lo: int, ts_hi: int,
 def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
                         ts0, ts1, R0, p0, v0):
     """Single-endpoint BLIND dead-reckoning prediction at ts1, given a known state
-    (R0, p0, v0) at ts0 -- no peeking at any ground truth at ts1. Collapses
-    visualize_position_orientation.py's _dead_reckon_gap (validated against 13 real
-    tracking-loss gaps, see visualization/controller_calibration_for_basalt/README.md
-    finding 11) to just the final point, for callers (e.g. PoseFusionFilter.predict,
+    (R0, p0, v0) at ts0 -- no peeking at any ground truth at ts1. The single-hop
+    primitive dead_reckon_dense (below) samples repeatedly to draw a dense curve
+    (validated against 13 real tracking-loss gaps, see
+    visualization/controller_calibration_for_basalt/README.md finding 11); this
+    is just the final point, for callers (e.g. PoseFusionFilter.predict,
     src/pose_fusion.py) that only need the endpoint, not a dense intermediate curve.
     Bias fixed at 0 throughout (this session's own validated finding -- bias choice
     doesn't measurably change real dead-reckoning outcomes on this hardware).
@@ -403,6 +404,58 @@ def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_ar
     if dp is None:
         return None
     return R1, p0 + dp
+
+
+def dead_reckon_dense(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
+                       t0, t1, R0, p0, v0, sample_every_n: int = 1):
+    """Dense, BLIND (no true-endpoint peeking) dead-reckoning through [t0, t1]:
+    one (t, R, p) sample per raw IMU timestamp in the gap (or every
+    sample_every_n-th, for very dense IMU streams / many repeated calls), each
+    computed via a fresh predict_world_pose call over [t0, t_i] -- the same
+    single-hop primitive PoseFusionFilter.predict uses, so a future change to
+    the single-hop formula can't silently diverge from what this draws. Shared
+    by visualize_position_orientation.py's offline gap-bridging plot and
+    PoseFusionFilter.predict_dense's live debug-visualization curve (moved
+    here from the former's own inlined copy, found in code review -- see this
+    project's history of exactly this kind of duplication).
+
+    COST: O(samples^2) -- each sample re-integrates the whole [t0, t_i]
+    prefix from scratch rather than incrementally extending the previous
+    sample's result (predict_world_pose's own docstring notes the same
+    tradeoff). Fine for a one-shot offline plot or a debug-viz curve bounded
+    to a few hundred samples; NOT suitable for anything called every frame
+    over an unbounded window -- callers wanting the latter should raise
+    sample_every_n or cap the sample count some other way first.
+
+    Returns (ts (N,) int64, positions (N,3), rotations: list of (3,3), one
+    per ts) -- empty arrays/list if no sample in [t0, t1] has coverage."""
+    mask = (t_gyro > t0) & (t_gyro < t1)
+    inner_ts = t_gyro[mask][::sample_every_n]
+    sample_ts = np.concatenate(([t0], inner_ts, [t1])).astype(np.int64)
+    sample_ts = np.unique(sample_ts)
+
+    out_ts, out_p, out_R = [], [], []
+    for t_i in sample_ts:
+        if t_i == t0:
+            R_i, p_i = R0, p0
+        else:
+            predicted = predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
+                                            t0, t_i, R0, p0, v0)
+            if predicted is None:
+                continue
+            R_i, p_i = predicted
+        out_ts.append(t_i)
+        out_p.append(p_i)
+        out_R.append(R_i)
+    if len(out_ts) <= 1:
+        # Only the t0 anchor itself was ever appended -- every real sample beyond
+        # it failed predict_world_pose's own coverage check (e.g. a genuine IMU
+        # dropout wider than slice_imu_to_window's pad). A 1-point "path" isn't a
+        # real prediction; signal unavailability the same way predict_world_pose/
+        # PoseFusionFilter.predict() do (found in review) instead of returning a
+        # trivially-"successful" single point frozen at the start position.
+        return np.array([]), np.zeros((0, 3)), []
+    return np.array(out_ts), np.array(out_p), out_R
 
 
 def accel_preint_residual(t_accel: np.ndarray, accel_body: np.ndarray, ts0, ts1: int,
