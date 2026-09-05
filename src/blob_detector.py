@@ -323,6 +323,28 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         too_large = areas > max_area
         too_small = areas < min_area
 
+        # Which labels contain >=1 pixel at required_threshold — computed ONCE,
+        # shared by both branches below, so visualize=True/False can never
+        # disagree on which blobs are bright enough. Safe to .view(bool) —
+        # cv2.threshold's THRESH_BINARY output is always exactly 0 or 255.
+        #
+        # This used to be a per-blob bbox-rectangle max in the visualize=True
+        # branch below (int(image[y_b:y_b+h_b, x_b:x_b+w_b].max())) instead of
+        # this label-scoped check — WRONG whenever another label's (or bright
+        # background's) pixel fell inside this blob's bounding box rectangle,
+        # since the bbox is a rectangle, not the blob's actual (possibly
+        # irregular/adjacent-to-others) pixel footprint: it silently passed
+        # blobs whose OWN pixels never reached required_threshold, only in the
+        # visualize=True path. Confirmed to flip real accept/reject decisions
+        # frame-to-frame (a controller only stayed tracked through frames
+        # 231/232 of one recording with visualize_rerun enabled, purely
+        # because of this).
+        _, bright_mask = cv2.threshold(image, required_threshold - 1, 255, cv2.THRESH_BINARY)
+        bright_ids = np.unique(labels[bright_mask.view(bool)])
+        bright_lut = np.zeros(n_labels, dtype=bool)
+        if bright_ids.size:
+            bright_lut[bright_ids] = True
+
         if visualize:
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             for cnt in contours:
@@ -341,30 +363,21 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                     det_rej_area_small.append(cnt)
                     continue
 
+                if not bright_lut[label_id]:
+                    det_rej_threshold.append(cnt)
+                    continue
+
                 # bbox comes free from stats — no separate cv2.boundingRect call.
                 x_b = int(stats[label_id, cv2.CC_STAT_LEFT])
                 y_b = int(stats[label_id, cv2.CC_STAT_TOP])
                 w_b = int(stats[label_id, cv2.CC_STAT_WIDTH])
                 h_b = int(stats[label_id, cv2.CC_STAT_HEIGHT])
 
-                if int(image[y_b:y_b + h_b, x_b:x_b + w_b].max()) < required_threshold:
-                    det_rej_threshold.append(cnt)
-                    continue
-
                 _finish_candidate(cnt, label_id, x_b, y_b, w_b, h_b)
         else:
-            # ── Vectorized brightness filter: which labels contain >=1 pixel
-            # at required_threshold, found in one pass instead of a per-blob
-            # bbox-slice max. Safe to .view(bool) — cv2.threshold's THRESH_BINARY
-            # output is always exactly 0 or 255.
             keep_area = ~too_small & ~too_large
             keep_ids  = np.empty(0, dtype=np.int64)
             if keep_area.any():
-                _, bright_mask = cv2.threshold(image, required_threshold - 1, 255, cv2.THRESH_BINARY)
-                bright_ids = np.unique(labels[bright_mask.view(bool)])
-                bright_lut = np.zeros(n_labels, dtype=bool)
-                if bright_ids.size:
-                    bright_lut[bright_ids] = True
                 keep_ids = np.where(keep_area & bright_lut[1:])[0] + 1
 
             # ── Trace contours only for surviving candidates ──────────────────
@@ -517,6 +530,24 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
 
     kept_indices     = np.where(keep_mask)[0]
     rejected_indices = np.where(~keep_mask)[0]
+
+    # Canonicalize candidate order regardless of which code path produced them.
+    # visualize=True traces via cv2.findContours(mask, ...) over the WHOLE image
+    # (an internal border-following traversal order); visualize=False instead
+    # iterates ascending label_id from connectedComponentsWithStats. Both return
+    # the exact SAME set of surviving blobs, but in a different (in fact
+    # observed to be reversed) order -- and downstream brute-force P3P search
+    # has an early-stopping heuristic, so a different exploration order can
+    # land on a different, non-equivalent accepted hypothesis for otherwise
+    # identical input. Confirmed on this project's own recording: same 10
+    # blobs, same values, reversed order -- visualize=True found 8 inliers/
+    # 0.18px, visualize=False found only 5 inliers/0.48px (rejected as
+    # implausible) purely from the order difference. Sorting by centroid
+    # position here makes every downstream consumer see a canonical order
+    # independent of the visualize flag.
+    if len(kept_indices):
+        _order = np.lexsort((centroids_arr[kept_indices, 0], centroids_arr[kept_indices, 1]))
+        kept_indices = kept_indices[_order]
 
     filtered_centroids   = centroids_arr[kept_indices]
     filtered_contours    = [blob_contours[i] for i in kept_indices]

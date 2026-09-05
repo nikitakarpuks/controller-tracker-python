@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from collections import deque
 from loguru import logger
-from typing import List, Tuple, Optional, Dict, Set, FrozenSet
+from typing import List, Tuple, Optional, Dict, Set, FrozenSet, Union
 
 from src._pnp import _project_points
 from src._visibility import _visible_mask, _cross_occluded_mask
@@ -13,6 +13,8 @@ from src.debug_config import is_continuous_sequence
 from src.transformations import Transform
 from src._self_calibration import SelfCalibrator
 from src.imu_data import integrate_gyro_segment
+from src.pose_fusion import PoseFusionFilter
+from src.pose_fusion_heuristic import HeuristicPoseFusionFilter
 
 
 # =========================================================
@@ -105,9 +107,20 @@ _GRAVITY_LOW_DYNAMICS_TOL_MS2 = 2.0   # |accel| within this of 9.81 m/s^2 => tru
 _GRAVITY_DISAGREEMENT_DEG     = 20.0  # log a warning above this angle between two consecutive low-dynamics readings
 
 
+def _interp_imu_sample(t: np.ndarray, data: np.ndarray, ts_ns: int) -> Optional[np.ndarray]:
+    """Per-axis linear interpolation of one (t, data) IMU stream at ts_ns, or None if
+    ts_ns falls outside [t[0], t[-1]] (no real coverage to interpolate from) -- shared
+    by _log_gravity_consistency and PoseFusionFilter's LiveGravityEstimator feed
+    (_commit_fused_solution), both of which need exactly this one-instant sample."""
+    if ts_ns < t[0] or ts_ns > t[-1]:
+        return None
+    return np.array([np.interp(ts_ns, t, data[:, i]) for i in range(3)])
+
+
 def _log_gravity_consistency(ctrl_name: str, R_now: np.ndarray, ts_now: int,
                               R_prev: Optional[np.ndarray], ts_prev: Optional[int],
-                              accel_data: Optional[tuple]) -> None:
+                              accel_data: Optional[tuple],
+                              accel_now: Optional[np.ndarray] = None) -> None:
     """Compares the accelerometer-implied 'down' direction (rotated into the
     controller's fused frame via R_now) against the same quantity computed at
     the previous accepted frame (R_prev) -- both gated on the accelerometer
@@ -116,15 +129,18 @@ def _log_gravity_consistency(ctrl_name: str, R_now: np.ndarray, ts_now: int,
     low-dynamics readings means at least one of the two orientations is
     probably wrong. Doesn't need a true world-frame reference: the camera rig
     only drifts slowly relative to gravity frame-to-frame, so "previous
-    accepted frame" is a good enough proxy over one ~16ms gap."""
+    accepted frame" is a good enough proxy over one ~16ms gap.
+
+    accel_now: caller's already-interpolated accel sample at ts_now, if it happened
+    to need one anyway (see _commit_fused_solution's gravity-estimator feed) -- avoids
+    interpolating the same stream at the same instant twice. None recomputes it here."""
     if accel_data is None or R_prev is None or ts_prev is None:
         return
     t_accel, accel_body = accel_data
-    if ts_now < t_accel[0] or ts_now > t_accel[-1] or ts_prev < t_accel[0] or ts_prev > t_accel[-1]:
+    a_now  = accel_now if accel_now is not None else _interp_imu_sample(t_accel, accel_body, ts_now)
+    a_prev = _interp_imu_sample(t_accel, accel_body, ts_prev)
+    if a_now is None or a_prev is None:
         return
-
-    a_now  = np.array([np.interp(ts_now,  t_accel, accel_body[:, i]) for i in range(3)])
-    a_prev = np.array([np.interp(ts_prev, t_accel, accel_body[:, i]) for i in range(3)])
     if abs(np.linalg.norm(a_now) - 9.81) > _GRAVITY_LOW_DYNAMICS_TOL_MS2:
         return
     if abs(np.linalg.norm(a_prev) - 9.81) > _GRAVITY_LOW_DYNAMICS_TOL_MS2:
@@ -333,6 +349,17 @@ class CameraTracker:
         self.proximity_match         = self._pose_searcher.proximity_search
         self.brute_match             = self._pose_searcher.brute_search
         self.prior_constrained_match = self._pose_searcher.constrained_search
+
+    def clear_prior(self) -> None:
+        """Drop everything this tracker would otherwise warm-start the next
+        search from -- shared by ControllerTracker._mark_all_lost's grace-
+        exhausted branch and _commit_fused_solution's persistent-reject
+        escape hatch (plan Phase 5), so the two "this tracker is genuinely
+        cold now" paths can't silently diverge (found in review)."""
+        self.prev_pose      = None
+        self.prev_prev_pose = None
+        self.vel_ema        = None
+        self.pose_history.clear()
 
     # # -----------------------------------------------------
     # # Custom projection
@@ -872,7 +899,11 @@ class ControllerTracker:
                  trackers: Dict[int, CameraTracker],
                  matching_cfg: Optional[dict] = None,
                  gyro_data: Optional[tuple] = None,
-                 accel_data: Optional[tuple] = None):
+                 accel_data: Optional[tuple] = None,
+                 lever_arm: Optional[np.ndarray] = None,
+                 g_world_estimator=None,
+                 fusion_cfg: Optional[dict] = None,
+                 debug_pose_fusion_cfg: Optional[dict] = None):
         self.ctrl_name        = ctrl_name
         self.cameras          = cameras
         self.trackers         = trackers           # {cam_id: CameraTracker}
@@ -891,7 +922,126 @@ class ControllerTracker:
         self._last_gravity_check_R: Optional[np.ndarray] = None
         self._last_gravity_check_ts: Optional[int] = None
 
-    def _mark_all_lost(self) -> None:
+        # Pose-fusion filter — None (fully bypassed, every frame reports the raw
+        # vision solve exactly as before this feature existed) unless fusion_cfg
+        # explicitly enables it. fusion.filter_type picks the implementation:
+        # "kalman" (default, src/pose_fusion.py, covariance/chi2-gate based) or
+        # "heuristic" (src/pose_fusion_heuristic.py, explicit ordered rules +
+        # self-calibrating thresholds — see /home/nikitakarpuks/.claude/plans/
+        # heuristic-direction-further-write-tingly-moonbeam.md for why). Both
+        # share the exact same public interface, so nothing below this branch
+        # needs to know or care which one got constructed.
+        self._g_world_estimator = g_world_estimator
+        _filter_cls = (HeuristicPoseFusionFilter
+                       if (fusion_cfg or {}).get("filter_type", "kalman") == "heuristic"
+                       else PoseFusionFilter)
+        _filter_kwargs = {"ctrl_name": self.ctrl_name} if _filter_cls is HeuristicPoseFusionFilter else {}
+        self._fusion_filter: Optional[Union[PoseFusionFilter, HeuristicPoseFusionFilter]] = (
+            _filter_cls(gyro_data, accel_data, lever_arm, g_world_estimator, fusion_cfg or {}, **_filter_kwargs)
+            if (fusion_cfg or {}).get("enabled", False) else None
+        )
+        # visualization.pose_fusion_debug (config/config.yml) — gates the extra
+        # per-frame cost of capturing PoseFusionFilter.debug_snapshot()/predict_dense()
+        # for the rerun debug tool below; a no-op when disabled (the default) or
+        # when self._fusion_filter is None regardless of this flag.
+        self._debug_pose_fusion_cfg = debug_pose_fusion_cfg or {}
+        self._debug_pose_fusion     = self._debug_pose_fusion_cfg.get("enabled", False)
+
+        # Other enabled controllers' own ControllerTracker instances -- wired post-
+        # construction via set_sibling_controllers() (TrackingSystem builds every
+        # ControllerTracker before any of them can reference the others), same
+        # pattern/site as PoseFusionFilter.set_siblings(). Used by
+        # _commit_fused_solution's escape hatch to also reset a sibling's own
+        # filter/camera-tracker state when THIS controller's rejection is an
+        # abs_reject-flagged identity-swap signature (see there for why a swap
+        # implicates both controllers' recent trust, not just this one's).
+        self._sibling_controllers: list = []
+
+        # True from the first frame vision ever produces a real candidate for
+        # this controller (set in _commit_fused_solution, unconditionally --
+        # reaching that method already means some camera found a plausible
+        # geometric fit this frame, regardless of what the fusion filter then
+        # does with it). Never reset for the rest of the session -- once we've
+        # confirmed this controller physically exists, a LATER full loss is a
+        # re-acquisition, not a startup cold-start, and skips the persistence/
+        # confirm-streak gate below (see the two call sites that read this).
+        self._ever_tracked: bool = False
+
+        # Consecutive frames (this loss streak) that _mark_all_lost has kept
+        # every camera's pose_history warm via pure IMU dead-reckoning instead
+        # of vision -- see _mark_all_lost and matching.imu_only_propagation_
+        # max_frames. Reset to 0 whenever vision produces a real candidate
+        # again (_commit_fused_solution), so each new loss gets its own fresh
+        # budget.
+        self._imu_only_propagated_frames: int = 0
+
+        # Guards the counter above against being spent twice on the SAME real
+        # frame -- _mark_all_lost is called once per FAILED search ATTEMPT,
+        # not once per frame: main.py retries a controller whose cheap search
+        # found nothing with an immediate cold re-detect + brute-force attempt
+        # (same frame_ts_ns), and if that also fails, ControllerTracker.update()
+        # calls _mark_all_lost a second time for it (controller.py:1114/1349,
+        # pre-existing pattern, unrelated to this feature). Without this guard
+        # the budget above would drain at ~2x the intended rate.
+        self._last_imu_propagate_ts_ns: Optional[int] = None
+
+        # The IMU-only pose _mark_all_lost actually decided on THIS frame (a
+        # Transform if within budget and IMU coverage allowed it, None
+        # otherwise) -- see imu_only_predicted_pose. Single source of truth
+        # so the 3D display can never show more consecutive IMU-only frames
+        # than the search-anchor propagation itself was budgeted for.
+        self._last_imu_only_pose: Optional[Transform] = None
+
+    def set_sibling_controllers(self, siblings: list) -> None:
+        self._sibling_controllers = list(siblings)
+
+    def imu_only_predicted_pose(self, frame_ts_ns: int) -> Optional[Transform]:
+        """IMU-only dead-reckoned world pose for THIS frame, or None if
+        _mark_all_lost didn't propagate one (no fusion filter, no prior state
+        yet, no IMU coverage, g_world not converged, or the
+        imu_only_propagation_max_frames budget for this loss streak is
+        already spent). Used by main.py to report/display a pose on a frame
+        with zero vision candidates, instead of hiding the controller
+        outright.
+
+        Deliberately reads _mark_all_lost's own cached decision
+        (_last_imu_only_pose) rather than calling self._fusion_filter.predict()
+        again here -- an earlier version did call it independently, which
+        meant the display had NO cap at all (predict() itself has no
+        duration limit): it kept extrapolating and showing a pose for as
+        long as IMU coverage/g_world allowed, completely ignoring the
+        budget the search-anchor side was honoring (found in review: 25
+        consecutive IMU-only frames shown despite a configured cap of 4).
+        Reusing the same cached Transform guarantees the display can never
+        show more consecutive IMU-only frames than the search anchor was
+        actually budgeted for."""
+        return self._last_imu_only_pose
+
+    def debug_fusion_state(self, frame_ts_ns: int):
+        """Pose-fusion debug snapshot + dense IMU path for a frame where this
+        controller had NO vision solution at all (cam_solutions empty this
+        frame -- update() returns None, _commit_fused_solution never runs, so
+        it never gets a chance to capture these itself). Callers should use
+        this from the "no solution this frame" branch so the rerun debug
+        tool's IMU-predicted-path curve keeps growing across a real full-
+        occlusion gap too, not just a reject streak where vision keeps
+        finding candidates but the filter keeps rejecting them (found in
+        review). Returns (fusion_debug, fusion_imu_path), both None if
+        debug logging or the filter itself isn't enabled."""
+        if self._fusion_filter is None or not self._debug_pose_fusion:
+            return None, None
+        fusion_debug = self._fusion_filter.debug_snapshot(frame_ts_ns)
+        stride = int(self._debug_pose_fusion_cfg.get("path_stride", 4))
+        fusion_imu_path = self._fusion_filter.predict_dense(frame_ts_ns, sample_every_n=stride)
+        _imu_x = float(fusion_imu_path[1][-1][0]) if fusion_imu_path is not None and len(fusion_imu_path[0]) else None
+        logger.bind(cat="pose_fusion").debug(
+            f"[{self.ctrl_name}] LOST frame debug_fusion_state ts={frame_ts_ns} "
+            f"has_state={self._fusion_filter.R is not None} "
+            f"trust={fusion_debug.get('trust')} imu_path={'yes' if fusion_imu_path is not None else 'None'} imu_x={_imu_x}"
+        )
+        return fusion_debug, fusion_imu_path
+
+    def _mark_all_lost(self, frame_ts_ns: int) -> None:
         """Record a failed frame on every camera-tracker and, once the
         configured grace period is exhausted, clear prev_pose/pose_history so
         the controller stops warm-starting off stale history. A single retry
@@ -904,16 +1054,85 @@ class ControllerTracker:
         Clearing here also starves _build_extrapolated_occluders (no
         extrapolated pose survives), so a genuinely cold controller no longer
         casts a phantom cross-controller occlusion mask.
+
+        Also checks self._fusion_filter.should_force_cold_start(frame_ts_ns) on
+        every call (plan Phase 5's escape hatch: elapsed-time-since-last-accepted-
+        update past `max_coast_s`, or too many consecutive live rejects) and
+        resets it if so — DELIBERATELY NOT tied to the vision-side grace above.
+        An earlier version reset the filter on that same 1-frame grace, which
+        turned out wrong: this method runs every frame during ANY vision loss,
+        including the short (sub-second) full-occlusion gaps the swap-bug
+        mechanism actually depends on (confirmed against this recording's real
+        gap: ~0.5s, both controllers, well inside the ~1s dead-reckoning-
+        reliable horizon) — clearing the filter's state after just 2 failed
+        frames would erase the exact pre-loss prediction that must survive to
+        catch the swap on reacquisition. should_force_cold_start's own
+        elapsed-time criterion is what should gate this, not vision's frame-
+        count grace, which exists for an unrelated reason (stop warm-starting
+        the pixel-space search off a stale prediction, an ~ms-scale concern).
+
+        IMU-only propagation (matching.imu_only_propagation_max_frames, default
+        4): before falling back to the grace-frame logic above, try dead-
+        reckoning a fresh world pose from self._fusion_filter.predict() and, if
+        IMU coverage/g_world allow it, warm-start every camera's pose_history
+        from THAT instead of leaving it frozen at the last vision-confirmed
+        pose. This keeps the search neighbourhood centered near where the
+        controller actually is during a short vision gap (occlusion, a missed
+        detection, a rejected re-acquisition) rather than stale, for up to this
+        many CONSECUTIVE lost frames -- reset the moment vision produces a
+        real candidate again (_commit_fused_solution). Past the budget (or
+        whenever predict() itself fails-open -- no IMU coverage yet, g_world
+        not converged, fusion disabled), this degrades to exactly the old
+        grace-frame-then-clear behavior; short-horizon accel+gyro dead-
+        reckoning is validated for gaps well beyond this budget (see
+        HeuristicPoseFusionFilter/PoseFusionFilter's own docstrings), so a few
+        frames of it is comfortably inside the reliable regime.
         """
         _grace = int(self._matching_cfg.get('tracking_lost_grace_frames', 1))
+        _imu_only_max = int(self._matching_cfg.get('imu_only_propagation_max_frames', 4))
+
+        _imu_pose = None
+        _already_handled_this_frame = (frame_ts_ns == self._last_imu_propagate_ts_ns)
+        if not _already_handled_this_frame:
+            if self._fusion_filter is not None and self._imu_only_propagated_frames < _imu_only_max:
+                _predicted = self._fusion_filter.predict(frame_ts_ns)
+                if _predicted is not None:
+                    _imu_pose = Transform(*_predicted)
+                    self._imu_only_propagated_frames += 1
+            self._last_imu_propagate_ts_ns = frame_ts_ns
+            # Cache THIS frame's decision for imu_only_predicted_pose (the 3D
+            # display) to read -- unconditionally on every NEW frame (not
+            # nested inside the budget check above), so it correctly clears
+            # to None the moment the budget is exhausted (or IMU coverage/
+            # g_world isn't there), rather than freezing at its last non-None
+            # value forever once the inner condition stops firing. A same-
+            # frame re-entry (_already_handled_this_frame) leaves it alone --
+            # that decision was already made and cached on the first call.
+            self._last_imu_only_pose = _imu_pose
+
+        if _imu_pose is not None:
+            self._propagate_pose_history(_imu_pose, frame_ts_ns)
+            if self._debug_pose_fusion:
+                logger.bind(cat="pose_fusion").debug(
+                    f"[{self.ctrl_name}] IMU-only propagation "
+                    f"({self._imu_only_propagated_frames}/{_imu_only_max}): "
+                    f"keeping search anchor warm during vision loss, pos={_imu_pose.t}"
+                )
+
         for _t in self.trackers.values():
             _t.tracking_lost_last_frame = True
             _t.consecutive_failures += 1
-            if _t.consecutive_failures > _grace:
-                _t.prev_pose      = None
-                _t.prev_prev_pose = None
-                _t.vel_ema        = None
-                _t.pose_history.clear()
+            if _imu_pose is None and _t.consecutive_failures > _grace:
+                _t.clear_prior()
+        if self._fusion_filter is not None and self._fusion_filter.should_force_cold_start(frame_ts_ns):
+            if self._debug_pose_fusion:
+                _elapsed = ((frame_ts_ns - self._fusion_filter.last_update_ts_ns) / 1e9
+                            if self._fusion_filter.last_update_ts_ns is not None else None)
+                logger.bind(cat="pose_fusion").debug(
+                    f"[{self.ctrl_name}] RESET during vision loss: ts={frame_ts_ns} elapsed_s={_elapsed} "
+                    f"consecutive_rejects={self._fusion_filter.consecutive_rejects}"
+                )
+            self._fusion_filter.reset()
 
     def update(
         self,
@@ -943,7 +1162,7 @@ class ControllerTracker:
         against that same untrustworthy prediction, just with a fuller blob
         set, would fail for the same reason it failed the first time."""
         if not avail:
-            self._mark_all_lost()
+            self._mark_all_lost(frame_ts_ns)
             return None
 
         # ── Every available camera searches independently ──────────────────────
@@ -1059,7 +1278,21 @@ class ControllerTracker:
                 # prev_pose once the grace period is exhausted, so
                 # prev_pose is None is exactly "truly cold" here; prev_pose is
                 # still set means "recently lost, within grace" — skip the gate.
-                if force_brute and tracker.prev_pose is None:
+                #
+                # self._ever_tracked additionally exempts a controller that has
+                # ALREADY been confirmed real earlier this session, even once
+                # prev_pose has been cleared -- the noise-filtering rationale
+                # below only makes sense for "might not even be a real
+                # controller yet" (frame 1), not "we know this controller
+                # exists and it just went missing." Without this, a genuine
+                # re-acquisition paid the same multi-frame confirmation delay
+                # as a never-seen-before startup, needlessly extending a real
+                # tracking-loss gap by cold_brute_force_confirm_frames frames
+                # even when the very next frame's brute-force would have
+                # succeeded immediately (confirmed on this project's own
+                # recording -- frames 25-26 lost purely to this gate, not to
+                # any actual re-detection failure).
+                if force_brute and tracker.prev_pose is None and not self._ever_tracked:
                     # Persistence gate: require _confirm_frames CONSECUTIVE
                     # frames of >= min_inliers blobs before paying for a full
                     # P3P/gate enumeration, since real reacquired LEDs persist
@@ -1164,7 +1397,7 @@ class ControllerTracker:
         )
 
         if not cam_solutions:
-            self._mark_all_lost()
+            self._mark_all_lost(frame_ts_ns)
             return None
 
         return self._fuse_and_finalize(
@@ -1297,6 +1530,44 @@ class ControllerTracker:
 
         return solution
 
+    def _propagate_pose_history(self, T_world_ctrl: Transform, frame_ts_ns: int) -> None:
+        """Warm-start every camera's own prev_pose/pose_history/vel_ema from
+        one world-frame pose -- the same computation regardless of where that
+        pose came from: an accepted vision fusion (_commit_fused_solution) or
+        pure IMU dead-reckoning while vision is lost (_mark_all_lost). Shared
+        so the two "advance the search anchor" call sites can't silently
+        diverge (this exact loop body used to live only in
+        _commit_fused_solution -- see git history for the REVERTED note on why
+        seeding from anything other than a stabilized pose is risky).
+
+        Caller is responsible for any accept-specific bookkeeping on top of
+        this (last_good_pose, prev_assignment, consecutive_failures) --
+        _mark_all_lost's IMU-only case deliberately does none of that, since
+        vision itself still didn't confirm anything this frame."""
+        _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
+        for _cid, _tracker in self.trackers.items():
+            _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
+            _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
+            _tv_np = _T_cam_ctrl.t.astype(np.float32)
+            if _tracker.prev_pose is not None:
+                _step = (_tv_np.reshape(3).astype(np.float64)
+                         - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
+                # vel_ema is a position-per-second RATE, not a raw per-call step —
+                # pose_history is non-empty whenever prev_pose is set (both are
+                # always written together, right here), so [0][2] is this
+                # tracker's previous frame's real timestamp.
+                _prev_ts_ns = int(_tracker.pose_history[0][2])
+                _dt_s = (frame_ts_ns - _prev_ts_ns) / 1e9
+                if _dt_s > 0:
+                    _step_rate = _step / _dt_s
+                    _tracker.vel_ema = (_beta * _step_rate + (1.0 - _beta) * _tracker.vel_ema
+                                       if _tracker.vel_ema is not None else _step_rate)
+                # else: degenerate/duplicate timestamp — leave vel_ema at its
+                # previous value rather than dividing by a non-positive dt.
+            _tracker.prev_prev_pose = _tracker.prev_pose
+            _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
+            _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np, frame_ts_ns))
+
     def _commit_fused_solution(
         self,
         solution: Dict,
@@ -1322,18 +1593,88 @@ class ControllerTracker:
         own RANSAC/inlier scoring absorbs a shared blob; cold-cold: conflicts
         are resolved explicitly by TrackingSystem._resolve_cold_conflicts
         before this is ever called).
+
+        Pose-fusion filter (see src/pose_fusion.py): when self._fusion_filter
+        exists, the incoming solution is gated through PoseFusionFilter.try_update
+        before any of the above runs. An ACCEPTED update proceeds exactly as
+        without the filter, except every downstream consumer (state propagation,
+        self-cal feed, and solution["T_world_ctrl"] itself, which callers read
+        AFTER this returns for CSV/log/rerun output) sees the filter's corrected
+        pose, not necessarily the raw vision solve. A REJECTED update skips claim
+        registration and the self-cal feed entirely (an implausible candidate is
+        not trustworthy ground truth for either), and state propagation instead
+        uses the filter's own IMU-only prediction for this frame — this is the
+        "smoothing term": the reported pose is now the filter's belief, never
+        just whatever the raw vision solve happened to be. A persistently
+        rejecting filter (should_force_cold_start) forces a full cold-start —
+        see the escape-hatch block near the end of this method, plan Phase 5.
         """
-        T_world_ctrl       = solution["T_world_ctrl"]
+        # Reaching this method at all means some camera found a plausible
+        # geometric fit for this controller this frame -- see _ever_tracked's
+        # own docstring (__init__) for why that's the right trigger and what
+        # it's used for.
+        self._ever_tracked = True
+        # Vision found something again -- this loss streak (if any) is over;
+        # the next one gets its own fresh IMU-only-propagation budget.
+        self._imu_only_propagated_frames = 0
+        self._last_imu_only_pose = None
+
         primary_cam_id     = solution["primary_cam"]
         anchor_assignment  = solution["assignment"]
         _other_assignments = solution["aux_assignments"]
+
+        # Preserved before any fusion overwrite below, unconditionally (cheap --
+        # same Transform object, no copy) -- solution["T_world_ctrl"] itself gets
+        # overwritten in place with the filter's reported pose a few lines down,
+        # with no other trace of the raw vision solve left in this dict afterward.
+        # The rerun debug tool (visualize_pose_fusion) needs the raw pose to plot
+        # alongside the fused one; every other consumer keeps reading
+        # solution["T_world_ctrl"] exactly as before (found in review-adjacent
+        # cross-check, not a behavior change).
+        solution["vision_T_world_ctrl"] = solution["T_world_ctrl"]
+
+        accepted = True
+        if self._fusion_filter is not None:
+            accepted = self._fusion_filter.try_update(solution, frame_ts_ns)
+            T_world_ctrl = Transform(self._fusion_filter.reported_R, self._fusion_filter.reported_p)
+            solution["T_world_ctrl"] = T_world_ctrl  # downstream reporting reads this same dict
+            if self._debug_pose_fusion:
+                _dbg = self._fusion_filter.debug_snapshot(frame_ts_ns)
+                solution["fusion_debug"] = _dbg
+                _stride = int(self._debug_pose_fusion_cfg.get("path_stride", 4))
+                solution["fusion_imu_path"] = self._fusion_filter.predict_dense(
+                    frame_ts_ns, sample_every_n=_stride)
+                # Console-visible trace for the SAME empirical-tuning purpose the rerun
+                # tab exists for -- e.g. spotting a persistently-unconverged g_world
+                # (predict()/predict_dense() silently fail-open/return None whenever
+                # self._g_world_estimator.g_world is None, which makes every accept
+                # "fail_open" and reported_p == the raw vision pose exactly, easy to
+                # misread as a fusion bug rather than "IMU prediction isn't live yet").
+                _pred_x = float(_dbg["pos_pred"][0]) if _dbg.get("pos_pred") is not None else None
+                _vision_x = float(solution["vision_T_world_ctrl"].t[0])
+                _fused_x = float(T_world_ctrl.t[0])
+                logger.bind(cat="pose_fusion").debug(
+                    f"[{self.ctrl_name}] ts={frame_ts_ns} outcome={_dbg.get('outcome')} accepted={accepted} "
+                    f"d2={_dbg.get('d2')} gate={_dbg.get('gate')} trust={_dbg.get('trust')} "
+                    f"pred_x={_pred_x} vision_x={_vision_x} fused_x={_fused_x} "
+                    f"g_world={'converged' if (self._g_world_estimator is not None and self._g_world_estimator.g_world is not None) else 'NOT converged'}"
+                )
+        else:
+            T_world_ctrl = solution["T_world_ctrl"]
+        # Downstream consumers (main.py's pose_csv/calibration_csv writers) that pair
+        # T_world_ctrl with solution["error"]/["assignment"] need to know those fields
+        # still describe the ORIGINAL vision candidate, not this frame's reported pose,
+        # whenever a rejected update swapped T_world_ctrl for the filter's own IMU-only
+        # prediction (found in review -- pairing a rejected pose with the discarded
+        # candidate's error/assignment silently corrupts calibration-threshold data).
+        solution["fusion_accepted"] = accepted
 
         # Reporting/self-cal anchor tracking (per-camera importance above is now the
         # reported signal; kept only for get_designated_primary_cameras()).
         self._designated_primary = primary_cam_id
 
         # ── Register claimed blobs (every camera that actually solved) ──────────
-        if claimed_blobs is not None:
+        if claimed_blobs is not None and accepted:
             for cs in cam_solutions:
                 for b, _ in cs["solution"]["assignment"]:
                     claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
@@ -1347,7 +1688,7 @@ class ControllerTracker:
         # circular: an aux camera's still-wrong intrinsics would leak into the
         # reference used to correct it. SelfCalibrator's own docstring assumes an
         # aux-camera-untainted primary solve; this is what actually provides one.
-        if (self_cal is not None
+        if (self_cal is not None and accepted
                 and primary_cam_id == self_cal.primary_camera.camera_idx):
             _primary_T_world_ctrl = solution["primary_T_world_ctrl"]
             _primary_err          = solution["primary_error"]
@@ -1375,48 +1716,151 @@ class ControllerTracker:
 
         # ── State propagation: every camera's own history is warm-started from
         # the one fused pose, using that camera's own assignment if it solved ──
-        _beta = float(self._matching_cfg.get("pose_prediction_vel_ema_beta", 0.3))
+        #
+        # REVERTED (2026-09-04): tried seeding search-time pose_history from raw
+        # vision on accepted updates instead of the fused T_world_ctrl, to
+        # decouple search-neighbourhood centering from the fusion filter's own
+        # trust/smoothing decisions (motivated by a real closed-loop problem --
+        # see pose_fusion.py's try_update, low-reprojection-error floor comment).
+        # An adversarial empirical audit (mocap-ground-truth-validated) found a
+        # SEVERE regression this introduced on a different part of the same
+        # recording (frame_range 2000-3000): the fused/smoothed pose had been
+        # acting as a STABILIZER on the search neighbourhood -- removing it let
+        # a drifting vision solve become self-reinforcing across ~40 frames
+        # (left_controller: ~600ms, up to 840mm mistrack vs mocap; right_
+        # controller: 34 dropped TRACKING LOST frames the fused-anchor version
+        # tracked cleanly). Isolated conclusively to this change alone (bit-
+        # identical vision output with the OTHER change of that session disabled
+        # still reproduced the mistrack at full magnitude). Reverted rather than
+        # shipped with a known severe failure mode; the underlying closed-loop
+        # problem this was trying to fix is real but needs a more careful
+        # solution (e.g. only anchor on vision when confidence is high, not
+        # unconditionally on every accept) before revisiting.
+        self._propagate_pose_history(T_world_ctrl, frame_ts_ns)
         for _cid, _tracker in self.trackers.items():
-            _T_cam_ctrl = self.cameras[_cid].T_world_cam.inverse().compose(T_world_ctrl)
-            _rv_np, _ = cv2.Rodrigues(_T_cam_ctrl.R.astype(np.float32))
-            _tv_np = _T_cam_ctrl.t.astype(np.float32)
-            if _tracker.prev_pose is not None:
-                _step = (_tv_np.reshape(3).astype(np.float64)
-                         - np.asarray(_tracker.prev_pose[1], np.float64).reshape(3)).astype(np.float32)
-                # vel_ema is a position-per-second RATE, not a raw per-call step —
-                # pose_history is non-empty whenever prev_pose is set (both are
-                # always written together, right here), so [0][2] is this
-                # tracker's previous frame's real timestamp.
-                _prev_ts_ns = int(_tracker.pose_history[0][2])
-                _dt_s = (frame_ts_ns - _prev_ts_ns) / 1e9
-                if _dt_s > 0:
-                    _step_rate = _step / _dt_s
-                    _tracker.vel_ema = (_beta * _step_rate + (1.0 - _beta) * _tracker.vel_ema
-                                       if _tracker.vel_ema is not None else _step_rate)
-                # else: degenerate/duplicate timestamp — leave vel_ema at its
-                # previous value rather than dividing by a non-positive dt.
-            _tracker.prev_prev_pose = _tracker.prev_pose
-            _tracker.prev_pose      = (_rv_np.reshape(3, 1), _tv_np)
-            _tracker.last_good_pose = _tracker.prev_pose
-            _tracker.pose_history.appendleft((_rv_np.reshape(3, 1), _tv_np, frame_ts_ns))
-            _own_asgn = (
-                anchor_assignment if _cid == primary_cam_id
-                else _other_assignments.get(_cid)
+            # Assignment/failure bookkeeping reflects trust in the vision candidate
+            # itself, not just "we have a pose to report" (that's the propagation
+            # above, which always runs so next frame still gets a sane warm-start
+            # prior). A rejected candidate is exactly the case where that trust
+            # doesn't hold, so leave these at their last-accepted values rather
+            # than seeding next frame's constrained search from an implausible
+            # assignment. _mark_all_lost itself is still never called from
+            # here (it also does vision-search bookkeeping that doesn't apply
+            # when vision itself just succeeded) — see the persistent-reject
+            # escape hatch right after this loop instead, plan Phase 5.
+            if accepted:
+                _tracker.last_good_pose = _tracker.prev_pose
+                _own_asgn = (
+                    anchor_assignment if _cid == primary_cam_id
+                    else _other_assignments.get(_cid)
+                )
+                if _own_asgn is not None:
+                    _tracker.prev_assignment      = _own_asgn
+                    _tracker.last_good_assignment = _own_asgn
+                elif _tracker.prev_assignment is None:
+                    _tracker.last_good_assignment = None
+                _tracker.consecutive_failures = 0
+                _tracker._consecutive_good_blob_frames = 0
+                _tracker.tracking_lost_last_frame = False
+
+        # ── Persistent-reject escape hatch (plan Phase 5) ───────────────────────
+        # should_force_cold_start's two conditions (elapsed time past max_coast_s,
+        # or too many consecutive rejects) were previously only ever checked from
+        # _mark_all_lost, which only runs when vision finds NOTHING this frame
+        # (cam_solutions empty). A controller vision keeps finding candidates for
+        # every frame but this filter keeps rejecting never reaches that path at
+        # all, so max_consecutive_rejects was unreachable in exactly the scenario
+        # it exists for (found in review). Checked here instead, unconditionally
+        # reachable on any reject regardless of why vision succeeded.
+        #
+        # Deliberately does MORE than reset the filter alone: the vision
+        # candidates driving the rejections may themselves be anchored on a bad
+        # camera-tracker prior (e.g. warm-tracking something plausible-looking
+        # but wrong), which a filter-only reset wouldn't touch — a fresh
+        # bootstrap would just accept the next frame's equally-anchored
+        # candidate right back. So this also clears every camera tracker's own
+        # prev_pose/pose_history, mirroring _mark_all_lost's grace-exhausted
+        # branch, so next frame's ctrl_has_prior (main.py) sees a true
+        # cold-start and triggers full blob-level re-detection + brute-force.
+        #
+        # consecutive_failures is ALSO pushed past tracking_lost_grace_frames
+        # here (found in review) even though this frame's vision search itself
+        # succeeded: finalize_search's re-acquisition plausibility gate only
+        # applies its tight 0.5m/60deg check against last_good_pose while
+        # consecutive_failures <= grace (see its own docstring — that check
+        # assumes "last known good" was ~1 frame ago). Clearing prev_pose
+        # above without also doing this would leave that invariant broken —
+        # _reacquiring becomes True (prev_pose is None) but consecutive_failures
+        # stays low, so the tight check would fire against a last_good_pose
+        # that's actually up to max_coast_s/several-rejects stale, wrongly
+        # rejecting the exact reacquisition candidate this escape hatch exists
+        # to accept. Jumping straight past grace (rather than incrementing by
+        # 1 like a normal per-frame failure) is correct, not a shortcut: by
+        # the time should_force_cold_start fires, this controller has already
+        # been in trouble for well over one grace period.
+        if self._fusion_filter is not None and not accepted \
+                and self._fusion_filter.should_force_cold_start(frame_ts_ns):
+            solution["fusion_forced_cold_start"] = True  # debug-viz annotation; set BEFORE
+                                                           # reset() below clears the state that
+                                                           # actually triggered this
+            # Read BEFORE reset() -- reset() clears self._fusion_filter._last to {}.
+            # abs_reject is the narrow, high-precision identity-swap signature (see
+            # pose_fusion.py's try_update): unlike an ordinary elapsed-time/
+            # consecutive-rejects escape-hatch firing (an unremarkable prolonged
+            # reacquisition failure, no reason to suspect the SIBLING controller),
+            # an abs_reject firing means a real position was seen but for the WRONG
+            # controller -- which by definition implicates the sibling's recent
+            # trust too, not just this controller's. So ALSO cross-reset every
+            # sibling's own filter/camera-tracker state (same reset shape as below)
+            # rather than just this controller's -- see set_sibling_controllers's
+            # docstring. This deliberately does NOT touch the sibling's `solution`
+            # dict already computed this frame (no brittle same-frame retroactive
+            # mutation) -- the sibling's own NEXT try_update() call naturally
+            # re-evaluates against this now-clean state instead of stale memory.
+            _is_abs_reject_swap = bool(self._fusion_filter._last.get("abs_reject"))
+            _elapsed_s = ((frame_ts_ns - self._fusion_filter.last_update_ts_ns) / 1e9
+                          if self._fusion_filter.last_update_ts_ns is not None else None)
+            logger.bind(cat="matching_decisions").debug(
+                f"[{self.ctrl_name}] PERSISTENT-REJECT ESCAPE HATCH fired: "
+                f"elapsed_s={_elapsed_s} max_coast_s={self._fusion_filter._cfg.get('max_coast_s')} "
+                f"consecutive_rejects={self._fusion_filter.consecutive_rejects} "
+                f"max_consecutive_rejects={self._fusion_filter._cfg.get('max_consecutive_rejects')} "
+                f"abs_reject_swap={_is_abs_reject_swap} "
+                f"siblings_to_cross_reset={[s.ctrl_name for s in self._sibling_controllers] if _is_abs_reject_swap else []}"
             )
-            if _own_asgn is not None:
-                _tracker.prev_assignment      = _own_asgn
-                _tracker.last_good_assignment = _own_asgn
-            elif _tracker.prev_assignment is None:
-                _tracker.last_good_assignment = None
-            _tracker.consecutive_failures = 0
-            _tracker._consecutive_good_blob_frames = 0
-            _tracker.tracking_lost_last_frame = False
+            self._fusion_filter.reset()
+            _grace = int(self._matching_cfg.get('tracking_lost_grace_frames', 1))
+            for _tracker in self.trackers.values():
+                _tracker.clear_prior()
+                _tracker.consecutive_failures = _grace + 1
+            if _is_abs_reject_swap:
+                for _sibling in self._sibling_controllers:
+                    if _sibling._fusion_filter is not None:
+                        _sibling._fusion_filter.reset()
+                    for _sib_tracker in _sibling.trackers.values():
+                        _sib_tracker.clear_prior()
+                        _sib_tracker.consecutive_failures = _grace + 1
+
+        # Sampled once and shared below (found in review: the gravity-estimator feed
+        # and _log_gravity_consistency were each independently interpolating the SAME
+        # accel stream at this SAME frame_ts_ns).
+        _accel_now = _interp_imu_sample(*self._accel_data, frame_ts_ns) if self._accel_data is not None else None
+
+        # Feed the live gravity estimator (see LiveGravityEstimator's docstring:
+        # accumulated incrementally on every ACCEPTED commit) — only meaningful
+        # once a filter/gravity-estimator pair actually exists, and only from a
+        # trustworthy pose.
+        if self._fusion_filter is not None and accepted and self._g_world_estimator is not None \
+                and self._gyro_data is not None and _accel_now is not None:
+            _gyro_sample = _interp_imu_sample(*self._gyro_data, frame_ts_ns)
+            if _gyro_sample is not None:
+                self._g_world_estimator.observe(T_world_ctrl.R, _gyro_sample, _accel_now)
 
         # Stage 3 gravity-alignment diagnostic (log-only, see _log_gravity_consistency).
         _log_gravity_consistency(
             self.ctrl_name, T_world_ctrl.R, frame_ts_ns,
             self._last_gravity_check_R, self._last_gravity_check_ts,
-            self._accel_data,
+            self._accel_data, accel_now=_accel_now,
         )
         self._last_gravity_check_R  = T_world_ctrl.R
         self._last_gravity_check_ts = frame_ts_ns
@@ -1509,7 +1953,11 @@ class TrackingSystem:
                  self_calibration_cfg: dict = None,
                  blob_detection_cfg: dict = None,
                  gyro_data: Optional[Dict[str, tuple]] = None,
-                 accel_data: Optional[Dict[str, tuple]] = None):
+                 accel_data: Optional[Dict[str, tuple]] = None,
+                 lever_arm: Optional[Dict[str, np.ndarray]] = None,
+                 g_world_estimator=None,
+                 fusion_cfg: Optional[dict] = None,
+                 debug_pose_fusion_cfg: Optional[dict] = None):
 
         self.cameras: Dict[int, Camera] = {cam.camera_idx: cam for cam in cameras}
 
@@ -1518,6 +1966,12 @@ class TrackingSystem:
         # entries when unavailable, in which case gyro/gravity-check logic no-ops.
         self._gyro_data:  Dict[str, tuple] = gyro_data or {}
         self._accel_data: Dict[str, tuple] = accel_data or {}
+        # Pose-fusion filter wiring (see PoseFusionFilter / ControllerTracker) — one
+        # shared LiveGravityEstimator across all controllers (gravity is a single
+        # per-session unknown, not per-controller), one lever arm per controller.
+        self._lever_arm:  Dict[str, np.ndarray] = lever_arm or {}
+        self._g_world_estimator = g_world_estimator
+        self._fusion_cfg: dict = fusion_cfg or {}
 
         # Self-calibration: optionally apply saved extrinsics before tracker creation
         # so every tracker's T_world_cam starts with the correct (calibrated) value.
@@ -1571,7 +2025,32 @@ class TrackingSystem:
                 ctrl.name, self.cameras, ctrl_cam_trackers, matching_cfg=matching_cfg,
                 gyro_data=self._gyro_data.get(ctrl.name),
                 accel_data=self._accel_data.get(ctrl.name),
+                lever_arm=self._lever_arm.get(ctrl.name),
+                g_world_estimator=self._g_world_estimator,
+                fusion_cfg=self._fusion_cfg,
+                debug_pose_fusion_cfg=debug_pose_fusion_cfg,
             )
+
+        # Wire each fusion filter to every OTHER enabled controller's own filter --
+        # a second pass since every ControllerTracker (and its own PoseFusionFilter)
+        # must already exist before any of them can reference the others. Used only
+        # by PoseFusionFilter.try_update's bootstrap branch (see there / pose_fusion.py's
+        # _looks_like_a_sibling): the per-controller-only gate has nothing to check a
+        # fresh bootstrap candidate against, so this closes that gap by letting it check
+        # a still-live SIBLING's own prediction instead — the cross-controller check the
+        # plan's original per-controller-independent design didn't have.
+        for ctrl in controllers:
+            tracker = self.ctrl_trackers[ctrl.name]
+            if tracker._fusion_filter is not None:
+                siblings = [
+                    other._fusion_filter for name, other in self.ctrl_trackers.items()
+                    if name != ctrl.name and other._fusion_filter is not None
+                ]
+                tracker._fusion_filter.set_siblings(siblings)
+            ctrl_siblings = [
+                other for name, other in self.ctrl_trackers.items() if name != ctrl.name
+            ]
+            tracker.set_sibling_controllers(ctrl_siblings)
 
         # Independent of parallel_search_enabled — lets blob-detection parallelism be
         # turned off on its own (e.g. if IPC/pickling the debug canvases turns out to
@@ -1728,6 +2207,10 @@ class TrackingSystem:
                             vel_ema_rate=tracker.vel_ema,
                         ) if tracker else None)
                 if pred is None:
+                    logger.bind(cat="matching_decisions").debug(
+                        f"[{ctrl_name} | cam {cam_id}] search_eligible=False: no pose_history "
+                        f"(pose_history len={len(tracker.pose_history) if tracker else 'no-tracker'})"
+                    )
                     proj_per_ctrl[ctrl_name]   = None
                     vel_per_ctrl[ctrl_name]    = 0.0
                     radius_per_ctrl[ctrl_name] = _base_r
@@ -1768,6 +2251,12 @@ class TrackingSystem:
                     # live here has moved entirely into the warm-cam-cap ranking
                     # pass below, which now treats every camera with >=1 visible
                     # LED as a candidate (see comment above).
+                    logger.bind(cat="matching_decisions").debug(
+                        f"[{ctrl_name} | cam {cam_id}] search_eligible=False: predicted pose "
+                        f"tvec={tvec_pred.tolist()} has 0 geometrically-visible LEDs "
+                        f"(out of frustum / facing away / behind camera) "
+                        f"pose_history_ts0={int(_ph[0][2]) if _ph else None} dt_target={_dt_target:.4f}s"
+                    )
                     proj_per_ctrl[ctrl_name]   = None
                     vel_per_ctrl[ctrl_name]    = 0.0
                     radius_per_ctrl[ctrl_name] = _base_r
@@ -2381,23 +2870,27 @@ class TrackingSystem:
                     continue
                 _other_cams_by_key[(ctrl_name, cid)] = _build_other_cameras_blobs(
                     self.cameras, obs_src, cid)
-                # Persistence gate, verbatim logic from
-                # ControllerTracker.update() (controller.py:930-948, this
-                # file) -- unconditional here (not "force_brute and
-                # prev_pose is None") because every controller passed to
-                # update_cold_batch is already known cold by the caller's
-                # contract, so the gate always applies.
-                if len(obs_full) >= tracker._pose_searcher._c_brute_min_inliers:
-                    tracker._consecutive_good_blob_frames += 1
-                else:
-                    tracker._consecutive_good_blob_frames = 0
-                if tracker._consecutive_good_blob_frames < _confirm_frames:
-                    logger.bind(cat="matching_decisions").debug(
-                        f"[{ctrl_name} | cam {cid}] cold brute-force gated (batch): "
-                        f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
-                        f"(n_blobs={len(obs_full)})"
-                    )
-                    continue
+                # Persistence gate, verbatim logic from ControllerTracker.update()
+                # (controller.py:930-948, this file) -- every controller passed to
+                # update_cold_batch is already known cold by the caller's contract
+                # (no camera has a usable prior right now), but that contract
+                # doesn't distinguish "never confirmed real this session" from
+                # "confirmed real earlier, just lost" -- self.ctrl_trackers[
+                # ctrl_name]._ever_tracked does, and skips the gate for the
+                # latter, same reasoning as ControllerTracker.update()'s own copy
+                # of this check.
+                if not self.ctrl_trackers[ctrl_name]._ever_tracked:
+                    if len(obs_full) >= tracker._pose_searcher._c_brute_min_inliers:
+                        tracker._consecutive_good_blob_frames += 1
+                    else:
+                        tracker._consecutive_good_blob_frames = 0
+                    if tracker._consecutive_good_blob_frames < _confirm_frames:
+                        logger.bind(cat="matching_decisions").debug(
+                            f"[{ctrl_name} | cam {cid}] cold brute-force gated (batch): "
+                            f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
+                            f"(n_blobs={len(obs_full)})"
+                        )
+                        continue
                 mask = np.ones(len(obs_full), dtype=bool)
                 states[(ctrl_name, cid)] = tracker._pose_searcher.new_brute_state(
                     obs_full, pose_prior=None, other_cameras_blobs=_other_cams_by_key[(ctrl_name, cid)],
@@ -2461,7 +2954,7 @@ class TrackingSystem:
         for ctrl_name in ctrl_names:
             cam_solutions = cam_solutions_per_ctrl[ctrl_name]
             if not cam_solutions:
-                self.ctrl_trackers[ctrl_name]._mark_all_lost()
+                self.ctrl_trackers[ctrl_name]._mark_all_lost(frame_ts_ns)
                 continue
             # Cold-cold candidates never excluded each other's blobs during search
             # (see this method's docstring) -- two of THIS controller's own cameras
@@ -2515,7 +3008,7 @@ class TrackingSystem:
                     f"[cold-batch] conflict: dropping {ctrl_name} — "
                     f"{loser_reason.get(ctrl_name, 'lost to a better inlier-discounted candidate this frame')}"
                 )
-                self.ctrl_trackers[ctrl_name]._mark_all_lost()
+                self.ctrl_trackers[ctrl_name]._mark_all_lost(frame_ts_ns)
                 results[ctrl_name] = None
                 continue
             obs_src = per_ctrl_observations.get(ctrl_name) or {}
