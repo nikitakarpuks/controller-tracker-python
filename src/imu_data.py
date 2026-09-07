@@ -406,6 +406,51 @@ def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_ar
     return R1, p0 + dp
 
 
+def predict_headset_relative_pose(t_gyro, gyro_body, t_accel, accel_body, g_world_abs, lever_arm,
+                                   ts0, ts1, R_hc0, p_hc0, v_hc0,
+                                   R_wh0, p_wh0, omega_h0, v_wh0, R_wh1, p_wh1):
+    """Same contract as predict_world_pose, EXCEPT (R_hc0, p_hc0, v_hc0) are HEADSET-RELATIVE --
+    this pipeline's own "world" frame is really the headset-IMU rig frame (Camera.T_world_cam is
+    a fixed rig extrinsic, see src/camera.py), not any inertial frame, so predict_world_pose's own
+    blind dead-reckoning silently mis-treats the headset as non-rotating/non-accelerating during
+    [ts0,ts1]. This wraps it with an exact frame conversion at the boundary instead of touching
+    its (validated) internals: lift the headset-relative state to the absolute frame using the
+    caller-supplied headset ego-motion, run predict_world_pose completely unchanged, then project
+    the result back to headset-relative using the headset's absolute pose at ts1.
+
+    R_wh0/p_wh0, R_wh1/p_wh1: the headset's own absolute pose (e.g. mocap-derived, see
+    src.mocap_data.world_pose) at ts0/ts1. omega_h0 (rad/s): headset body-frame angular velocity
+    at ts0 (see src.mocap_data.headset_angular_velocity). v_wh0 (m/s): headset WORLD-frame linear
+    velocity at ts0 (see src.mocap_data.headset_linear_velocity). g_world_abs: gravity already
+    expressed in the ABSOLUTE frame (NOT the headset-relative g_world predict_world_pose normally
+    takes -- rotating a headset-relative gravity estimate into this frame, if that's your source,
+    is the caller's responsibility; this function does no such rotation itself).
+
+    Velocity-lift derivation: differentiating p_wc(t) = R_wh(t) @ p_hc(t) + p_wh(t) using this
+    codebase's own body-frame angular-velocity convention (dR/dt = R @ [omega]_x -- the
+    continuous-time limit of integrate_gyro_segment's own R_new = R_old @ R_rel right-composition)
+    gives v_wc = R_wh @ (v_hc + omega_h x p_hc) + v_wh -- the cross term is the "arm's-length
+    lever" effect of the headset itself spinning while the controller sits at a nonzero
+    headset-relative offset; omitting it (as naively reusing v_hc0 as an absolute velocity would)
+    is exactly the kind of error this function exists to avoid.
+
+    Returns (R_hc1, p_hc1), or None under the same conditions predict_world_pose returns None for
+    (propagated, not duplicated)."""
+    R_wc0 = R_wh0 @ R_hc0
+    p_wc0 = R_wh0 @ p_hc0 + p_wh0
+    v_wc0 = R_wh0 @ (v_hc0 + np.cross(omega_h0, p_hc0)) + v_wh0
+
+    predicted = predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world_abs, lever_arm,
+                                    ts0, ts1, R_wc0, p_wc0, v_wc0)
+    if predicted is None:
+        return None
+    R_wc1, p_wc1 = predicted
+
+    R_hc1 = R_wh1.T @ R_wc1
+    p_hc1 = R_wh1.T @ (p_wc1 - p_wh1)
+    return R_hc1, p_hc1
+
+
 def dead_reckon_dense(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
                        t0, t1, R0, p0, v0, sample_every_n: int = 1):
     """Dense, BLIND (no true-endpoint peeking) dead-reckoning through [t0, t1]:

@@ -1,5 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173103_static_dark/mav0"
+  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826175510_walk_medium/mav0"
   layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
                            # side-by-side into a single wide image per frame (uses
                            # img_width/total_cameras_number below to slice per camera).
@@ -31,19 +31,111 @@ data:
     lower: null  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: null  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 500  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
   # Only read when fusion.filter_type: heuristic. See src/pose_fusion_heuristic.py
-  # (HeuristicPoseFusionFilter). Every vision solution is fused (no hard
-  # gating) by minimizing J(p) = cost_weight_imu*||p-p_imu||^2 +
-  # w_vision*||p-p_vision||^2 + cost_weight_smooth*||p-p_prev||^2 -- closed-
-  # form minimizer is a weighted average of the three candidates (rotation
-  # uses the same weights on tangent-space error vectors).
-  cost_weight_imu: 1.0        # pulls the fused pose toward the IMU dead-reckoned prediction
-  cost_weight_smooth: 0.5     # pulls the fused pose toward the previous fused state (temporal smoothing)
+  # (HeuristicPoseFusionFilter). TWO decoupled mechanisms, not one blend:
+  #  1. Tracking state: every vision solution is fused (no hard gating, except
+  #     the implausible_jump_* gate below) by minimizing
+  #         J(p) = cost_weight_imu*||p-p_imu||^2 + w_vision*||p-p_vision||^2
+  #     -- closed-form minimizer is a weighted average of the two candidates
+  #     (rotation uses the same weights on tangent-space error vectors). This
+  #     state is what predict() dead-reckons off next frame -- never smoothed.
+  #  2. Reported/displayed pose: a One Euro Filter (one_euro_*: below) applied
+  #     to the tracking state's output -- this is what used to be a THIRD
+  #     w_smooth*||p-p_prev||^2 term in the cost function above, REMOVED
+  #     entirely (2026-09-06) in favor of a filter purpose-built for jitter
+  #     (heavy smoothing at rest, none during real motion) instead of one
+  #     weight whose effective strength shifted every frame depending on
+  #     what cost_weight_imu/w_vision happened to be that frame.
+  cost_weight_imu: 0.0        # pulls the fused TRACKING STATE toward the IMU dead-reckoned
+                               # prediction -- this is the BASE (full-trust) value; see
+                               # imu_decay_frames below for how it fades out over a coasting
+                               # streak. Restored to 1.0 (was manually zeroed for the
+                               # vision-only-vs-fused isolation test that led to this redesign).
   trust_window_len: 5         # rolling window of recent accepted-frame confidences, used by trust_score()/trust()
+
+  # One Euro Filter (Casiez et al. 2012 -- see src/one_euro_filter.py's own
+  # module docstring) applied to the REPORTED pose only, replacing the old
+  # w_smooth cost term. min_cutoff: the cutoff frequency (Hz) used when the
+  # signal isn't moving -- LOWER = heavier smoothing/more lag at rest (this is
+  # the tremble-killer). beta: how fast the cutoff opens up as speed
+  # increases -- HIGHER = less lag during real motion, at the cost of less
+  # noise rejection then. d_cutoff: cutoff for filtering the derivative
+  # estimate itself -- 1.0 is the paper's own default, rarely needs tuning.
+  #
+  # beta MUST be scaled to the signal's own real units -- cutoff =
+  # min_cutoff + beta*speed, so beta only means something relative to the
+  # actual speed values it'll be multiplied by. beta=0.3 (an initial guess
+  # carried over from pixel-space 1-euro examples, where speeds run in the
+  # hundreds/thousands) was found to barely open the filter at all for
+  # meter-scale position at this project's own real hand speeds (p50=0.30-
+  # 0.34, p90=0.48-0.56, p99=0.58-0.83 m/s, both controllers -- see fusion:
+  # process_noise_pos_m_per_s' own comment below for the source data): at
+  # p90 speed, cutoff only rose to ~1.17-1.19Hz from a min_cutoff of 1.0 --
+  # essentially still full rest-state smoothing while the hand was genuinely
+  # moving, i.e. exactly the "crazy bad once movement starts" lag reported
+  # against the first-cut defaults. Retuned so cutoff reaches roughly 9-12Hz
+  # (near fully open -- minimal smoothing/lag) by around p90-p99 real speed:
+  # pos beta=15 -> cutoff=1+15*0.56=9.4Hz at p90, 1+15*0.83=13.5Hz at p99.
+  # rot beta scaled the same way but in rad/s of tangent-space rotation, not
+  # deg/s (Rotation.as_rotvec() is radians) -- process_noise_rot_deg_per_s'
+  # own p50~132-135/p90~244-246/p99~384-446 deg/s converts to roughly
+  # p50~2.3/p90~4.3/p99~7.0 rad/s: rot beta=3 -> cutoff=1+3*4.3=13.9Hz at p90.
+  #
+  # beta=15/3 (above derivation) still left real, sustained-motion lag in the
+  # ~13mm mean / 21mm max range on this recording's actual fast frames (this
+  # walk_medium recording's own real speeds run well past the static-recording
+  # p99 numbers the derivation above was based on, up to ~2 m/s) -- any
+  # constant-cutoff low-pass has a STEADY-STATE lag of velocity * tau where
+  # tau=1/(2*pi*cutoff), so a "fairly open" 9-14Hz cutoff still lags visibly
+  # during genuinely fast motion; the fix is more beta, not a different
+  # mechanism. Swept beta directly against this recording's own real motion
+  # (replaying the already-logged tracking-state series through OneEuroFilter
+  # in isolation, no pipeline rerun needed) -- rest-state damping barely
+  # changes across the whole range (reported step 0.05mm at beta=15 up to
+  # only 0.11mm at beta=300), so there's essentially no cost to pushing this
+  # much higher: beta=40 -> fast-motion lag mean 5.9mm/max 10.4mm, beta=80 ->
+  # 3.2/6.0mm, beta=150 -> 1.8/3.7mm, beta=300 -> 0.9/2.0mm. Landed on 150 (a
+  # 10x jump from the position derivation above) as "barely affected while
+  # moving" without going as far as 300; rot beta scaled by the same 10x
+  # factor (3 -> 30) rather than re-deriived from a rotation-specific sweep --
+  # re-check by feel, rotation lag wasn't independently measured here.
+  one_euro_pos_min_cutoff_hz: 1.0
+  one_euro_pos_beta: 150.0
+  one_euro_pos_d_cutoff_hz: 1.0
+  one_euro_rot_min_cutoff_hz: 1.0
+  one_euro_rot_beta: 30.0
+  one_euro_rot_d_cutoff_hz: 1.0
+  # Debug bypass (see HeuristicPoseFusionFilter._report), same spirit as
+  # vision_only_debug below -- false makes reported_R/reported_p exactly the
+  # unsmoothed tracking-state output, for isolating vision/IMU investigation
+  # from smoothing lag. Not a tuning knob -- put back to true when done.
+  one_euro_enabled: false
+
+  # w_imu's own decay (see HeuristicPoseFusionFilter.frames_since_update): fades
+  # linearly from full cost_weight_imu at 0 consecutive lost/coasted REAL FRAMES
+  # to exactly 0 at imu_decay_frames -- frame-COUNTED (deduped by timestamp),
+  # not time-based, since this recording's own cadence isn't uniform (alternates
+  # ~11ms/~22ms) so "N frames" and "N frames' worth of seconds" aren't the same
+  # threshold. Added after a real case: an 8-lost-frame reacquisition still had
+  # w_imu at its full undiminished 1.0, pulling the fused result ~200mm away
+  # from a solid (n_inliers=12, error=0.08px) freshly-reacquired vision
+  # candidate -- which then rejected several genuinely-correct following
+  # vision frames as "implausible" against that wrong anchor. 4 matches the
+  # same horizon imu_only_propagation_max_frames (matching: below) already
+  # uses for the search-anchor coasting budget.
+  imu_decay_frames: 4
+
+  # DEBUG BYPASS, not a tuning knob -- forces imu_frame_scale to 0 on every
+  # single accepted frame, so w_imu is always 0 and the tracking state is
+  # EXACTLY the raw vision candidate every frame (see try_update's own
+  # comment). Still passes through the One Euro Filter above like any other
+  # reported pose. For manually isolating "is this IMU contamination or is
+  # this vision itself" -- set back to false when done.
+  vision_only_debug: false
 
   # w_vision is NOT a fixed constant like the two above -- see
   # HeuristicPoseFusionFilter._vision_weight. cost_weight_vision below is
@@ -97,22 +189,47 @@ fusion_heuristic:
   implausible_jump_pos_m: 0.3
   implausible_jump_rot_deg: 60.0
 
-  # Long-gap damping (see HeuristicPoseFusionFilter._gap_scale_factors) -- scales
-  # w_vision down and w_smooth up as the elapsed gap since the last accepted
-  # update (dt_s) grows, on top of the inlier/error ramps above. Added after a
-  # real jump on this recording: a frame landing right after two rejected
-  # frames (dt=66.6ms) had a weak match (n_inliers=6) but a deceptively clean
-  # error=0.05px, earning vision_share=0.40 (tied with IMU) and producing a
-  # ~115mm single-step jump vs. the ~3-7mm/frame typical of stable tracking --
-  # the inlier/error ramps alone have no notion of how long the IMU side has
-  # been dead-reckoning unconstrained. Below gap_dt_normal_s this is a no-op
-  # (both scales are 1.0); linearly ramps to the floor/boost values below by
-  # gap_dt_full_s. First-cut defaults, not yet validated against a wider
-  # sample of this recording's own gap distribution.
+  # Long-gap damping (see HeuristicPoseFusionFilter._gap_vision_scale) -- scales
+  # w_vision down as the elapsed gap since the last accepted update (dt_s)
+  # grows, on top of the inlier/error ramps above. Added after a real jump on
+  # this recording: a frame landing right after two rejected frames (dt=66.6ms)
+  # had a weak match (n_inliers=6) but a deceptively clean error=0.05px,
+  # earning vision_share=0.40 (tied with IMU) and producing a ~115mm
+  # single-step jump vs. the ~3-7mm/frame typical of stable tracking -- the
+  # inlier/error ramps alone have no notion of how long the IMU side has been
+  # dead-reckoning unconstrained. Below gap_dt_normal_s this is a no-op (scale
+  # is 1.0); linearly ramps to the floor value below by gap_dt_full_s.
+  # First-cut defaults, not yet validated against a wider sample of this
+  # recording's own gap distribution.
   gap_dt_normal_s: 0.04         # same cadence cutoff as PoseFusionFilter's _WARM_FRAME_DT_CUTOFF_S
   gap_dt_full_s: 0.15           # full damping applies at/above this elapsed gap
   gap_vision_weight_floor: 0.3  # w_vision multiplier at/beyond gap_dt_full_s (1.0 = no damping)
-  gap_smooth_weight_boost: 2.5  # w_smooth multiplier at/beyond gap_dt_full_s (1.0 = no boost)
+
+  # Soft agreement ramp (see HeuristicPoseFusionFilter._agreement_factor/
+  # _agreement_weak_bounds) -- Case A: pushback for a warm-state vision/p_pred
+  # disagreement too small to hit implausible_jump_pos_m/_rot_deg above but
+  # still inconsistent with a trustworthy IMU prediction (a few cm/mm-scale
+  # jump that today gets zero pushback). The "weak" bound is adaptive --
+  # k_pos/k_rot times this controller's own recent p90 innovation (last
+  # agreement_hist_len normal-cadence fused accepts), floored/ceilinged so it
+  # can only ever be MORE sensitive than the hard gate, never less. First-cut
+  # defaults -- tune during the verification pass, same as every other
+  # threshold in this block.
+  agreement_hist_len: 20
+  agreement_hist_min_samples: 5   # below this many samples, falls back to the hard-gate ceiling (no extra pushback)
+  agreement_k_pos: 3.0
+  agreement_k_rot: 3.0
+  agreement_floor_pos_m: 0.01
+  agreement_floor_rot_deg: 2.0
+
+  # Cold-state (vision_only) reacquisition -- see
+  # HeuristicPoseFusionFilter._try_cold_reacquire. Vision is trusted directly
+  # (consistent with cost_weight_imu=0's normal warm-path trust) once past
+  # the sibling-collision check below -- REMOVED (2026-09-06, explicit
+  # direction) a 3-frame confirmation window that used to hold even a strong
+  # reacquisition candidate "pending" for 2 extra frames first; see that
+  # method's own docstring for why.
+  sibling_collision_dist_m: 0.15   # flat-radius identity-swap check vs. a live sibling's own predicted position
 
   # Per-controller overrides -- see HeuristicPoseFusionFilter._hc_get.
   # Any key from fusion_heuristic: above can be overridden here per
@@ -143,15 +260,15 @@ fusion:
                   # prediction/gating -- fails open (behaves as if disabled) otherwise.
   filter_type: heuristic  # kalman | heuristic. kalman = src/pose_fusion.py's PoseFusionFilter
                   # (covariance/chi2-gate based). heuristic = src/pose_fusion_heuristic.py's
-                  # HeuristicPoseFusionFilter -- a plain 3-term weighted-cost fusion (IMU
-                  # prediction, vision measurement, previous-state smoothing), no gating, no
-                  # self-calibration; see fusion_heuristic: below. Shared keys (max_coast_s,
-                  # max_consecutive_rejects, trust_gap_tau_s, g_world_min_samples,
+                  # HeuristicPoseFusionFilter -- a 2-term weighted-cost fusion (IMU prediction,
+                  # vision measurement) for the tracking state, plus a One Euro Filter on the
+                  # reported pose for jitter removal; see fusion_heuristic: below. Shared keys
+                  # (max_coast_s, max_consecutive_rejects, trust_gap_tau_s, g_world_min_samples,
                   # g_world_low_omega_thresh_rad_s, all in this block) are read by BOTH filter
                   # types; everything else in fusion: below is kalman-only.
   max_coast_s: 0.3                    # force cold-start once this long has elapsed with no accepted update
   max_consecutive_rejects: 5          # force cold-start after this many implausible-in-a-row rejections
-  imu_vision_collision_dist_m: 0.05   # cross-controller check, read by main.py directly (not either filter
+  imu_vision_collision_dist_m: 0.12   # cross-controller check, read by main.py directly (not either filter
                                        # class) -- two controllers are separate rigid bodies and cannot
                                        # physically share a tracked origin. If a controller with NO real vision
                                        # this frame (full occlusion, or a fusion-rejected candidate -- either
@@ -162,12 +279,20 @@ fusion:
                                        # are force-reset, rather than showing two interpenetrating controller
                                        # meshes. Only fires when exactly one side is vision-backed -- two
                                        # simultaneously-coasting controllers overlapping isn't resolved here
-                                       # (neither side is more trustworthy). 0.05m is well under any real
-                                       # controller-to-controller separation seen in this recording's own
-                                       # motion, comfortably above the ~1-3cm seen in this project's own
-                                       # documented identity-swap cases (see fusion_heuristic's implausible_
-                                       # jump_pos_m comment) -- tune per-recording if controllers legitimately
-                                       # come this close together (e.g. a two-handed grip).
+                                       # (neither side is more trustworthy).
+                                       #
+                                       # RAISED from 0.05m (found investigating a real report of a wrongly-
+                                       # identified controller's IMU-only coast overlapping the other
+                                       # controller's freshly-confirmed vision pose without being caught): the
+                                       # old value was an anecdote from a past small-separation swap case, not
+                                       # derived from the controllers' actual physical size. Measured directly
+                                       # from both controller LED models (data/controllers/*.json): each has a
+                                       # max LED-to-centroid radius of ~5.9cm (32-LED ring, ~11.4cm full
+                                       # extent) -- two controller ORIGINS closer together than the sum of
+                                       # their radii (~12cm) means their physical bodies genuinely overlap in
+                                       # space, regardless of how far apart the pipeline's own tracked origins
+                                       # happen to be. 0.05m only caught near-total origin coincidence, missing
+                                       # the much more common case of partial but real body interpenetration.
   process_noise_pos_m_per_s: 0.6      # error-covariance growth rate, position -- sized to this recording's
                                        # real p90 frame-to-frame speed (data/vision_pose_log.csv: right
                                        # p50=0.34 p90=0.56 p99=0.83 m/s, left p50=0.30 p90=0.48 p99=0.58 m/s).
@@ -263,7 +388,13 @@ mocap:
                   # (sibling to mav0/, not inside it) -- requires each enabled
                   # device's mocap_calib_path below to be set; falls back to no
                   # ground truth (with a startup warning) if a device's files are
-                  # missing. Only used for debug.mocap_log_dir's export for now.
+                  # missing. Used for debug.mocap_log_dir's export, AND (when a
+                  # headset trajectory loads successfully) to correct
+                  # HeuristicPoseFusionFilter's dead-reckoning for headset ego-motion
+                  # -- see src.imu_data.predict_headset_relative_pose. Disabling this
+                  # (or a missing/incomplete headset mocap trajectory) makes the
+                  # correction a no-op, falling back to today's uncorrected
+                  # dead-reckoning -- never a hard failure.
   max_interp_gap_ms: 30.0  # a query timestamp whose two bracketing real mocap samples are
                   # farther apart than this is treated as "no ground truth here" (returns
                   # None) rather than interpolated across -- guards against gaps left by
@@ -453,7 +584,38 @@ matching:
   # --------------------------------------------------------------------------
   # LED physical model
   # --------------------------------------------------------------------------
-  led_facing_angle_deg: 90.0      # emission half-angle; LEDs beyond this from camera axis are culled
+  # TIGHTENED 2026-09-06 from 90.0 -- with the scoring formula in
+  # _visibility.py (score = clip(led_facing_angle_deg / angle_deg, 0, 1) for
+  # angle_deg < 90), a value of EXACTLY 90 makes 90/angle_deg >= 1.0 (clipped
+  # to 1.0) for every angle from 0-90 deg -- the "soft emission-cone" scoring
+  # was fully degenerate, giving every front-hemisphere LED a perfect 1.0
+  # score with zero graduated falloff, right up to a hard cliff exactly at
+  # 90deg. Combined with proximity_vis_score_threshold=0.95, that meant the
+  # facing-angle check excluded NOTHING -- found investigating a real report
+  # of proximity search bailing out to expensive brute-force on "too
+  # ambiguous" scenes (est_combos in the tens of millions) at oblique camera
+  # angles, where many genuinely marginal/grazing LEDs were still being
+  # counted as fully visible and feeding the combinatorial explosion. 75.0
+  # gives real discrimination in the 75-90deg band (effective proximity
+  # cutoff ~75/0.95=79deg given the 0.95 threshold above) -- a first-cut,
+  # physically-motivated value (typical IR LED emission half-angles for this
+  # class of hardware), not yet empirically swept against real detectability
+  # data; retune if inlier counts drop or "too ambiguous" doesn't improve
+  # enough.
+  led_facing_angle_deg: 65.0      # emission half-angle used to build EXPECTED-visible LED sets against a
+                                   # not-yet-final pose (proximity's predicted-pose gate, brute-force
+                                   # hypothesis scoring, cross-cam bonus-correspondence lookup) -- this one
+                                   # is a matching-tolerance knob, safe to retune: too loose lets ambiguous
+                                   # grazing LEDs flood the candidate set, too tight risks omitting a LED
+                                   # that's genuinely about to be seen once the pose is refined.
+  led_facing_angle_strict_deg: 90.0 # emission half-angle used for the POST-REFINEMENT truth recheck once
+                                   # RANSAC has already produced an accurate pose (proximity's post-RANSAC
+                                   # vis-drop, brute-force's step-6 recheck) -- this decides whether an
+                                   # already-matched inlier is real or a phantom, so it should reflect the
+                                   # true physical self-occlusion horizon (~90deg), not the looser matching
+                                   # tolerance above. Loosening led_facing_angle_deg must NOT also tighten
+                                   # this check, or genuinely-visible grazing-angle inliers with good RANSAC
+                                   # agreement get spuriously dropped -> "post-vis-drop too few pairs" -> None.
   max_warm_search_cameras: 2      # cap on how many cameras a warm controller searches per frame —
                                    # candidates with mean facing_cos below warm_cam_cap_min_facing_deg's
                                    # cosine are excluded outright, survivors ranked by mean LED distance
@@ -551,10 +713,21 @@ matching:
   proximity_score_metric: "mean"        # error metric used when scoring hypotheses: "max" or "mean"
   proximity_top_k_ransac: 3
   proximity_stage2_max_err_factor: 4.0  # skip stage-2 RANSAC rescoring when best ITERATIVE err > this × accept_error_px (too few points for RANSAC to rescue a fit that far off)
-  visibility_occlusion_margin_m: 0.01   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
-  proximity_vis_score_threshold: 0.95   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
+  visibility_occlusion_margin_m: 0.02   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
+  proximity_vis_score_threshold: 0.99   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
 
-  proximity_expansion_velocity_k: 0.3   # extra px per px/frame of estimated velocity
+  proximity_expansion_velocity_k: 0.1   # extra px per px/(reference frame) of estimated velocity
+  # Fixed period used to convert vel_ema (a genuine m/s rate) into the
+  # "px/frame" scale proximity_expansion_velocity_k was tuned against. NOT the
+  # frame's own actual dt_target -- this recording's frame rate oscillates
+  # (e.g. 30/60fps), and using the real variable dt_target here made the
+  # velocity-scaled margin swing ~2x in sync with that cadence for identical
+  # real hand speed (see cheap_search_core's own comment on this fix). 1/30s
+  # is a first-cut default (the slower of the two observed cadences) -- if the
+  # neighbourhood still feels mis-sized after this fix, retune this value
+  # (and/or proximity_expansion_velocity_k) against this recording's actual
+  # typical speed range, not dt_target.
+  proximity_expansion_velocity_ref_dt_s: 0.0333
   proximity_expansion_uncertainty_k: 1.0  # extra px / n_history; largest at n=1 (2nd frame), decays as 1/n
   proximity_expansion_depth_k: 2.0        # extra px * m of depth; same pattern as local_search_depth_k — closer controller → bigger neigh
 
@@ -581,8 +754,57 @@ matching:
   # Pose validation
   # --------------------------------------------------------------------------
   accept_error_px: 1.5                          # max mean reprojection error to accept any solution
-  pose_jump_pos_thresh_m: [0.25, 0.25, 0.30]    # per-axis translation jump limit [x, y, z] in metres
+  # pose_jump_pos_thresh_m TIGHTENED 2026-09-06 from [0.25, 0.25, 0.30] --
+  # empirically retuned against walk_medium (5546 real predicted-vs-actual
+  # position-diff samples, 2536 of them quality-filtered: n_inliers>=8,
+  # error_px<=0.8) via CONTROLLER_TRACKER_JUMP_STATS_CSV (src/controller.py)
+  # instead of guessing. Real predicted(prev_pose)-vs-actual position diff on
+  # GENUINE tracked frames: p50=15mm p90=36mm p95=43mm p99=54mm p99.5=59mm
+  # max=70mm (quality-filtered); including the noisier rows the quality
+  # filter excludes (not necessarily wrong, just below the quality bar):
+  # p99=100mm p99.5=131mm (max well into the hundreds of mm on real
+  # outlier/wrong matches -- exactly what this gate exists to catch). Old
+  # 250-300mm was 2-4x looser than even that noisy-inclusive p99.5.
+  # Re-verified directly (not just estimated) against the same data using the
+  # actual OR-logic (accept if EITHER prev_pose OR predicted_pose check
+  # passes, magnitude-based approximation of the real per-axis check): on the
+  # quality-filtered subset, 0/2536 would be rejected under EITHER the old or
+  # the new threshold (zero new false-reject risk on genuine frames); on the
+  # full noisy-inclusive set, catch rate roughly triples (4/5546 -> 12/5546)
+  # while staying a small fraction overall. pose_jump_rot_thresh_deg left
+  # UNCHANGED -- quality-filtered real data already reaches
+  # p99.5=22.6deg/max=26.4deg, not far under the existing 30deg, so there's
+  # little room to tighten it without risking false rejects on genuine
+  # frames. Full percentile breakdown and speed-bucketed analysis not
+  # persisted anywhere -- rerun via CONTROLLER_TRACKER_JUMP_STATS_CSV
+  # (src/controller.py) if this needs revisiting later.
+  pose_jump_pos_thresh_m: [0.18, 0.18, 0.20]    # per-axis translation jump limit [x, y, z] in metres -- vs prev_pose only
   pose_jump_rot_thresh_deg: [30.0, 30.0, 30.0]  # per-axis rotation jump limit [rx, ry, rz] in degrees
+  # vs-predicted_pose position tolerance (CameraTracker.finalize_search) is
+  # VELOCITY-DEPENDENT instead -- scalar magnitude, thresh_mm = base + per_speed
+  # * |vel_ema| (m/s), not the fixed per-axis pos_thresh_xyz_m above. Added
+  # 2026-09-06: empirically fit against real predicted(prev_pose)-vs-actual
+  # data (CONTROLLER_TRACKER_JUMP_STATS_CSV) -- the residual predicted_pose
+  # error grows roughly linearly with speed (p99 fit: intercept~7.5mm,
+  # slope~7.6mm per m/s, R^2=0.83-0.87, 2536 quality-filtered samples).
+  # Defaults are that fit x~1.3 margin, re-verified directly against the same
+  # data with the actual OR-logic this code runs: 0/2536 quality-filtered
+  # frames newly rejected, even down to 8+8 -- kept 10+10 for margin beyond
+  # this one dataset. rot_thresh_xyz_deg above is still used unchanged for
+  # the vs-predicted_pose rotation check -- only position went velocity-dependent.
+  pose_jump_pred_pos_thresh_base_mm: 10.0
+  pose_jump_pred_pos_thresh_per_speed_mm_s: 10.0
+  # Cold-start plausibility check (CameraTracker.finalize_search) widening --
+  # once a loss runs longer than imu_only_propagation_max_frames,
+  # predicted_pose goes stale/unavailable and only last_good_pose (frozen at
+  # the last real vision accept) is left; these two rates widen its threshold
+  # per additional lost frame past that budget instead of dropping the check
+  # entirely. Deliberately generous (fast-hand-motion-scale, not tuned tight)
+  # -- this widening only matters once already past the point of having a
+  # live reference, so its job is "still catch a wildly wrong candidate," not
+  # "stay precise."
+  cold_start_stale_max_speed_m_s: 3.0
+  cold_start_stale_max_ang_speed_deg_s: 720.0
 
   # --------------------------------------------------------------------------
   # Joint multi-camera optimisation
@@ -597,6 +819,16 @@ matching:
   joint_lm_ftol: 0.001            # TRF convergence tolerances (cost/param/gradient); looser = fewer
   joint_lm_xtol: 0.001            # iterations before "converged", at the expense of solution precision.
   joint_lm_gtol: 0.001            # 1e-4 verified numerically equivalent to 1e-7 at pixel-level precision.
+  # fuse_camera_poses() fallback: when the joint LM fit is BOTH this many
+  # times worse than the best individual camera's own solo error AND this
+  # many px in absolute terms, trust that single camera's own solve instead
+  # of the joint one -- a large joint/solo blowup is evidence the cameras
+  # aren't looking at consistent geometry (e.g. a mismatched LED
+  # correspondence), not noise a joint fit should average out. Found on a
+  # real case: two cameras solved to ~1.1-1.25px each independently, joint
+  # LM only reached 4.05px (~3.5x worse than either input alone).
+  joint_fusion_max_error_ratio: 2.0
+  joint_fusion_fallback_min_abs_px: 1.0
 
   # --------------------------------------------------------------------------
   # Cross-controller occlusion
@@ -721,7 +953,7 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving

@@ -463,6 +463,35 @@ def fuse_camera_poses(
     )
     if T_joint is None:
         return seed['T_world_ctrl'], seed['error']
+
+    # Trust a single camera's own solve over the joint one when the joint fit
+    # is dramatically worse than every individual camera's own error -- e.g.
+    # two cameras each independently solve to ~1px, but the one pose that
+    # best explains BOTH simultaneously only reaches ~4px. That's not "each
+    # view has a little noise the joint fit averages out" -- it's evidence
+    # the two solves aren't actually looking at consistent geometry (e.g. a
+    # mismatched LED correspondence in one view that happens to reproject
+    # deceptively well ALONE, but is geometrically inconsistent with the
+    # other camera's own view -- the same "clean-but-wrong" trap this
+    # project has hit before, see HeuristicPoseFusionFilter._vision_weight's
+    # own docstring). Forcing one pose to fit both then produces a
+    # compromise that fits NEITHER well, worse than just trusting whichever
+    # camera's own independent solve was best. Found on a real case:
+    # cam0=1.07px/cam1=1.25px solo, joint=4.05px -- 3.2-3.8x worse than
+    # either input alone.
+    #
+    # Two conditions, both required, so this only fires on a genuinely
+    # suspicious blowup: a large RATIO alone would also fire on two
+    # near-perfect solo fits (e.g. 0.02px vs 0.005px) where the absolute
+    # difference is meaningless; a large ABSOLUTE error alone would also
+    # fire when every camera's own solve is already this noisy (nothing
+    # for the joint fit to be relatively worse than).
+    best_solo = min(cam_solutions, key=lambda s: s['error'])
+    _max_ratio = float(_cfg.get('joint_fusion_max_error_ratio', 2.0))
+    _min_abs_px = float(_cfg.get('joint_fusion_fallback_min_abs_px', 1.0))
+    if err_joint > _min_abs_px and err_joint > _max_ratio * best_solo['error']:
+        return best_solo['T_world_ctrl'], best_solo['error']
+
     return T_joint, err_joint
 
 
@@ -541,6 +570,10 @@ class PoseSearcher:
         # ── cached config (static for the lifetime of this searcher) ────────────
         # shared
         self._c_facing_deg          = float(_cfg.get('led_facing_angle_deg',             86.0))
+        # Post-refinement truth recheck (RANSAC-accurate pose) -- must reflect the real
+        # physical self-occlusion horizon, not the looser matching tolerance above. See
+        # config.yml's own comment: relaxing led_facing_angle_deg must not also relax this.
+        self._c_facing_deg_strict   = float(_cfg.get('led_facing_angle_strict_deg',       90.0))
         self._c_occ_radius          = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
         self._c_occ_margin_px       = float(_cfg.get('cross_occlusionself._c_occ_margin_px',   20.0))
         # joint optimisation — snap_camera's own prefilter; the fusion LM itself
@@ -832,18 +865,43 @@ class PoseSearcher:
                 + (f"  hyp_sizes={[len(candidates[k]) for k in hyp_k]}" if hyp_k else "")
             )
 
-            # Gate: skip proximity entirely when the raw (pre-collision-pruning) combo
-            # space is too large to be worth searching. Cheap, closed-form estimate —
-            # comb(len(hyp_k), n_assigned) * geomean(hyp_sizes)^n_assigned, where
-            # n_assigned = len(hyp_k) - min_none_forced is how many LEDs must get a
-            # real (non-None) blob at the hardest (first-tried) None level — computed
-            # with no enumeration, before any combo search runs. Locked=0 scenes with
-            # many dense, overlapping candidate LEDs essentially never resolve via
-            # proximity anyway (see proximity_max_estimated_combos in config.yml for
-            # the real data this was calibrated against); falling straight through to
-            # brute-force (which already fires automatically whenever no camera finds
-            # a proximity solution) is both correct and far cheaper than paying for a
-            # doomed best-first search.
+            # REMOVED 2026-09-06 (was: skip proximity entirely when the raw
+            # (pre-collision-pruning) combo space estimate exceeded
+            # proximity_max_estimated_combos, deferring straight to
+            # brute-force). Found investigating a real "too ambiguous, >5M
+            # estimated combos" report: the estimate this gate compared
+            # against was never actually representative of the real
+            # downstream cost. The hypothesis search that runs AFTER this
+            # gate is already independently, tightly bounded regardless of
+            # how large the raw combo space is --
+            # proximity_level0_max_hyp/proximity_topk_max_pop cap each
+            # None-level's combo enumeration to a bounded best-first search
+            # (see _bt_combos_topk's own docstring: O(max_pop) heap pops, not
+            # O(all combos)), and proximity_max_hypotheses (256, live
+            # default) caps the total PnP-scored hypotheses across the ENTIRE
+            # search regardless of None-level count. So the "doomed best-first
+            # search" this gate was built to avoid paying for was already
+            # cheap and safety-capped on its own -- meanwhile the ALTERNATIVE
+            # this gate forced (falling straight through to full-image
+            # brute-force) is far more expensive (tens of thousands of P3P
+            # calls per tier, seen repeatedly in this project's own logs).
+            # Net effect of removing this: worst case, the now-attempted
+            # bounded search fails and falls through to brute-force anyway
+            # (same outcome as before, marginally slower by the bounded
+            # search's own small, capped cost); best case, it succeeds and
+            # brute-force is avoided entirely. Also separately investigated
+            # and fixed the same session: led_facing_angle_deg was
+            # misconfigured (90.0, degenerate) and inflating hyp_k/ambiguity
+            # counts by counting grazing-angle LEDs as fully visible -- see
+            # its own config.yml comment; that fix reduces how often scenes
+            # get this ambiguous in the first place, independent of this one.
+            #
+            # _gate_estimate itself (kept, informational only, logged
+            # unconditionally below) is STILL useful as a diagnostic --
+            # comb(len(hyp_k), n_assigned) * geomean(hyp_sizes)^n_assigned,
+            # where n_assigned = len(hyp_k) - min_none_forced is how many
+            # LEDs must get a real (non-None) blob at the hardest
+            # (first-tried) None level -- computed with no enumeration.
             if hyp_k:
                 _gate_avail_blobs = set(b for k in hyp_k for b in candidates[k]) - truly_locked_blobs
                 _gate_min_none    = max(0, len(hyp_k) - len(_gate_avail_blobs))
@@ -853,11 +911,11 @@ class PoseSearcher:
                 _gate_estimate    = math.comb(len(hyp_k), _gate_n_assigned) * (_gate_geomean ** _gate_n_assigned)
                 if _gate_estimate > self._c_prox_max_est_combos:
                     logger.bind(cat="proximity_match").debug(
-                        f"[{self._ctrl} | cam {self._cam}] Proximity: too ambiguous "
+                        f"[{self._ctrl} | cam {self._cam}] Proximity: ambiguous "
                         f"(est_combos={_gate_estimate:,.0f} > {self._c_prox_max_est_combos:,}, "
-                        f"n_assigned={_gate_n_assigned}/{len(hyp_k)})  — deferring to brute-force"
+                        f"n_assigned={_gate_n_assigned}/{len(hyp_k)}) — trying bounded search anyway "
+                        f"(no longer deferring straight to brute-force, see this block's own comment)"
                     )
-                    return None
 
             # Pre-undistort all blob positions once — reused across all hypothesis evaluations.
             _blobs_norm = self.camera.undistort_points(blobs).astype(np.float32)
@@ -1430,7 +1488,7 @@ class PoseSearcher:
             self.model.positions, self.model.normals, geom,
             cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
             cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
-            facing_threshold_deg=self._c_facing_deg,
+            facing_threshold_deg=self._c_facing_deg_strict,
             occlusion_margin_m=0.0,
         )
         if occluders_per_cam:
@@ -2237,7 +2295,7 @@ class PoseSearcher:
                                 geom,
                                 cam_K=K, cam_dc=dc, cam_w=self.camera.width, cam_h=self.camera.height,
                                 cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
-                                facing_threshold_deg=self._c_facing_deg,
+                                facing_threshold_deg=self._c_facing_deg_strict,
                             )
                             if occluders_per_cam:
                                 _occ_r = occluders_per_cam.get(self.camera.camera_idx)

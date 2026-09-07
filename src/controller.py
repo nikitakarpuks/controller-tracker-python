@@ -1,4 +1,6 @@
 import copy
+import csv
+import os
 import time
 import cv2
 import numpy as np
@@ -13,8 +15,38 @@ from src.debug_config import is_continuous_sequence
 from src.transformations import Transform
 from src._self_calibration import SelfCalibrator
 from src.imu_data import integrate_gyro_segment
+from src.mocap_data import world_pose
 from src.pose_fusion import PoseFusionFilter
 from src.pose_fusion_heuristic import HeuristicPoseFusionFilter
+
+
+# =========================================================
+# Temporary diagnostic: predicted-vs-actual jump-tolerance stats
+# =========================================================
+# Opt-in via CONTROLLER_TRACKER_JUMP_STATS_CSV=/path/to/out.csv -- a no-op
+# (zero overhead, no file touched) otherwise. One row per solved per-camera
+# candidate in finalize_search, BEFORE either jump gate runs, so this
+# captures the real predicted-vs-actual distribution the gates are meant to
+# bound -- used to empirically retune pose_jump_pos_thresh_m/_rot_thresh_xyz_deg
+# (2026-09-06 investigation) rather than guessing. Not wired through any
+# config file / call-site signature on purpose -- this is a one-off analysis
+# tool, not a permanent feature; remove this whole block once done, or leave
+# it (env-gated, so harmless either way) if it turns out useful to rerun
+# later.
+_JUMP_STATS_CSV_PATH = os.environ.get("CONTROLLER_TRACKER_JUMP_STATS_CSV")
+_jump_stats_writer = None
+_jump_stats_file = None
+
+
+def _log_jump_stats_row(**fields) -> None:
+    global _jump_stats_writer, _jump_stats_file
+    if not _JUMP_STATS_CSV_PATH:
+        return
+    if _jump_stats_writer is None:
+        _jump_stats_file = open(_JUMP_STATS_CSV_PATH, "w", newline="")
+        _jump_stats_writer = csv.DictWriter(_jump_stats_file, fieldnames=list(fields.keys()))
+        _jump_stats_writer.writeheader()
+    _jump_stats_writer.writerow(fields)
 
 
 # =========================================================
@@ -239,13 +271,26 @@ def cheap_search_core(
         gyro_rel_R=gyro_rel_R,
     )
 
-    # Velocity-scaled search gates: expand proximity radius proportionally to speed.
-    # v_px = ‖predicted.t − prev.t‖ × fx / depth  (pixels/frame, camera-agnostic)
+    # Velocity-scaled search gates: expand proximity radius proportionally to
+    # SPEED (m/s) -- NOT to how far the point-prediction moved this particular
+    # frame. BUG (found investigating an oscillating neighbourhood-size report):
+    # this used to be ‖predicted.t - prev.t‖, which equals |vel_ema| * dt_target
+    # once vel_ema is active -- i.e. displacement over the ACTUAL upcoming gap.
+    # On a recording whose own frame rate alternates (e.g. 30/60fps), dt_target
+    # itself swings ~2x frame to frame, so the SAME real hand speed produced a
+    # halved margin right after a 60fps-cadence step and a doubled one right
+    # after a 30fps-cadence step, purely from which cadence happened to apply
+    # that frame -- nothing to do with the controller's actual motion. vel_ema
+    # is already a genuine, dt-normalised m/s rate (see
+    # ControllerTracker._propagate_pose_history), so converting it to a pixel
+    # margin needs a FIXED reference period, not this frame's own variable
+    # dt_target, or the normalisation vel_ema already did gets undone right
+    # back here.
     _v_px = 0.0
-    if predicted_pose is not None and prev_pose is not None:
-        _v_vec = predicted_pose[1].reshape(3) - np.asarray(prev_pose[1], np.float64).reshape(3)
-        _depth = max(float(np.asarray(prev_pose[1]).reshape(3)[2]), 0.1)
-        _v_px  = float(np.linalg.norm(_v_vec)) * pose_searcher.camera.fx / _depth
+    if vel_ema is not None and prev_pose is not None:
+        _depth  = max(float(np.asarray(prev_pose[1]).reshape(3)[2]), 0.1)
+        _ref_dt = float(_cfg.get('proximity_expansion_velocity_ref_dt_s', 0.0333))
+        _v_px   = float(np.linalg.norm(vel_ema)) * _ref_dt * pose_searcher.camera.fx / _depth
     _base_expansion = float(_cfg.get('proximity_expansion_px', 8.0))
     _prox_vel_k     = float(_cfg.get('proximity_expansion_velocity_k', 0.0))
     _eff_expansion  = _base_expansion + _prox_vel_k * _v_px
@@ -314,6 +359,16 @@ class CameraTracker:
         # Retained across loss events so brute re-acquisition can be
         # validated for plausibility (pose-jump guard).
         self.last_good_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        # Real timestamp last_good_pose was captured at -- set alongside it,
+        # always (see the one live setter in ControllerTracker._commit_fused_
+        # solution). Needed by finalize_search's cold-start staleness widening
+        # to use REAL elapsed time, not a frame-count proxy -- this
+        # recording's own frame rate oscillates (~11-22ms), so consecutive_
+        # failures * an assumed nominal frame period diverges from the true
+        # elapsed gap over a multi-frame loss (found auditing every
+        # prediction/staleness site in this pipeline for exactly this class
+        # of bug -- this was the one still using a count-based proxy).
+        self.last_good_pose_ts_ns: Optional[int] = None
         self.last_good_assignment = None
 
         # Consecutive frames without a valid solution.
@@ -667,11 +722,20 @@ class CameraTracker:
                          other_cameras_blobs: Optional[List] = None,
                          blob_mask: Optional[np.ndarray] = None,
                          occluders_per_cam: Optional[Dict] = None,
-                         allow_expensive_fallback: bool = True) -> Optional[Dict]:
+                         allow_expensive_fallback: bool = True,
+                         *, frame_ts_ns: int) -> Optional[Dict]:
         """Validate and accept/reject an already-obtained candidate `solution` — from
         search_cheap(), or from a brute-force recovery attempt (cold-start or
         proximity-failed). Reads self state, does not commit results — call apply()
         with the returned value to commit state changes.
+
+        frame_ts_ns: this frame's real timestamp -- keyword-only (forces every call
+        site to pass it explicitly rather than silently misaligning positionally).
+        Needed by the cold-start staleness widening below, which must use REAL
+        elapsed time since last_good_pose was captured, not a frame-count proxy
+        (this recording's own frame rate oscillates ~11-22ms, so a count-based
+        proxy diverges from the true elapsed gap -- found auditing every
+        prediction/staleness site in this pipeline for exactly this class of bug).
 
         allow_expensive_fallback: gates the brute-force retries that fire when this
         camera HAS a prior but the candidate is a pose-jump or its error is too high —
@@ -706,49 +770,304 @@ class CameraTracker:
         # continuous per-frame tracking — tracking_lost_last_frame is.
         _reacquiring = self.prev_pose is None or self.tracking_lost_last_frame
 
+        # Temporary diagnostic (see _log_jump_stats_row, no-op unless
+        # CONTROLLER_TRACKER_JUMP_STATS_CSV is set) -- captures the raw
+        # predicted-vs-actual distribution for continuous warm frames only
+        # (the exact population the tight per-frame jump gate below applies
+        # to), BEFORE either jump gate can reject/mutate this candidate.
+        if _JUMP_STATS_CSV_PATH and solution is not None and not _reacquiring and self.prev_pose is not None:
+            _tv_new = np.asarray(solution["tvec"], np.float64).reshape(3)
+            _R_new, _ = cv2.Rodrigues(np.asarray(solution["rvec"], np.float32).reshape(3, 1))
+            _rvp, _tvp = self.prev_pose
+            _tv_prev = np.asarray(_tvp, np.float64).reshape(3)
+            _R_prev, _ = cv2.Rodrigues(np.asarray(_rvp, np.float32).reshape(3, 1))
+            _pos_diff_prev_mm = float(np.linalg.norm(_tv_new - _tv_prev)) * 1000.0
+            # R_new @ R_ref.T -- MUST match _pose_jump_too_large's own convention
+            # (src/controller.py:512) exactly, not the transposed order. The total
+            # rotation ANGLE (this magnitude-only use) is actually invariant to
+            # the order -- R_new@R_ref.T and R_ref.T@R_new are conjugate/similar
+            # matrices, same trace, same angle -- so this specific line was never
+            # numerically wrong; kept consistent with the fix below anyway so
+            # nothing here is left as a trap for a future per-axis extraction.
+            _rot_diff_prev_deg = float(np.degrees(np.linalg.norm(
+                cv2.Rodrigues((_R_new @ _R_prev.T).astype(np.float32))[0])))
+            _dt_prev_s = ((frame_ts_ns - int(self.pose_history[0][2])) / 1e9
+                          if self.pose_history else float("nan"))
+            _pos_diff_pred_mm = _rot_diff_pred_deg = float("nan")
+            if predicted_pose is not None:
+                _rvec_pred, _tv_pred = predicted_pose  # _predict_pose returns (rvec, tvec), NOT a rotation matrix
+                _R_pred, _ = cv2.Rodrigues(np.asarray(_rvec_pred, np.float32).reshape(3, 1))
+                _pos_diff_pred_mm = float(np.linalg.norm(_tv_new - np.asarray(_tv_pred, np.float64).reshape(3))) * 1000.0
+                _rot_diff_pred_deg = float(np.degrees(np.linalg.norm(
+                    cv2.Rodrigues((_R_new @ _R_pred.T).astype(np.float32))[0])))
+            _n_inliers_stat = (len(solution.get("assignment") or [])
+                                + sum(len(v) for v in (solution.get("aux_assignments") or {}).values()))
+            _log_jump_stats_row(
+                ts_ns=frame_ts_ns, ctrl_name=ctrl_name, cam_idx=cam_idx,
+                method=solution.get("method", "?"),
+                n_inliers=_n_inliers_stat, error_px=float(solution.get("error", 0.0)),
+                dt_prev_s=_dt_prev_s,
+                pos_diff_prev_mm=_pos_diff_prev_mm, rot_diff_prev_deg=_rot_diff_prev_deg,
+                pos_diff_pred_mm=_pos_diff_pred_mm, rot_diff_pred_deg=_rot_diff_pred_deg,
+                speed_est_m_s=(_pos_diff_prev_mm / 1000.0 / _dt_prev_s) if _dt_prev_s and _dt_prev_s > 0 else float("nan"),
+            )
+
         # Cold-start / re-acquisition plausibility check: reject a candidate
-        # that's too far from the last known good pose. Only valid when frames
-        # are a real temporal sequence — against a curated/isolated frame set
+        # that's too far from BOTH the last known good pose AND the current
+        # predicted (IMU-extrapolated) pose. Only valid when frames are a real
+        # temporal sequence — against a curated/isolated frame set
         # (assume_continuous_frames: false) there's no real "last frame" to be
         # near, so this check is skipped and the controller can be anywhere.
         #
-        # Also only valid within the tracking_lost_grace_frames window: fixed
-        # distance/angle thresholds assume "last known good" was seen ~1 frame
-        # ago, which is only true right after loss. Once consecutive_failures
-        # exceeds the grace period, the controller is genuinely lost (see
-        # ControllerTracker._mark_all_lost, which clears prev_pose/pose_history
-        # at that same threshold) and may have had arbitrarily long — and thus
-        # arbitrarily far — to drift, so the check no longer applies.
-        _grace = int(_cfg.get('tracking_lost_grace_frames', 1))
+        # No hard frame-count cutoff any more (previously
+        # tracking_lost_grace_frames=1, then imu_only_propagation_max_frames=4
+        # -- see git history for both). Both were hard cliffs: tight check
+        # right up to the cutoff, then NO CHECK AT ALL past it. Found a real
+        # case where that gap mattered even at 4 frames: a 6-consecutive-lost-
+        # frame gap (one past that budget) let a confidently-wrong, thin
+        # brute-force bootstrap (4 inliers, 0.05 confidence, 14/32 LED triples
+        # reached) sail through completely unchecked. Replaced with a
+        # continuous widening instead:
+        #
+        #   - Up to imu_only_propagation_max_frames lost frames: predicted_pose
+        #     (IMU-extrapolated, computed fresh THIS frame regardless of how
+        #     long the loss has run) is still live -- see
+        #     ControllerTracker._mark_all_lost, which keeps THIS camera's
+        #     prev_pose/pose_history IMU-warm-started for exactly that many
+        #     frames. Checked at the normal tight threshold (never stale by
+        #     construction -- it's a fresh prediction every call).
+        #   - Past that budget, pose_history gets cleared (clear_prior()) and
+        #     predicted_pose goes None in lockstep -- last_good_pose (frozen at
+        #     the last real vision accept) is all that's left, and it gets
+        #     staler every additional REAL SECOND, not every additional lost
+        #     FRAME -- this recording's own frame rate oscillates (~11-22ms
+        #     gaps), so a frame-count proxy for elapsed time diverges from the
+        #     truth over a multi-frame loss (an earlier version of this fix
+        #     used consecutive_failures * an assumed nominal frame period;
+        #     found wrong auditing every prediction/staleness site in this
+        #     pipeline for exactly this class of bug -- fixed by tracking
+        #     last_good_pose_ts_ns alongside last_good_pose, see its own
+        #     comment). Threshold WIDENS continuously with REAL elapsed time
+        #     since last_good_pose (cold_start_stale_max_speed_m_s /
+        #     _max_ang_speed_deg_s, a generous fast-hand-motion-scale rate) --
+        #     NOT gated on first crossing the imu_only_propagation_max_frames
+        #     budget (a second, later bug in the first version of this fix:
+        #     that gate assumed real elapsed time and the budget's frame count
+        #     move together, which breaks during a fast-cadence stretch --
+        #     found on a real case where consecutive_failures=8, already past
+        #     the 4-frame budget so predicted_pose was gone, but real elapsed
+        #     time was still under the budget's assumed duration, so a clean
+        #     6-inlier/0.04px candidate got "+0mm/+0deg for 0.00s stale" --
+        #     the exact same failure this whole mechanism exists to prevent).
+        #     A continuous version of the ORIGINAL comment's own reasoning
+        #     ("may have had arbitrarily long -- and thus arbitrarily far --
+        #     to drift, so the check no longer applies"), arrived at gradually
+        #     instead of via a sudden binary cliff, so an extremely long loss
+        #     still degrades toward "no meaningful check" the same way it
+        #     always did, just without a specific frame count where
+        #     protection vanishes outright.
+        #
+        # Same OR-logic as the tight per-frame guard below (accept if
+        # plausible against EITHER reference) -- kept consistent with that
+        # check deliberately, not reinvented here.
+        _cold_start_check_frames = int(_cfg.get('imu_only_propagation_max_frames', 4))
         if (solution is not None and _reacquiring and self.last_good_pose is not None
-                and self.consecutive_failures <= _grace
                 and is_continuous_sequence()):
             rvec_lg, tvec_lg = self.last_good_pose
-            if self._pose_jump_too_large(
+
+            # Real elapsed time since last_good_pose was captured -- widens
+            # from t=0, NO baseline "free pass" window. An earlier version of
+            # this fix subtracted imu_only_propagation_max_frames worth of
+            # assumed time before widening kicked in (reasoning: predicted_pose
+            # covers that regime via the OR-check below anyway) -- wrong,
+            # found on a real case: consecutive_failures=8 (well past the
+            # 4-frame budget, so predicted_pose was ALREADY unavailable) but
+            # real elapsed time still under that ~133ms baseline (a fast-
+            # cadence stretch), so a clean 6-inlier/0.04px candidate got
+            # rejected against last_good_pose with "+0mm/+0deg for 0.00s
+            # stale" -- the tight, ~1-frame-sized base threshold, even though
+            # up to 8 real (undefended) frames had actually elapsed and
+            # predicted_pose was no longer there to rescue it either. The
+            # baseline conflated two different budgets (predicted_pose
+            # availability vs. how much widening the FIXED reference pose
+            # needs) that don't actually move together once real cadence
+            # varies -- removed; widening now tracks the true elapsed time
+            # unconditionally, so it can never lag behind predicted_pose's own
+            # (frame-count-based) expiry the way the baseline let it.
+            _stale_s = 0.0
+            if self.last_good_pose_ts_ns is not None:
+                _stale_s = max(0.0, (frame_ts_ns - self.last_good_pose_ts_ns) / 1e9)
+            _extra_pos_m = float(_cfg.get('cold_start_stale_max_speed_m_s', 3.0)) * _stale_s
+            _extra_rot_deg = float(_cfg.get('cold_start_stale_max_ang_speed_deg_s', 720.0)) * _stale_s
+
+            def _widen(_thresh, _extra):
+                return (tuple(v + _extra for v in _thresh) if isinstance(_thresh, tuple)
+                        else _thresh + _extra)
+
+            _lg_jump_kw = dict(_jump_kw)
+            if 'pos_thresh_xyz_m' in _lg_jump_kw:
+                _lg_jump_kw['pos_thresh_xyz_m'] = _widen(_lg_jump_kw['pos_thresh_xyz_m'], _extra_pos_m)
+            if 'rot_thresh_xyz_deg' in _lg_jump_kw:
+                _lg_jump_kw['rot_thresh_xyz_deg'] = _widen(_lg_jump_kw['rot_thresh_xyz_deg'], _extra_rot_deg)
+
+            _jump_vs_last_good = self._pose_jump_too_large(
                 solution["rvec"], solution["tvec"],
                 rvec_lg, tvec_lg,
-                max_dist_m=0.5,
-                max_angle_deg=60.0,
-                **_jump_kw,
-            ):
-                logger.bind(cat="matching_decisions").debug(f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far from last known good pose")
+                max_dist_m=0.5 + _extra_pos_m,
+                max_angle_deg=60.0 + _extra_rot_deg,
+                **_lg_jump_kw,
+            )
+            _jump_vs_pred = None
+            if _jump_vs_last_good and predicted_pose is not None:
+                _jump_vs_pred = self._pose_jump_too_large(
+                    solution["rvec"], solution["tvec"],
+                    predicted_pose[0], predicted_pose[1],
+                    max_dist_m=0.5,
+                    max_angle_deg=60.0,
+                    **_jump_kw,
+                )
+            if _jump_vs_last_good and (predicted_pose is None or _jump_vs_pred):
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{ctrl_name} | cam {cam_idx} | track] brute re-acquisition rejected: too far "
+                    f"from both last known good pose (widened +{_extra_pos_m * 1000:.0f}mm/"
+                    f"+{_extra_rot_deg:.0f}deg for {_stale_s:.2f}s stale) and predicted (IMU) pose "
+                    f"(consecutive_failures={self.consecutive_failures}, budget={_cold_start_check_frames})"
+                )
                 solution = None
+            elif _jump_vs_last_good:
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{ctrl_name} | cam {cam_idx} | track] re-acquisition candidate far from "
+                    f"last_good_pose but rescued by predicted_pose "
+                    f"(consecutive_failures={self.consecutive_failures}, budget={_cold_start_check_frames}) — accepting."
+                )
 
         # ------------------------------------------------------------------
-        # Pose-jump guard against prev_pose (tight, per-frame — continuous
-        # tracking only; skipped while re-acquiring, see above)
+        # Pose-jump guard against prev_pose AND predicted_pose (tight,
+        # per-frame — continuous tracking only; skipped while re-acquiring,
+        # see above). Rejects only if the candidate is implausibly far from
+        # BOTH references, not just the raw previous frame -- prev_pose alone
+        # has no notion of how fast the controller was actually moving, so a
+        # genuine fast-motion frame can legitimately clear pos/rot thresholds
+        # sized for "one ordinary frame step" versus prev_pose while still
+        # landing close to predicted_pose (the vel_ema-extrapolated
+        # prediction, which DOES account for that motion). Confirmed on a
+        # real case (2026-09-06 investigation): a rotation-only jump of
+        # 31.3deg on one axis vs prev_pose (threshold 30.0deg -- ~4% over,
+        # position was nowhere near its own threshold) that was only 21.5deg
+        # vs predicted_pose, comfortably under threshold there -- rejecting
+        # it forced a brute-force recovery that failed and cost the whole
+        # frame (TRACKING LOST). Same OR-logic the brute-recovery fallback a
+        # few lines below already uses for its own rescue check
+        # (_near_prev or _near_pred) -- this makes the INITIAL gate consistent
+        # with that established pattern instead of only applying it after a
+        # reject has already happened.
         # ------------------------------------------------------------------
         if solution is not None and self.prev_pose is not None and not _reacquiring:
             rvec_p, tvec_p = self.prev_pose
-            if self._pose_jump_too_large(
+            _jump_vs_prev = self._pose_jump_too_large(
                 solution["rvec"], solution["tvec"],
                 rvec_p, tvec_p,
                 **_jump_kw,
-            ):
-                logger.warning(f"[{ctrl_name} | cam {cam_idx} | tracking] Pose jump detected "
-                               f"(method={solution.get('method','?')}, "
-                               f"err={solution['error']:.2f} px) — "
-                               f"attempting brute recovery.")
+            )
+            # vs-predicted_pose position tolerance is VELOCITY-DEPENDENT
+            # (scalar, magnitude-based -- not the fixed per-axis
+            # pos_thresh_xyz_m used for the vs-prev_pose check above).
+            # Empirically fit 2026-09-06 against real predicted(prev_pose)-vs-
+            # actual data from a full walk_medium run (CONTROLLER_TRACKER_
+            # JUMP_STATS_CSV, src/controller.py): the residual position error
+            # BETWEEN predicted_pose and the actual accepted pose (i.e. how
+            # much predicted_pose DOESN'T already explain) grows roughly
+            # linearly with speed -- p99 fit intercept~7.5mm, slope~7.6mm per
+            # m/s (R^2=0.83-0.87 across 2536 quality-filtered samples,
+            # n_inliers>=8/error_px<=0.8). Defaults below (10mm + 10mm per
+            # m/s) are that fit with a ~1.3x margin, re-verified directly
+            # against the same real data (same OR-logic this code actually
+            # runs): 0/2536 quality-filtered frames would be newly rejected,
+            # even down to 8mm+8mm/s -- picked 10+10 to keep some margin
+            # beyond this one dataset. self.vel_ema is the SAME velocity
+            # estimate predicted_pose itself was built from this frame (see
+            # _predict_pose's vel_ema_rate param) -- not a separate estimate.
+            _speed_est_m_s = float(np.linalg.norm(self.vel_ema)) if self.vel_ema is not None else 0.0
+            _vel_pos_thresh_m = (float(_cfg.get('pose_jump_pred_pos_thresh_base_mm', 10.0))
+                                  + float(_cfg.get('pose_jump_pred_pos_thresh_per_speed_mm_s', 10.0))
+                                  * _speed_est_m_s) / 1000.0
+            _jump_vs_pred = None
+            if _jump_vs_prev and predicted_pose is not None:
+                _jump_vs_pred = self._pose_jump_too_large(
+                    solution["rvec"], solution["tvec"],
+                    predicted_pose[0], predicted_pose[1],
+                    max_dist_m=_vel_pos_thresh_m,
+                    rot_thresh_xyz_deg=_jump_kw.get('rot_thresh_xyz_deg'),
+                )
+            _is_jump = _jump_vs_prev and (predicted_pose is None or _jump_vs_pred)
+
+            if _jump_vs_prev and not _is_jump:
+                # Rescued: implausible vs the raw previous frame, but
+                # plausible vs the motion-compensated prediction -- accepted
+                # as genuine fast motion, not a mismatch. Debug, not warning:
+                # this is the expected/working case the OR-logic exists for.
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{ctrl_name} | cam {cam_idx} | tracking] pose jump vs prev_pose rescued by "
+                    f"predicted_pose (thresh={_vel_pos_thresh_m * 1000:.0f}mm @ speed={_speed_est_m_s:.2f}m/s, "
+                    f"method={solution.get('method', '?')}, "
+                    f"match_err={solution['error']:.2f}px) — accepting."
+                )
+
+            if _is_jump:
+                # Precise diagnostics for the WARNING below -- the old message's
+                # "err=Npx" is solution['error'], the PROXIMITY MATCH'S OWN
+                # reprojection error (match quality), which has nothing to do
+                # with why this got flagged as a jump; the actual pos/rot delta
+                # that tripped the gate was never logged at all.
+                _tv_new = np.asarray(solution["tvec"], np.float64).reshape(3)
+                _tv_p   = np.asarray(tvec_p, np.float64).reshape(3)
+                _pos_diff_mm = (_tv_new - _tv_p) * 1000.0
+                _R_new, _ = cv2.Rodrigues(np.asarray(solution["rvec"], np.float32).reshape(3, 1))
+                _R_p,   _ = cv2.Rodrigues(np.asarray(rvec_p, np.float32).reshape(3, 1))
+                # R_new @ R_p.T -- MUST match _pose_jump_too_large's own
+                # convention (this file, _pose_jump_too_large: "R_rel = R_new @
+                # R_ref.T") exactly, not the transposed order. Unlike a pure
+                # magnitude (rotation ANGLE is order-invariant -- conjugate
+                # matrices share a trace/angle), the PER-AXIS breakdown printed
+                # here is NOT order-invariant: R_new@R_p.T and R_p.T@R_new
+                # represent the same physical rotation's axis expressed in two
+                # different frames, so their individual x/y/z components
+                # legitimately differ. Found on a real case: this line's old
+                # (wrong) order printed rot_diff=(19.1,0.7,28.3)deg, all three
+                # individually under the 30deg-per-axis threshold, while the
+                # ACTUAL check (correct order) had rejected the frame -- the
+                # log was describing a different computation than the one that
+                # ran, exactly the "why did this reject, the printed numbers
+                # don't justify it" report this was found from.
+                _rot_diff_deg = np.degrees(np.abs(
+                    cv2.Rodrigues((_R_new @ _R_p.T).astype(np.float32))[0].reshape(3)))
+                # 0.15/25.0 mirror _pose_jump_too_large's own scalar-mode
+                # defaults -- only reachable if pose_jump_pos_thresh_m/
+                # _rot_thresh_xyz_deg were both left unset in config (today's
+                # config sets both, so _jump_kw always has these keys in
+                # practice; kept for display accuracy if that ever changes).
+                _pos_thresh = _jump_kw.get('pos_thresh_xyz_m', 0.15)
+                _rot_thresh = _jump_kw.get('rot_thresh_xyz_deg', 25.0)
+                _pred_str = " | vs predicted_pose: n/a (no prediction available -- reject stands on prev_pose alone)"
+                if predicted_pose is not None:
+                    _tv_pred = np.asarray(predicted_pose[1], np.float64).reshape(3)
+                    _pos_vs_pred_mm = float(np.linalg.norm(_tv_new - _tv_pred)) * 1000.0
+                    _R_pred, _ = cv2.Rodrigues(np.asarray(predicted_pose[0], np.float32).reshape(3, 1))
+                    _rot_vs_pred_deg = float(np.degrees(np.linalg.norm(
+                        cv2.Rodrigues((_R_new @ _R_pred.T).astype(np.float32))[0])))
+                    _pred_str = (f" | vs predicted_pose: dist={_pos_vs_pred_mm:.0f}mm "
+                                 f"(vel-dependent thresh={_vel_pos_thresh_m * 1000:.0f}mm @ "
+                                 f"speed={_speed_est_m_s:.2f}m/s) "
+                                 f"rot={_rot_vs_pred_deg:.1f}deg (also over threshold -- not rescued)")
+                logger.warning(
+                    f"[{ctrl_name} | cam {cam_idx} | tracking] Pose jump detected vs prev_pose "
+                    f"(match_err={solution['error']:.2f}px, method={solution.get('method', '?')}) — "
+                    f"pos_diff=({_pos_diff_mm[0]:.0f},{_pos_diff_mm[1]:.0f},{_pos_diff_mm[2]:.0f})mm "
+                    f"thresh={tuple(round(v * 1000) for v in _pos_thresh) if isinstance(_pos_thresh, tuple) else f'{_pos_thresh * 1000:.0f}mm scalar'} "
+                    f"rot_diff=({_rot_diff_deg[0]:.1f},{_rot_diff_deg[1]:.1f},{_rot_diff_deg[2]:.1f})deg "
+                    f"thresh={_rot_thresh if isinstance(_rot_thresh, tuple) else f'{_rot_thresh}deg scalar'}"
+                    f"{_pred_str} — attempting brute recovery."
+                )
                 solution = None
                 if allow_expensive_fallback and n_available >= 4:
                     _jump_prior = predicted_pose if predicted_pose is not None else self.prev_pose
@@ -840,6 +1159,7 @@ class CameraTracker:
         return self.finalize_search(
             solution, predicted_pose, blobs, blob_radii, other_cameras_blobs,
             blob_mask, occluders_per_cam, allow_expensive_fallback,
+            frame_ts_ns=frame_ts_ns,
         )
 
     def apply(self, result: Optional[Dict]) -> None:
@@ -902,6 +1222,8 @@ class ControllerTracker:
                  accel_data: Optional[tuple] = None,
                  lever_arm: Optional[np.ndarray] = None,
                  g_world_estimator=None,
+                 headset_mocap=None,
+                 g_world_estimator_abs=None,
                  fusion_cfg: Optional[dict] = None,
                  debug_pose_fusion_cfg: Optional[dict] = None):
         self.ctrl_name        = ctrl_name
@@ -932,10 +1254,20 @@ class ControllerTracker:
         # share the exact same public interface, so nothing below this branch
         # needs to know or care which one got constructed.
         self._g_world_estimator = g_world_estimator
+        # Headset-ego-motion correction for dead-reckoning (see src.mocap_data.world_pose /
+        # src.imu_data.predict_headset_relative_pose) -- both None unless mocap.enabled and a
+        # headset mocap trajectory actually loaded (main.py); HeuristicPoseFusionFilter treats
+        # either being None as "correction unavailable, use the uncorrected path" (fail-open).
+        self._headset_mocap = headset_mocap
+        self._g_world_estimator_abs = g_world_estimator_abs
         _filter_cls = (HeuristicPoseFusionFilter
                        if (fusion_cfg or {}).get("filter_type", "kalman") == "heuristic"
                        else PoseFusionFilter)
-        _filter_kwargs = {"ctrl_name": self.ctrl_name} if _filter_cls is HeuristicPoseFusionFilter else {}
+        _filter_kwargs = (
+            {"ctrl_name": self.ctrl_name, "headset_mocap": headset_mocap,
+             "g_world_estimator_abs": g_world_estimator_abs}
+            if _filter_cls is HeuristicPoseFusionFilter else {}
+        )
         self._fusion_filter: Optional[Union[PoseFusionFilter, HeuristicPoseFusionFilter]] = (
             _filter_cls(gyro_data, accel_data, lever_arm, g_world_estimator, fusion_cfg or {}, **_filter_kwargs)
             if (fusion_cfg or {}).get("enabled", False) else None
@@ -1031,11 +1363,24 @@ class ControllerTracker:
         proof that prediction is wrong (two rigid controllers cannot share a
         tracked origin) -- resetting here means the very next frame starts a
         genuine cold re-detect instead of continuing to coast from (and
-        potentially re-warm-start off) the disproven position."""
+        potentially re-warm-start off) the disproven position.
+
+        Also clears last_good_pose/last_good_pose_ts_ns (clear_prior() itself
+        deliberately does NOT -- it's meant to survive an ordinary vision
+        loss as a re-acquisition reference, see CameraTracker.clear_prior's
+        own docstring). But this reset means the recent belief was PROVEN
+        wrong, not just lost -- last_good_pose was almost certainly captured
+        during the same contaminated (misidentified) stretch, so leaving it
+        alive would hand CameraTracker.finalize_search's own cold-start
+        plausibility check a corrupted reference to judge the NEXT real
+        candidate against, right after we just established it can't be
+        trusted."""
         if self._fusion_filter is not None:
             self._fusion_filter.reset()
         for _tracker in self.trackers.values():
             _tracker.clear_prior()
+            _tracker.last_good_pose = None
+            _tracker.last_good_pose_ts_ns = None
         self._imu_only_propagated_frames = 0
         self._last_imu_only_pose = None
         if reason:
@@ -1262,7 +1607,7 @@ class ControllerTracker:
                     solution, predicted_pose, obs_full,
                     blob_radii=rad_full, other_cameras_blobs=None,
                     blob_mask=mask, occluders_per_cam=occluders_per_cam,
-                    allow_expensive_fallback=False,
+                    allow_expensive_fallback=False, frame_ts_ns=frame_ts_ns,
                 )
                 if solution is None:
                     continue
@@ -1403,7 +1748,7 @@ class ControllerTracker:
                     sol, predicted_pose_by_cid.get(cid), obs_full,
                     blob_radii=rad_full, other_cameras_blobs=_other_cams_by_cid[cid],
                     blob_mask=mask, occluders_per_cam=occluders_per_cam,
-                    allow_expensive_fallback=True,
+                    allow_expensive_fallback=True, frame_ts_ns=frame_ts_ns,
                 )
                 if sol is not None:
                     cam_solutions.append({"cam_id": cid, "tracker": tracker, "solution": sol})
@@ -1669,7 +2014,21 @@ class ControllerTracker:
         accepted = True
         if self._fusion_filter is not None:
             accepted = self._fusion_filter.try_update(solution, frame_ts_ns)
-            T_world_ctrl = Transform(self._fusion_filter.reported_R, self._fusion_filter.reported_p)
+            # reported_R/reported_p can legitimately still be None here: a
+            # brand new filter (self.R is None, never had any state at all)
+            # whose very first candidate gets rejected before ever calling
+            # _report() -- e.g. HeuristicPoseFusionFilter's bootstrap-branch
+            # sibling-collision check -- has genuinely nothing to report yet,
+            # unlike a WARM reject (implausible-jump, cold-reacquire-pending),
+            # which always has a meaningful prior/IMU-predicted pose to fall
+            # back on. T_world_ctrl stays None in that case rather than a
+            # broken Transform(None, None) (crashed here and in every
+            # downstream consumer before this fix, found on a real run) --
+            # every consumer below and in main.py must treat T_world_ctrl is
+            # None as "nothing to report this frame", same spirit as the
+            # existing fusion_forced_cold_start hide-this-frame handling.
+            _rep_R, _rep_p = self._fusion_filter.reported_R, self._fusion_filter.reported_p
+            T_world_ctrl = Transform(_rep_R, _rep_p) if (_rep_R is not None and _rep_p is not None) else None
             solution["T_world_ctrl"] = T_world_ctrl  # downstream reporting reads this same dict
             if self._debug_pose_fusion:
                 _dbg = self._fusion_filter.debug_snapshot(frame_ts_ns)
@@ -1685,7 +2044,7 @@ class ControllerTracker:
                 # misread as a fusion bug rather than "IMU prediction isn't live yet").
                 _pred_x = float(_dbg["pos_pred"][0]) if _dbg.get("pos_pred") is not None else None
                 _vision_x = float(solution["vision_T_world_ctrl"].t[0])
-                _fused_x = float(T_world_ctrl.t[0])
+                _fused_x = float(T_world_ctrl.t[0]) if T_world_ctrl is not None else None
                 logger.bind(cat="pose_fusion").debug(
                     f"[{self.ctrl_name}] ts={frame_ts_ns} outcome={_dbg.get('outcome')} accepted={accepted} "
                     f"d2={_dbg.get('d2')} gate={_dbg.get('gate')} trust={_dbg.get('trust')} "
@@ -1769,7 +2128,15 @@ class ControllerTracker:
         # problem this was trying to fix is real but needs a more careful
         # solution (e.g. only anchor on vision when confidence is high, not
         # unconditionally on every accept) before revisiting.
-        self._propagate_pose_history(T_world_ctrl, frame_ts_ns)
+        #
+        # Skipped when T_world_ctrl is None (see its own construction above --
+        # a brand new filter's very first candidate rejected before any state
+        # ever existed, nothing to propagate from). prev_pose/pose_history
+        # simply stay however they already were (None/empty for a genuine
+        # first-ever reject), which is the correct "still no prior" state for
+        # next frame's search -- crashed here otherwise (found on a real run).
+        if T_world_ctrl is not None:
+            self._propagate_pose_history(T_world_ctrl, frame_ts_ns)
         if accepted:
             # Vision produced a candidate the filter actually trusts -- this loss
             # streak (if any) is genuinely over; the next one gets its own fresh
@@ -1791,6 +2158,7 @@ class ControllerTracker:
             # escape hatch right after this loop instead, plan Phase 5.
             if accepted:
                 _tracker.last_good_pose = _tracker.prev_pose
+                _tracker.last_good_pose_ts_ns = frame_ts_ns
                 _own_asgn = (
                     anchor_assignment if _cid == primary_cam_id
                     else _other_assignments.get(_cid)
@@ -1874,6 +2242,14 @@ class ControllerTracker:
             for _tracker in self.trackers.values():
                 _tracker.clear_prior()
                 _tracker.consecutive_failures = _grace + 1
+                # clear_prior() deliberately leaves last_good_pose alone (it's meant
+                # to survive an ORDINARY vision loss) -- but this escape hatch means
+                # recent belief was PROVEN wrong (persistent implausible rejects, or
+                # an outright identity-swap signature below), so last_good_pose was
+                # almost certainly captured during that same contaminated stretch.
+                # Same reasoning/fix as ControllerTracker.force_cold_start's own.
+                _tracker.last_good_pose = None
+                _tracker.last_good_pose_ts_ns = None
             if _is_abs_reject_swap:
                 for _sibling in self._sibling_controllers:
                     if _sibling._fusion_filter is not None:
@@ -1881,6 +2257,8 @@ class ControllerTracker:
                     for _sib_tracker in _sibling.trackers.values():
                         _sib_tracker.clear_prior()
                         _sib_tracker.consecutive_failures = _grace + 1
+                        _sib_tracker.last_good_pose = None
+                        _sib_tracker.last_good_pose_ts_ns = None
 
         # Sampled once and shared below (found in review: the gravity-estimator feed
         # and _log_gravity_consistency were each independently interpolating the SAME
@@ -1897,14 +2275,32 @@ class ControllerTracker:
             if _gyro_sample is not None:
                 self._g_world_estimator.observe(T_world_ctrl.R, _gyro_sample, _accel_now)
 
+                # Second, ABSOLUTE-frame gravity accumulator for the headset-ego-motion-corrected
+                # dead-reckoning path (see src.imu_data.predict_headset_relative_pose) -- kept
+                # fully separate from the headset-relative one above rather than rotating that
+                # one's (session-averaged, headset-roll/pitch-smeared) estimate per predict() call,
+                # so this converges to a genuinely fixed absolute gravity vector instead of
+                # inheriting that smearing. Skipped outright (not "observed with a stale/None
+                # value") whenever mocap has no coverage at this exact ts -- never mix frame
+                # conventions into one running accumulator.
+                if self._headset_mocap is not None and self._g_world_estimator_abs is not None:
+                    _T_wh = world_pose(self._headset_mocap, frame_ts_ns)
+                    if _T_wh is not None:
+                        self._g_world_estimator_abs.observe(_T_wh.R @ T_world_ctrl.R, _gyro_sample, _accel_now)
+
         # Stage 3 gravity-alignment diagnostic (log-only, see _log_gravity_consistency).
-        _log_gravity_consistency(
-            self.ctrl_name, T_world_ctrl.R, frame_ts_ns,
-            self._last_gravity_check_R, self._last_gravity_check_ts,
-            self._accel_data, accel_now=_accel_now,
-        )
-        self._last_gravity_check_R  = T_world_ctrl.R
-        self._last_gravity_check_ts = frame_ts_ns
+        # Skipped when T_world_ctrl is None (see its own construction above --
+        # a brand new filter's very first candidate rejected before any state
+        # ever existed) -- nothing to log/compare against; crashed here
+        # otherwise (found on a real run, AttributeError on T_world_ctrl.R).
+        if T_world_ctrl is not None:
+            _log_gravity_consistency(
+                self.ctrl_name, T_world_ctrl.R, frame_ts_ns,
+                self._last_gravity_check_R, self._last_gravity_check_ts,
+                self._accel_data, accel_now=_accel_now,
+            )
+            self._last_gravity_check_R  = T_world_ctrl.R
+            self._last_gravity_check_ts = frame_ts_ns
 
     def _fuse_and_finalize(
         self,
@@ -1997,6 +2393,8 @@ class TrackingSystem:
                  accel_data: Optional[Dict[str, tuple]] = None,
                  lever_arm: Optional[Dict[str, np.ndarray]] = None,
                  g_world_estimator=None,
+                 headset_mocap=None,
+                 g_world_estimator_abs=None,
                  fusion_cfg: Optional[dict] = None,
                  debug_pose_fusion_cfg: Optional[dict] = None):
 
@@ -2012,6 +2410,12 @@ class TrackingSystem:
         # per-session unknown, not per-controller), one lever arm per controller.
         self._lever_arm:  Dict[str, np.ndarray] = lever_arm or {}
         self._g_world_estimator = g_world_estimator
+        # Headset-ego-motion correction (see src.mocap_data.world_pose /
+        # src.imu_data.predict_headset_relative_pose) -- both shared, non-per-controller objects,
+        # threaded through to every ControllerTracker exactly like g_world_estimator above. None
+        # unless mocap.enabled and a headset mocap trajectory actually loaded (main.py).
+        self._headset_mocap = headset_mocap
+        self._g_world_estimator_abs = g_world_estimator_abs
         self._fusion_cfg: dict = fusion_cfg or {}
 
         # Self-calibration: optionally apply saved extrinsics before tracker creation
@@ -2068,6 +2472,8 @@ class TrackingSystem:
                 accel_data=self._accel_data.get(ctrl.name),
                 lever_arm=self._lever_arm.get(ctrl.name),
                 g_world_estimator=self._g_world_estimator,
+                headset_mocap=self._headset_mocap,
+                g_world_estimator_abs=self._g_world_estimator_abs,
                 fusion_cfg=self._fusion_cfg,
                 debug_pose_fusion_cfg=debug_pose_fusion_cfg,
             )
@@ -2258,20 +2664,32 @@ class TrackingSystem:
                     continue
                 rvec_pred, tvec_pred = pred
                 _ph = tracker.pose_history
-                # dt from the last known pose to THIS frame — converts a rate
-                # (vel_ema, position/second) or a historical per-step delta into
-                # the expected displacement over the actual upcoming gap, not a
-                # fixed "per assumed-uniform-frame" amount.
+                # dt from the last known pose to THIS frame -- used below ONLY
+                # for the debug log's dt_target field. tvec_pred (the predicted
+                # CENTER, from _predict_pose above) already correctly folds this
+                # in via vel_ema_rate * dt_target; it must NOT also be baked
+                # into the margin/radius term below (vel_rate_3d) -- see that
+                # computation's own comment for why (same bug/fix as
+                # cheap_search_core's _v_px, src/controller.py).
                 _dt_target = max((frame_ts_ns - int(_ph[0][2])) / 1e9, 0.0) if _ph else 0.0
+                # Speed estimate (m/s) for the margin term below -- deliberately
+                # NOT scaled by _dt_target: doing that used to make the margin
+                # swing ~2x with this recording's own 30/60fps cadence
+                # oscillation for identical real hand speed, since dt_target
+                # itself swings ~2x frame to frame (found investigating a
+                # reported oscillating search-neighbourhood size). The
+                # predicted CENTER above already correctly incorporates
+                # dt_target; this is a separate, deliberately dt-INDEPENDENT
+                # "how fast is it moving right now" term.
                 if tracker.vel_ema is not None:
-                    vel_disp_3d = tracker.vel_ema.astype(np.float64) * _dt_target
+                    vel_rate_3d = tracker.vel_ema.astype(np.float64)
                 elif len(_ph) >= 2:
                     _dt_hist = (int(_ph[0][2]) - int(_ph[1][2])) / 1e9
                     _step    = (np.asarray(_ph[0][1], np.float64).reshape(3)
                                 - np.asarray(_ph[1][1], np.float64).reshape(3))
-                    vel_disp_3d = (_step / _dt_hist * _dt_target) if _dt_hist > 0 else np.zeros(3, np.float64)
+                    vel_rate_3d = (_step / _dt_hist) if _dt_hist > 0 else np.zeros(3, np.float64)
                 else:
-                    vel_disp_3d = np.zeros(3, np.float64)
+                    vel_rate_3d = np.zeros(3, np.float64)
 
                 R_pred, _ = cv2.Rodrigues(rvec_pred.reshape(3, 1))
                 R_pred    = R_pred.astype(np.float32)
@@ -2346,7 +2764,12 @@ class TrackingSystem:
                 _center_dist[(ctrl_name, cam_id)]   = float(np.mean(lateral_dist))
                 _center_facing[(ctrl_name, cam_id)] = float(np.mean(facing_cos))
                 _depth_pred = max(float(tvec_pred[2]), 0.1)
-                _v_px       = float(np.linalg.norm(vel_disp_3d)) * camera.fx / _depth_pred
+                # Same fixed reference period as cheap_search_core's own _v_px --
+                # keep the two in lockstep (see its comment for why a config-
+                # driven default of proximity_expansion_velocity_ref_dt_s, not
+                # a scale re-derived here independently).
+                _ref_dt     = float(self._matching_cfg.get('proximity_expansion_velocity_ref_dt_s', 0.0333))
+                _v_px       = float(np.linalg.norm(vel_rate_3d)) * _ref_dt * camera.fx / _depth_pred
                 vel_per_ctrl[ctrl_name] = _v_px
 
                 # Full effective blob-detection search radius — mirrors track() expansion logic
@@ -2793,7 +3216,7 @@ class TrackingSystem:
             solution, predicted_pose = raw[(ctrl_name, cid)]
             solution = tracker.finalize_search(
                 solution, predicted_pose, obs, blob_radii=rad,
-                allow_expensive_fallback=False,
+                allow_expensive_fallback=False, frame_ts_ns=frame_ts_ns,
             )
             if solution is not None:
                 cam_solutions_per_ctrl[ctrl_name].append(
@@ -2998,6 +3421,7 @@ class TrackingSystem:
                 sol, None, obs_full, blob_radii=rad_full,
                 other_cameras_blobs=_other_cams_by_key[(ctrl_name, cid)],
                 blob_mask=mask, occluders_per_cam=None, allow_expensive_fallback=True,
+                frame_ts_ns=frame_ts_ns,
             )
             if sol is not None:
                 cam_solutions_per_ctrl[ctrl_name].append(

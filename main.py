@@ -133,6 +133,10 @@ def main():
     accel_data: dict = {}
     lever_arm:  dict = {}   # {ctrl_key: (3,) accel<->gyro lever arm}, see PoseFusionFilter
     g_world_estimator = None
+    g_world_estimator_abs = None  # second, absolute (mocap-world)-frame accumulator -- see
+                                   # src.imu_data.predict_headset_relative_pose / config.yml's
+                                   # mocap: block; harmless no-op whenever mocap is disabled or a
+                                   # headset trajectory isn't loaded (never fed, stays unconverged)
     if imu_cfg.get("enabled", False):
         _mav0_root = Path(config["data"]["root"])
         _IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
@@ -159,6 +163,10 @@ def main():
 
         fusion_cfg = config.get("fusion", {})
         g_world_estimator = LiveGravityEstimator(
+            omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
+            min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
+        )
+        g_world_estimator_abs = LiveGravityEstimator(
             omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
             min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
         )
@@ -218,7 +226,26 @@ def main():
         accel_data=accel_data,
         lever_arm=lever_arm,
         g_world_estimator=g_world_estimator,
-        fusion_cfg=config.get("fusion", {}),
+        headset_mocap=device_mocap.get("headset"),
+        g_world_estimator_abs=g_world_estimator_abs,
+        # HeuristicPoseFusionFilter reads its OWN knobs from a nested
+        # "fusion_heuristic" key inside this dict (self._hc = cfg.get(
+        # "fusion_heuristic", {})) -- but config.yml's fusion_heuristic: block
+        # is a SIBLING top-level key, not nested under fusion:. config.get(
+        # "fusion", {}) alone therefore never contained it, so self._hc was
+        # always {} and every _hc.get(...)/_hc_get(...) call in that filter
+        # silently fell back to its hardcoded Python default -- NONE of
+        # config.yml's fusion_heuristic: tuning (cost_weight_vision, the
+        # inlier/error ramps, per_controller overrides, imu_decay_frames,
+        # gap_dt_*, vision_only_debug, ...) was ever actually read live. Went
+        # unnoticed because most of those defaults were set to match whatever
+        # was in config.yml at the time each knob was added, so behavior
+        # looked config-driven by coincidence -- found only once a config
+        # value was changed to something that actually differs from the
+        # code's own default (vision_only_debug: true had no effect at all).
+        # PoseFusionFilter (kalman) doesn't have this problem -- all of ITS
+        # knobs live directly under fusion: with no second-tier block.
+        fusion_cfg={**config.get("fusion", {}), "fusion_heuristic": config.get("fusion_heuristic", {})},
         debug_pose_fusion_cfg=config["visualization"].get("pose_fusion_debug", {}),
     )
     pool          = tracking_system.get_pool()
@@ -1090,8 +1117,17 @@ def main():
                 # tracking-loss frame (T_world_ctrl_frame/frozen_T_world_ctrl_frame
                 # absent -- see src/visualization.py's _log_frame). Everything else in
                 # this block (CSV writers, frame-summary logging, etc.) is left as-is.
+                #
+                # ALSO hidden when T_world_ctrl is None -- a brand new fusion filter's
+                # very first candidate rejected before any state ever existed (e.g. the
+                # bootstrap-branch sibling-collision check) has genuinely no pose to
+                # report at all, unlike a warm reject (which always falls back to a
+                # meaningful IMU-coasted prediction) -- crashed every consumer below
+                # before this None-check existed (found on a real run: TypeError
+                # dereferencing T_world_ctrl.t on a rejected bootstrap).
                 _forced_cold_start_this_frame = bool(sol.get("fusion_forced_cold_start"))
-                if not _forced_cold_start_this_frame:
+                _no_pose_this_frame = _forced_cold_start_this_frame or T_world_ctrl is None
+                if not _no_pose_this_frame:
                     T_world_ctrl_frame[ctrl_name]        = T_world_ctrl
                     pose_is_imu_only_frame[ctrl_name]    = not sol.get("fusion_accepted", True)
                 # Always populated (cheap -- same Transform object, no copy), not just
@@ -1125,7 +1161,7 @@ def main():
                 primary_cams_frame_out[ctrl_name]    = primary_cam_idx
                 aux_assignments_frame_out[ctrl_name] = sol.get("aux_assignments")
                 camera_importance_frame_out[ctrl_name] = sol.get("camera_importance")
-                if not _forced_cold_start_this_frame:
+                if not _no_pose_this_frame:
                     last_good_T_world[ctrl_name] = T_world_ctrl
                     frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
                 # Gated on fusion_accepted (found in review): a fusion-rejected frame still
@@ -1145,20 +1181,27 @@ def main():
                     # so pairing it with the discarded candidate's error/inlier-count would
                     # misrepresent this row as a real vision fit (found in review).
                     _fusion_accepted = sol.get("fusion_accepted", True)
-                    _qx, _qy, _qz, _qw = Rotation.from_matrix(T_world_ctrl.R).as_quat()
+                    if T_world_ctrl is not None:
+                        _qx, _qy, _qz, _qw = Rotation.from_matrix(T_world_ctrl.R).as_quat()
+                        _px, _py, _pz = T_world_ctrl.t
+                    else:
+                        # No pose at all this frame (see _no_pose_this_frame above) --
+                        # "nan", not "" -- downstream readers (compare_vision_mocap.py,
+                        # pnp_certainty_check.py) unconditionally float() every column;
+                        # an empty string crashes them the first time they load a
+                        # fusion-enabled pose_csv (found in review). float("nan")
+                        # parses cleanly and is still an honest "no fit at all" row,
+                        # keeping this frame's row present for downstream alignment
+                        # instead of silently skipping it.
+                        _qx = _qy = _qz = _qw = _px = _py = _pz = float("nan")
                     _pose_csv_writer.writerow([
                         int(img_path.stem), ctrl_name,
                         f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
-                        f"{T_world_ctrl.t[0]:.6f}", f"{T_world_ctrl.t[1]:.6f}", f"{T_world_ctrl.t[2]:.6f}",
-                        # "nan", not "" -- downstream readers (compare_vision_mocap.py,
-                        # pnp_certainty_check.py) unconditionally float() this column;
-                        # an empty string crashes them the first time they load a
-                        # fusion-enabled pose_csv (found in review). float("nan")
-                        # parses cleanly and is still an honest "not a real fit" value.
+                        f"{_px:.6f}", f"{_py:.6f}", f"{_pz:.6f}",
                         (f"{sol['error']:.4f}" if _fusion_accepted else "nan"),
                         (len(sol["assignment"]) if _fusion_accepted else 0),
                     ])
-                if ctrl_name in _algo_log_writers:
+                if ctrl_name in _algo_log_writers and T_world_ctrl is not None:
                     T_Ih_Ic = T_world_ctrl.compose(_algo_log_T_ref_ic[ctrl_name])
                     _aqx, _aqy, _aqz, _aqw = Rotation.from_matrix(T_Ih_Ic.R).as_quat()
                     _algo_log_writers[ctrl_name].writerow([
