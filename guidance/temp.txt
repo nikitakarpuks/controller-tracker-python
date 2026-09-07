@@ -1285,3 +1285,98 @@ The background validation run got killed (not something I did — likely the ses
   run's 1.17% confirms the bandwidth-independent-of-window-size behavior I noted in memory). It just never got to report solve results before being killed.
 
   Want me to relaunch it, or hold off for now?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  I have much nicier detections with vision only. Okay, let's think. What am I unhappy about when using vision-only?
+  1. "trembling" - even for low motion positions I get very small and sharp changes of pose. This is not nice for a user, you would get vision sickness
+  2. sometimes due to some factors we can't fix in vision, we have some obviously wrong poses, which are too sharp, they jump too much. And this is not handled by this big and general
+  threshold of jump. We could think about something much smarter here. Like whether predicted pose and actual pose difference is too big. Because with vision only next pose prediction is
+  very nice. Here we theoretically can use imu data, to check inter frames accel, there we can give even more precise answer whether this is a jump or not.
+  3. when we have a temporary "in thhe middle" lost tracking (for instance from arm occlusion), we don't understand what is happeining with controller. I would still do brute search
+  there, but meanwhile for like 4 frames we could use just imu prediction, but this should not affect new pose search, except strong jump detection
+
+  so, I would rather make imu + smooth something secondary and supporting, rather than treat them equally. Btw, how smoothness is calculated? This stays not clear for me.
+  Suggest what can we do here?
+
+● How smoothing works today (this is worth being precise about, since the entanglement is exactly your problem #3's root cause): w_smooth * ||p - p_prev||^2 where p_prev is self.p — the
+  previous FUSED output, not the previous vision reading. Since each frame's output feeds back in as next frame's p_prev, it's an implicit exponential-moving-average chain, but it's not a
+  clean, standalone EMA — it's one term inside the same 3-way normalized weighted average as w_imu and w_vision, so its effective strength silently shifts every frame depending on what
+  w_imu/w_vision happen to be (gap-scale, quality ramps, decay...). That's exactly why it doesn't feel legible — there's no single "how much am I smoothing right now" number, it's a
+  byproduct of three interacting terms.
+
+  I think all three of your complaints trace back to the same design flaw: the cost function treats "dead-reckon a prediction," "reject outliers," and "damp jitter for display" as one
+  blended job, when they're three different jobs that want different reference points and different math. Proposal — split them:
+
+  1. Trembling → a purpose-built jitter filter, decoupled from IMU entirely. This exact problem (position tracking that's noisy when still but must stay responsive when moving fast) has a
+     well-known, small, standard solution: the One Euro Filter — a low-pass filter whose cutoff frequency adapts to recent speed, so it kills tremble at rest and doesn't lag during real
+     motion, with exactly two intuitive parameters. Vision-only position feeds it directly; no IMU, no p_prev cost term. This alone likely fixes complaint #1 without touching IMU logic at
+     all.
+  2. Smarter jump detection → re-anchor on last-accepted-vision pose, gate adaptively, not against a stale fused blend. Your insight is the key one: one-frame-ahead IMU prediction is
+     genuinely reliable, it's only reliable over multi-frame coasts that it stops being trustworthy. So: keep a separate "last good vision (R, p, t)" anchor (not the fused/smoothed one),
+     dead-reckon it forward by the real elapsed dt every frame using the existing predict_world_pose, and gate the new vision candidate against that — which is naturally almost always a
+     single-frame hop, not a stale multi-frame extrapolation. On top of that, replace the flat 0.3m/60° constant with a threshold sized from the IMU's own measured motion over that window
+     (e.g. a bound derived from measured accel/gyro magnitude × dt, or a proper Mahalanobis-style test using the actual measured acceleration variance) instead of one number for every
+     situation — a real 1-frame hop at rest should have a much tighter tolerance than a 1-frame hop during a fast swing, and a fixed constant can't express that.
+  3. Brief occlusion → display-only coasting, walled off from the jump-detection anchor. During a short loss, keep showing the IMU-coasted position (this already mostly exists), keep
+
+  1. Trembling → a purpose-built jitter filter, decoupled from IMU entirely. This exact problem (position tracking that's noisy when still but must stay responsive when moving fast) has a
+     well-known, small, standard solution: the One Euro Filter — a low-pass filter whose cutoff frequency adapts to recent speed, so it kills tremble at rest and doesn't lag during real
+     motion, with exactly two intuitive parameters. Vision-only position feeds it directly; no IMU, no p_prev cost term. This alone likely fixes complaint #1 without touching IMU logic at
+     all.
+  2. Smarter jump detection → re-anchor on last-accepted-vision pose, gate adaptively, not against a stale fused blend. Your insight is the key one: one-frame-ahead IMU prediction is
+     genuinely reliable, it's only reliable over multi-frame coasts that it stops being trustworthy. So: keep a separate "last good vision (R, p, t)" anchor (not the fused/smoothed one),
+     dead-reckon it forward by the real elapsed dt every frame using the existing predict_world_pose, and gate the new vision candidate against that — which is naturally almost always a
+     single-frame hop, not a stale multi-frame extrapolation. On top of that, replace the flat 0.3m/60° constant with a threshold sized from the IMU's own measured motion over that window
+     (e.g. a bound derived from measured accel/gyro magnitude × dt, or a proper Mahalanobis-style test using the actual measured acceleration variance) instead of one number for every
+     situation — a real 1-frame hop at rest should have a much tighter tolerance than a 1-frame hop during a fast swing, and a fixed constant can't express that.
+  3. Brief occlusion → display-only coasting, walled off from the jump-detection anchor. During a short loss, keep showing the IMU-coasted position (this already mostly exists), keep
+     brute-force search running unaffected (already true), but don't let the coasted value become the reference the next real vision candidate gets checked against — gate reacquisition
+     against the last-good-vision anchor extrapolated over the real elapsed gap (mechanism from #2), not against whatever the display was coasting on. This is what actually caused the
+     frame-265 cascade: the gating reference and the coasting/display value were the same state.
+
+  2. Smarter jump detection → re-anchor on last-accepted-vision pose, gate adaptively, not against a stale fused blend. Your insight is the key one: one-frame-ahead IMU prediction is
+     genuinely reliable, it's only reliable over multi-frame coasts that it stops being trustworthy. So: keep a separate "last good vision (R, p, t)" anchor (not the fused/smoothed one),
+     dead-reckon it forward by the real elapsed dt every frame using the existing predict_world_pose, and gate the new vision candidate against that — which is naturally almost always a
+     single-frame hop, not a stale multi-frame extrapolation. On top of that, replace the flat 0.3m/60° constant with a threshold sized from the IMU's own measured motion over that window
+     (e.g. a bound derived from measured accel/gyro magnitude × dt, or a proper Mahalanobis-style test using the actual measured acceleration variance) instead of one number for every
+     situation — a real 1-frame hop at rest should have a much tighter tolerance than a 1-frame hop during a fast swing, and a fixed constant can't express that.
+  3. Brief occlusion → display-only coasting, walled off from the jump-detection anchor. During a short loss, keep showing the IMU-coasted position (this already mostly exists), keep
+     brute-force search running unaffected (already true), but don't let the coasted value become the reference the next real vision candidate gets checked against — gate reacquisition
+     against the last-good-vision anchor extrapolated over the real elapsed gap (mechanism from #2), not against whatever the display was coasting on. This is what actually caused the
+     frame-265 cascade: the gating reference and the coasting/display value were the same state.
+
+  Net effect: vision is authoritative and unblended when trustworthy (matches what you're seeing — "nicer" output); IMU's only two jobs become "was that jump physically plausible" and
+  "what do we show for a few frames while genuinely blind"; jitter gets fixed by a filter built for exactly that, not by borrowing IMU as a smoothing crutch.
+
+
+  Tradeoff to flag: this is a real architecture change, not a config tweak — it replaces the single weighted-average cost function with three separate mechanisms. Before I start: do you
+     situation — a real 1-frame hop at rest should have a much tighter tolerance than a 1-frame hop during a fast swing, and a fixed constant can't express that.
+  3. Brief occlusion → display-only coasting, walled off from the jump-detection anchor. During a short loss, keep showing the IMU-coasted position (this already mostly exists), keep
+     brute-force search running unaffected (already true), but don't let the coasted value become the reference the next real vision candidate gets checked against — gate reacquisition
+     against the last-good-vision anchor extrapolated over the real elapsed gap (mechanism from #2), not against whatever the display was coasting on. This is what actually caused the
+     frame-265 cascade: the gating reference and the coasting/display value were the same state.
+
+  Net effect: vision is authoritative and unblended when trustworthy (matches what you're seeing — "nicer" output); IMU's only two jobs become "was that jump physically plausible" and
+  "what do we show for a few frames while genuinely blind"; jitter gets fixed by a filter built for exactly that, not by borrowing IMU as a smoothing crutch.
+
+  Tradeoff to flag: this is a real architecture change, not a config tweak — it replaces the single weighted-average cost function with three separate mechanisms. Before I start: do you
+  want the adaptive jump threshold to go straight for the accel-based bound, or start simpler (re-anchor on last-good-vision, keep the flat 0.3m constant, measure whether that alone is
+  enough) and add the accel-based sizing only if needed?

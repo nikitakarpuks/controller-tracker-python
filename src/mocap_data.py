@@ -147,7 +147,21 @@ class DeviceMocap:
         idx0 = max(idx0, 0)
         if self.t_ns[idx0 + 1] - self.t_ns[idx0] > self.max_interp_gap_ns:
             return None
-        R, pos = interpolate_vio(np.array([t_lookup]), self.t_ns, self.position, self.quat_xyzw)
+        # Slice to just the two bracketing samples before interpolating -- t_lookup is guaranteed
+        # (by idx0's own clamping above) to fall within [t_ns[idx0], t_ns[idx0+1]], and SLERP/
+        # linear interpolation between two points depends only on those two points, so this is
+        # numerically identical to interpolating against the full trajectory. Performance fix,
+        # not a math change: interpolate_vio rebuilds a fresh Rotation+Slerp over WHATEVER array
+        # it's given on every call -- passing the full ~8.3ms-cadence, whole-recording trajectory
+        # (thousands of samples) on every single query made this call's cost scale with recording
+        # length instead of being ~O(1), which went from a minor pre-existing inefficiency (this
+        # was previously called at most twice per frame, for the ground-truth CSV export) to a
+        # dominant one once headset_angular_velocity/headset_linear_velocity/
+        # predict_headset_relative_pose's wiring started calling this several times per predict()
+        # call, itself called multiple times per frame per controller (found from a real ~5x
+        # slowdown report after that feature landed).
+        R, pos = interpolate_vio(np.array([t_lookup]), self.t_ns[idx0:idx0 + 2],
+                                  self.position[idx0:idx0 + 2], self.quat_xyzw[idx0:idx0 + 2])
         return R[0], pos[0]
 
 
@@ -165,6 +179,72 @@ def world_pose(device: DeviceMocap, query_ts_ns: int):
         return None
     T_world_marker = Transform(*m)
     return T_world_marker.compose(device.T_imu_marker.inverse())
+
+
+DEFAULT_EGO_MOTION_WINDOW_S = 0.02  # +-10ms central finite-difference window, see the two
+                                    # functions below -- an implementation-numerical constant
+                                    # (mocap's own ~8.3ms nominal cadence is stable across
+                                    # recordings), not a per-recording tuning knob, so a function
+                                    # default rather than a config.yml key.
+
+
+def _bracket_world_poses(device: DeviceMocap, query_ts_ns: int, window_s: float):
+    """(T_wh_a, T_wh_b) = world_pose(device, t) at query_ts_ns -+ window_s/2, or None if either
+    endpoint lacks mocap coverage (propagates world_pose's/pose_at's own None contract -- a real,
+    non-rare occurrence: marker-occlusion gaps up to ~158ms are documented in DeviceMocap's own
+    docstring). Shared by headset_angular_velocity/headset_linear_velocity below so both draw
+    from the exact same pair of pose_at lookups rather than risking two independently-rounded
+    brackets."""
+    half_ns = int(window_s * 1e9 / 2)
+    T_a = world_pose(device, query_ts_ns - half_ns)
+    T_b = world_pose(device, query_ts_ns + half_ns)
+    if T_a is None or T_b is None:
+        return None
+    return T_a, T_b
+
+
+def headset_angular_velocity(device: DeviceMocap, query_ts_ns: int,
+                              window_s: float = DEFAULT_EGO_MOTION_WINDOW_S):
+    """Body-frame angular velocity (rad/s) of device's IMU frame at query_ts_ns, via a central
+    finite difference of world_pose(device, t)'s ROTATION across a small window straddling
+    query_ts_ns. Returns None on any coverage gap (see _bracket_world_poses).
+
+    Differences world_pose's own (IMU-frame) rotation, NOT device.pose_at's raw marker rotation
+    directly -- the two differ by the fixed T_imu_marker rotation, and only world_pose's is
+    already expressed in the IMU's own axes. Differencing the raw marker rotation would give the
+    same physical rate in different, wrongly-oriented coordinates, silently corrupting every
+    caller of this function (in particular src.imu_data.predict_headset_relative_pose, which
+    needs this in the SAME frame as the gyro_body it composes against).
+
+    dR/dt = R @ [omega]_x (this codebase's own body-frame angular-velocity convention -- see
+    src.imu_data.integrate_gyro_segment's R_new = R_old @ R_rel right-composition, of which this
+    is the continuous-time limit), so omega = Log(R_a.T @ R_b) / window_s, evaluated at the
+    window's start (treated as ~constant over window_s, matching integrate_gyro_segment's own
+    midpoint-rule small-angle assumption over a comparably short span)."""
+    bracket = _bracket_world_poses(device, query_ts_ns, window_s)
+    if bracket is None:
+        return None
+    T_a, T_b = bracket
+    rotvec = Rotation.from_matrix(T_a.R.T @ T_b.R).as_rotvec()
+    return rotvec / window_s
+
+
+def headset_linear_velocity(device: DeviceMocap, query_ts_ns: int,
+                             window_s: float = DEFAULT_EGO_MOTION_WINDOW_S):
+    """World-frame (mocap-world) linear velocity (m/s) of device's IMU-frame ORIGIN at
+    query_ts_ns, via a central finite difference of world_pose(device, t)'s POSITION. Returns
+    None on any coverage gap (see _bracket_world_poses).
+
+    Differences world_pose's IMU-origin position, NOT the raw marker position -- this correctly
+    captures the velocity induced by the marker<->IMU lever arm sweeping through rotation
+    whenever the device is rotating (the mocap-side analog of src.imu_data's existing
+    controller-side _lever_arm_correction); differencing the raw marker position would miss
+    exactly that component."""
+    bracket = _bracket_world_poses(device, query_ts_ns, window_s)
+    if bracket is None:
+        return None
+    T_a, T_b = bracket
+    return (T_b.t - T_a.t) / window_s
 
 
 def relative_pose(headset: DeviceMocap, device: DeviceMocap, query_ts_ns: int):
