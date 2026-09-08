@@ -2276,17 +2276,16 @@ class ControllerTracker:
                 self._g_world_estimator.observe(T_world_ctrl.R, _gyro_sample, _accel_now)
 
                 # Second, ABSOLUTE-frame gravity accumulator for the headset-ego-motion-corrected
-                # dead-reckoning path (see src.imu_data.predict_headset_relative_pose) -- kept
-                # fully separate from the headset-relative one above rather than rotating that
-                # one's (session-averaged, headset-roll/pitch-smeared) estimate per predict() call,
-                # so this converges to a genuinely fixed absolute gravity vector instead of
-                # inheriting that smearing. Skipped outright (not "observed with a stale/None
-                # value") whenever mocap has no coverage at this exact ts -- never mix frame
-                # conventions into one running accumulator.
-                if self._headset_mocap is not None and self._g_world_estimator_abs is not None:
-                    _T_wh = world_pose(self._headset_mocap, frame_ts_ns)
-                    if _T_wh is not None:
-                        self._g_world_estimator_abs.observe(_T_wh.R @ T_world_ctrl.R, _gyro_sample, _accel_now)
+                # dead-reckoning path (see src.imu_data.predict_headset_relative_pose) -- COMMENTED
+                # OUT, not deleted: direct total replacement by the empirically-validated
+                # MOCAP_ROOM_G_WORLD constant (src/imu_data.py) -- the mocap room's Y axis was
+                # confirmed gravity-aligned to within ~0.06 degrees across a real recording, so
+                # this converges-over-time accumulator is unnecessary. Kept here for future
+                # research if a future recording's room leveling ever needs re-estimating live.
+                # if self._headset_mocap is not None and self._g_world_estimator_abs is not None:
+                #     _T_wh = world_pose(self._headset_mocap, frame_ts_ns)
+                #     if _T_wh is not None:
+                #         self._g_world_estimator_abs.observe(_T_wh.R @ T_world_ctrl.R, _gyro_sample, _accel_now)
 
         # Stage 3 gravity-alignment diagnostic (log-only, see _log_gravity_consistency).
         # Skipped when T_world_ctrl is None (see its own construction above --

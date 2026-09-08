@@ -28,10 +28,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: null  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 200  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 500  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 300  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -555,6 +555,87 @@ blob_detection:
   outlier_factor: 2.5               # 1-NN distance > this * median(1-NN) → spatial outlier
   interior_edge_margin_px: 10.0    # centroid farther inside a large rejected blob than this is dropped
 
+  # Single-frame, stateless structural filter for ceiling-lamp fixtures.
+  # Rewritten 2026-09-08 -- see src/lamp_blob_filter.py's module docstring
+  # for the full design and the empirical basis for every number below; this
+  # is the short version. Scoped to the cold and hybrid-warm stats-based
+  # paths only (same `not warm_mode` gate as interior_edge_margin_px above)
+  # -- never reaches _detect_blobs_local's per-LED fit search. No cross-frame
+  # tracking, no 3D mapping -- deliberately simpler than the mocap-grounded
+  # 3D voxel-vote/lattice-fit approach explored earlier (dev-time/offline
+  # only tool; this filter needs nothing but the current frame).
+  lamp_blob_filter:
+    enabled: true
+
+    # A real fixture row shows 14-15 points per row on this project's own
+    # recordings, spanning 100-150px, with spacing dominated by 5-9px steps
+    # and at most one or two larger physical gaps up to ~19-20px. A real
+    # controller LED ring, at ANY pose or distance (verified by directly
+    # projecting all 32 real LEDs through this project's own camera model,
+    # across 100,000 random poses plus a systematic edge-on/tangential sweep
+    # -- see src/lamp_blob_filter.py's docstring), never produces a run of
+    # points spaced like that: it's either too few, or bunched far tighter
+    # (~3px) than spacing_min_px. So min_points + the spacing bounds ARE the
+    # real safety margin here -- several pixels of headroom against every
+    # controller pose tested, not a fraction of a pixel like the old design.
+    area_min: 0.4
+    area_max: 15.0
+    spacing_min_px: 4.0    # tighter than this = a real controller ring's tightly-bunched silhouette edge
+    spacing_max_px: 25.0   # covers this project's own confirmed real physical fixture gaps (Euclidean,
+                            # not just horizontal -- measured up to ~20.6px on cam3's own frame 0),
+                            # with margin. Re-verified safe: even at this wider bound, no controller
+                            # pose in the simulation above ever reached n=8 with lamp-like spacing, and
+                            # n=7 still needs residual >= 14.7px (vs. this file's max_line_residual_px below)
+    min_points: 6          # margin, not the tightest safe value: n=6 needs residual >= 11.96px and n=7
+                            # needs >= 14.7px to be achieved by any controller pose in the simulation above
+                            # (vs. this file's max_line_residual_px=2.0 -- 6-7x headroom either way), so 8
+                            # was needlessly conservative. Lowered after a real recording (frame_range
+                            # 200-300, relative frame 32) showed a genuine 7-point lamp row -- one point
+                            # short of 8 only because one of its 8 combined points was a non-collinear
+                            # outlier -- go un-recognized and leak through un-filtered. Re-verified safe:
+                            # 500 trials of 80 random points each, zero false positives at min_points=6.
+    max_lines: 20           # a frame can hold several separate lamp elements at once (this project's own
+                            # recordings show up to 6 distinct real lines in a single cam3 frame) -- each
+                            # candidate line is independently gated by min_points/spacing/residual/brightness
+                            # regardless of how many are found, so a generous cap here costs CPU, not safety
+
+    # Guards against removing a real controller LED -- both conjunctive per
+    # candidate (either failing spares the WHOLE candidate, not just the one
+    # offending blob).
+    max_brightness: 60          # 0-255 (blob's single brightest pixel); every member blob of a
+                                 # candidate must be <= this or the whole candidate is spared.
+                                 # Production's real floor is required_threshold =
+                                 # min_threshold*required_threshold_factor (7*2.0=14 by this
+                                 # file's own values above) -- every blob reaching this filter
+                                 # already clears that; real LEDs typically saturate far brighter.
+    max_line_residual_px: 2.0   # every line in a candidate must have max perpendicular PCA-fit
+                                 # residual <= this or the whole candidate is spared. Generous by
+                                 # design: min_points+spacing above is the real guard (no
+                                 # controller pose in the simulation ever achieved lamp-like
+                                 # spacing below a 6.6px residual, and never at all for >=7
+                                 # points), so this mainly protects against a coincidental,
+                                 # unrelated set of points that happens to satisfy count+spacing.
+                                 # Real confirmed lamp rows measure ~0.10-0.41px noise on real
+                                 # hardware -- 2.0px leaves ~5x headroom above that.
+
+    pass2_exclusion_pad_px: 22.0  # radius (px) of the exclusion footprint drawn around every point
+                                 # of a REMOVED lamp candidate (full kept+dim/context set, not just
+                                 # the removed kept blobs), fed into pass 2 the same way an oversized
+                                 # pass-1 blob's H1 interior-exclusion zone is. Pass 2 re-thresholds
+                                 # lower and never sees this pass's lamp-filter decision, so without
+                                 # this it independently re-discovers the same physical lamp elements
+                                 # -- now at a threshold permissive enough to pull in even MORE of the
+                                 # fixture's dim elements, un-filtered (this filter never re-runs on
+                                 # pass 2's own blob set).
+                                 #
+                                 # MUST stay comfortably above interior_edge_margin_px above (default
+                                 # 10.0) -- the H1 exclusion check only rejects a point MORE than
+                                 # interior_edge_margin_px deep inside the contour, not merely inside
+                                 # it. Confirmed on real data (cam3 frame 36): an earlier 8.0px pad
+                                 # left a real lamp point at pointPolygonTest distance 7.0 (inside,
+                                 # but not deep enough) -- pass 2 then re-discovered it, un-filtered.
+                                 # 22.0 = interior_edge_margin_px(10) + 12px margin.
+
   # ── Cold path – pass 2 (adaptive re-threshold, optional) ──────────────────
   pass2_threshold_factor: 0.7       # 0 = disabled; pixel_threshold_2 = percentile(mean_per_blob) * factor
   pass2_required_factor: 1.2        # required_threshold_2 = percentile(mean_per_blob) * factor; must be > pass2_threshold_factor
@@ -602,7 +683,7 @@ matching:
   # class of hardware), not yet empirically swept against real detectability
   # data; retune if inlier counts drop or "too ambiguous" doesn't improve
   # enough.
-  led_facing_angle_deg: 65.0      # emission half-angle used to build EXPECTED-visible LED sets against a
+  led_facing_angle_deg: 70.0      # emission half-angle used to build EXPECTED-visible LED sets against a
                                    # not-yet-final pose (proximity's predicted-pose gate, brute-force
                                    # hypothesis scoring, cross-cam bonus-correspondence lookup) -- this one
                                    # is a matching-tolerance knob, safe to retune: too loose lets ambiguous
@@ -676,7 +757,7 @@ matching:
   # --------------------------------------------------------------------------
   # Proximity match
   # --------------------------------------------------------------------------
-  use_proximity_match: true              # set to false to always use brute force
+  use_proximity_match: false              # set to false to always use brute force
   proximity_min_inliers: 4               # min inliers for proximity match — kept at the brute-force floor;
                                           # 3 is a zero-redundancy PnP fit (6 DOF, 2 eqns/point) whose error
                                           # can look deceptively perfect regardless of correctness
@@ -714,7 +795,7 @@ matching:
   proximity_top_k_ransac: 3
   proximity_stage2_max_err_factor: 4.0  # skip stage-2 RANSAC rescoring when best ITERATIVE err > this × accept_error_px (too few points for RANSAC to rescue a fit that far off)
   visibility_occlusion_margin_m: 0.02   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
-  proximity_vis_score_threshold: 0.99   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
+  proximity_vis_score_threshold: 0.95   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
 
   proximity_expansion_velocity_k: 0.1   # extra px per px/(reference frame) of estimated velocity
   # Fixed period used to convert vel_ema (a genuine m/s rate) into the
@@ -983,3 +1064,56 @@ visualization:
                       # HTML export, decoupled from the live tracking run entirely).
                       # Lower = smoother 3D path, higher per-frame cost (the integration is
                       # O(samples^2), see src/imu_data.py's dead_reckon_dense).
+
+# Static-light (ceiling-lamp) exclusion -- mocap-grounded voxel-vote map, hard-excludes
+# cold-start/brute-force blob candidates only (never the production warm-tracking
+# proximity-search path). See guidance plan for the full design. `enabled: false` by
+# default -- inert until wired into ControllerTracker.update (rollout phase 5); the
+# offline-only keys below are already consumed by build_static_light_map.py.
+static_light_exclusion:
+  enabled: false
+  map_path: "./data/static_light_maps/default.json"
+
+  # ── Runtime application (cold-search filtering; not wired in yet) ──────────
+  relax_margin_px: 20.0                # case-6 controller-occlusion relaxation slack
+  controller_relax_bounding_radius_m: 0.18
+
+  # ── Offline map-building only (build_static_light_map.py) ──────────────────
+  warm_trust_threshold: 0.7            # both controllers' same-frame vision-solve confidence >= this
+  claimed_blob_exclusion_px: 6.0       # survey blob within this of a claimed LED is dropped from U
+  survey_required_threshold_factor: 1.0  # survey pass's required_threshold = min_threshold * this;
+                                        # pixel_threshold (segmentation floor) is NEVER scaled down --
+                                        # confirmed on real low-light footage that lowering it collapses
+                                        # the whole frame into one rejected too-large blob instead of
+                                        # separating real dim ones. Only the "must reach one truly bright
+                                        # pixel" gate is relaxed (production uses required_threshold_factor
+                                        # 2.0; 1.0 here = no extra brightness bar beyond segmentation itself).
+  dim_blob_min_area_px: 2.0            # hardcoded floor for "too dim but big enough" reject-recovery
+  voxel_size_m: 0.10
+  min_votes: 30
+  min_positional_spread_m: 0.15
+  min_angular_spread_deg: 15.0
+  radius_margin_m: 0.05
+  ray_max_range_m: 8.0
+  ray_step_m: 0.05
+  # cluster_merge_distance_m: omit to default to voxel_size_m * 2.35 (see
+  # StaticLightVoxelAccumulator's own docstring) -- two confirmed voxels for
+  # the SAME physical fixture can triangulate more than one voxel-step apart
+  # (confirmed on real data: 0.2236m gap, beyond 26-adjacency's 0.173m max),
+  # so cluster merging is a plain Euclidean distance test on voxel centers,
+  # not grid adjacency. Only override if a future recording's real fixtures
+  # sit closer together than ~0.245m (the nearest observed distinct-feature
+  # gap in this dataset) and get wrongly merged.
+
+  # max_confirmed_median_reproj_resid_px: 0.0 = disabled (default). build_static_light_map.py
+  # only -- for each confirmed cluster, reprojects its fitted 3D centroid into every
+  # contributing frame and compares against where the blob was actually detected there;
+  # a coincidental (non-physical) accumulation scatters across many unrelated detections
+  # that happened to land in the same coarse voxel, so its median residual is much larger
+  # than a real point's. Session diagnostic on one real recording found real lamps at
+  # 13-22px median residual vs. one clearly-spurious candidate at 67px -- 40.0 cleanly
+  # separated them there, but this is ONE recording's numbers, not yet swept against the
+  # full 8-recording dataset, so left disabled here; a second candidate in the same test
+  # (median 20px, inside the real-lamp range) stayed AMBIGUOUS under this test despite
+  # other evidence (raw-pixel brightness) suggesting it might also be spurious -- this
+  # gate is a genuine, validated signal but not a complete answer on its own.
