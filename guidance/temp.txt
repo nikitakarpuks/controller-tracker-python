@@ -1380,3 +1380,21 @@ The background validation run got killed (not something I did — likely the ses
   Tradeoff to flag: this is a real architecture change, not a config tweak — it replaces the single weighted-average cost function with three separate mechanisms. Before I start: do you
   want the adaptive jump threshold to go straight for the accel-based bound, or start simpler (re-anchor on last-good-vision, keep the flat 0.3m constant, measure whether that alone is
   enough) and add the accel-based sizing only if needed?
+
+
+
+
+
+
+
+emory saved. Summary of where this stands for tomorrow:
+
+  - Built (Phases 1–3 + partial 4): mocap-grounded room-frame ray casting, the voxel-vote accumulator, the offline build_static_light_map.py builder, and the probe_static_light_map.py
+    visual sanity tool (now outputting a PNG folder + legend, per your request).
+  - First real test (walk_medium, cam3, frames 1-100) found 5 spatially coherent confirmed points along a bright band — real signal, but identity unconfirmed and possibly one continuous
+    feature that got split into 5 clusters by strict voxel-adjacency merging.
+  - Open thread: you're reviewing visualization/static_light_probe/cam3_frames/ + legend.png to judge whether that band is actually the lamp, and we discussed five alternatives to the
+    discrete-cluster representation (looser merge distance, line/plane fit, template fit to your described fixture shape, density-field extraction, or dropping 3D triangulation for a
+    bearing-space mask) without picking one yet.
+
+  Next session I'll pick up by asking what you found in the images.

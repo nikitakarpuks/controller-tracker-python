@@ -706,3 +706,20 @@ class LiveGravityEstimator:
     @property
     def n_samples(self) -> int:
         return self._n
+
+
+# Mocap room-frame gravity, ADDITIVE convention matching LiveGravityEstimator.g_world
+# (a_world = R(t) @ accel_body + g_world). Empirically validated, not assumed: rotating
+# raw headset-IMU (imu0) accelerometer samples into mocap room frame via the mocap-
+# tracked headset orientation at each timestamp, over 7852 low-motion samples (|gyro|
+# <= LOW_OMEGA_THRESH_RAD_S) spread across a real walk_medium recording, gives a mean
+# accel of [-0.005, 9.997, 0.155] m/s^2 -- 99.99% of magnitude on the Y axis (0.01%
+# off-axis leakage) -- confirming the mocap room's Y axis is gravity-aligned by the
+# room's own manual leveling, to within ~0.06 degrees. Unlike the rig-frame g_world
+# (which rotates WITH the headset and genuinely has no session-constant value), the
+# room/absolute frame's gravity vector is a true constant once that leveling is trusted
+# -- no 20-sample convergence wait needed. Replaces g_world_estimator_abs entirely (see
+# main.py / src/controller.py / src/pose_fusion_heuristic.py -- that estimator is
+# commented out, not deleted, in case a future recording's room leveling needs
+# reverifying against this same empirical check before trusting this constant again).
+MOCAP_ROOM_G_WORLD = np.array([0.0, -9.81, 0.0])

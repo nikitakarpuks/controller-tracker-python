@@ -133,10 +133,12 @@ def main():
     accel_data: dict = {}
     lever_arm:  dict = {}   # {ctrl_key: (3,) accel<->gyro lever arm}, see PoseFusionFilter
     g_world_estimator = None
-    g_world_estimator_abs = None  # second, absolute (mocap-world)-frame accumulator -- see
-                                   # src.imu_data.predict_headset_relative_pose / config.yml's
-                                   # mocap: block; harmless no-op whenever mocap is disabled or a
-                                   # headset trajectory isn't loaded (never fed, stays unconverged)
+    g_world_estimator_abs = None  # second, absolute (mocap-world)-frame accumulator --
+                                   # REPLACED by the empirically-validated MOCAP_ROOM_G_WORLD
+                                   # constant (see src/imu_data.py's own comment there for the
+                                   # validation numbers); left wired as None/commented-out below
+                                   # rather than deleted, for future re-validation if a future
+                                   # recording's mocap room leveling needs re-checking.
     if imu_cfg.get("enabled", False):
         _mav0_root = Path(config["data"]["root"])
         _IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
@@ -166,10 +168,13 @@ def main():
             omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
             min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
         )
-        g_world_estimator_abs = LiveGravityEstimator(
-            omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
-            min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
-        )
+        # g_world_estimator_abs = LiveGravityEstimator(
+        #     omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
+        #     min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
+        # )
+        # -- commented out, not deleted: direct total replacement by MOCAP_ROOM_G_WORLD
+        # (src/imu_data.py), for future research if this ever needs re-estimating live
+        # again (e.g. a recording where the mocap room wasn't leveled against gravity).
 
     # ── Mocap ground truth (see src/mocap_data.py + the imu/mocap organization
     # discussion): per-device filtered/aligned trajectories live under

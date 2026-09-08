@@ -137,11 +137,34 @@ def _bbox_scoped_contour(labels, label_id, x_b, y_b, w_b, h_b):
     return cnt.astype(np.int32) + np.array([[[x_b, y_b]]], dtype=np.int32)
 
 
+def _lamp_exclusion_contours(points, image_shape, pad_px):
+    """Inflated footprint around a removed lamp candidate's full point set
+    (kept + dim/context), for feeding into pass 2 as an H1 interior-exclusion
+    zone -- see the "3b" splice's own comment for why this exists: without
+    it, pass 2's own (lower, adaptive) threshold independently re-discovers
+    the same physical lamp elements, un-filtered, since it never sees pass
+    1's lamp-filter decision. A raw convex hull over near-collinear points is
+    a near-zero-width sliver that pointPolygonTest's "deep inside" check
+    would rarely trigger on, so this draws a filled circle at every point
+    and inflates via that circle's own footprint instead."""
+    mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    h, w = image_shape[:2]
+    for x, y in points:
+        cx, cy = int(round(x)), int(round(y))
+        if -pad_px <= cx <= w + pad_px and -pad_px <= cy <= h + pad_px:
+            cv2.circle(mask, (cx, cy), pad_px, 255, -1)
+    if not mask.any():
+        return []
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return list(cnts)
+
+
 def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    visualize=False, img_path=None, vis_suffix="",
                    max_area_override=None, min_area_override=None,
                    min_circularity_override=None,
                    interior_exclude_blobs=None,
+                   lamp_exclude_blobs=None,
                    warm_mode=False,
                    skip_spatial_outlier=False,
                    vis_patch_out=None,
@@ -234,6 +257,18 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # regardless of has_prior — only warm_mode gates it (see below).
     interior_edge_margin_px = float(cfg.get("interior_edge_margin_px", 10.0))
 
+    # The lamp-fixture filter (section 3b below) is scoped to true cold,
+    # full-frame passes only. warm_mode already excludes the per-LED "fit"
+    # local search; skip_spatial_outlier additionally excludes the "hybrid"
+    # warm strategy's neighborhood-scoped stats search — a real lamp row
+    # spans 100-150px, far larger than any per-LED search neighborhood, so
+    # there is structurally never enough of one visible in a hybrid-warm
+    # crop to recognize; running the line finder there would be pure waste
+    # (and skip_spatial_outlier is already the exact same "this call is
+    # neighborhood-scoped, not full-frame" signal the DBSCAN spatial-outlier
+    # filter above uses for an analogous reason).
+    lamp_filter_scope_ok = not warm_mode and not skip_spatial_outlier
+
     # ── 1. Threshold at pixel_threshold ──────────────────────────────────────
     _, mask = cv2.threshold(image, pixel_threshold, 255, cv2.THRESH_BINARY)
 
@@ -269,6 +304,11 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     blob_contours    = []
     blob_pixels_list = []
     blob_max_pixels  = []
+    # Lamp-fixture filter context (see src/lamp_blob_filter.py's module
+    # docstring) — initialized here, not inside `if n_labels > 1:` below, so
+    # a frame with zero raw components at all (empty mask) still leaves this
+    # bound for the lamp-filter check further down.
+    dim_centroids, dim_contours, dim_max_pixels = [], [], []
     # Large blobs rejected by area — always tracked; passed to pass-2 as H1 exclusion zones.
     large_rejected_contours = []
     # Per-reason rejection lists — populated only when visualize=True.
@@ -276,6 +316,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     det_rej_area_large = []
     det_rej_threshold  = []
     det_rej_interior   = []   # H1: centroid deep inside a large blob (2-pass path only, cold or hybrid)
+    det_rej_lamp       = []   # H1 (lamp_exclude_blobs) + section 3b below: removed as lamp, either way
     intensities = image.astype(np.float32)
 
     def _finish_candidate(cnt, label_id, x_b, y_b, w_b, h_b):
@@ -307,6 +348,20 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 dist = cv2.pointPolygonTest(large_cnt, (float(cx), float(cy)), True)
                 if dist > interior_edge_margin_px:
                     if visualize: det_rej_interior.append(cnt)
+                    return
+
+        # Same H1 mechanism, separate exclusion set: a pass-1 lamp-fixture
+        # removal's neighborhood (see section 3b below / src/lamp_blob_filter.py).
+        # Kept visually and semantically distinct from the oversized-blob H1
+        # check above -- this candidate wasn't rejected for being "deep in a
+        # large blob", it was rejected for being lamp, so it gets the same
+        # C_LAMP color/legend entry as section 3b's own direct removals, not
+        # C_INTERIOR's.
+        if lamp_filter_scope_ok and lamp_exclude_blobs:
+            for lamp_cnt in lamp_exclude_blobs:
+                dist = cv2.pointPolygonTest(lamp_cnt, (float(cx), float(cy)), True)
+                if dist > interior_edge_margin_px:
+                    if visualize: det_rej_lamp.append(cnt)
                     return
 
         centroids.append((cx, cy))
@@ -344,6 +399,50 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         bright_lut = np.zeros(n_labels, dtype=bool)
         if bright_ids.size:
             bright_lut[bright_ids] = True
+
+        # Dim-blob support for the lamp-fixture filter (see
+        # src/lamp_blob_filter.py's module docstring). A real ceiling
+        # fixture's own elements are very often too dim to ever cross
+        # required_threshold -- they're discarded right here, before
+        # _finish_candidate ever runs, so a structure detector fed only
+        # `filtered_*` (blobs that DID cross required_threshold) is
+        # structurally blind to most or all of a real fixture's elements,
+        # not just a few noisy ones. Computed ONLY when lamp_blob_filter is
+        # enabled (real per-blob cost otherwise skipped entirely) and used
+        # SOLELY as extra context for recognizing the lamp pattern -- these
+        # dim blobs are never added to filtered_*/the matching candidate
+        # pool. (Below, once the post-split circularity filter runs, blobs
+        # that ARE bright enough but get rejected for being non-circular --
+        # e.g. two adjacent fixture elements that blended into one elongated
+        # blob at this threshold -- get appended to this same context list
+        # for the identical reason: real signal the structure detector
+        # should see, but that must never become removable.) Deliberately
+        # kept OUT of the main centroids/blob_contours pipeline (no
+        # splitting/circularity/DBSCAN): mixing a lamp's own context
+        # elements into that pipeline would skew the DBSCAN spatial-
+        # outlier epsilon (median-nearest-neighbor-based) against the real
+        # controller LED cluster it exists to protect.
+        if lamp_filter_scope_ok and (cfg.get("lamp_blob_filter") or {}).get("enabled", False):
+            dim_lut = ~too_large & ~too_small & ~bright_lut[1:]
+            for label_id in np.where(dim_lut)[0] + 1:
+                label_id = int(label_id)
+                x_b = int(stats[label_id, cv2.CC_STAT_LEFT])
+                y_b = int(stats[label_id, cv2.CC_STAT_TOP])
+                w_b = int(stats[label_id, cv2.CC_STAT_WIDTH])
+                h_b = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+                cnt = _bbox_scoped_contour(labels, label_id, x_b, y_b, w_b, h_b)
+                roi_labels = labels[y_b:y_b + h_b, x_b:x_b + w_b]
+                ys_roi, xs_roi = np.nonzero(roi_labels == label_id)
+                ys, xs = ys_roi + y_b, xs_roi + x_b
+                w_pix = intensities[ys, xs]
+                total_weight = float(w_pix.sum())
+                if total_weight == 0:
+                    continue
+                cx = float(np.sum((xs + 1) * w_pix)) / total_weight - 1.0
+                cy = float(np.sum((ys + 1) * w_pix)) / total_weight - 1.0
+                dim_centroids.append((cx, cy))
+                dim_contours.append(cnt.reshape(-1, 2).astype(np.float32))
+                dim_max_pixels.append(int(w_pix.max()))
 
         if visualize:
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -509,6 +608,16 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             circ_keep_mask[i] = False
     keep_mask &= circ_keep_mask
 
+    # Bright-but-non-circular blobs also join the lamp-fixture context list
+    # (see the comment above dim_centroids' own definition) -- e.g. two
+    # adjacent fixture elements that blended into one elongated blob at this
+    # threshold. Never affects filtered_*/the matching candidate pool.
+    if lamp_filter_scope_ok and (cfg.get("lamp_blob_filter") or {}).get("enabled", False):
+        for i in np.where(~circ_keep_mask)[0]:
+            dim_centroids.append((float(centroids_arr[i, 0]), float(centroids_arr[i, 1])))
+            dim_contours.append(blob_contours[i])
+            dim_max_pixels.append(int(blob_max_pixels_arr[i]))
+
     # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
     # Skipped in local-search mode (warm_mode) and in hybrid's union-of-
     # neighborhoods crop (skip_spatial_outlier) alike: LED projections are
@@ -564,6 +673,91 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         dtype=np.float32,
     ) if len(filtered_contours) > 0 else np.empty(0, dtype=np.float32)
 
+    # ── 3b. Single-frame lamp-fixture structural filter (true cold path only) ──
+    # lamp_filter_scope_ok excludes both warm strategies: never reached by
+    # _detect_blobs_local's per-LED "fit" warm search (warm_mode), and also
+    # skipped for the "hybrid" warm strategy's neighborhood-scoped search
+    # (skip_spatial_outlier) -- a real lamp row spans 100-150px, far larger
+    # than any per-LED search neighborhood, so there's structurally never
+    # enough of one visible there to recognize. See src/lamp_blob_filter.py
+    # for the full design (a deterministic global line finder, plus a
+    # brightness guard, both biased toward never removing a real controller
+    # LED over removing a real lamp blob).
+    lamp_cfg = cfg.get("lamp_blob_filter") or {}
+    lamp_exclusion_contours_out = []   # fed to pass 2 as its own lamp_exclude_blobs (see detect())
+    if lamp_filter_scope_ok and lamp_cfg.get("enabled", False) and (len(filtered_centroids) > 0 or len(dim_centroids) > 0):
+        from src.lamp_blob_filter import detect_lamp_blobs  # local: avoids a module-level
+        # circular import (lamp_blob_filter imports BlobResult from this module).
+        _pre_lamp_contours = filtered_contours
+        n_kept = len(filtered_centroids)
+        # Structure detection sees the FULL picture (kept + dim) -- a real
+        # fixture's row is often mostly dim, individually below
+        # required_threshold, so the line finder needs both to recognize the
+        # pattern at all (see the dim-blob computation
+        # above). Only the KEPT portion (indices < n_kept) can ever actually
+        # be removed -- dim blobs were never in the matching candidate pool
+        # to begin with, nothing to remove there; they exist purely as
+        # context that lets a real (but individually dim) fixture element
+        # get recognized as part of the SAME structure as its brighter
+        # neighbors.
+        combined_centroids = (np.vstack([filtered_centroids, np.array(dim_centroids, dtype=np.float32).reshape(-1, 2)])
+                               if dim_centroids else filtered_centroids)
+        combined_contours = list(filtered_contours) + dim_contours
+        combined_brightnesses = (np.concatenate([filtered_brightnesses, np.array(dim_max_pixels, dtype=np.float32)])
+                                  if dim_centroids else filtered_brightnesses)
+        combined_radii = np.array(
+            [np.sqrt(max(cv2.contourArea(cnt.reshape(-1, 1, 2)), 1.0) / np.pi) for cnt in combined_contours],
+            dtype=np.float32,
+        ) if combined_contours else np.empty(0, dtype=np.float32)
+        cand_blobs = BlobResult(centroids=combined_centroids, radii=combined_radii,
+                                 brightnesses=combined_brightnesses, contours=combined_contours)
+        lamp_result = detect_lamp_blobs(cand_blobs, lamp_cfg)
+
+        kept_keep_mask = lamp_result.keep_mask[:n_kept]
+        if not kept_keep_mask.all():
+            if visualize:
+                det_rej_lamp.extend(_pre_lamp_contours[i] for i in np.where(~kept_keep_mask)[0])
+            filtered_centroids    = filtered_centroids[kept_keep_mask]
+            filtered_contours     = [c for c, k in zip(filtered_contours, kept_keep_mask) if k]
+            filtered_is_split     = (filtered_is_split[kept_keep_mask]
+                                      if len(filtered_is_split) else filtered_is_split)
+            filtered_split_group  = (filtered_split_group[kept_keep_mask]
+                                      if len(filtered_split_group) else filtered_split_group)
+            filtered_brightnesses = filtered_brightnesses[kept_keep_mask]
+            filtered_radii        = filtered_radii[kept_keep_mask]
+
+        # A removed lamp candidate's neighborhood must also be excluded from
+        # pass 2 -- own exclusion set (lamp_exclude_blobs), kept separate from
+        # large_rejected_contours/interior_exclude_blobs so a pass-2 blob
+        # rejected here is correctly attributed to the lamp filter (C_LAMP,
+        # "lamp (removed)") rather than mislabeled as H1's "deep in large
+        # blob" (C_INTERIOR) -- see the H1 check above. Pass 2 re-thresholds
+        # lower and has no visibility into this pass's lamp-filter decision,
+        # so without this it independently re-discovers the same physical
+        # lamp elements at pass 2's own (more permissive) threshold, un-
+        # filtered. Uses the FULL combined (kept + dim/context) point set,
+        # not just the removed kept ones -- pass 2's lower threshold will
+        # pull in MORE of the fixture's dim elements than pass 1 saw, so the
+        # exclusion zone needs to already cover that full recognized
+        # footprint.
+        #
+        # pad_px must stay comfortably ABOVE interior_edge_margin_px: the H1
+        # check only excludes a point that is MORE than interior_edge_margin_px
+        # deep inside the contour (`dist > interior_edge_margin_px`), not
+        # merely inside it -- a pad_px too close to that margin leaves points
+        # sitting near the union-of-circles' own edge (e.g. right at a seed
+        # point, which is only pad_px from that edge) un-excluded. Confirmed
+        # on real data (cam3 frame 36): pad_px=8 against the default
+        # interior_edge_margin_px=10 left a real lamp point at
+        # pointPolygonTest distance 7.0 -- inside, but not deep enough to
+        # trigger the H1 reject.
+        exclusion_pad_px = float(lamp_cfg.get(
+            "pass2_exclusion_pad_px", interior_edge_margin_px + 12.0))
+        for cand in lamp_result.rejected_candidates:
+            lamp_exclusion_contours_out.extend(
+                _lamp_exclusion_contours(combined_centroids[cand.blob_indices],
+                                          image.shape, int(round(exclusion_pad_px))))
+
     # ── 4. Visualization ──────────────────────────────────────────────────────
     vis_out = None
     if visualize:
@@ -599,6 +793,15 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         C_CIRC     = (0, 255, 255)   # yellow      — circularity filter
         C_SPAT     = (0, 0, 255) # grey        — spatial (DBSCAN) outlier (cold path only)
         C_INTERIOR = (100, 180, 255) # light blue  — H1: deep inside large blob (cold path only)
+        # Lamp-fixture filter color -- deliberately picked to NOT collide
+        # with any color above (violet is the only unused hue family left;
+        # C_AREA_SM's pink and C_LAMP's violet are close in RGB terms but
+        # still distinguishable in practice). Only actually-removed blobs
+        # get a dedicated color/legend entry -- guard-vetoed and dim/context
+        # blobs stay in their normal category (e.g. white "kept") since they
+        # were never removed; a single unambiguous "was this removed or
+        # not" signal is what matters here, not every intermediate state.
+        C_LAMP       = (255, 0, 140) # violet      — removed as lamp-fixture structure (cold path only)
         C_KEPT     = (255, 255, 255) # white       — kept
         C_SPLT     = (0, 255, 128)   # cyan        — kept (split)
         C_SPLT_CUT = (0, 0, 0)       # black       — divider mark between a split pair
@@ -612,6 +815,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         for cnt in det_rej_threshold:  _draw_cnt(cnt, C_THRESH)
         if not warm_mode:
             for cnt in det_rej_interior: _draw_cnt(cnt, C_INTERIOR)
+            for cnt in det_rej_lamp:     _draw_cnt(cnt, C_LAMP)
 
         for i in rejected_indices:
             if not circ_keep_mask[i]:
@@ -676,6 +880,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 (C_AREA_LG,  f"area > {int(max_area)}px"),
                 (C_AREA_SM,  f"pixels < {int(min_area)}"),
             ]
+            if lamp_cfg.get("enabled", False):
+                strip_entries.append((C_LAMP, "lamp (removed)"))
             row_h = 20
             half = len(strip_entries) // 2 + len(strip_entries) % 2
             rows = [strip_entries[:half], strip_entries[half:]]
@@ -714,7 +920,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     return (filtered_centroids, filtered_contours, filtered_radii,
             filtered_brightnesses,
             rejected_centroids, rejected_contours, large_rejected_contours,
-            vis_out)
+            vis_out, lamp_exclusion_contours_out)
 
 
 def _correct_radii_for_threshold(radii: np.ndarray, brightnesses: np.ndarray,
@@ -1002,7 +1208,7 @@ def _detect_blobs_local(image, led_projections, cfg,
             vis_patches.append((patch_out[0], x1, y1, i, pixel_thr_i, req_thr_i))
 
         centroids_crop, contours_crop, radii, brightnesses, \
-            rej_centroids_crop, rej_contours_crop, large_rejected, _ = result
+            rej_centroids_crop, rej_contours_crop, large_rejected, _, _ = result
 
         # Remap centroids and contours to full-image coordinates
         if len(centroids_crop) > 0:
@@ -1287,6 +1493,25 @@ class BlobDetector:
             "max_area":           self._memory.get("max_area"),
         }
 
+    def detect_survey(self, image: np.ndarray, pixel_threshold: float,
+                       required_threshold: float, min_area_override: float) -> BlobResult:
+        """Full-image, permissive detection call for the static-light
+        (ceiling-lamp) exclusion feature's offline survey pass (see
+        src/static_light_survey.py) -- deliberately calls the module-level
+        _detect_blobs directly instead of self.detect(), and never reads or
+        writes self._memory, so it cannot perturb production pass-2's
+        EMA/percentile calibration state. skip_spatial_outlier=True: the
+        DBSCAN 1-NN filter assumes a single spatially-clustered controller's
+        LEDs and would wrongly reject an isolated static light far from any
+        other blob."""
+        centroids, contours, radii, brightnesses, *_ = _detect_blobs(
+            image, pixel_threshold, required_threshold, self._cfg,
+            min_area_override=min_area_override,
+            skip_spatial_outlier=True,
+        )
+        return BlobResult(centroids=centroids, radii=radii,
+                           brightnesses=brightnesses, contours=contours)
+
     def detect(
         self,
         image: np.ndarray,
@@ -1395,6 +1620,7 @@ class BlobDetector:
                                vis_background=image, vis_offset=(offset_x, offset_y),
                                neighborhoods=_neighborhoods)
         large_blobs_pass1 = result[6]
+        lamp_blobs_pass1  = result[8]
         canvases = {}
         if result[7] is not None:
             canvases["pass1"] = result[7]
@@ -1468,6 +1694,7 @@ class BlobDetector:
                         max_area_override=max_area_pass2,
                         min_area_override=min_area_pass2,
                         interior_exclude_blobs=large_blobs_pass1,
+                        lamp_exclude_blobs=lamp_blobs_pass1,
                         skip_spatial_outlier=has_prior,
                         frame_name=frame_name,
                         vis_background=image, vis_offset=(offset_x, offset_y),
@@ -1522,6 +1749,7 @@ class BlobDetector:
                 max_area_override=_mem_max_area,
                 min_area_override=min_area_pass2,
                 interior_exclude_blobs=large_blobs_pass1,
+                lamp_exclude_blobs=lamp_blobs_pass1,
                 skip_spatial_outlier=has_prior,
                 frame_name=frame_name,
                 vis_background=image, vis_offset=(offset_x, offset_y),
