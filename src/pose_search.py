@@ -534,6 +534,20 @@ class BruteSearchState:
     best_error: float = float('inf')
     best_orient_err: float = float('inf')
     best_tvec_err: float = float('inf')
+    # Last-resort fallback (added 2026-09-10): tracks the best RANSAC-surviving
+    # candidate that failed ONLY the balanced_coverage gate -- see
+    # brute_search_tier's own comment at the coverage check for why. Mirrors
+    # best_solution/best_inliers_total/best_error/... exactly, just for
+    # candidates the main path's `continue` would otherwise discard entirely.
+    # Only ever consulted by finalize_brute_state if best_solution is still
+    # None once the whole search completes -- "no alternative beats no
+    # solution," never preferred over a real coverage-clearing candidate.
+    fallback_solution: Optional[Dict] = None
+    fallback_inliers_total: int = 0
+    fallback_error: float = float('inf')
+    fallback_orient_err: float = float('inf')
+    fallback_tvec_err: float = float('inf')
+    fallback_tier: Optional[int] = None
     strong_found: bool = False
     solution_tier: Optional[int] = None
     seen_bijections: set = field(default_factory=set)
@@ -575,7 +589,7 @@ class PoseSearcher:
         # config.yml's own comment: relaxing led_facing_angle_deg must not also relax this.
         self._c_facing_deg_strict   = float(_cfg.get('led_facing_angle_strict_deg',       90.0))
         self._c_occ_radius          = float(_cfg.get('cross_occlusion_bounding_radius_m', 0.18))
-        self._c_occ_margin_px       = float(_cfg.get('cross_occlusionself._c_occ_margin_px',   20.0))
+        self._c_occ_margin_px       = float(_cfg.get('cross_occlusion_gate_margin_px',   20.0))
         # joint optimisation — snap_camera's own prefilter; the fusion LM itself
         # (huber_scale, max_nfev, ftol/xtol/gtol) is read directly from matching_cfg
         # by fuse_camera_poses, since that's a module-level function shared across
@@ -2489,6 +2503,65 @@ class PoseSearcher:
                                         f" {n_inlier_blobs}/{min(n_available, n_visible_leds)} blobs"
                                         f" +{extra_inlier_count} aux)"
                                     )
+                                # Last-resort fallback tracking (added 2026-09-10): this
+                                # candidate failed ONLY the coverage gate -- keep track of the
+                                # best such candidate anyway, consulted by finalize_brute_state
+                                # ONLY if the whole search never clears coverage for ANY
+                                # candidate at all ("no alternative beats no solution" -- see
+                                # that method's own comment). Found on a real case: a genuinely
+                                # good match (7 of 8 visible LEDs, low reprojection error) sat at
+                                # balanced_coverage=0.58, just under the 0.6 gate, purely because
+                                # several of this frame's geometrically-visible LEDs were at
+                                # grazing incidence (close, oblique view) and so contributed
+                                # little weight to either side of the ratio -- exhaustively
+                                # searching every tier/anchor never found anything better, so the
+                                # frame was rejected outright (TRACKING LOST) despite a
+                                # perfectly usable candidate having been found early on.
+                                # Still requires n_inlier_blobs >= min_inliers_eff -- the same
+                                # bare floor every real accept must clear -- so a thin/noise
+                                # correspondence can't become the fallback purely for lack of
+                                # anything to compare it to. confidence is hardcoded to 0.0
+                                # (never coverage-vetted) rather than computed, so downstream
+                                # fusion code can never mistake this for a normally-trusted
+                                # brute recovery.
+                                if n_inlier_blobs >= state.min_inliers_eff:
+                                    _fb_proj = _project_points(rvec_r, tvec_r, positions[inlier_leds], K, dc,
+                                                                is_fisheye=self.camera.is_fisheye)
+                                    _fb_err = float(np.mean(np.linalg.norm(_fb_proj - blobs[inlier_blobs], axis=1)))
+                                    _fb_orient_err = np.inf
+                                    if R_prior is not None:
+                                        _fb_cos = np.clip((np.trace(R_r @ R_prior.T) - 1.0) / 2.0, -1.0, 1.0)
+                                        _fb_orient_err = float(np.arccos(_fb_cos))
+                                    _fb_tvec_err = np.inf
+                                    if tvec_prior is not None:
+                                        _fb_tvec_err = float(np.linalg.norm(tvec_r.reshape(3) - tvec_prior))
+                                    _fb_is_better = (
+                                        (n_inlier_total > state.fallback_inliers_total and _fb_err < state.fallback_error + 1.0) or
+                                        (n_inlier_total >= state.fallback_inliers_total + 2 and _fb_err < state.fallback_error + 1.5) or
+                                        (n_inlier_total == state.fallback_inliers_total and _fb_err < state.fallback_error)
+                                    )
+                                    if _fb_is_better:
+                                        state.fallback_solution = {
+                                            "rvec":             rvec_r,
+                                            "tvec":             tvec_r,
+                                            "inliers":          n_inlier_blobs,
+                                            "aux_inliers":      extra_inlier_count,
+                                            "aux_cameras":      aux_cameras_current or None,
+                                            "aux_assignments":  dict(aux_assignments_current) or None,
+                                            "error":            _fb_err,
+                                            "assignment":       list(zip(inlier_blobs.tolist(), inlier_leds.tolist())),
+                                            "method":           "p3p_systematic",
+                                            "confidence":       0.0,
+                                            "led_cov":          led_cov,
+                                            "blob_cov":         blob_cov,
+                                            "balanced_coverage": balanced_coverage,
+                                            "coverage_fallback": True,
+                                        }
+                                        state.fallback_inliers_total = n_inlier_total
+                                        state.fallback_error         = _fb_err
+                                        state.fallback_orient_err    = _fb_orient_err
+                                        state.fallback_tvec_err      = _fb_tvec_err
+                                        state.fallback_tier          = tier_idx
                                 t_coverage_tail += time.perf_counter() - _t0
                                 continue
 
@@ -2604,7 +2677,42 @@ class PoseSearcher:
                                         + _aux_dbg
                                     )
 
-                                if state.best_error <= self._c_brute_strong_err and balanced_coverage >= self._c_brute_min_vis_cov:
+                                # n_inlier_blobs floor added 2026-09-10: state.strong_inliers_eff
+                                # (from config strong_match_inliers) was already being computed and
+                                # threaded onto BruteSearchState but never actually READ anywhere --
+                                # a dead leftover from the tier-based rewrite (brute_search's own
+                                # docstring: "preserves ... best-so-far behavior of the original
+                                # monolithic search", but this particular check didn't survive the
+                                # port). Without it, a candidate right at min_inliers (the bare
+                                # floor to accept ANYTHING at all) could also trip strong_found and
+                                # stop the anchor search early purely because balanced_coverage's
+                                # RATIO looked good -- confirmed on a real case: primary camera had
+                                # only 4 inliers (exactly min_inliers) out of just 8 visible LEDs,
+                                # pooled with 2 aux-camera inliers to n_inlier_total=6, err=0.107px,
+                                # balanced_coverage=0.688 (>= the configured 0.6 floor) -- stopped
+                                # after only 3 of 32 possible anchor LEDs.
+                                #
+                                # Deliberately checked against n_inlier_blobs (THIS camera's own
+                                # count), NOT n_inlier_total (pooled with aux cameras): "is this
+                                # camera's own P3P solve well-constrained enough to stop looking for
+                                # a better anchor" is a question about the fit being solved here, not
+                                # about how much outside corroboration happened to exist elsewhere.
+                                # Aux-camera evidence already has its own role -- it feeds
+                                # balanced_coverage (both led_cov and blob_cov pool it in) -- but must
+                                # not let a thin primary-camera fit (e.g. 2-3 own inliers) borrow
+                                # strength from a lucky aux match to justify cutting the anchor search
+                                # short. A handful of correspondences has little power to rule out an
+                                # alternative anchor assignment producing an equally clean fit; a real
+                                # "strong, stop looking" call needs enough of ITS OWN correspondences
+                                # to mean something, not a favorable ratio or outside help.
+                                #
+                                # Only gates EARLY TERMINATION of the anchor loop, not acceptance --
+                                # finalize_brute_state returns state.best_solution unconditionally,
+                                # so a thin candidate that's never "strong" is still returned if nothing
+                                # better ever turns up after the full search completes.
+                                if (state.best_error <= self._c_brute_strong_err
+                                        and balanced_coverage >= self._c_brute_min_vis_cov
+                                        and n_inlier_blobs >= state.strong_inliers_eff):
                                     state.strong_found = True
                             t_coverage_tail += time.perf_counter() - _t0
 
@@ -2644,14 +2752,33 @@ class PoseSearcher:
         ControllerTracker level via fuse_camera_poses, not per camera here.
         """
         best_solution = state.best_solution
+        used_fallback = False
+        if best_solution is None and state.fallback_solution is not None:
+            # Last-resort fallback (2026-09-10): nothing ever cleared
+            # balanced_coverage across the WHOLE search -- use the best
+            # candidate that failed ONLY that gate rather than reporting
+            # "not found" outright. See the coverage check's own comment in
+            # brute_search_tier for the real case this fixes. confidence is
+            # already hardcoded to 0.0 on this dict (never coverage-vetted).
+            best_solution = state.fallback_solution
+            used_fallback = True
 
         total_p3p_tried = sum(state.tier_p3p_calls)
 
-        result_str = (
-            f"found in tier_{state.solution_tier} ({_tier_label(self._c_brute_depth_tiers[state.solution_tier])})  "
-            f"({state.best_inliers} inliers, {state.best_error:.2f} px)"
-            if best_solution is not None else "not found"
-        )
+        if best_solution is None:
+            result_str = "not found"
+        elif used_fallback:
+            result_str = (
+                f"found in tier_{state.fallback_tier} ({_tier_label(self._c_brute_depth_tiers[state.fallback_tier])}) "
+                f"[COVERAGE FALLBACK -- never cleared balanced_coverage>={self._c_brute_min_vis_cov}, "
+                f"best had {best_solution['balanced_coverage']:.2f}]  "
+                f"({best_solution['inliers']} inliers, {best_solution['error']:.2f} px)"
+            )
+        else:
+            result_str = (
+                f"found in tier_{state.solution_tier} ({_tier_label(self._c_brute_depth_tiers[state.solution_tier])})  "
+                f"({state.best_inliers} inliers, {state.best_error:.2f} px)"
+            )
         dup_line = ""
         if state.bijection_counts is not None:
             n_unique = len(state.bijection_counts)

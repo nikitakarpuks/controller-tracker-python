@@ -122,6 +122,22 @@ def _filled_px_area(cnt) -> float:
 # candidate blobs a typical frame actually has).
 _BBOX_SCOPED_MAX_LABELS = 50
 
+# Circuit breaker shared by BOTH split-peak lamp-fixture context call sites
+# below -- the too-large-blob one and the non-circular-blob one:
+# _find_split_maxima's greedy NMS loop degrades badly on a large, near-flat/
+# saturated blob (a real window or overexposed light source, not a
+# lamp-fixture merge) -- pairwise Python-level distance checks against a
+# growing "kept" list with little early-exit benefit once most of the blob
+# is one uniform value, measured 850ms on a single synthetic 70x70px
+# fully-saturated blob (worst case). Real too-large blobs on this project's
+# own recording are overwhelmingly big bright regions, not small
+# lamp-element merges: measured area distribution (walk_medium, 600 frames)
+# has p25=737px/p50=1580px, while the confirmed real lamp-merge cases this
+# fix targets are only 93-128px. 400px comfortably covers a lamp fixture
+# merging several more elements than either of those cases ever showed,
+# while skipping ~80%+ of this project's own real too-large blobs outright.
+_TOO_LARGE_SPLIT_MAX_PIXELS = 400
+
 
 def _bbox_scoped_contour(labels, label_id, x_b, y_b, w_b, h_b):
     """External contour of one connectedComponentsWithStats label, scoped to
@@ -444,6 +460,63 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 dim_contours.append(cnt.reshape(-1, 2).astype(np.float32))
                 dim_max_pixels.append(int(w_pix.max()))
 
+            # Too-large blobs also join the lamp-fixture context list, one
+            # point per internal local maximum -- not one point for the whole
+            # blob. A real fixture row's individual elements are only a few
+            # px apart (spacing_min_px), so at pass 2's lower/wider threshold
+            # (see BlobDetector.detect's own pass-2 comments) several
+            # adjacent elements routinely touch and merge into a single
+            # connected component whose area is far bigger than any real
+            # single LED or lamp element -- confirmed on a real frame (cam3,
+            # frame_range 600-700 relative frame 0): a genuine lamp column's
+            # own gap-bridging element merged with FIVE of its neighbors into
+            # one 128px^2 blob spanning 34x23px with 6 distinct internal
+            # peaks, entirely invisible to the line-finder (too-large blobs
+            # were dropped outright, contributing nothing -- unlike the dim
+            # and non-circular-blended cases above, which do reach this
+            # context list). Collapsing a blob like that to a single
+            # (weighted-average or contour-average) centroid was tried and
+            # measured too fragile to fix it: on that same real blob, both
+            # centroid choices landed within ~1px of breaking spacing_max_px
+            # against one of the blob's real neighbors, purely from which
+            # averaging method was used -- because a 34x23px multi-peak
+            # smear has no single point that represents its actual chain of
+            # discrete elements. Using each of _find_split_maxima's own
+            # local maxima instead (same peak-finding already used for the
+            # 2-seed splitter below, just not restricted to the 2-maxima
+            # case, and never added to the real candidate pool -- see this
+            # function's own docstring on why 3+-maxima blobs are treated as
+            # noise THERE, a decision this leaves untouched) reproduces the
+            # fixture's real individual elements closely enough that every
+            # consecutive gap, including into its real neighbors on both
+            # sides, stays well inside spacing_max_px. Each peak gets its own
+            # tiny synthetic diamond contour (~2px^2, comfortably inside
+            # area_min/area_max) purely so it carries a valid area/brightness
+            # like every other context point -- detect_lamp_blobs never
+            # looks at a contour's shape, only its derived area and the
+            # blob's own brightness.
+            # See _TOO_LARGE_SPLIT_MAX_PIXELS's own comment: skip the (small)
+            # minority of too-large blobs too big to plausibly be a lamp
+            # merge before doing ANY per-blob work, not just before calling
+            # _find_split_maxima -- areas is already computed above, so this
+            # is a free vectorized pre-filter.
+            splittable_too_large = too_large & (areas <= _TOO_LARGE_SPLIT_MAX_PIXELS)
+            for label_id in np.where(splittable_too_large)[0] + 1:
+                label_id = int(label_id)
+                x_b = int(stats[label_id, cv2.CC_STAT_LEFT])
+                y_b = int(stats[label_id, cv2.CC_STAT_TOP])
+                w_b = int(stats[label_id, cv2.CC_STAT_WIDTH])
+                h_b = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+                roi_labels = labels[y_b:y_b + h_b, x_b:x_b + w_b]
+                ys_roi, xs_roi = np.nonzero(roi_labels == label_id)
+                ys, xs = ys_roi + y_b, xs_roi + x_b
+                for peak_y, peak_x in _find_split_maxima(image, ys, xs, required_threshold, min_split_dist):
+                    dim_centroids.append((float(peak_x), float(peak_y)))
+                    dim_contours.append(np.array(
+                        [[peak_x - 1, peak_y], [peak_x, peak_y - 1],
+                         [peak_x + 1, peak_y], [peak_x, peak_y + 1]], dtype=np.float32))
+                    dim_max_pixels.append(int(image[peak_y, peak_x]))
+
         if visualize:
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             for cnt in contours:
@@ -609,14 +682,76 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     keep_mask &= circ_keep_mask
 
     # Bright-but-non-circular blobs also join the lamp-fixture context list
-    # (see the comment above dim_centroids' own definition) -- e.g. two
+    # (see the comment above dim_centroids' own definition) -- e.g. several
     # adjacent fixture elements that blended into one elongated blob at this
     # threshold. Never affects filtered_*/the matching candidate pool.
+    #
+    # Same one-point-per-internal-peak treatment as the too-large-blob case
+    # above (see _TOO_LARGE_SPLIT_MAX_PIXELS's own comment), and for the
+    # identical reason: a real chain of several lamp elements that blended
+    # together doesn't always exceed blob_detection's own (generic, per-any-
+    # blob) `max_area` -- it can just as easily fail circularity instead
+    # while staying comfortably inside that area bound, in which case it
+    # reaches THIS block, not the too-large one. Confirmed on a real frame
+    # (cam3, frame_range 0-2, bbox ~[190,425,330,465]): a 93px/118px
+    # 4-5-peak blended blob, well under blob_detection.max_area=500, so it
+    # was never "too large" -- only non-circular (0.126-0.156 vs
+    # min_circularity=0.5). The single-centroid contribution this block used
+    # to make is not just imprecise here, it's actively WRONG: a whole
+    # multi-element blob's own contour area (60-90px^2 by the same
+    # measure detect_lamp_blobs itself uses) exceeds the lamp filter's own
+    # area_max (25.0) outright, so detect_lamp_blobs' own area_ok filter
+    # silently dropped that single context point before line-finding ever
+    # saw it -- confirmed directly reproducing this with the real recorded
+    # centroid/radius: single-centroid contribution left the whole real row
+    # unfiltered (nothing removed), splitting into peaks fully removed it.
+    # No separate pixel-count circuit breaker needed here (unlike the
+    # too-large case above): every blob reaching this point already passed
+    # the SAME upstream too_large check every kept blob does, so its raw
+    # pixel count can never exceed blob_detection's own `max_area` (500 in
+    # this project's config) -- there's no unbounded-window/saturated-region
+    # risk to guard against, only this already-existing, much tighter
+    # ceiling. Measured worst case at exactly that ceiling (500px, fully
+    # flat/saturated, the same worst-case shape _TOO_LARGE_SPLIT_MAX_PIXELS's
+    # own comment measured): <=37ms one-off -- acceptable given this is a
+    # rare per-blob event, not a per-frame-systematic one (a real merged
+    # lamp fixture reaching this path is a handful of px in practice, per
+    # the 93-118px cases actually seen). Falls back to the original
+    # single-centroid contribution only if the contour couldn't be
+    # rasterized at all (degenerate 1-2-point contour) -- unlike the
+    # too-large case, this path already contributed something for every
+    # non-circular blob before this fix, so silently dropping it here would
+    # be a real regression, not just a missed optimization.
     if lamp_filter_scope_ok and (cfg.get("lamp_blob_filter") or {}).get("enabled", False):
         for i in np.where(~circ_keep_mask)[0]:
-            dim_centroids.append((float(centroids_arr[i, 0]), float(centroids_arr[i, 1])))
-            dim_contours.append(blob_contours[i])
-            dim_max_pixels.append(int(blob_max_pixels_arr[i]))
+            cnt_i = blob_contours[i]
+            added_peaks = False
+            if len(cnt_i) >= 3:
+                x_b = int(np.floor(cnt_i[:, 0].min()))
+                y_b = int(np.floor(cnt_i[:, 1].min()))
+                w_b = int(np.ceil(cnt_i[:, 0].max())) - x_b + 1
+                h_b = int(np.ceil(cnt_i[:, 1].max())) - y_b + 1
+                roi_mask = np.zeros((h_b, w_b), dtype=np.uint8)
+                cnt_shift = cnt_i.copy()
+                cnt_shift[:, 0] -= x_b
+                cnt_shift[:, 1] -= y_b
+                cv2.drawContours(roi_mask, [cnt_shift.reshape(-1, 1, 2).astype(np.int32)], -1, 255, -1)
+                ys_roi, xs_roi = np.nonzero(roi_mask)
+                if len(ys_roi) > 0:
+                    ys, xs = ys_roi + y_b, xs_roi + x_b
+                    peaks = _find_split_maxima(image, ys, xs, required_threshold, min_split_dist)
+                    if peaks:
+                        added_peaks = True
+                        for peak_y, peak_x in peaks:
+                            dim_centroids.append((float(peak_x), float(peak_y)))
+                            dim_contours.append(np.array(
+                                [[peak_x - 1, peak_y], [peak_x, peak_y - 1],
+                                 [peak_x + 1, peak_y], [peak_x, peak_y + 1]], dtype=np.float32))
+                            dim_max_pixels.append(int(image[peak_y, peak_x]))
+            if not added_peaks:
+                dim_centroids.append((float(centroids_arr[i, 0]), float(centroids_arr[i, 1])))
+                dim_contours.append(cnt_i)
+                dim_max_pixels.append(int(blob_max_pixels_arr[i]))
 
     # ── 3b. DBSCAN 1-NN filter: reject blobs isolated from the surviving set.
     # Skipped in local-search mode (warm_mode) and in hybrid's union-of-
@@ -686,8 +821,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     lamp_cfg = cfg.get("lamp_blob_filter") or {}
     lamp_exclusion_contours_out = []   # fed to pass 2 as its own lamp_exclude_blobs (see detect())
     if lamp_filter_scope_ok and lamp_cfg.get("enabled", False) and (len(filtered_centroids) > 0 or len(dim_centroids) > 0):
-        from src.lamp_blob_filter import detect_lamp_blobs  # local: avoids a module-level
-        # circular import (lamp_blob_filter imports BlobResult from this module).
+        from src.lamp_blob_filter import detect_lamp_blobs, restrict_dim_context_to_kept_neighborhood
+        # local: avoids a module-level circular import (lamp_blob_filter
+        # imports BlobResult from this module).
         _pre_lamp_contours = filtered_contours
         n_kept = len(filtered_centroids)
         # Structure detection sees the FULL picture (kept + dim) -- a real
@@ -700,6 +836,16 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         # context that lets a real (but individually dim) fixture element
         # get recognized as part of the SAME structure as its brighter
         # neighbors.
+        #
+        # Restricted to dim blobs actually near a kept one BEFORE combining --
+        # a dim point with no kept blob anywhere near it can't be "context"
+        # for anything (see restrict_dim_context_to_kept_neighborhood's own
+        # docstring for the real blowup this fixes: 8 kept vs 429 scattered
+        # dim blobs on one real frame once min_threshold was lowered,
+        # multi-second searches over an almost-entirely-irrelevant pool).
+        _dim_radius_px = float(lamp_cfg.get("dim_context_radius_px", 150.0))
+        dim_centroids, dim_contours, dim_max_pixels = restrict_dim_context_to_kept_neighborhood(
+            dim_centroids, dim_contours, dim_max_pixels, filtered_centroids, _dim_radius_px)
         combined_centroids = (np.vstack([filtered_centroids, np.array(dim_centroids, dtype=np.float32).reshape(-1, 2)])
                                if dim_centroids else filtered_centroids)
         combined_contours = list(filtered_contours) + dim_contours
@@ -1530,9 +1676,13 @@ class BlobDetector:
         # min_threshold is the noise floor — velocity relaxation must never
         # push below it (that's what the pose-guided fit path's own `c`
         # velocity term, applied per-LED above this floor, is for instead).
-        # threshold_scale historically multiplied this down; that effect is
-        # now confined to _detect_blobs_local's per-LED pixel_thrs, which has
-        # physics-model headroom above the floor to actually relax.
+        # threshold_scale historically multiplied pixel_threshold itself down;
+        # that effect is now confined to _detect_blobs_local's per-LED
+        # pixel_thrs, which has physics-model headroom above the floor to
+        # actually relax. required_threshold (the dim-blob rejection floor,
+        # below) is a separate application of the same threshold_scale, added
+        # for the hybrid warm path -- see its own scaling below, gated on
+        # has_prior.
         pixel_threshold    = int(cfg["min_threshold"])
         _req_factor        = float(cfg.get("required_threshold_factor", 1.5))
         required_threshold = min(int(pixel_threshold * _req_factor), 255)
@@ -1572,6 +1722,24 @@ class BlobDetector:
             search_image, offset_x, offset_y = _build_neighborhood_crop(
                 image, predicted_leds, search_radii)
             vis_extra = "_hybridwarm"
+
+            # Relax the dim-blob rejection floor at speed: motion blur
+            # spreads a moving LED's photon count across more pixels over
+            # the exposure window, lowering its peak brightness even though
+            # it's a genuine LED, not noise -- without this, a real LED on a
+            # fast-moving controller can fail required_threshold and get
+            # dropped as "too dim" (see the C_THRESH label in
+            # _detect_blobs). threshold_scale is the same velocity_threshold_k
+            # / velocity_threshold_min_factor knob the "fit" warm_strategy
+            # already applies (previously a no-op here -- see this file's own
+            # config.yml comment, now stale) -- reused rather than adding a
+            # second velocity coefficient. Floored at pixel_threshold: a blob
+            # can only ever contain pixels already >= pixel_threshold, so
+            # scaling required_threshold below that floor would make the dim
+            # check a no-op rather than "genuinely relaxed". Gated on
+            # has_prior (warm only) -- cold detection has no single
+            # controller's velocity to relax against.
+            required_threshold = max(pixel_threshold, int(round(required_threshold * threshold_scale)))
 
             # Fit-based area ceiling for pass 1 — replaces the flat
             # cfg["max_area"] with a per-frame bound from the predicted LED
