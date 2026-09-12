@@ -8,6 +8,25 @@ from typing import List, Optional
 _NEIGHBOR_DY = np.array([-1, -1, -1,  0,  0,  1,  1,  1], dtype=np.int32)
 _NEIGHBOR_DX = np.array([-1,  0,  1, -1,  1, -1,  0,  1], dtype=np.int32)
 
+# Circuit breaker for the NMS loop below, not for the blob as a whole: a real,
+# well-structured blob -- however large in raw pixel count -- has very few
+# raw is_max candidates (confirmed on a real 1661px lamp-fixture merge, cam3
+# frame_range 1750-1800 relative frame 15: only 50 raw candidates, NMS-kept
+# down to 34, whole call 1.1ms), because real brightness gradients rarely tie
+# across many neighbors. A large, near-flat/saturated region (a window, not a
+# lamp) is the opposite: most of its pixels tie with their neighbors, so
+# candidate count scales with pixel count instead of staying small -- that's
+# what made the too-large-blob split-peak fix's own earlier, cruder guard (a
+# flat pixel-COUNT cap on the whole blob) both too tight for real large merges
+# like the one above, and not what was actually expensive: the earlier
+# benchmark's own numbers (a size=N flat square, N=20/30/40 -> 400/900/1600
+# candidates, 6.6/31.6/93.7ms) scale with candidates, not the blob's own pixel
+# footprint. Capping candidates directly (keeping the brightest -- a dimmer
+# tied candidate is the least likely to be a real distinct peak anyway) bounds
+# NMS cost to a few ms regardless of how large or flat the source blob is,
+# without needing any pixel-count pre-filter on the caller side at all.
+_MAX_SPLIT_MAXIMA_CANDIDATES = 300
+
 
 def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     """
@@ -16,6 +35,12 @@ def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     A pixel is a local maximum if its value is >= all 8-connected neighbors
     AND >= peak_threshold.  NMS then suppresses weaker maxima within
     min_split_dist pixels of a stronger one.  Returns a list of (y, x).
+
+    If more than _MAX_SPLIT_MAXIMA_CANDIDATES survive the is_max mask (only
+    plausible for a large, near-flat/saturated region -- see that constant's
+    own comment), only the brightest _MAX_SPLIT_MAXIMA_CANDIDATES go into the
+    O(candidates x kept) NMS loop below, bounding its cost regardless of blob
+    size; real, well-structured blobs never come close to this cap.
     """
     vals = image[ys, xs].astype(np.int32)
     is_max = vals >= peak_threshold
@@ -36,6 +61,8 @@ def _find_split_maxima(image, ys, xs, peak_threshold, min_split_dist):
     max_vals = vals[is_max]
 
     order = np.argsort(max_vals)[::-1]
+    if len(order) > _MAX_SPLIT_MAXIMA_CANDIDATES:
+        order = order[:_MAX_SPLIT_MAXIMA_CANDIDATES]
     kept = []
     for i in order:
         y, x = int(max_ys[i]), int(max_xs[i])
@@ -122,22 +149,6 @@ def _filled_px_area(cnt) -> float:
 # candidate blobs a typical frame actually has).
 _BBOX_SCOPED_MAX_LABELS = 50
 
-# Circuit breaker shared by BOTH split-peak lamp-fixture context call sites
-# below -- the too-large-blob one and the non-circular-blob one:
-# _find_split_maxima's greedy NMS loop degrades badly on a large, near-flat/
-# saturated blob (a real window or overexposed light source, not a
-# lamp-fixture merge) -- pairwise Python-level distance checks against a
-# growing "kept" list with little early-exit benefit once most of the blob
-# is one uniform value, measured 850ms on a single synthetic 70x70px
-# fully-saturated blob (worst case). Real too-large blobs on this project's
-# own recording are overwhelmingly big bright regions, not small
-# lamp-element merges: measured area distribution (walk_medium, 600 frames)
-# has p25=737px/p50=1580px, while the confirmed real lamp-merge cases this
-# fix targets are only 93-128px. 400px comfortably covers a lamp fixture
-# merging several more elements than either of those cases ever showed,
-# while skipping ~80%+ of this project's own real too-large blobs outright.
-_TOO_LARGE_SPLIT_MAX_PIXELS = 400
-
 
 def _bbox_scoped_contour(labels, label_id, x_b, y_b, w_b, h_b):
     """External contour of one connectedComponentsWithStats label, scoped to
@@ -162,17 +173,28 @@ def _lamp_exclusion_contours(points, image_shape, pad_px):
     1's lamp-filter decision. A raw convex hull over near-collinear points is
     a near-zero-width sliver that pointPolygonTest's "deep inside" check
     would rarely trigger on, so this draws a filled circle at every point
-    and inflates via that circle's own footprint instead."""
-    mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    and inflates via that circle's own footprint instead.
+
+    Mask is padded by pad_px on every side (points/contour coordinates are
+    shifted accordingly, transparently to the caller) so a circle centered
+    near the real image's own edge is never clipped by the array bounds --
+    confirmed on a real frame (cam0, right, frame_range 1750-1800 relative
+    frame 44): a removed lamp point at x=638.67 in a 640px-wide frame sits
+    only 1.33px from the array edge, far less than pad_px=22, so the
+    unpadded mask's own contour there was actually the ARRAY boundary, not
+    the circle's true edge -- pointPolygonTest measured ~0.3px "depth"
+    instead of the real ~22px, so pass 2's H1 check (dist >
+    interior_edge_margin_px) never triggered and pass 1's own removed point
+    resurfaced un-filtered in pass 2's independent re-detection."""
     h, w = image_shape[:2]
+    mask = np.zeros((h + 2 * pad_px, w + 2 * pad_px), dtype=np.uint8)
     for x, y in points:
-        cx, cy = int(round(x)), int(round(y))
-        if -pad_px <= cx <= w + pad_px and -pad_px <= cy <= h + pad_px:
-            cv2.circle(mask, (cx, cy), pad_px, 255, -1)
+        cx, cy = int(round(x)) + pad_px, int(round(y)) + pad_px
+        cv2.circle(mask, (cx, cy), pad_px, 255, -1)
     if not mask.any():
         return []
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    return list(cnts)
+    return [cnt - pad_px for cnt in cnts]
 
 
 def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
@@ -495,13 +517,16 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             # like every other context point -- detect_lamp_blobs never
             # looks at a contour's shape, only its derived area and the
             # blob's own brightness.
-            # See _TOO_LARGE_SPLIT_MAX_PIXELS's own comment: skip the (small)
-            # minority of too-large blobs too big to plausibly be a lamp
-            # merge before doing ANY per-blob work, not just before calling
-            # _find_split_maxima -- areas is already computed above, so this
-            # is a free vectorized pre-filter.
-            splittable_too_large = too_large & (areas <= _TOO_LARGE_SPLIT_MAX_PIXELS)
-            for label_id in np.where(splittable_too_large)[0] + 1:
+            # No pixel-count pre-filter here (an earlier version of this fix
+            # had one, gated on a flat blob-area cap): real too-large blobs
+            # can be legitimately huge (confirmed on a real 1661px lamp-
+            # fixture merge, cam3 frame_range 1750-1800 relative frame 15 --
+            # a whole two-row fixture merged at pass 2's threshold that
+            # frame) while still being cheap to peak-find, and a large,
+            # near-flat/saturated non-lamp region (the actual expensive case)
+            # is now bounded by _find_split_maxima's own internal candidate
+            # cap regardless of blob size -- see that constant's own comment.
+            for label_id in np.where(too_large)[0] + 1:
                 label_id = int(label_id)
                 x_b = int(stats[label_id, cv2.CC_STAT_LEFT])
                 y_b = int(stats[label_id, cv2.CC_STAT_TOP])
@@ -687,8 +712,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # threshold. Never affects filtered_*/the matching candidate pool.
     #
     # Same one-point-per-internal-peak treatment as the too-large-blob case
-    # above (see _TOO_LARGE_SPLIT_MAX_PIXELS's own comment), and for the
-    # identical reason: a real chain of several lamp elements that blended
+    # above, and for the identical reason: a real chain of several lamp elements that blended
     # together doesn't always exceed blob_detection's own (generic, per-any-
     # blob) `max_area` -- it can just as easily fail circularity instead
     # while staying comfortably inside that area bound, in which case it
@@ -705,18 +729,13 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # saw it -- confirmed directly reproducing this with the real recorded
     # centroid/radius: single-centroid contribution left the whole real row
     # unfiltered (nothing removed), splitting into peaks fully removed it.
-    # No separate pixel-count circuit breaker needed here (unlike the
-    # too-large case above): every blob reaching this point already passed
-    # the SAME upstream too_large check every kept blob does, so its raw
-    # pixel count can never exceed blob_detection's own `max_area` (500 in
-    # this project's config) -- there's no unbounded-window/saturated-region
-    # risk to guard against, only this already-existing, much tighter
-    # ceiling. Measured worst case at exactly that ceiling (500px, fully
-    # flat/saturated, the same worst-case shape _TOO_LARGE_SPLIT_MAX_PIXELS's
-    # own comment measured): <=37ms one-off -- acceptable given this is a
-    # rare per-blob event, not a per-frame-systematic one (a real merged
-    # lamp fixture reaching this path is a handful of px in practice, per
-    # the 93-118px cases actually seen). Falls back to the original
+    # No pixel-count concern here either way: _find_split_maxima's own
+    # internal candidate cap (_MAX_SPLIT_MAXIMA_CANDIDATES) already bounds
+    # NMS cost regardless of blob size, and every blob reaching this point
+    # additionally already passed the SAME upstream too_large check every
+    # kept blob does, so its raw pixel count can never exceed
+    # blob_detection's own `max_area` (500 in this project's config) in the
+    # first place. Falls back to the original
     # single-centroid contribution only if the contour couldn't be
     # rasterized at all (degenerate 1-2-point contour) -- unlike the
     # too-large case, this path already contributed something for every

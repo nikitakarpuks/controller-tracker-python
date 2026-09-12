@@ -208,12 +208,23 @@ def run_blob_detect(
     memory_in/return value's 3rd element: BlobDetector's only cross-call mutable
     state (`_memory`, cold-path EMA-blended detection thresholds) is round-tripped
     explicitly rather than left as worker-resident state, same reasoning as
-    BruteSearchState above — a call for a given (camera, controller) pair isn't
-    pinned to the same worker each time, so continuity has to travel with the data.
-    The caller keys its own memory cache by (cam_idx, ctrl_name) rather than just
-    cam_idx, so two controllers cold-starting on the same camera in the same frame
-    no longer clobber each other's EMA state (a pre-existing quirk when this memory
-    lived solely on a single shared per-camera BlobDetector instance).
+    BruteSearchState above — a call for a given camera isn't pinned to the same
+    worker each time, so continuity has to travel with the data. The caller keys
+    its own memory cache by cam_idx ALONE (one real camera, one real adaptive-
+    threshold history) — NOT by (cam_idx, ctrl_name), which was tried first
+    (2026-09-11) specifically to stop two controllers cold-starting on the same
+    camera in the same frame from clobbering a single shared BlobDetector
+    instance's memory, but that traded the clobbering bug for a worse one: two
+    controllers' per-camera memory would silently diverge and never reconverge,
+    so the SAME physical camera's blob detection would run as two independent,
+    ever-diverging pipelines for the two controllers indefinitely (confirmed on a
+    real recording — [blob-dedup] simply stopped firing for that camera across
+    dozens of consecutive frames). The caller's dedup grouping (see
+    `_run_blob_detect_batch_multi` in main.py) is what actually prevents the
+    original clobbering now — it merges every controller needing the same camera
+    with the same params THIS frame into one task before ever reaching this
+    function, so two controllers' calls for the same camera in the same frame
+    never race here in the first place.
 
     Returns (BlobResult, canvases_dict, memory_out, diag). diag = (t_worker_start,
     t_compute_start, t_compute_end) — wall-clock (time.time(), synchronized with the

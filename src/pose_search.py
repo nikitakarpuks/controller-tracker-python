@@ -1803,7 +1803,8 @@ class PoseSearcher:
         # Depth sanity check
         if not _check_z_range(t_solved.astype(np.float32)):
             logger.bind(cat="proximity_match").debug(
-                f"prior_constrained ({mode}): solved depth {t_solved[2]:.3f} m out of range → None"
+                f"prior_constrained ({mode}): solved position {np.linalg.norm(t_solved):.3f} m "
+                f"(z={t_solved[2]:.3f} m) out of range → None"
             )
             return None
 
@@ -2215,7 +2216,7 @@ class PoseSearcher:
                             tvec_h = tvec_h.reshape(3).astype(np.float32)
 
                             _t0 = time.perf_counter()
-                            # ── 2. Depth range check (OpenHMD: 0.05 m – 15 m) ─
+                            # ── 2. Range check (front of camera, <= 2 m Euclidean) ─
                             z_ok = _check_z_range(tvec_h)
                             self._dbg(dbg_hyp, f"  sol {sol_i}: z={tvec_h[2]:.3f} m  depth_ok={z_ok}")
                             if not z_ok:
