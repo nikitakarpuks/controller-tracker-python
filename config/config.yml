@@ -28,10 +28,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 800  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 3850  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 900  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 3950  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -611,36 +611,64 @@ blob_detection:
     # real safety margin here -- several pixels of headroom against every
     # controller pose tested, not a fraction of a pixel like the old design.
     area_min: 0.4
-    area_max: 25.0   # RAISED 2026-09-10 from 15.0 -- unlike spacing_min_px/spacing_max_px/min_points/
-                     # max_line_residual_px above, area_max/area_min never had a documented safety
-                     # derivation at all (not part of the 100k-pose controller-ring simulation, which
-                     # only ever validated 2D projected-position spacing/count/residual patterns,
-                     # never blob area) -- it was just excluding real lamp elements outright before
-                     # they ever reached the line-finder. Confirmed on a real frame (cam3, right,
-                     # frame_range 600-700 relative frame 1): a genuine single-column 14-point lamp
-                     # fixture had 8 points area 7-10px^2 (correctly caught) and 6 points area
-                     # 13.5-19.5px^2 (silently excluded from area_ok, invisible to the line-finder
-                     # entirely, regardless of min_points/spacing/residual -- those 6 could never be
-                     # removed no matter how obviously they lined up with the other 8). 25.0 gives
-                     # ~28% margin over the observed 19.5px^2 max, matching the SAME "one confirmed
-                     # real case + margin" methodology spacing_max_px above was itself set with (its
-                     # own real 20.6px case -> 25px bound). Does not touch the core safety argument at
-                     # all: that argument was never area-dependent, so widening this cannot newly let
-                     # a controller-ring pose satisfy it.
+    area_max: 50.0   # RAISED AGAIN 2026-09-11 from 25.0 -- 25.0 (set 2026-09-10, see the case below)
+                     # turned out to be a second instance of the SAME underestimate, not a one-off:
+                     # confirmed on a real 5-frame sequence (frame_range 1785-1790, cam1 right,
+                     # bbox ~[510,90,635,160]) across FOUR separate frames, all the same fixture --
+                     # individually-legitimate, correctly-circular, correctly-sized-by-blob_detection's-
+                     # own-standards kept blobs with real areas up to 36.0px^2 (28.5, 30.0, 32.5, 33.5,
+                     # 35.5, 36.0 all observed) were silently excluded from area_ok, each one sitting
+                     # directly in-line (confirmed via pairwise spacing, all inside spacing_max_px)
+                     # with an otherwise-correctly-recognized-and-removed run of the same real lamp
+                     # row -- invisible to the line-finder regardless of min_points/spacing/residual,
+                     # exactly like the 2026-09-10 case. 50.0 gives ~39% margin over the observed
+                     # 36.0px^2 max (deliberately more generous than the prior fix's ~28%, given this
+                     # is the second time the bound was underestimated from real data). Still does not
+                     # touch the core safety argument at all -- see area_min/area_max's own original
+                     # 2026-09-10 reasoning immediately below, unchanged: area was never part of the
+                     # 100k-pose controller-ring simulation (only 2D projected-position
+                     # spacing/count/residual were), so widening this cannot newly let a
+                     # controller-ring pose satisfy it.
+                     #
+                     # ORIGINAL 2026-09-10 case (raised from 15.0 to 25.0), kept for history: a genuine
+                     # single-column 14-point lamp fixture (cam3, right, frame_range 600-700 relative
+                     # frame 1) had 8 points area 7-10px^2 (correctly caught) and 6 points area
+                     # 13.5-19.5px^2 (silently excluded) -- same mechanism, smaller numbers.
     spacing_min_px: 4.0    # tighter than this = a real controller ring's tightly-bunched silhouette edge
     spacing_max_px: 25.0   # covers this project's own confirmed real physical fixture gaps (Euclidean,
                             # not just horizontal -- measured up to ~20.6px on cam3's own frame 0),
                             # with margin. Re-verified safe: even at this wider bound, no controller
                             # pose in the simulation above ever reached n=8 with lamp-like spacing, and
                             # n=7 still needs residual >= 14.7px (vs. this file's max_line_residual_px below)
-    min_points: 6          # margin, not the tightest safe value: n=6 needs residual >= 11.96px and n=7
-                            # needs >= 14.7px to be achieved by any controller pose in the simulation above
-                            # (vs. this file's max_line_residual_px=2.0 -- 6-7x headroom either way), so 8
-                            # was needlessly conservative. Lowered after a real recording (frame_range
-                            # 200-300, relative frame 32) showed a genuine 7-point lamp row -- one point
-                            # short of 8 only because one of its 8 combined points was a non-collinear
-                            # outlier -- go un-recognized and leak through un-filtered. Re-verified safe:
-                            # 500 trials of 80 random points each, zero false positives at min_points=6.
+    min_points: 6          # RAISED 2026-09-11 from 6 -- min_points=6 was re-validated back then only
+                            # against RANDOM SCATTER points (500 trials of 80 random points each, zero
+                            # false positives), never against the real controller-LED-ring geometry
+                            # itself projected through many poses -- a materially weaker test, since a
+                            # ring's own 32 LEDs are NOT randomly scattered, they're highly structured
+                            # (evenly spaced around a real circle), which is exactly what can
+                            # accidentally line up. Direct simulation with the real LED ring (32 real
+                            # LEDs, data/controllers/*.json, projected through this project's own real
+                            # camera model across 30,000 uniformly-random orientations/distances, not
+                            # just the edge-on/tangential sweep in tests/test_lamp_blob_filter.py's
+                            # ControllerRingSafetyTests) found min_points=6 actually false-positive
+                            # removes at least one real LED in 2.17% of random poses (worst case: ALL
+                            # visible LEDs removed) -- a real, non-negligible exposure the original
+                            # edge-on-only + random-SCATTER validation never covered. Same simulation
+                            # at min_points=7: 0.29% (13x fewer); min_points=8: 0.02%; min_points=9:
+                            # 0.00% (zero in 30k trials). 7 is a middle ground, not zero-risk -- re-run
+                            # the same real-LED-ring simulation (not just random scatter) before ever
+                            # lowering this again. NOTE: 2.17%/0.29% are rates over UNIFORMLY RANDOM
+                            # SO(3) orientations, not real hand-motion statistics -- real recordings
+                            # don't sample orientation space uniformly, so the practical rate on real
+                            # data is plausibly lower, but not necessarily zero.
+                            #
+                            # ORIGINAL 2026-09-?? reasoning for 6 (kept for history): n=6 needs
+                            # residual >= 11.96px and n=7 needs >= 14.7px to be achieved by any
+                            # controller pose in the EDGE-ON sweep above (vs. this file's
+                            # max_line_residual_px=2.0 -- 6-7x headroom either way) -- true, but an
+                            # incomplete picture per the above. Lowered from 8 after a real recording
+                            # (frame_range 200-300, relative frame 32) showed a genuine 7-point lamp
+                            # row go un-recognized and leak through un-filtered.
     max_lines: 20           # a frame can hold several separate lamp elements at once (this project's own
                             # recordings show up to 6 distinct real lines in a single cam3 frame) -- each
                             # candidate line is independently gated by min_points/spacing/residual/brightness
@@ -649,14 +677,56 @@ blob_detection:
     # Guards against removing a real controller LED -- both conjunctive per
     # candidate (either failing spares the WHOLE candidate, not just the one
     # offending blob).
-    max_brightness: 60          # 0-255 (blob's single brightest pixel); every member blob of a
-                                 # candidate must be <= this or the whole candidate is spared.
-                                 # Production's real floor is required_threshold =
-                                 # min_threshold*required_threshold_factor (7*2.0=14 by this
-                                 # file's own values above, cold path; the hybrid warm path can
-                                 # relax this down to min_threshold=7 at speed, see
-                                 # velocity_threshold_k above) -- every blob reaching this filter
-                                 # already clears that; real LEDs typically saturate far brighter.
+    max_brightness: 210         # RAISED AGAIN 2026-09-11 from 80 -- 0-255 (blob's single
+                                 # brightest pixel); every member blob of a candidate must be <=
+                                 # this or the whole candidate is spared. 80 (set earlier the same
+                                 # day for a 61-brightness split-peak case, see history below) was
+                                 # found to be the SAME underestimate pattern a second, much larger
+                                 # time: confirmed on a real frame (cam3, left, frame_range
+                                 # 1700-1735 relative frame 24) -- TWO clean, genuinely real lamp
+                                 # rows (14 and 13 points, residuals 1.20px/1.22px, exactly this
+                                 # project's own documented real-fixture-row signature) were BOTH
+                                 # entirely spared, because each row had one member reading 84 and
+                                 # 130 respectively -- comfortably real fixture brightness, not a
+                                 # fluke, confirmed visually against the raw frame (a clean bright-
+                                 # to-dim diagonal gradient along the whole row, not an isolated
+                                 # spike).
+                                 #
+                                 # This is a structural conflict, not a threshold that was merely
+                                 # set a bit too low: this project's own real bright-LED range on
+                                 # this recording (measured brightnesses of genuinely tracked/
+                                 # accepted LEDs: median 40, up to 203) OVERLAPS the real lamp-row
+                                 # brightness range (now confirmed up to at least 130) over most of
+                                 # its span. No single max_brightness value can both (a) spare every
+                                 # real accepted-LED brightness up to 203 AND (b) reject a lamp row
+                                 # reaching 130 -- there is no gap between the two populations to
+                                 # place a threshold in. 210 leaves the guard covering only the
+                                 # narrow band between the real lamp max seen so far (130) and the
+                                 # real LED max seen so far (203) rather than trying to draw a line
+                                 # through territory both populations actually occupy; this is
+                                 # consistent with the guard's own designed role -- it is
+                                 # explicitly defense-in-depth, not the real safety margin (that's
+                                 # min_points+spacing+residual below, never brightness-dependent,
+                                 # and validated directly against the real controller-LED-ring
+                                 # geometry via 100k-pose simulation) -- so widening it further does
+                                 # not touch the core safety argument, only how much this
+                                 # SECONDARY guard still does on top of it. If a future real case
+                                 # again needs this raised past 203 (the current documented real-LED
+                                 # ceiling), that's a sign this guard has stopped being able to
+                                 # discriminate anything at all on this recording and should be
+                                 # dropped rather than raised again.
+                                 #
+                                 # ORIGINAL 2026-09-11 case (60->80), kept for history: a genuine
+                                 # 23-point lamp row (residual 1.08px, spacing 5-9px) was entirely
+                                 # spared because ONE of its real peaks -- a split-peak point from a
+                                 # big pass-2 merged blob (see blob_detector.py's too-large-blob
+                                 # context injection) -- measured brightness=61, just 1 unit over
+                                 # the old 60 bound. Production's real floor is required_threshold =
+                                 # min_threshold*required_threshold_factor (7*2.0=14 by this file's
+                                 # own values above, cold path; the hybrid warm path can relax this
+                                 # down to min_threshold=7 at speed, see velocity_threshold_k above)
+                                 # -- every blob reaching this filter already clears that; real LEDs
+                                 # typically saturate far brighter.
     max_line_residual_px: 2.0   # every line in a candidate must have max perpendicular PCA-fit
                                  # residual <= this or the whole candidate is spared. Generous by
                                  # design: min_points+spacing above is the real guard (no
@@ -771,16 +841,14 @@ matching:
                                    # longer silently dropped either way) -- this fix is about search
                                    # completeness/robustness in general, not that one case specifically.
     - [2, 3]
+    - [2, 3, "edge"]
 #    - [2, 4]
-#    - [2, 4, "edge"]
-#    - [3, 5]
-#    - [3, 5, "edge"]
-#    - [4, 6]
+
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
   reprojection_threshold: 2.5    # RANSAC inlier threshold
-  min_inliers: 4
-  cold_brute_force_confirm_frames: 3   # a cold controller's camera must show >= min_inliers
+  min_inliers: 5
+  cold_brute_force_confirm_frames: 1   # a cold controller's camera must show >= min_inliers
                                         # blobs for this many CONSECUTIVE frames before brute-force
                                         # is even attempted there — filters out transient noise
                                         # blobs (e.g. 4,5,1 across 3 frames never triggers; 4,5,6
@@ -811,6 +879,26 @@ matching:
                              # state.best_solution unconditionally, so a thin candidate that never
                              # reaches "strong" is still returned/accepted if the full search completes
                              # without finding anything better (no alternative beats no solution).
+  weak_solo_blob_utilization_floor: 0.7   # ADDED 2026-09-11: ControllerTracker.update's cheap-search
+                             # dispatch normally skips brute-force recovery entirely once ANY camera's
+                             # proximity accept succeeds, regardless of how weak it is or whether
+                             # ANOTHER camera with real detected blobs this frame came up with nothing.
+                             # Confirmed on a real recording (frame_range 800-900 relative frames
+                             # 50/51/53): cam1 kept accepting 4-7-inlier proximity matches with several
+                             # of its own detected blobs left unmatched, while cam0 -- which had its own
+                             # real candidate blobs every one of those frames -- never got to
+                             # independently confirm or contradict it, letting one weak, partially-wrong
+                             # camera lock in the whole controller's fused pose frame after frame with no
+                             # cross-check. Now, when every accepted camera's solution is "weak" --
+                             # either its own inlier count < strong_match_inliers above, OR its
+                             # inliers/available-blobs ratio is below this floor -- AND at least one
+                             # other camera had real detected blobs but no accepted solution, that other
+                             # camera also gets a brute-force cross-check this frame (appended to, never
+                             # replacing, the already-accepted weak solution). 0.7 is empirically set:
+                             # surveyed 1684 real accepted proximity solutions (walk_medium, 3000 frames)
+                             # -- median ratio is 1.0 (most accepts use every detected blob), only 4.04%
+                             # ever fall below 0.7 -- low enough to essentially never fire on a normal,
+                             # healthy single-camera accept.
   score_error_floor_px: 0.5   # _inlier_discounted_error's error floor, used when comparing
                               # competing candidates (_resolve_cold_conflicts across
                               # controllers, _select_best_cam_solution across one

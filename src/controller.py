@@ -114,6 +114,42 @@ def _build_other_cameras_blobs(cameras: Dict[int, Camera], obs_src: Dict[int, np
     ]
 
 
+def _weak_solo_accept_cids(cam_solutions: List[dict], eligible_cids: List[int],
+                            av_count_by_cid: Dict[int, int], matching_cfg: dict) -> List[int]:
+    """Shared by ControllerTracker.update and TrackingSystem.update_warm_batch:
+    both accept a controller's cheap-search result the instant ANY camera
+    produces something, even a single low-confidence camera while another
+    camera that had real detected blobs this frame came up with nothing --
+    see either call site's own comment for the real recording (frame_range
+    800-900 relative frames 50/51/53) that motivated this.
+
+    Returns the eligible-but-unsolved camera ids (empty = nothing to flag)
+    when EVERY accepted cam_solutions entry is "weak": either its own inlier
+    count is below matching.strong_match_inliers (the SAME floor
+    PoseSearcher's own brute strong_found early-exit uses), OR its
+    inliers/available-blobs ratio is below matching.
+    weak_solo_blob_utilization_floor (default 0.7, empirically set -- see
+    that config key's own comment). Empty whenever every camera that had
+    blobs this frame already contributed (nothing left to cross-check
+    against) or at least one accepted solution is already strong."""
+    if not cam_solutions or len(cam_solutions) >= len(eligible_cids):
+        return []
+    strong_floor = int(matching_cfg.get('strong_match_inliers', 6))
+    util_floor   = float(matching_cfg.get('weak_solo_blob_utilization_floor', 0.7))
+
+    def _is_weak(cs: dict) -> bool:
+        n_inliers = len(cs["solution"]["assignment"])
+        if n_inliers < strong_floor:
+            return True
+        n_av = av_count_by_cid.get(cs["cam_id"], 0)
+        return n_av > 0 and (n_inliers / n_av) < util_floor
+
+    if not all(_is_weak(cs) for cs in cam_solutions):
+        return []
+    solved_cids = {cs["cam_id"] for cs in cam_solutions}
+    return [cid for cid in eligible_cids if cid not in solved_cids]
+
+
 # =========================================================
 # 3. TRACKER (per camera + controller)
 # =========================================================
@@ -143,13 +179,20 @@ def _predicted_world_for_vel_ema(fusion_filter, trackers, frame_ts_ns: int):
     see _vel_ema_with_imu_fallback's own gate), so this adds zero overhead
     once vision-only tracking is running normally.
 
-    Returns None (skip predict() entirely) if there's no fusion filter or no
+    Returns None (skip predict() entirely) if there's no fusion filter, no
     camera-tracker currently in the narrow gap _imu_vel_ema_override exists
-    for; otherwise returns predict()'s own (R_pred_world, p_pred_world) or
-    None result unchanged."""
+    for, or the fusion filter has no established velocity of its own yet
+    (fusion_filter.velocity_established -- see its own comment) -- this
+    entire mechanism exists to derive a POSITION velocity substitute from the
+    fusion filter's dead-reckoning, so if the fusion filter itself has never
+    measured a real velocity (still on a fabricated v=0 from a bootstrap/
+    reset/fail-open), there is nothing here to derive; otherwise returns
+    predict()'s own (R_pred_world, p_pred_world) or None result unchanged."""
     if fusion_filter is None:
         return None
     if not any(t.vel_ema is None and len(t.pose_history) <= 2 for t in trackers):
+        return None
+    if not fusion_filter.velocity_established:
         return None
     return fusion_filter.predict(frame_ts_ns)
 
@@ -453,6 +496,24 @@ class CameraTracker:
         # prediction/staleness site in this pipeline for exactly this class
         # of bug -- this was the one still using a count-based proxy).
         self.last_good_pose_ts_ns: Optional[int] = None
+        # (n_inliers, error_px) this camera's own solve reached when
+        # last_good_pose was captured -- set alongside it (ControllerTracker.
+        # apply() and _commit_fused_solution's per-camera loop). Lets
+        # finalize_search's re-acquisition gate tell "this reference itself
+        # was a weak/marginal accept" apart from "this reference was a clean,
+        # confident one" -- both currently get the exact same fixed jump
+        # threshold, which is wrong: a brand-new candidate that clearly beats
+        # a weak reference on both inliers and error is evidence the
+        # REFERENCE was inaccurate, not that the candidate is implausible.
+        # Confirmed on a real recording (frame_range 3850-3950 relative frame
+        # 50): a clean 11-inlier/0.12px re-acquisition candidate was rejected
+        # for disagreeing by just 2.6deg over threshold on one rotation axis
+        # (40.5deg vs a 37.9deg widened threshold) against a last_good_pose
+        # that was itself only a 5-inlier/0.98px COVERAGE-FALLBACK accept one
+        # frame earlier -- the far more likely explanation is that the WEAK
+        # reference's own orientation estimate was off by that much, not that
+        # the controller physically rotated ~40deg in 11ms (>3600deg/s).
+        self.last_good_pose_quality: Optional[Tuple[int, float]] = None
         self.last_good_assignment = None
 
         # Consecutive frames without a valid solution.
@@ -862,6 +923,63 @@ class CameraTracker:
         # continuous per-frame tracking — tracking_lost_last_frame is.
         _reacquiring = self.prev_pose is None or self.tracking_lost_last_frame
 
+        # Stricter floor for a WARM/proximity accept specifically while the
+        # velocity estimate is IMMATURE -- len(pose_history) < 3, i.e. fewer
+        # than pose_history_window's own "3+=linear fit" tier (see its config
+        # comment: 1=constant pos, 2=const vel, 3+=linear fit). Cheap/
+        # proximity search builds its per-LED candidate neighborhoods from
+        # predicted_pose, which at this depth is either a constant-position +
+        # gyro-only extrapolation (n=1, self.vel_ema is None -- see its own
+        # comment below) or a single-pair, UNSMOOTHED velocity estimate (n=2,
+        # self.vel_ema is that one raw step -- no EMA blending has happened
+        # yet, see apply()'s own vel_ema computation) -- with no mature
+        # velocity to work from, a controller that moved at all (n=1) OR a
+        # single noisy step inherited from an imprecise anchor pose (n=2) gets
+        # neighborhoods centered on the WRONG spot, and proximity's own
+        # combinatorial search degrades accordingly. Confirmed on a real
+        # recording (frame_range 3850-3950 relative frame 51): pose_history
+        # was at n=2 (vel_ema a single raw step derived from the PRIOR frame's
+        # own weak 5-inlier/0.98px accept), 9 of 13 visible LEDs' neighborhoods
+        # found zero candidates at all, the primary top-k search hit its own
+        # 8000-node safety cap without finding a result, and the eventual
+        # fallback "best" hypothesis matched only 4/13 LEDs at up to 2.07px
+        # residual -- yet nothing rejected it, because the position half of
+        # the jump gate is deliberately disabled/loosened at this depth (see
+        # self.vel_ema is None's own comment below) and rotation alone
+        # happened to agree. Rather than loosen a check that's correctly
+        # relaxed for a real reason, this instead raises the bar for what
+        # counts as an acceptable proximity result in this one narrow window:
+        # it must clear strong_match_inliers/strong_match_error_px (the same
+        # "confidently strong" bar pose_search.py's own strong_found decision
+        # and the last_good_pose quality-rescue above both already use) on
+        # its own merits, with no prediction-based check to lean on instead.
+        # Failing that floor is treated as "no solution found" here, exactly
+        # like an outright proximity failure -- main.py's existing "warm
+        # proximity lost" fallback then runs a fresh COLD (brute-force) re-
+        # detect, which doesn't depend on this same unreliable prediction at
+        # all. Brute-force/cold results are deliberately EXEMPT: their own
+        # coverage-fallback mechanism ("take the best available candidate
+        # rather than nothing") is an intentional design choice for a genuine
+        # cold start with no other reference to fall back on -- this floor
+        # would defeat that policy for no reason, since a rejected cold
+        # result has nowhere cheaper left to fall back to.
+        if (solution is not None and len(self.pose_history) < 3
+                and solution.get("method") == "proximity"):
+            _n_inliers_floor = (len(solution.get("assignment") or [])
+                                  + sum(len(v) for v in (solution.get("aux_assignments") or {}).values()))
+            _strong_inliers_floor = float(_cfg.get("strong_match_inliers", 6))
+            _strong_error_floor_px = float(_cfg.get("strong_match_error_px", 0.5))
+            if (_n_inliers_floor < _strong_inliers_floor
+                    or float(solution.get("error", float("inf"))) > _strong_error_floor_px):
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{ctrl_name} | cam {cam_idx} | track] proximity accept rejected: below "
+                    f"strong-match floor with an immature velocity estimate "
+                    f"(pose_history_len={len(self.pose_history)}, {_n_inliers_floor} "
+                    f"inliers/{float(solution.get('error', float('inf'))):.2f}px, need "
+                    f">= {_strong_inliers_floor:.0f}/<= {_strong_error_floor_px:.2f}px)"
+                )
+                solution = None
+
         # Temporary diagnostic (see _log_jump_stats_row, no-op unless
         # CONTROLLER_TRACKER_JUMP_STATS_CSV is set) -- captures the raw
         # predicted-vs-actual distribution for continuous warm frames only
@@ -1020,6 +1138,29 @@ class CameraTracker:
             _vel_pos_thresh_m += float(_cfg.get('cold_start_stale_max_speed_m_s', 3.0)) * _coast_stale_s
             _extra_pred_rot_deg = float(_cfg.get('cold_start_stale_max_ang_speed_deg_s', 720.0)) * _coast_stale_s
             _vel_rot_thresh_deg = tuple(v + _extra_pred_rot_deg for v in _vel_rot_thresh_deg)
+        # No established velocity estimate yet (self.vel_ema is None -- true
+        # exactly when pose_history has fewer than 2 accepted frames):
+        # _predict_pose's translation half is NOT a prediction here, it
+        # returns pose_history[0]'s own tvec completely unchanged (see its
+        # own n==1 docstring branch) -- the SAME reference point vs_prev_pose
+        # already checks. Left as _vel_pos_thresh_m's base-only 61.5mm, that
+        # identical displacement would be silently re-judged against a
+        # threshold far TIGHTER than vs_prev_pose's own (180/180/200mm), with
+        # no velocity information to justify the extra strictness -- purely
+        # an artifact of which check happens to run, not a real second
+        # opinion. Disabled outright (not widened to some other number worth
+        # re-litigating later) rather than picked to match vs_prev_pose's own
+        # bound, which would just be re-deriving a threshold that already
+        # exists one call away. Rotation is untouched: it genuinely differs
+        # here (gyro-measured, independent of vision-history depth -- see
+        # _predict_pose's own docstring) and keeps doing real work regardless
+        # of vel_ema. Confirmed on a real recording (frame_range 1000-1010,
+        # relative frame 4): a candidate 90mm from prev_pose (well inside
+        # vs_prev_pose's own 180mm) was independently vetoed by this position
+        # check alone at n=1 -- vetoed anyway that frame by rotation, but a
+        # position-only false reject at n=1 was otherwise fully possible.
+        if self.vel_ema is None:
+            _vel_pos_thresh_m = float('inf')
         _jump_vs_pred = None
         if solution is not None and predicted_pose is not None:
             _jump_vs_pred = self._pose_jump_too_large(
@@ -1140,10 +1281,50 @@ class CameraTracker:
                 max_angle_deg=60.0 + _extra_rot_deg,
                 **_lg_jump_kw,
             )
+
+            # Quality-comparison rescue: a candidate that CLEARLY beats
+            # last_good_pose's own recorded quality on both inliers and error
+            # is evidence the REFERENCE was the inaccurate one, not that the
+            # candidate is an implausible jump -- see last_good_pose_quality's
+            # own comment (__init__) for the real case this fixes (a clean
+            # 11-inlier/0.12px candidate rejected against a 5-inlier/0.98px
+            # COVERAGE-FALLBACK reference by 2.6deg on one rotation axis).
+            # Deliberately conservative on both axes at once (not "OR"): a
+            # candidate that's merely somewhat better shouldn't override this
+            # gate on a hunch, only one so clearly stronger that the
+            # reference's own inaccuracy is the more likely explanation.
+            # "Strong" reuses strong_match_inliers/strong_match_error_px
+            # (pose_search.py's own bar for a confident match) rather than a
+            # new tunable -- the candidate must clear that bar outright, not
+            # just beat the reference by some relative margin, so a weak
+            # reference can never validate an only-slightly-less-weak
+            # candidate as "clearly better."
+            _quality_rescue = False
+            if _jump_vs_last_good and self.last_good_pose_quality is not None:
+                _lg_inliers, _lg_error = self.last_good_pose_quality
+                _cand_inliers = len(solution.get("assignment") or [])
+                _cand_error = float(solution.get("error", float("inf")))
+                _strong_inliers = float(_cfg.get("strong_match_inliers", 6))
+                _strong_error_px = float(_cfg.get("strong_match_error_px", 0.5))
+                _reference_weak = _lg_inliers < _strong_inliers or _lg_error > _strong_error_px
+                _candidate_strong = _cand_inliers >= _strong_inliers and _cand_error <= _strong_error_px
+                _candidate_clearly_better = (_cand_inliers >= 2 * _lg_inliers
+                                              and _cand_error <= 0.5 * max(_lg_error, 1e-6))
+                _quality_rescue = _reference_weak and _candidate_strong and _candidate_clearly_better
+                if _quality_rescue:
+                    logger.bind(cat="matching_decisions").debug(
+                        f"[{ctrl_name} | cam {cam_idx} | track] re-acquisition candidate far from "
+                        f"last_good_pose but rescued by quality comparison (candidate: "
+                        f"{_cand_inliers} inliers/{_cand_error:.2f}px vs weak reference: "
+                        f"{_lg_inliers} inliers/{_lg_error:.2f}px) — accepting."
+                    )
+
             # _jump_vs_pred is the SHARED, tight vs-predicted_pose check
             # computed once above (2026-09-10 consolidation) -- previously
             # this block ran its OWN separate, much looser rescue check here.
-            if _jump_vs_last_good and (predicted_pose is None or _jump_vs_pred):
+            if _jump_vs_last_good and _quality_rescue:
+                pass  # accepted above -- solution stays as-is
+            elif _jump_vs_last_good and (predicted_pose is None or _jump_vs_pred):
                 # stale_s vs imu_budget_s are now directly comparable (same
                 # clock, same units -- see imu_only_propagation_max_s's own
                 # config comment): stale_s > imu_budget_s means predicted_pose
@@ -1467,6 +1648,7 @@ class CameraTracker:
             ))
             self.prev_assignment      = result["assignment"]
             self.last_good_pose       = self.prev_pose
+            self.last_good_pose_quality = (len(result["assignment"]), float(result.get("error", 0.0)))
             self.last_good_assignment = self.prev_assignment
             self.consecutive_failures = 0
         else:
@@ -1568,14 +1750,6 @@ class ControllerTracker:
 
         # True from the first frame vision ever produces a real candidate for
         # this controller (set in _commit_fused_solution, unconditionally --
-        # reaching that method already means some camera found a plausible
-        # geometric fit this frame, regardless of what the fusion filter then
-        # does with it). Never reset for the rest of the session -- once we've
-        # confirmed this controller physically exists, a LATER full loss is a
-        # re-acquisition, not a startup cold-start, and skips the persistence/
-        # confirm-streak gate below (see the two call sites that read this).
-        self._ever_tracked: bool = False
-
         # Guards _mark_all_lost's per-frame IMU-only-propagation decision
         # (matching.imu_only_propagation_max_s) against being made twice on
         # the SAME real frame -- _mark_all_lost is called once per FAILED
@@ -1657,6 +1831,7 @@ class ControllerTracker:
             _tracker.clear_prior()
             _tracker.last_good_pose = None
             _tracker.last_good_pose_ts_ns = None
+            _tracker.last_good_pose_quality = None
         # No separate IMU-only-propagation counter to reset -- self._fusion_
         # filter.reset() above already nulls last_update_ts_ns (and R/p), so
         # _mark_all_lost's elapsed-time budget check finds no anchor to
@@ -1781,7 +1956,16 @@ class ControllerTracker:
                 # guards) artificially undecayed for the rest of an arbitrarily long loss.
                 self._fusion_filter.note_real_frame(frame_ts_ns)
             if (self._fusion_filter is not None and _elapsed_since_real_update_s is not None
-                    and _elapsed_since_real_update_s < _imu_only_max_s):
+                    and _elapsed_since_real_update_s < _imu_only_max_s
+                    and self._fusion_filter.velocity_established):
+                # velocity_established gate: predict()'s position component is
+                # dead-reckoned from self._fusion_filter.v, which right after a
+                # bootstrap/reset/fail-open is a fabricated v=0, not a real
+                # measurement (see HeuristicPoseFusionFilter.velocity_established's
+                # own comment) -- warm-starting the next search's neighborhood
+                # from that position has no more basis than just leaving prev_pose
+                # alone, so this falls through to the grace-frame-then-clear path
+                # below instead of fabricating an anchor to search around.
                 _predicted = self._fusion_filter.predict(frame_ts_ns)
                 if _predicted is not None:
                     _imu_pose = Transform(*_predicted)
@@ -1945,8 +2129,74 @@ class ControllerTracker:
         n_rounds = 0
         _pool_rt_ms: Dict[int, float] = {}   # cid -> worst brute-tier pool round-trip, if pool was used
 
-        if force_brute or (not cam_solutions and allow_brute):
+        # ── Weak single-camera cheap accept + another eligible camera failed ────
+        # "Only if NO camera produced anything this frame do we pay for brute-force
+        # recovery" (see this method's own docstring) is too coarse: it treats a
+        # single low-inlier proximity accept from one camera as equally trustworthy
+        # as a solid multi-camera one, even when ANOTHER camera that had real
+        # detected blobs this frame (in _cheap_specs, not just geometrically
+        # in-frustum) came up with nothing or got jump-rejected. Confirmed on a
+        # real recording (frame_range 800-900 relative frames 50/51/53): cam1 kept
+        # accepting 4-7-inlier proximity matches with several of its own detected
+        # blobs left unmatched, while cam0 -- which had its own real candidate
+        # blobs every one of those frames -- never got to independently confirm or
+        # contradict it, letting a single weak, partially-wrong camera lock in the
+        # whole controller's fused pose frame after frame with no cross-check.
+        #
+        # "Weak" = either too few inliers (reuses strong_match_inliers, the SAME
+        # "is this actually a strong match" floor PoseSearcher's own brute
+        # strong_found early-exit uses -- not a second, separate threshold) OR too
+        # low a blob-utilization ratio (inliers / this camera's own available blob
+        # count this frame) -- inlier count alone missed frame 50's case (7
+        # inliers, comfortably >= strong_match_inliers, but from only 9 of the
+        # camera's own 13 detected blobs, the rest genuinely unmatched).
+        # weak_solo_blob_utilization_floor=0.7 is empirically set: surveyed 1684
+        # real accepted proximity solutions (walk_medium, 3000 frames) and only
+        # 4.04% ever fall below 0.7 (median ratio is 1.0, i.e. most accepts use
+        # every detected blob) -- low enough that this essentially never fires on
+        # a normal, healthy single-camera accept.
+        _weak_solo_cids: List[int] = []
+        if not force_brute and cam_solutions:
+            _av_count_by_cid = {cid: len(av_orig) for cid, _t, _o, _r, _b, _m, av_orig in _cheap_specs}
+            _weak_solo_cids = _weak_solo_accept_cids(
+                cam_solutions, [c[0] for c in _cheap_specs], _av_count_by_cid, self._matching_cfg)
+            if _weak_solo_cids and not allow_brute:
+                # Can't run the cross-check brute-force here -- this is the FIRST
+                # sequential fallback stage (main.py's _update_ctrl(allow_brute=False)
+                # after update_warm_batch itself deferred, see that method's own
+                # matching comment). Discard the weak solution and signal failure
+                # (empty cam_solutions -> "if not cam_solutions" below) so the
+                # caller's NEXT stage (cold re-detect + force_brute=True, the same
+                # path any other total cheap-search failure already takes) gets a
+                # real, unrestricted brute-force attempt instead of this method
+                # quietly returning a weak, single-camera, un-cross-checked solution.
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{self.ctrl_name}] weak solo accept (cam(s) "
+                    f"{sorted({cs['cam_id'] for cs in cam_solutions})}) while cam(s) "
+                    f"{_weak_solo_cids} had blobs but no accepted solution -- "
+                    f"allow_brute=False here, deferring to cold re-detect + brute"
+                )
+                cam_solutions = []
+                _weak_solo_cids = []
+            elif _weak_solo_cids:
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{self.ctrl_name}] weak solo accept (cam(s) "
+                    f"{sorted({cs['cam_id'] for cs in cam_solutions})}) while cam(s) "
+                    f"{_weak_solo_cids} had blobs but no accepted solution -- "
+                    f"forcing brute-force cross-check on {_weak_solo_cids}"
+                )
+
+        if force_brute or (not cam_solutions and allow_brute) or (allow_brute and _weak_solo_cids):
             # ── Tier-round brute-force recovery ─────────────────────────────────
+            # For a plain weak-solo trigger (not force_brute, not the "nothing at
+            # all" case), only the camera(s) that failed cheap search actually run
+            # brute-force below -- the already-accepted weak solution stays in
+            # cam_solutions untouched (never re-run/duplicated), and a real brute
+            # candidate from the other camera, if found, is simply APPENDED
+            # alongside it for joint_fusion/conflict-resolution to weigh together.
+            _brute_cids = (
+                list(avail.keys()) if (force_brute or not cam_solutions) else _weak_solo_cids
+            )
             # tier_0 for every camera with a chance (>=4 available blobs); wait for
             # the whole round to finish before deciding anything (no mid-tier
             # cancellation); stop widening the instant any camera hits strong_found
@@ -1957,7 +2207,8 @@ class ControllerTracker:
             }
             _t_new_state_start = time.perf_counter()
             _confirm_frames = int(self._matching_cfg.get('cold_brute_force_confirm_frames', 3))
-            for cid, (av_blobs, av_radii, av_brts, av_orig) in avail.items():
+            for cid in _brute_cids:
+                av_blobs, av_radii, av_brts, av_orig = avail[cid]
                 tracker = self.trackers[cid]
                 # force_brute=True covers TWO distinct cases (main.py:585 and
                 # main.py:633): a truly cold controller (no prior anywhere), and
@@ -1972,20 +2223,37 @@ class ControllerTracker:
                 # prev_pose is None is exactly "truly cold" here; prev_pose is
                 # still set means "recently lost, within grace" — skip the gate.
                 #
-                # self._ever_tracked additionally exempts a controller that has
-                # ALREADY been confirmed real earlier this session, even once
-                # prev_pose has been cleared -- the noise-filtering rationale
-                # below only makes sense for "might not even be a real
-                # controller yet" (frame 1), not "we know this controller
-                # exists and it just went missing." Without this, a genuine
-                # re-acquisition paid the same multi-frame confirmation delay
-                # as a never-seen-before startup, needlessly extending a real
-                # tracking-loss gap by cold_brute_force_confirm_frames frames
-                # even when the very next frame's brute-force would have
-                # succeeded immediately (confirmed on this project's own
-                # recording -- frames 25-26 lost purely to this gate, not to
-                # any actual re-detection failure).
-                if force_brute and tracker.prev_pose is None and not self._ever_tracked:
+                # self._ever_tracked used to ALSO unconditionally exempt a
+                # controller confirmed real earlier this session, even once
+                # prev_pose had been cleared (grace period long expired) --
+                # reasoning: "might not even be a real controller yet" (frame
+                # 1) doesn't apply once we already know it's real, so don't
+                # pay the multi-frame confirmation delay again (confirmed on
+                # this project's own recording: frames 25-26 lost purely to
+                # this gate). REMOVED 2026-09-11: that exemption disables the
+                # streak check FOREVER after a controller's first successful
+                # track, not just briefly after loss -- the persistence
+                # streak isn't only about "is this a real controller," it's
+                # about "is THIS PARTICULAR reacquisition candidate real,"
+                # which stays just as necessary for an already-known-real
+                # controller's Nth reacquisition as its 1st. Confirmed on a
+                # real case (frame_range 1750-1800 relative frame 48): a
+                # previously-tracked, long-lost right_controller re-acquired
+                # on the very first frame with exactly min_inliers=4 blobs
+                # available -- a zero-redundancy accept (every available blob
+                # instantly counted as an inlier, RANSAC had nothing to reject
+                # against) that immediately lost warm proximity again next
+                # frame and forced a collision-based RESET two frames later.
+                # The frames-25-26 case above is still covered without this
+                # exemption: prev_pose stays set through tracking_lost_grace_
+                # frames (see the comment above), so a controller that
+                # re-solves within its own grace window never reaches this
+                # branch at all regardless of _ever_tracked -- only a gap
+                # that outlasts the grace period now also pays the same
+                # streak-confirmation cost a first-time acquisition does,
+                # which is the intended behavior per cold_brute_force_
+                # confirm_frames' own config.yml description.
+                if force_brute and tracker.prev_pose is None:
                     # Persistence gate: require _confirm_frames CONSECUTIVE
                     # frames of >= min_inliers blobs before paying for a full
                     # P3P/gate enumeration, since real reacquired LEDs persist
@@ -2302,11 +2570,6 @@ class ControllerTracker:
         rejecting filter (should_force_cold_start) forces a full cold-start —
         see the escape-hatch block near the end of this method, plan Phase 5.
         """
-        # Reaching this method at all means some camera found a plausible
-        # geometric fit for this controller this frame -- see _ever_tracked's
-        # own docstring (__init__) for why that's the right trigger and what
-        # it's used for.
-        self._ever_tracked = True
         # NOTE: the IMU-only-coast budget (_mark_all_lost's elapsed-time check
         # against self._fusion_filter.last_update_ts_ns) is deliberately NOT
         # reset here -- last_update_ts_ns only advances inside the fusion
@@ -2477,6 +2740,9 @@ class ControllerTracker:
             # bearing here too, not just for consecutive_failures below). No
             # separate counter to reset any more.
             self._last_imu_only_pose = None
+        # cam_id -> that camera's OWN solved dict (error/assignment), for
+        # last_good_pose_quality below -- see that field's own comment.
+        _cam_sol_by_cid = {cs["cam_id"]: cs["solution"] for cs in cam_solutions}
         for _cid, _tracker in self.trackers.items():
             # Assignment/failure bookkeeping reflects trust in the vision candidate
             # itself, not just "we have a pose to report" (that's the propagation
@@ -2495,6 +2761,13 @@ class ControllerTracker:
                     anchor_assignment if _cid == primary_cam_id
                     else _other_assignments.get(_cid)
                 )
+                # Quality this camera's OWN solve reached when last_good_pose
+                # was captured -- see last_good_pose_quality's own comment
+                # (__init__) for why finalize_search's re-acquisition gate
+                # needs this alongside the pose itself.
+                _own_sol = _cam_sol_by_cid.get(_cid)
+                if _own_asgn is not None and _own_sol is not None:
+                    _tracker.last_good_pose_quality = (len(_own_asgn), float(_own_sol.get("error", 0.0)))
                 if _own_asgn is not None:
                     _tracker.prev_assignment      = _own_asgn
                     _tracker.last_good_assignment = _own_asgn
@@ -2582,6 +2855,7 @@ class ControllerTracker:
                 # Same reasoning/fix as ControllerTracker.force_cold_start's own.
                 _tracker.last_good_pose = None
                 _tracker.last_good_pose_ts_ns = None
+                _tracker.last_good_pose_quality = None
             if _is_abs_reject_swap:
                 for _sibling in self._sibling_controllers:
                     if _sibling._fusion_filter is not None:
@@ -2591,6 +2865,7 @@ class ControllerTracker:
                         _sib_tracker.consecutive_failures = _grace + 1
                         _sib_tracker.last_good_pose = None
                         _sib_tracker.last_good_pose_ts_ns = None
+                        _sib_tracker.last_good_pose_quality = None
 
         # Sampled once and shared below (found in review: the gravity-estimator feed
         # and _log_gravity_consistency were each independently interpolating the SAME
@@ -3556,7 +3831,11 @@ class TrackingSystem:
             }
 
         cam_solutions_per_ctrl: Dict[str, list] = {c: [] for c in ctrl_names}
+        eligible_cids_per_ctrl: Dict[str, List[int]] = {c: [] for c in ctrl_names}
+        av_count_per_ctrl_cid: Dict[str, Dict[int, int]] = {c: {} for c in ctrl_names}
         for ctrl_name, cid, tracker, obs, rad, brt in specs:
+            eligible_cids_per_ctrl[ctrl_name].append(cid)
+            av_count_per_ctrl_cid[ctrl_name][cid] = len(obs)
             solution, predicted_pose = raw[(ctrl_name, cid)]
             solution = tracker.finalize_search(
                 solution, predicted_pose, obs, blob_radii=rad,
@@ -3571,6 +3850,27 @@ class TrackingSystem:
         for ctrl_name in ctrl_names:
             cam_solutions = cam_solutions_per_ctrl[ctrl_name]
             if not cam_solutions:
+                results[ctrl_name] = None
+                continue
+            # Weak single-camera accept + another eligible camera failed (see
+            # _weak_solo_accept_cids' own docstring, and ControllerTracker.update's
+            # matching comment for the real recording that motivated this): this
+            # batched warm-warm path has NO brute-force of its own (see this
+            # method's own docstring), so the only thing to do here is defer --
+            # returning None routes this controller through main.py's existing
+            # "cheap pass wasn't good enough" fallback (sequential retry, then cold
+            # re-detect + real brute-force), exactly as any other cheap-search
+            # failure already does, instead of silently accepting an unconfirmed,
+            # partially-wrong single-camera solution.
+            _weak_solo = _weak_solo_accept_cids(
+                cam_solutions, eligible_cids_per_ctrl[ctrl_name], av_count_per_ctrl_cid[ctrl_name],
+                self.ctrl_trackers[ctrl_name]._matching_cfg)
+            if _weak_solo:
+                logger.bind(cat="matching_decisions").debug(
+                    f"[{ctrl_name}] weak solo accept in warm-batch (cam(s) "
+                    f"{sorted({cs['cam_id'] for cs in cam_solutions})}) while cam(s) {_weak_solo} "
+                    f"had blobs but no accepted solution -- deferring to sequential brute fallback"
+                )
                 results[ctrl_name] = None
                 continue
             obs_src = per_ctrl_observations.get(ctrl_name) or {}
@@ -3679,26 +3979,25 @@ class TrackingSystem:
                 _other_cams_by_key[(ctrl_name, cid)] = _build_other_cameras_blobs(
                     self.cameras, obs_src, cid)
                 # Persistence gate, verbatim logic from ControllerTracker.update()
-                # (controller.py:930-948, this file) -- every controller passed to
+                # (controller.py, this file) -- every controller passed to
                 # update_cold_batch is already known cold by the caller's contract
-                # (no camera has a usable prior right now), but that contract
-                # doesn't distinguish "never confirmed real this session" from
-                # "confirmed real earlier, just lost" -- self.ctrl_trackers[
-                # ctrl_name]._ever_tracked does, and skips the gate for the
-                # latter, same reasoning as ControllerTracker.update()'s own copy
-                # of this check.
-                if not self.ctrl_trackers[ctrl_name]._ever_tracked:
-                    if len(obs_full) >= tracker._pose_searcher._c_brute_min_inliers:
-                        tracker._consecutive_good_blob_frames += 1
-                    else:
-                        tracker._consecutive_good_blob_frames = 0
-                    if tracker._consecutive_good_blob_frames < _confirm_frames:
-                        logger.bind(cat="matching_decisions").debug(
-                            f"[{ctrl_name} | cam {cid}] cold brute-force gated (batch): "
-                            f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
-                            f"(n_blobs={len(obs_full)})"
-                        )
-                        continue
+                # (no camera has a usable prior right now). No _ever_tracked
+                # exemption here either (removed 2026-09-11, see
+                # ControllerTracker.update()'s own copy of this check for the
+                # full reasoning) -- a controller confirmed real earlier this
+                # session still needs each individual reacquisition candidate
+                # to clear the same noise-persistence bar as a first-time one.
+                if len(obs_full) >= tracker._pose_searcher._c_brute_min_inliers:
+                    tracker._consecutive_good_blob_frames += 1
+                else:
+                    tracker._consecutive_good_blob_frames = 0
+                if tracker._consecutive_good_blob_frames < _confirm_frames:
+                    logger.bind(cat="matching_decisions").debug(
+                        f"[{ctrl_name} | cam {cid}] cold brute-force gated (batch): "
+                        f"streak={tracker._consecutive_good_blob_frames}/{_confirm_frames} "
+                        f"(n_blobs={len(obs_full)})"
+                    )
+                    continue
                 mask = np.ones(len(obs_full), dtype=bool)
                 states[(ctrl_name, cid)] = tracker._pose_searcher.new_brute_state(
                     obs_full, pose_prior=None, other_cameras_blobs=_other_cams_by_key[(ctrl_name, cid)],

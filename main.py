@@ -292,9 +292,25 @@ def main():
     lost_streak       = {n: 0 for n in enabled_ctrls}
     # Cold-path BlobDetector EMA-threshold memory, round-tripped explicitly through
     # run_blob_detect() rather than left as worker-resident state (a pool task isn't
-    # pinned to the same worker every call) — keyed per (cam_idx, ctrl_name) so two
-    # controllers cold-starting on the same camera in the same frame no longer
-    # clobber each other's memory (see run_blob_detect's docstring).
+    # pinned to the same worker every call) — keyed per cam_idx ALONE (one real
+    # camera, one real adaptive-threshold history), NOT per (cam_idx, ctrl_name).
+    #
+    # Was keyed per (cam_idx, ctrl_name) until 2026-09-11: that avoided an earlier
+    # same-frame clobbering bug (two controllers cold-starting on the same camera
+    # in the same frame stepping on a single shared BlobDetector instance's
+    # memory) but traded it for a worse one — confirmed on a real recording
+    # (frame_range 1700-1735, cam3, both controllers cold): [blob-dedup] never
+    # fired for cam3 across dozens of consecutive frames (it did for cam2, same
+    # frames) because left_controller's and right_controller's per-controller
+    # memory for cam3 had already diverged from earlier in the run and never
+    # reconverged, so they silently ran as two independent, ever-diverging
+    # detection pipelines against the SAME physical camera indefinitely — not
+    # randomness, a real architectural gap. Fixed by going back to one shared
+    # per-camera history (the dedup grouping below, which already merges same-
+    # frame same-camera "cold" requests into one task+one memory read/write
+    # instead of one per controller, is what actually prevents the ORIGINAL
+    # clobbering bug now -- see the "cold" grouping key just below, which no
+    # longer needs a memory-value comparison to decide who can share a call).
     _cold_memory: dict = {}
 
     _csv_path = debug_cfg.get("calibration_csv")
@@ -524,39 +540,22 @@ def main():
                 return (images_override or {}).get(ctrl_name, {}).get(cam_idx, cam_images[cam_idx])
 
             # ── Dedup: two-or-more controllers sharing a camera whose detect()
-            # inputs are provably identical — no image override, the same
-            # predicted_leds/radius/threshold/velocity kwargs, and equal
-            # cold-path EMA memory (both empty/never-established, or both
-            # holding the same pixel_threshold/required_threshold/max_area/
-            # blob_count — which is what two controllers that have been
-            # deduped together since they went cold end up with, since
-            # BlobDetector.detect is a pure function of (image,
-            # predicted_leds, radius, threshold_scale, velocity_px, memory)
-            # and identical inputs produce identical memory going forward)
-            # — get ONE detect() call instead of one per controller, with
-            # that single result copied to every member below. ctrl_label
-            # only affects a debug-canvas filename.
+            # inputs are identical this frame — no image override, same
+            # predicted_leds/radius/threshold/velocity kwargs — get ONE
+            # detect() call instead of one per controller, with that single
+            # result (and the one resulting _cold_memory[cam_idx] update)
+            # shared by every member below. ctrl_label only affects a debug-
+            # canvas filename.
             #
-            # Comparing memory *by value* (not just "has any memory been
-            # established") matters: an earlier version treated any
-            # established memory as disqualifying, which meant two
-            # controllers that started cold-cold and got deduped on their
-            # first frame would permanently fall back to solo (duplicated)
-            # detection from their second cold frame onward, even though
-            # their fanned-out memory was still identical — silently
-            # doubling blob-detection cost for the rest of a cold-cold run.
-            # Only large_blobs is left out of the comparison below — it's
-            # write-only in BlobDetector (never read back via _mem), so it
-            # can't affect detect()'s output and including it would just
-            # risk an unnecessary split (or an elementwise-comparison error
-            # on the numpy contour arrays it holds).
-            def _mem_key(cam_idx, ctrl_name):
-                mem = _cold_memory.get((cam_idx, ctrl_name))
-                if not mem:
-                    return None
-                return (mem.get("pixel_threshold"), mem.get("required_threshold"),
-                        mem.get("max_area"), mem.get("blob_count"))
-
+            # No memory-value comparison needed in the grouping key (unlike an
+            # earlier version, which compared _cold_memory by value to decide
+            # whether two controllers could share a call): _cold_memory is now
+            # keyed by cam_idx alone, so any two controllers hitting the same
+            # camera with the same params in this same call are, by
+            # construction, reading the exact same dict entry already — there
+            # is no "memory might differ" case left to guard against. See
+            # _cold_memory's own comment (this file, above) for why per-camera
+            # (not per (camera, controller)) is the correct invariant here.
             groups: dict = {}   # dedup_key -> [(ctrl_name, cam_idx, kwargs), ...]
             for ctrl_name, cam_kwargs in cam_kwargs_per_ctrl.items():
                 for cam_idx, kwargs in cam_kwargs.items():
@@ -570,7 +569,6 @@ def main():
                             kwargs.get("local_search_radius_px", 0.0),
                             kwargs.get("threshold_scale", 1.0),
                             kwargs.get("velocity_px", 0.0),
-                            _mem_key(cam_idx, ctrl_name),
                         )
                     groups.setdefault(key, []).append((ctrl_name, cam_idx, kwargs))
 
@@ -589,12 +587,15 @@ def main():
                     )
                 )
 
-            def _fan_out(ctrl_name, cam_idx, det_result, memory_out=None):
+            def _fan_out(ctrl_name, cam_idx, det_result):
+                # No memory write here: _cold_memory is keyed by cam_idx alone
+                # now, and every fanned-out member shares that SAME cam_idx
+                # (dedup only ever merges same-camera entries) — the
+                # representative's own _cold_memory[cam_idx] write, made by
+                # the caller before/after this, already covers every member.
                 for _mc, _mcam, _ in _group_by_rep[(ctrl_name, cam_idx)][1:]:
                     results_by_ctrl[_mc][_mcam] = det_result
                     ms_by_ctrl[_mc][_mcam] = 0.0
-                    if memory_out is not None:
-                        _cold_memory[(_mcam, _mc)] = memory_out
 
             if pool is not None and blob_parallel:
                 from src.parallel_search import run_blob_detect
@@ -610,12 +611,12 @@ def main():
                         kwargs.get("threshold_scale", 1.0),
                         kwargs.get("velocity_px", 0.0),
                         _visualize_compute, img_path_arg, img_path.name,
-                        _cold_memory.get((cam_idx, ctrl_name)),
+                        _cold_memory.get(cam_idx),
                     )
                 for (ctrl_name, cam_idx), fut in futures.items():
                     result, canvases, memory_out, diag = fut.result()
                     t_result = time()
-                    _cold_memory[(cam_idx, ctrl_name)] = memory_out
+                    _cold_memory[cam_idx] = memory_out
                     results_by_ctrl[ctrl_name][cam_idx] = (result, canvases)
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - t0_by_key[(ctrl_name, cam_idx)]) * 1000
                     if debug_config.log_enabled("blob_diag"):
@@ -630,7 +631,7 @@ def main():
                             f"dispatch={dispatch_ms:.2f}ms  compute={compute_ms:.2f}ms  "
                             f"return={return_ms:.2f}ms  total={total_ms:.2f}ms"
                         )
-                    _fan_out(ctrl_name, cam_idx, (result, canvases), memory_out=memory_out)
+                    _fan_out(ctrl_name, cam_idx, (result, canvases))
             else:
                 for ctrl_name, cam_idx, kwargs in flat:
                     ctrl_label = ctrl_name.replace("_controller", "")
