@@ -20,6 +20,7 @@ from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_fro
     LiveGravityEstimator
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
                             relative_pose, DRIFT_CHECK_VARIANT
+from src.headset_pose_source import MocapHeadsetPoseSource
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
 from src.transformations import Transform
@@ -27,6 +28,36 @@ from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
                                fine_tune_alignment, load_trimesh)
 
 SLOW_MATCH_THRESHOLD_S = 1.5
+
+
+def _is_recent_memory_usable(last_good_pose, last_good_pose_ts_ns, last_good_pose_quality,
+                              frame_ts_ns, max_stale_s, min_inliers, max_error_px) -> bool:
+    """Pure boolean logic behind main()'s own _has_recent_memory closure --
+    see that closure's own (long) docstring for the full safety reasoning
+    behind each condition below. Factored out to a plain, dependency-free,
+    module-level function specifically so it has DIRECT unit tests
+    (tests/test_has_recent_memory_logic.py), not just incidental exercise
+    through the full pipeline -- this exact logic was found unsafe once
+    already (an under-specified first version passed a 3-agent critique's
+    scrutiny straight to a real, describable failure mode), so it earns its
+    own isolated test coverage rather than trusting a closure buried inside
+    main()'s own multi-hundred-line per-frame loop.
+
+    True only if last_good_pose is BOTH fresh (within max_stale_s of
+    frame_ts_ns, never negative-stale) AND strong (quality clears
+    min_inliers/max_error_px) -- either missing/failing condition returns
+    False, the conservative default."""
+    if last_good_pose is None:
+        return False
+    if last_good_pose_ts_ns is None:
+        return False
+    stale_s = (frame_ts_ns - last_good_pose_ts_ns) / 1e9
+    if not (0.0 <= stale_s <= max_stale_s):
+        return False
+    if last_good_pose_quality is None:
+        return False
+    lg_inliers, lg_error = last_good_pose_quality
+    return lg_inliers >= min_inliers and lg_error <= max_error_px
 
 
 def main():
@@ -220,6 +251,11 @@ def main():
                 f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
                 f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source})")
 
+    # For src/lamp_region_memory.py (blob_detection.lamp_blob_filter.static_lamp_mask)
+    # -- None (complete no-op there) whenever headset mocap isn't loaded.
+    _headset_pose_source = (MocapHeadsetPoseSource(device_mocap["headset"])
+                             if device_mocap.get("headset") is not None else None)
+
     tracking_system = TrackingSystem(
         list(enabled_ctrls.values()), list(cameras.values()),
         matching_cfg=config.get("matching", {}),
@@ -250,7 +286,8 @@ def main():
         # code's own default (vision_only_debug: true had no effect at all).
         # PoseFusionFilter (kalman) doesn't have this problem -- all of ITS
         # knobs live directly under fusion: with no second-tier block.
-        fusion_cfg={**config.get("fusion", {}), "fusion_heuristic": config.get("fusion_heuristic", {})},
+        fusion_cfg={**config.get("fusion", {}), "fusion_heuristic": config.get("fusion_heuristic", {}),
+                    "matching": config.get("matching", {})},
         debug_pose_fusion_cfg=config["visualization"].get("pose_fusion_debug", {}),
     )
     pool          = tracking_system.get_pool()
@@ -312,6 +349,10 @@ def main():
     # clobbering bug now -- see the "cold" grouping key just below, which no
     # longer needs a memory-value comparison to decide who can share a call).
     _cold_memory: dict = {}
+    # Same round-trip idea, for src/lamp_region_memory.py's LampRegionMemory
+    # (the parallel-pool path's workers aren't pinned to a camera across
+    # calls, same as _cold_memory above) -- keyed by cam_idx alone.
+    _cold_region_memory: dict = {}
 
     _csv_path = debug_cfg.get("calibration_csv")
     _csv_file = _csv_writer = None
@@ -519,9 +560,12 @@ def main():
             computation, not independent work.
 
             cam_kwargs_per_ctrl: {ctrl_name: {cam_idx: {predicted_leds,
-            local_search_radius_px, threshold_scale, velocity_px}}} — only
-            predicted_leds is required per camera, the rest default to the
-            cold-path values.
+            local_search_radius_px, threshold_scale, velocity_px,
+            has_recent_memory}}} — only predicted_leds is required per
+            camera, the rest default to the cold-path values.
+            has_recent_memory participates in the dedup grouping key below
+            (not just forwarded) since it changes detect()'s own exclusion
+            behavior -- see that key's own comment.
 
             images_override: optional {ctrl_name: {cam_idx: image}} — used by
             the cross-controller blackout (_build_blackout_images) to hand a
@@ -564,11 +608,20 @@ def main():
                     if _has_override or _has_prior:
                         key = ("solo", ctrl_name, cam_idx)
                     else:
+                        # has_recent_memory included: two controllers cold on
+                        # the same camera this frame can differ on it (one
+                        # just lost track, one never tracked at all) -- since
+                        # it changes detect()'s own exclusion behavior (see
+                        # BlobDetector.detect()'s own docstring), they are
+                        # NOT the same computation and must not be merged
+                        # into one shared detect() call the way identical
+                        # cold kwargs otherwise would be.
                         key = (
                             "cold", cam_idx,
                             kwargs.get("local_search_radius_px", 0.0),
                             kwargs.get("threshold_scale", 1.0),
                             kwargs.get("velocity_px", 0.0),
+                            bool(kwargs.get("has_recent_memory", False)),
                         )
                     groups.setdefault(key, []).append((ctrl_name, cam_idx, kwargs))
 
@@ -612,11 +665,15 @@ def main():
                         kwargs.get("velocity_px", 0.0),
                         _visualize_compute, img_path_arg, img_path.name,
                         _cold_memory.get(cam_idx),
+                        frame_ts_ns,
+                        _cold_region_memory.get(cam_idx),
+                        kwargs.get("has_recent_memory", False),
                     )
                 for (ctrl_name, cam_idx), fut in futures.items():
-                    result, canvases, memory_out, diag = fut.result()
+                    result, canvases, memory_out, region_memory_out, diag = fut.result()
                     t_result = time()
                     _cold_memory[cam_idx] = memory_out
+                    _cold_region_memory[cam_idx] = region_memory_out
                     results_by_ctrl[ctrl_name][cam_idx] = (result, canvases)
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - t0_by_key[(ctrl_name, cam_idx)]) * 1000
                     if debug_config.log_enabled("blob_diag"):
@@ -646,6 +703,10 @@ def main():
                         visualize=_visualize_compute,
                         img_path=img_path_arg,
                         frame_name=img_path.name,
+                        camera=cameras[cam_idx],
+                        pose_source=_headset_pose_source,
+                        frame_ts_ns=frame_ts_ns,
+                        has_recent_memory=kwargs.get("has_recent_memory", False),
                     )
                     results_by_ctrl[ctrl_name][cam_idx] = det_result
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - _t0) * 1000
@@ -733,6 +794,105 @@ def main():
         # covered Phase 2 and was easy to mistake for the whole per-frame cost.
         blob_ms_per_ctrl: dict = {}
 
+        # See _has_recent_memory's own docstring for the full story. Both
+        # values below are read once, outside the per-call helper, from the
+        # SAME config namespace ControllerTracker's own jump-gate reads
+        # (matching.*) plus a new, dedicated static_lamp_mask.* budget --
+        # deliberately NOT reusing an existing "coast"/"budget" constant,
+        # since none of them represent "how long before the vs-last_good_pose
+        # jump-gate is still meaningfully tight," which is the one thing
+        # this specific decision needs.
+        _recent_memory_max_s = float(
+            (config["blob_detection"].get("lamp_blob_filter") or {})
+            .get("static_lamp_mask", {}).get("recent_memory_max_s", 0.05))
+        _recent_memory_min_inliers = float(config["matching"].get("strong_match_inliers", 6))
+        _recent_memory_max_error_px = float(config["matching"].get("strong_match_error_px", 0.5))
+
+        def _has_recent_memory(ctrl_name: str, cam_idx: int) -> bool:
+            """True if this (controller, camera) pair has a FRESH, STRONG
+            last_good_pose -- i.e. this is genuinely a "just lost this
+            frame or the last few, re-acquiring" cold call, not merely
+            "has ever been tracked, however long ago." Forwarded to
+            BlobDetector.detect() as has_recent_memory, which gates
+            static_lamp_mask's EXCLUSION only (never its tracking) -- see
+            that parameter's own docstring for the full reasoning.
+
+            FIXED 2026-09-15 (3-agent critique of the first version, which
+            checked ONLY `last_good_pose is not None`): two independent
+            reviewers found that check alone doesn't hold up.
+              1. last_good_pose is retained INDEFINITELY across loss events
+                 by design (CameraTracker's own comment: "Retained across
+                 loss events") -- it's cleared only on a PROVABLY WRONG
+                 reset (identity-swap/contested-winner), never for
+                 staleness. Meanwhile ControllerTracker._check_vs_last_good
+                 (src/controller.py) widens its own accept threshold
+                 UNBOUNDED with real elapsed time since last_good_pose_ts_ns
+                 (no cap anywhere -- confirmed by grep), by explicit design
+                 ("degrades toward no meaningful check" -- that function's
+                 own comment). Checked against this project's REAL shipped
+                 matching.* config (not just the code's own fallback
+                 defaults): the rotation half of that check reaches its
+                 absolute ceiling (180 degrees -- i.e. a total no-op) after
+                 roughly 70ms of staleness. Without a recency requirement
+                 here, has_recent_memory could stay True indefinitely after
+                 a controller is merely SET DOWN or walks out of view for
+                 an extended period, disabling lamp exclusion at exactly the
+                 moment (both this feature's own check AND the jump-gate it
+                 leans on are gone) protection matters most -- the opposite
+                 of "true cold start still gets full protection."
+              2. Even within a fresh window, ControllerTracker's own
+                 _quality_rescue can bypass the position/rotation check
+                 OUTRIGHT (not just widen it) whenever the REFERENCE
+                 (last_good_pose_quality) was weak -- and matching.min_inliers
+                 (the floor for ANY accepted solve at all) sits BELOW
+                 strong_match_inliers, so an entirely ordinary recent accept
+                 (not a coverage_fallback, just a modest edge-of-frame/
+                 partial-occlusion one) already counts as "weak" by this
+                 definition, making the bypass reachable far more often than
+                 "rare edge case." Requiring the reference to already be
+                 STRONG here closes that path: if last_good_pose_quality
+                 itself clears the same strong_match_inliers/error_px bar,
+                 _quality_rescue's own _reference_weak condition can never
+                 be true, so the real position/rotation distance check is
+                 the one actually protecting this frame, not a corroboration-
+                 free bypass.
+
+            KNOWN RESIDUAL RISK, not fully closed by either fix above (flagged
+            by review, not hidden): the safety argument assumes a lamp-
+            mistaken solve's position differs greatly in 3D from
+            last_good_pose because "a lamp is room-fixed near the ceiling,
+            a recently-tracked controller was near the camera." If the
+            controller's own last real position was ALSO close to the
+            lamp (e.g. genuinely held up near ceiling height, not typical
+            but not impossible), that premise weakens for exactly this
+            frame. Accepted, not solved here -- deliberately narrowed via
+            the fresh+strong requirements above rather than left wide open,
+            and revisit if real usage ever shows this scenario matters in
+            practice.
+
+            Missing/unknown state (a controller or camera pairing this
+            function doesn't recognize, or a reference with no recorded
+            quality/timestamp to check freshness/strength against) defaults
+            to False -- the conservative, NON-regressive direction: today's
+            shipped behavior before this whole feature existed is "always
+            apply lamp exclusion on every cold call," so an uncertain case
+            falls back to exactly that.
+
+            The actual fresh/strong boolean logic lives in the pure,
+            independently-unit-tested module-level function
+            _is_recent_memory_usable (top of this file) -- this closure only
+            does the tracker lookups it can't do outside main()'s own scope."""
+            ctrl_tracker = tracking_system.ctrl_trackers.get(ctrl_name)
+            if ctrl_tracker is None:
+                return False
+            cam_tracker = ctrl_tracker.trackers.get(cam_idx)
+            if cam_tracker is None:
+                return False
+            return _is_recent_memory_usable(
+                cam_tracker.last_good_pose, cam_tracker.last_good_pose_ts_ns,
+                cam_tracker.last_good_pose_quality, frame_ts_ns,
+                _recent_memory_max_s, _recent_memory_min_inliers, _recent_memory_max_error_px)
+
         # Pass A: figure out each controller's per-camera detection kwargs
         # (and out-of-scope skips) independently — no cross-controller
         # dependency here, so this loop stays per-controller; only the actual
@@ -776,6 +936,7 @@ def main():
                     local_search_radius_px=radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r),
                     threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
                     velocity_px=_v_px,
+                    has_recent_memory=_has_recent_memory(ctrl_name, cam_idx),
                 )
 
             skipped_cams_per_ctrl[ctrl_name] = list(_skipped_cams)
@@ -972,19 +1133,24 @@ def main():
                 # that just proved untrustworthy, so brute-force against those SAME
                 # blobs has no better chance: a blob outside a wrong ROI was never
                 # detected at all. Re-detect this controller's blobs cold (full-image,
-                # no prior — same as frame 1) before falling back to brute, and add the
-                # cold-path (pass1/pass2) canvases to this frame's debug view alongside
-                # the failed warm-path ("local") one, instead of replacing it — seeing
-                # what the failed proximity attempt looked at is exactly what's needed
-                # to understand why it missed.
+                # no prior — same as frame 1) before falling back to brute.
+                #
+                # The debug view shows ONLY this fresh cold-path (pass1/pass2) canvas,
+                # not the failed warm-path ("local") one alongside it -- an earlier
+                # version merged both (to show what the failed proximity attempt
+                # looked at), but the warm/local path never applies the static-lamp
+                # mask at all (lamp_region_active requires not has_prior, by design --
+                # see src/blob_detector.py's own comment), so it always shows a real
+                # static lamp as an unfiltered "detection" regardless of whether
+                # anything is actually wrong. Next to the correctly-filtered cold
+                # panel, that reads as "the redetect lost the lamp" when nothing of
+                # the sort happened -- confusing, not informative.
                 _cold_cams = [c for c in cameras if c in cam_images]
-                _warm_canvases = {
-                    cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
-                    for cam_idx in _cold_cams
-                }
                 _t_redetect0 = time()
                 _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
-                    ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
+                    ctrl_name, {c: {"predicted_leds": None,
+                                     "has_recent_memory": _has_recent_memory(ctrl_name, c)}
+                                for c in _cold_cams},
                     images_override=_build_blackout_images(ctrl_name, _cold_cams),
                 )
                 # Extra blob-detection work triggered mid-Phase-2 — counts
@@ -995,10 +1161,8 @@ def main():
                 _redetect_ms_total += _redetect_s * 1000
                 for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
                     per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
-                    _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
-                    _merged_canvases.update(det_result_1 or {})
-                    if _merged_canvases:
-                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
+                    if det_result_1:
+                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = dict(det_result_1)
                     else:
                         frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
                 _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())

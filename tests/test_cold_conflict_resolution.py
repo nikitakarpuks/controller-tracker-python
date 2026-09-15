@@ -24,6 +24,18 @@ import unittest
 import numpy as np
 
 from src.controller import TrackingSystem
+from src.transformations import Transform
+
+
+def _T(x: float) -> Transform:
+    """A world-frame pose at (x, 0, 0) -- only sol['T_world_ctrl'].t is ever
+    read by these tests' own code paths (occlusion is never enabled here,
+    so the physical-overlap check is the only T_world_ctrl consumer that
+    actually runs). Callers space these >> min_controller_center_distance_m
+    (default 0.05m) apart so this check stays inert and each test's own
+    intended mechanism (shared-blob/chain/fixed-candidate) remains the
+    deciding factor, exactly as before T_world_ctrl became required here."""
+    return Transform(np.eye(3), np.array([x, 0.0, 0.0]))
 
 
 def _make_tracking_system(matching_cfg=None, ctrl_trackers=None, cameras=None):
@@ -56,11 +68,11 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # lower fused error and should be kept; ctrl_b should be dropped.
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(10.0),
                 "assignment": [(5, 0), (6, 1)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 0, "error": 2.0,
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(20.0),
                 "assignment": [(5, 0), (7, 1)], "aux_assignments": {},
             },
         }
@@ -69,7 +81,7 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_b": {0: _geo({5: (500, 0), 7: (700, 0)})},
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
         self.assertEqual(losers, {"ctrl_b"})
 
     def test_distinct_blob_positions_are_not_a_conflict(self):
@@ -80,11 +92,11 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # equality across independently-detected arrays is meaningless).
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(30.0),
                 "assignment": [(5, 0)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 0, "error": 2.0,
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(40.0),
                 "assignment": [(5, 0)], "aux_assignments": {},
             },
         }
@@ -93,7 +105,7 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_b": {0: _geo({5: (900, 0)})},
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
         self.assertEqual(losers, set())
 
     def test_missing_blob_geometry_skips_shared_blob_check(self):
@@ -102,16 +114,16 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # index equality.
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(50.0),
                 "assignment": [(5, 0)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 0, "error": 2.0,
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(60.0),
                 "assignment": [(5, 0)], "aux_assignments": {},
             },
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(candidates)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates)
         self.assertEqual(losers, set())
 
     def test_shared_blob_conflict_prefers_many_inliers_over_lowest_raw_error(self):
@@ -126,11 +138,11 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # two do conflict and the score decides the winner.
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 0.20,
+                "primary_cam": 0, "error": 0.20, "T_world_ctrl": _T(70.0),
                 "assignment": [(5, 0), (6, 1)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 0, "error": 0.35,
+                "primary_cam": 0, "error": 0.35, "T_world_ctrl": _T(80.0),
                 "assignment": [(5, 10), (7, 11), (8, 12), (9, 13)],
                 "aux_assignments": {1: [(0, 20), (1, 21), (2, 22), (3, 23), (4, 24), (6, 25)]},
             },
@@ -140,7 +152,7 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_b": {0: _geo({5: (500, 0), 7: (700, 0), 8: (800, 0), 9: (900, 0)})},
         }
         ts = _make_tracking_system(matching_cfg={"min_inliers": 2})
-        losers, _reasons = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
         self.assertEqual(losers, {"ctrl_a"})
 
     def test_three_node_chain_lets_far_end_win_once_middle_is_dropped(self):
@@ -155,15 +167,15 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # later" case, not just pairwise comparison.
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(90.0),
                 "assignment": [(1, 10)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 0, "error": 3.0,
+                "primary_cam": 0, "error": 3.0, "T_world_ctrl": _T(100.0),
                 "assignment": [(1, 20), (2, 21)], "aux_assignments": {},
             },
             "ctrl_c": {
-                "primary_cam": 0, "error": 2.0,
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(110.0),
                 "assignment": [(2, 30)], "aux_assignments": {},
             },
         }
@@ -173,7 +185,7 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_c": {0: _geo({2: (200, 0)})},
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
         self.assertEqual(losers, {"ctrl_b"})
 
     def test_occlusion_disabled_skips_occlusion_branch_entirely(self):
@@ -186,27 +198,27 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # reached, not just that it happened to find no occlusion.
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(120.0),
                 "assignment": [(1, 10)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 1, "error": 2.0,
+                "primary_cam": 1, "error": 2.0, "T_world_ctrl": _T(130.0),
                 "assignment": [(1, 20)], "aux_assignments": {},
             },
         }
         ts = _make_tracking_system(matching_cfg={"cross_controller_occlusion": False})
-        losers, _reasons = ts._resolve_cold_conflicts(candidates)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates)
         self.assertEqual(losers, set())
 
     def test_single_candidate_never_conflicts(self):
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(140.0),
                 "assignment": [(1, 10)], "aux_assignments": {},
             },
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(candidates)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates)
         self.assertEqual(losers, set())
 
     def test_fixed_candidate_always_wins_even_with_higher_error(self):
@@ -219,11 +231,11 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # comparison.
         candidates = {
             "ctrl_cold": {
-                "primary_cam": 0, "error": 0.5,
+                "primary_cam": 0, "error": 0.5, "T_world_ctrl": _T(150.0),
                 "assignment": [(1, 10)], "aux_assignments": {},
             },
             "ctrl_warm": {
-                "primary_cam": 0, "error": 5.0,
+                "primary_cam": 0, "error": 5.0, "T_world_ctrl": _T(160.0),
                 "assignment": [(1, 20)], "aux_assignments": {},
             },
         }
@@ -232,7 +244,7 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_warm": {0: _geo({1: (100, 0)})},
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(
             candidates, fixed_names={"ctrl_warm"}, blob_geometry=blob_geometry,
         )
         self.assertEqual(losers, {"ctrl_cold"})
@@ -245,15 +257,15 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # must still be dropped normally.
         candidates = {
             "ctrl_warm_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(170.0),
                 "assignment": [(1, 10)], "aux_assignments": {},
             },
             "ctrl_warm_b": {
-                "primary_cam": 0, "error": 2.0,
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(180.0),
                 "assignment": [(1, 20)], "aux_assignments": {},
             },
             "ctrl_cold": {
-                "primary_cam": 0, "error": 0.1,
+                "primary_cam": 0, "error": 0.1, "T_world_ctrl": _T(190.0),
                 "assignment": [(1, 30)], "aux_assignments": {},
             },
         }
@@ -263,7 +275,7 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_cold":   {0: _geo({1: (100, 0)})},
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(
             candidates, fixed_names={"ctrl_warm_a", "ctrl_warm_b"}, blob_geometry=blob_geometry,
         )
         self.assertEqual(losers, {"ctrl_cold"})
@@ -273,11 +285,11 @@ class ResolveColdConflictsTests(unittest.TestCase):
         # original cold-cold-only signature (lower error wins).
         candidates = {
             "ctrl_a": {
-                "primary_cam": 0, "error": 1.0,
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(200.0),
                 "assignment": [(5, 0)], "aux_assignments": {},
             },
             "ctrl_b": {
-                "primary_cam": 0, "error": 2.0,
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(210.0),
                 "assignment": [(5, 0)], "aux_assignments": {},
             },
         }
@@ -286,8 +298,122 @@ class ResolveColdConflictsTests(unittest.TestCase):
             "ctrl_b": {0: _geo({5: (500, 0)})},
         }
         ts = _make_tracking_system()
-        losers, _reasons = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
         self.assertEqual(losers, {"ctrl_b"})
+
+
+class ContestedWinnersTests(unittest.TestCase):
+    """Regression for _resolve_cold_conflicts' third return value,
+    contested_winners (2026-09-13) -- ctrl_names that WON (survived, not in
+    losers) despite being part of at least one real conflict this frame.
+    Added after a real case: a 6-inlier/0.32px bootstrap won a shared-blob
+    conflict outright (an otherwise perfectly ordinary-looking confidence/
+    error/inlier profile) and turned out 132.7deg/1.63m wrong vs mocap
+    ground truth -- "won" only means "beat whichever candidate it directly
+    conflicted with," not "is correct." See _commit_fused_solution's own
+    winner_was_contested parameter for how callers use this."""
+
+    def test_uncontested_winner_is_not_in_contested_set(self):
+        # No conflict at all (distinct blob positions) -- neither survivor
+        # should appear in contested_winners.
+        candidates = {
+            "ctrl_a": {
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(1000.0),
+                "assignment": [(5, 0)], "aux_assignments": {},
+            },
+            "ctrl_b": {
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(1010.0),
+                "assignment": [(5, 0)], "aux_assignments": {},
+            },
+        }
+        blob_geometry = {
+            "ctrl_a": {0: _geo({5: (100, 0)})},
+            "ctrl_b": {0: _geo({5: (900, 0)})},
+        }
+        ts = _make_tracking_system()
+        losers, _reasons, contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        self.assertEqual(losers, set())
+        self.assertEqual(contested, set())
+
+    def test_winner_of_a_real_conflict_is_contested(self):
+        # Same shared-blob setup as test_shared_blob_conflict_keeps_lower_error:
+        # ctrl_a wins outright, but it WAS part of a real conflict -- must be
+        # flagged contested even though it's not a loser.
+        candidates = {
+            "ctrl_a": {
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(1020.0),
+                "assignment": [(5, 0), (6, 1)], "aux_assignments": {},
+            },
+            "ctrl_b": {
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(1030.0),
+                "assignment": [(5, 0), (7, 1)], "aux_assignments": {},
+            },
+        }
+        blob_geometry = {
+            "ctrl_a": {0: _geo({5: (500, 0), 6: (600, 0)})},
+            "ctrl_b": {0: _geo({5: (500, 0), 7: (700, 0)})},
+        }
+        ts = _make_tracking_system()
+        losers, _reasons, contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        self.assertEqual(losers, {"ctrl_b"})
+        self.assertEqual(contested, {"ctrl_a"})
+
+    def test_three_node_chain_only_flags_the_nodes_that_actually_conflicted(self):
+        # Same chain as test_three_node_chain_lets_far_end_win_once_middle_is_
+        # dropped: ctrl_a wins round 1 (conflicted with ctrl_b -> contested),
+        # ctrl_c wins round 2 with NO remaining conflicts (its only conflict,
+        # ctrl_b, was already dropped) -- but ctrl_c DID conflict with ctrl_b
+        # originally, so it's contested too; conflicts[] is fixed at graph-
+        # build time, not reduced by drops.
+        candidates = {
+            "ctrl_a": {
+                "primary_cam": 0, "error": 1.0, "T_world_ctrl": _T(1040.0),
+                "assignment": [(1, 10)], "aux_assignments": {},
+            },
+            "ctrl_b": {
+                "primary_cam": 0, "error": 3.0, "T_world_ctrl": _T(1050.0),
+                "assignment": [(1, 20), (2, 21)], "aux_assignments": {},
+            },
+            "ctrl_c": {
+                "primary_cam": 0, "error": 2.0, "T_world_ctrl": _T(1060.0),
+                "assignment": [(2, 30)], "aux_assignments": {},
+            },
+        }
+        blob_geometry = {
+            "ctrl_a": {0: _geo({1: (100, 0)})},
+            "ctrl_b": {0: _geo({1: (100, 0), 2: (200, 0)})},
+            "ctrl_c": {0: _geo({2: (200, 0)})},
+        }
+        ts = _make_tracking_system()
+        losers, _reasons, contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        self.assertEqual(losers, {"ctrl_b"})
+        self.assertEqual(contested, {"ctrl_a", "ctrl_c"})
+
+    def test_fixed_winner_that_conflicted_is_contested(self):
+        # Same setup as test_fixed_candidate_always_wins_even_with_higher_error:
+        # ctrl_warm is fixed and wins by fiat, but it DID conflict with
+        # ctrl_cold -- must still be flagged contested (fixed winners aren't
+        # exempt from this signal, only from being droppable).
+        candidates = {
+            "ctrl_cold": {
+                "primary_cam": 0, "error": 0.5, "T_world_ctrl": _T(1070.0),
+                "assignment": [(1, 10)], "aux_assignments": {},
+            },
+            "ctrl_warm": {
+                "primary_cam": 0, "error": 5.0, "T_world_ctrl": _T(1080.0),
+                "assignment": [(1, 20)], "aux_assignments": {},
+            },
+        }
+        blob_geometry = {
+            "ctrl_cold": {0: _geo({1: (100, 0)})},
+            "ctrl_warm": {0: _geo({1: (100, 0)})},
+        }
+        ts = _make_tracking_system()
+        losers, _reasons, contested = ts._resolve_cold_conflicts(
+            candidates, fixed_names={"ctrl_warm"}, blob_geometry=blob_geometry,
+        )
+        self.assertEqual(losers, {"ctrl_cold"})
+        self.assertEqual(contested, {"ctrl_warm"})
 
 
 if __name__ == "__main__":

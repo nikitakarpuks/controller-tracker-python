@@ -375,6 +375,47 @@ def slice_imu_to_window(t: np.ndarray, data: np.ndarray, ts_lo: int, ts_hi: int,
     return t[i0:i1], data[i0:i1]
 
 
+def peak_gyro_accel_over_window(gyro_data, accel_data, ts_lo: int, ts_hi: int,
+                                 g_world_mag: float = 9.81) -> tuple:
+    """(peak_gyro_dps, peak_dynamic_accel_mps2) over [ts_lo, ts_hi] -- the real
+    peak |gyro|/|accel| magnitude measured during this window, a coarse "how
+    violent was the real motion here" signal. Factored out 2026-09-14 from
+    HeuristicPoseFusionFilter._peak_gyro_accel (added 2026-09-13 for the
+    accel/gyro-aware implausibility-gate widening, see that method's own
+    real-case docstring) so ControllerTracker's separate imu_only_
+    propagation_max_s coasting budget (src/controller.py) can use the exact
+    same signal instead of a second, drifting copy -- both are answering the
+    same underlying "is IMU-only dead-reckoning still credible right now"
+    question, just at different layers.
+
+    gyro_data/accel_data: (t_ns, values) tuples, same convention
+    slice_imu_to_window itself takes -- pass None for either to get an inert
+    (0.0, 0.0) result (matches predict()'s own fail-open contract: this
+    signal should default to contributing nothing, not raise, when IMU
+    coverage isn't available).
+
+    peak_dynamic_accel_mps2: raw |accel_body| magnitude minus g_world_mag
+    (this device's own estimated gravity magnitude, ~9.81 by default) --
+    DELIBERATELY a coarse proxy, not a properly R(t)-rotated gravity
+    subtraction like integrate_accel_to_position's internal one (that would
+    need a full gyro re-integration redundant with predict()'s own). By the
+    reverse triangle inequality (||a|-|g|| <= |a-g|), this is always a LOWER
+    bound on the true dynamic acceleration magnitude -- understates violent
+    motion for some orientations, never overstates it, the safe direction
+    for a signal that only ever WIDENS a gate or SHRINKS a trust budget.
+
+    Returns (0.0, 0.0) -- inert, not NaN -- when either array is missing or
+    the window has no samples."""
+    if gyro_data is None or accel_data is None:
+        return 0.0, 0.0
+    _, gyro = slice_imu_to_window(*gyro_data, ts_lo, ts_hi, pad_ns=0)
+    _, accel = slice_imu_to_window(*accel_data, ts_lo, ts_hi, pad_ns=0)
+    peak_gyro_dps = float(np.degrees(np.linalg.norm(gyro, axis=1)).max()) if len(gyro) else 0.0
+    peak_accel_mps2 = (float(max(np.linalg.norm(accel, axis=1).max() - g_world_mag, 0.0))
+                       if len(accel) else 0.0)
+    return peak_gyro_dps, peak_accel_mps2
+
+
 def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
                         ts0, ts1, R0, p0, v0):
     """Single-endpoint BLIND dead-reckoning prediction at ts1, given a known state
