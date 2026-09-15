@@ -363,7 +363,8 @@ class HeuristicPoseFusionFilter:
         return peak_gyro_accel_over_window(
             self._gyro_data, self._accel_data, self.last_update_ts_ns, frame_ts_ns, g_world_mag)
 
-    def _effective_coast_budget_s(self, base_budget_s: float, frame_ts_ns: int) -> float:
+    def _effective_coast_budget_s(self, base_budget_s: float, frame_ts_ns: int,
+                                   axis: str = "both", rate_prefix: str = "coast_trust") -> float:
         """base_budget_s shrunk by how violent real measured gyro/accel was
         over [last_update_ts_ns, frame_ts_ns] (see _peak_gyro_accel), down
         to a floor of coast_trust_min_budget_s -- never widened, only ever
@@ -384,15 +385,62 @@ class HeuristicPoseFusionFilter:
         real dt_s/peak_gyro/peak_accel-vs-actual-prediction-error data
         across both available recordings (COAST_BUDGET_STATS_CSV, temporary
         env-gated diagnostic -- see this session's own project memory for
-        the fit)."""
+        the fit).
+
+        axis (2026-09-15, user-directed, same real case revisited: frame 71,
+        3-frame coast + a zero-quality candidate hitting try_update's
+        degenerate w_sum<=0 fallback -- see that branch's own comment):
+        "both" (default, unchanged behavior for the two original callers --
+        _report_if_still_usable's display budget and ControllerTracker.
+        _mark_all_lost's search-anchor budget) includes both shrink terms,
+        same as before. "accel"/"gyro" include only that one term -- lets a
+        caller ask two separate questions ("how long is p_pred's POSITION
+        still credible" vs "how long is its ROTATION still credible")
+        instead of one combined answer, mirroring how mocap ground truth on
+        the frame-71 case showed the two axes were WRONG BY DIFFERENT
+        AMOUNTS (406mm position error, only 4.24deg rotation error) -- a
+        single combined budget can't express that a coast's rotation can
+        still be trustworthy well after its position no longer is (gyro
+        integration has no velocity precondition; position dead-reckoning
+        does, see velocity_established's own docstring).
+
+        rate_prefix (2026-09-15, user-directed, same real case's own
+        follow-up: cold_pending_report_max_gap_s's flat 0.25s base was
+        "crazy big" -- a 4-frame-lost/moderately-elevated-motion gap
+        [right_controller, frame 39: 1363deg/s peak gyro, 38.6 m/s^2 peak
+        accel -- "fast" motion, not extreme] still displayed a coast 291mm
+        off mocap ground truth, well past the ~10cm bound this budget's
+        own fit targeted). Lets _report_if_still_usable's DISPLAY-only
+        budget use its OWN, separately-tunable shrink rate
+        (cold_pending_shrink_s_per_mps2/_dps) instead of sharing
+        coast_trust_shrink_s_per_mps2/_dps with the other two, higher-
+        stakes consumers (the degenerate-fallback CORE-STATE gate in
+        try_update, and ControllerTracker._mark_all_lost's own SEARCH-
+        ANCHOR budget) -- gentling the display's own rate (so "fast" lands
+        at a real ~35ms ceiling instead of snapping straight past it to
+        the floor) must not also gentle those two already-validated,
+        already-tighter budgets (see this session's own real case,
+        right_controller frame 71, which the degenerate-fallback gate was
+        specifically built and validated against). calm floors and
+        min_budget_s stay SHARED across all three on purpose -- the target
+        floor (0.025s, unchanged, user-directed: "min budget should stay
+        at 25ms") is identical either way, and the calm floors (0.0 for
+        both axes) don't change under a pure rate rescaling, so there was
+        nothing case-specific left to duplicate for those two."""
         peak_gyro_dps, peak_accel_mps2 = self._peak_gyro_accel(frame_ts_ns)
         accel_calm_floor = float(self._hc_get("coast_trust_accel_calm_floor_mps2", 40.0))
         gyro_calm_floor = float(self._hc_get("coast_trust_gyro_calm_floor_dps", 900.0))
-        per_accel = float(self._hc_get("coast_trust_shrink_s_per_mps2", 0.0))
-        per_gyro = float(self._hc_get("coast_trust_shrink_s_per_dps", 0.0))
-        min_budget_s = float(self._hc_get("coast_trust_min_budget_s", 0.025))
-        shrink = (per_accel * max(0.0, peak_accel_mps2 - accel_calm_floor)
-                  + per_gyro * max(0.0, peak_gyro_dps - gyro_calm_floor))
+        per_accel = float(self._hc_get(f"{rate_prefix}_shrink_s_per_mps2", 0.0))
+        per_gyro = float(self._hc_get(f"{rate_prefix}_shrink_s_per_dps", 0.0))
+        min_budget_s = float(self._hc_get("coast_trust_min_budget_s", 0.035))
+        accel_shrink = per_accel * max(0.0, peak_accel_mps2 - accel_calm_floor)
+        gyro_shrink = per_gyro * max(0.0, peak_gyro_dps - gyro_calm_floor)
+        if axis == "accel":
+            shrink = accel_shrink
+        elif axis == "gyro":
+            shrink = gyro_shrink
+        else:
+            shrink = accel_shrink + gyro_shrink
         return max(min_budget_s, base_budget_s - shrink)
 
     def _implausible_jump_thresholds(self, frame_ts_ns: int) -> tuple:
@@ -927,24 +975,36 @@ class HeuristicPoseFusionFilter:
         fallback a close approximation of today's binary gate while staying a
         valid (non-degenerate) ramp.
 
-        Always clipped to [floor, ceiling] once history IS populated: the
+        Always clipped to [floor, 0.9*ceiling] once history IS populated: the
         floor stops a dead-still controller's own near-zero recent noise
         floor from making ordinary vision jitter look like a soft jump; the
         ceiling is the same hard-gate threshold _implausible_jump_thresholds
         computes (evaluated at THIS moment's own speed -- self.v if
         velocity_established, else base-only, same as the hard gate itself),
         so this can only ever make the gate MORE sensitive than today, never
-        less."""
+        less. The SAME 0.9x margin as the thin-history fallback above --
+        2026-09-15, real case: right_controller, walk_hard, frame 34 --
+        confirmed this exact branch (populated history, len=10) can ALSO hit
+        the identical weak==ceiling degenerate condition the thin-history
+        fallback's own comment already documents, whenever this controller's
+        recent history has been noisy enough that agreement_k_pos/_rot *
+        percentile90(hist) reaches the raw (unmargined) ceiling -- a 69mm/
+        11ms, quality=0.17 candidate got agreement=1.0 (zero pushback) purely
+        from this clip landing exactly at pos_ceil_m, not because the
+        candidate was actually trustworthy. The original 0.9x margin was
+        only ever applied to the THIN-history return above; this branch's
+        own clip used the raw ceiling unmargined, missing the exact fix its
+        sibling branch already got for the exact same underlying bug."""
         pos_ceiling, rot_ceiling = self._implausible_jump_thresholds(frame_ts_ns)
         min_samples = int(self._hc.get("agreement_hist_min_samples", 5))
         if len(self._pos_innov_hist) < min_samples:
             return 0.9 * pos_ceiling, 0.9 * rot_ceiling
         pos_weak = float(np.clip(
             float(self._hc.get("agreement_k_pos", 3.0)) * float(np.percentile(self._pos_innov_hist, 90)),
-            float(self._hc.get("agreement_floor_pos_m", 0.01)), pos_ceiling))
+            float(self._hc.get("agreement_floor_pos_m", 0.01)), 0.9 * pos_ceiling))
         rot_weak = float(np.clip(
             float(self._hc.get("agreement_k_rot", 3.0)) * float(np.percentile(self._rot_innov_hist, 90)),
-            float(self._hc.get("agreement_floor_rot_deg", 2.0)), rot_ceiling))
+            float(self._hc.get("agreement_floor_rot_deg", 2.0)), 0.9 * rot_ceiling))
         return pos_weak, rot_weak
 
     def _looks_like_a_sibling(self, p_meas: np.ndarray, frame_ts_ns: int) -> bool:
@@ -1018,6 +1078,12 @@ class HeuristicPoseFusionFilter:
         # so _try_cold_reacquire's weak/strong routing can see it too.
         n_inliers = (len(solution.get("assignment") or [])
                      + sum(len(v) for v in (solution.get("aux_assignments") or {}).values()))
+        # Also hoisted early (2026-09-15, same reason as n_inliers above) so
+        # _try_cold_reacquire's own contested-winner exemption (see that
+        # method's own docstring) can judge "genuinely strong" the same way
+        # _vision_weight does -- inliers alone isn't enough to rule out a
+        # clean-but-wrong low-point fit.
+        error_px = float(solution.get("error", 0.0))
 
         # ── Bootstrap (no prior state) ──────────────────────────────────
         # Reuses _try_cold_reacquire's own weak/strong buffering wholesale
@@ -1036,7 +1102,9 @@ class HeuristicPoseFusionFilter:
             return self._try_cold_reacquire(
                 R_meas, p_meas, frame_ts_ns, confidence,
                 coverage_fallback=bool(solution.get("coverage_fallback", False)), n_inliers=n_inliers,
+                error_px=error_px,
                 winner_was_contested=bool(solution.get("winner_was_contested", False)),
+                swap_suspected=bool(solution.get("swap_suspected", False)),
                 log_prefix="BOOTSTRAP", pending_outcome="bootstrap_pending", accept_outcome="bootstrap",
             )
 
@@ -1099,8 +1167,10 @@ class HeuristicPoseFusionFilter:
         if imu_frame_scale <= 0.0:
             return self._try_cold_reacquire(R_meas, p_meas, frame_ts_ns, confidence,
                                              coverage_fallback=bool(solution.get("coverage_fallback", False)),
-                                             n_inliers=n_inliers, R_pred=R_pred, p_pred=p_pred, dt_s=dt_s,
-                                             winner_was_contested=bool(solution.get("winner_was_contested", False)))
+                                             n_inliers=n_inliers, error_px=error_px, R_pred=R_pred, p_pred=p_pred,
+                                             dt_s=dt_s,
+                                             winner_was_contested=bool(solution.get("winner_was_contested", False)),
+                                             swap_suspected=bool(solution.get("swap_suspected", False)))
 
         # Manual-debug override: fusion_heuristic.vision_only_debug: true forces
         # imu_frame_scale to 0 on EVERY frame, regardless of frames_since_update --
@@ -1209,7 +1279,8 @@ class HeuristicPoseFusionFilter:
         # moved to a One Euro Filter applied to the REPORTED pose only (_report,
         # called below), decoupled from this tracking-state blend entirely.
         # w_vision itself is quality-dependent -- see _vision_weight. ──
-        error_px = float(solution.get("error", 0.0))
+        # (error_px itself is now hoisted to the top of this method, next to
+        # n_inliers -- see that computation's own comment.)
 
         # vision_only: past imu_decay_frames lost/coasted real frames, the IMU
         # prediction is no longer a trustworthy reference (a long unconstrained
@@ -1249,11 +1320,57 @@ class HeuristicPoseFusionFilter:
 
         w_sum = w_imu + w_vision
         if w_sum <= 0.0:
-            # Degenerate: IMU has fully decayed AND vision's own quality ramps
-            # both bottomed out (rare -- needs both at once, since gate_active
-            # above already stops the distance check alone from zeroing
-            # w_vision here). Nothing trustworthy to blend -- fall back to the
-            # bare IMU prediction rather than dividing by zero.
+            # Degenerate: vision's own quality ramps both bottomed out (rare --
+            # needs both n_inliers AND error_px at/below their weak floors at
+            # once, since gate_active above already stops the distance check
+            # alone from zeroing w_vision here) -- AND, in this project's real
+            # config, w_imu is ALSO always 0 here regardless of imu_frame_scale
+            # (cost_weight_imu=0.0, "matches this project's current real
+            # config" -- see this class's own module docstring), not because
+            # IMU "has fully decayed" as an earlier version of this comment
+            # claimed. Nothing trustworthy to blend by the normal weights --
+            # but rather than falling back to the bare IMU prediction
+            # UNCONDITIONALLY (as this branch used to), check whether p_pred
+            # ITSELF is still credible on each axis first.
+            #
+            # Added 2026-09-15 (user-directed, real case: right_controller,
+            # walk_hard, frame 71, cam3): a 3-frame-lost (imu_frame_scale=0.25,
+            # dt_s=66.7ms) reacquisition candidate hit this exact branch
+            # (n_inliers=5/error_px=1.20, both at/below their weak floors) and
+            # got the bare IMU prediction unconditionally -- no time/accel/gyro
+            # decay of any kind, unlike every other "how long is a coast still
+            # trustworthy" question in this file. Mocap ground truth: that pure
+            # -IMU pose was 406mm off in POSITION but only 4.24deg off in
+            # ROTATION; the rejected vision candidate was 103.8mm off in
+            # position but 135deg off in rotation -- each source wrong on a
+            # DIFFERENT axis, which a single blind trust-or-not decision can't
+            # express. Reuses _effective_coast_budget_s (already-validated
+            # accel/gyro shrink formula, see that method's own docstring) with
+            # a NEW, axis-split base budget: degenerate_fallback_max_s mirrors
+            # matching.imu_only_propagation_max_s's own value (this is a
+            # search-anchor-tier decision, not the more lenient display-tier
+            # cold_pending_report_max_gap_s) rather than a re-derived fit --
+            # see that config key's own comment. Past EITHER axis budget,
+            # p_pred is no longer trustworthy enough to blindly accept as the
+            # new tracked state -- route through _try_cold_reacquire instead
+            # (same weak-candidate buffer/confirm machinery the imu_frame_scale
+            # <=0 case above already uses): n_inliers<=weak_inliers is
+            # guaranteed true here (inlier_factor==0 requires exactly that, and
+            # quality==0 requires inlier_factor==0), so this ALWAYS takes that
+            # method's own weak-buffer path, never its immediate-accept path --
+            # "0 imu impact, a weak pose from vision that requires
+            # verification," not a NEW trust decision bolted on top of an
+            # existing one.
+            _degenerate_base_s = float(self._hc_get("degenerate_fallback_max_s", 0.066))
+            _pos_budget_s = self._effective_coast_budget_s(_degenerate_base_s, frame_ts_ns, axis="accel")
+            _rot_budget_s = self._effective_coast_budget_s(_degenerate_base_s, frame_ts_ns, axis="gyro")
+            if dt_s > _pos_budget_s or dt_s > _rot_budget_s:
+                return self._try_cold_reacquire(
+                    R_meas, p_meas, frame_ts_ns, confidence,
+                    coverage_fallback=bool(solution.get("coverage_fallback", False)),
+                    n_inliers=n_inliers, error_px=error_px, R_pred=R_pred, p_pred=p_pred, dt_s=dt_s,
+                    winner_was_contested=bool(solution.get("winner_was_contested", False)),
+                    swap_suspected=bool(solution.get("swap_suspected", False)))
             w_imu, w_sum = 1.0, 1.0
 
         p_new = (w_imu * p_pred + w_vision * p_meas) / w_sum
@@ -1453,7 +1570,9 @@ class HeuristicPoseFusionFilter:
     def _try_cold_reacquire(self, R_meas: np.ndarray, p_meas: np.ndarray,
                              frame_ts_ns: int, confidence: float,
                              coverage_fallback: bool = False, n_inliers: int = 0,
+                             error_px: float = 0.0,
                              winner_was_contested: bool = False,
+                             swap_suspected: bool = False,
                              R_pred: np.ndarray | None = None, p_pred: np.ndarray | None = None,
                              dt_s: float | None = None, log_prefix: str = "COLD REACQUIRE",
                              pending_outcome: str = "cold_pending",
@@ -1656,7 +1775,8 @@ class HeuristicPoseFusionFilter:
             if R_pred is None or p_pred is None or dt_s is None:
                 return
             base_report_max_gap_s = float(self._hc_get("cold_pending_report_max_gap_s", 0.25))
-            report_max_gap_s = self._effective_coast_budget_s(base_report_max_gap_s, frame_ts_ns)
+            report_max_gap_s = self._effective_coast_budget_s(base_report_max_gap_s, frame_ts_ns,
+                                                                rate_prefix="cold_pending")
             if dt_s <= report_max_gap_s:
                 self._report(frame_ts_ns, R_pred, p_pred)
             else:
@@ -1675,7 +1795,41 @@ class HeuristicPoseFusionFilter:
         # that another controller's candidate contested the same evidence
         # this frame flagged it. Routes through the exact same weak-pair
         # buffer/confirm machinery below, no separate handling needed.
-        weak = coverage_fallback or n_inliers <= weak_inliers or winner_was_contested
+        #
+        # EXEMPTED (2026-09-15, user-directed, real case: left_controller,
+        # walk_hard, frame 29) if the winner is GENUINELY strong -- not just
+        # "not weak" (n_inliers > weak_inliers), but clearing the SAME
+        # strong_inliers/strong_error_px bar _vision_weight itself uses for
+        # "full trust, no quality discount at all". Real case: an 11-inlier/
+        # 0.11px winner (well past strong_inliers=8/strong_error_px=0.15)
+        # won a physical-overlap conflict (1.5cm apart) and got buffered for
+        # a full extra frame despite being correct (mocap: 21.5mm/5.4deg off
+        # truth) -- an unnecessary display-lag cost for a candidate this
+        # solid. Does NOT reopen the original 132.7deg bug above: that
+        # bootstrap's own n_inliers=6 is BELOW strong_inliers (8 real-config/
+        # 18 code-default) either way, so it would still be forced weak and
+        # buffered under this exemption, unchanged. `_looks_like_a_sibling`
+        # (this method's own very first check, run unconditionally before
+        # this weak/strong routing) is a separate, position-based defense
+        # against the identity-swap risk a "clean solve, wrong controller"
+        # case would pose -- this exemption doesn't bypass or weaken it.
+        strong_inliers = float(self._hc_get("vision_weight_strong_inliers", 18))
+        strong_error_px = float(self._hc_get("vision_weight_strong_error_px", 0.15))
+        _contested_but_strong = winner_was_contested and n_inliers >= strong_inliers and error_px <= strong_error_px
+        # swap_suspected (2026-09-16): a FOURTH trigger, alongside coverage_
+        # fallback/low-inlier-count/contested -- see TrackingSystem.
+        # _detect_cold_identity_swap's own docstring for the real case (both
+        # controllers simultaneously cold, each landing on the OTHER's own
+        # last-known position instead of their own). Deliberately NOT given
+        # the same strong-exemption _contested_but_strong gets above -- a
+        # cross-controller swap can look individually clean (high inliers,
+        # low error) on BOTH sides at once, since each side really is a
+        # correct geometric solve, just assigned to the wrong controller;
+        # letting a "strong" swap bypass buffering would defeat the whole
+        # point of this check. Always forces weak/buffered, no exemption.
+        weak = (coverage_fallback or n_inliers <= weak_inliers
+                or (winner_was_contested and not _contested_but_strong)
+                or swap_suspected)
 
         if not weak:
             if pending is not None:
@@ -1698,8 +1852,9 @@ class HeuristicPoseFusionFilter:
             self._set_last(outcome=pending_outcome, confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
             _log.info(
                 f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} "
-                f"n_inliers={n_inliers} coverage_fallback={coverage_fallback} — weak candidate, "
-                f"buffering for confirmation instead of trusting immediately"
+                f"n_inliers={n_inliers} coverage_fallback={coverage_fallback} "
+                f"winner_was_contested={winner_was_contested} swap_suspected={swap_suspected} — "
+                f"weak candidate, buffering for confirmation instead of trusting immediately"
             )
             return False
 

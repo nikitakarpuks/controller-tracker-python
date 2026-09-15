@@ -29,10 +29,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 690  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: null  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 750  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: null  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -335,10 +335,27 @@ fusion_heuristic:
   # left frozen instead (same "short lost track, IMU still usable" vs. "long
   # loss, not usable" distinction matching.imu_only_propagation_max_s already
   # draws for a different mechanism -- see ControllerTracker._mark_all_lost).
-  # 0.25s sized against a real case: the recording's own "64->65" event had
-  # dt_s ~= 0.166s at exactly this point -- a tighter value (e.g. 0.15s,
-  # matching gap_dt_full_s below) would have just missed reporting on it.
-  cold_pending_report_max_gap_s: 0.25
+  #
+  # REVISED 2026-09-15 (user-directed: "0.25s is crazy big... for high
+  # speed/accel sequences we should not go over 35ms; for slow motion
+  # maybe 60ms is acceptable, not more") from the original 0.25s (sized
+  # against the recording's own "64->65" event, dt_s~=0.166s). Real case
+  # that prompted the revision: right_controller frame 39, a 4-frame-lost
+  # gap with only "fast, not extreme" measured motion (1363deg/s peak
+  # gyro, 38.6 m/s^2 peak accel) still displayed a coast 291mm off mocap
+  # ground truth, well past the ~10cm bound this budget's own original fit
+  # targeted -- the flat 0.25s (and even the accel/gyro-shrunk budget
+  # under the OLD, steeper cold_pending_shrink_s_per_*, which snapped
+  # straight past any real target to the floor for anything beyond trivial
+  # motion) was simply too generous for a display-only value. 0.06s is the
+  # new calm ceiling ("slow motion, not more"); cold_pending_shrink_s_per_*
+  # below (this consumer's OWN rate, NOT shared with coast_trust_shrink_s_
+  # per_* -- see that key's own comment for why) is fit so frame 39's own
+  # real numbers land at exactly 35ms -- at the time this was fit, that sat
+  # just above the (then 25ms) shared coast_trust_min_budget_s floor; that
+  # floor was bumped to 35ms itself the next day (see its own comment) so
+  # the two now coincide exactly for frame 39's own violence level.
+  cold_pending_report_max_gap_s: 0.06
 
   # HeuristicPoseFusionFilter._effective_coast_budget_s -- shrinks
   # cold_pending_report_max_gap_s (above) by how violent real measured
@@ -377,15 +394,73 @@ fusion_heuristic:
   # there?". This recording's own single-frame gaps alternate ~11.1ms/22.2ms
   # (see matching.imu_only_propagation_max_s's own "4*16.5ms" comment) --
   # 0.025s (a touch above the larger 22.2ms alternate, for timestamp jitter
-  # margin) guarantees at least one ordinary lost frame's worth of coast
-  # survives regardless of alternation phase, while still shrinking the
-  # 0.066s/0.25s base budgets by more than half for genuinely violent
-  # multi-frame losses.
+  # margin) guaranteed at least ONE ordinary lost frame's worth of coast
+  # survives regardless of alternation phase.
+  #
+  # REVISED AGAIN 2026-09-16 (user-directed: "25 seems too small, it's only
+  # 1 frame. Let's trust it 2 consecutive frames") -- bumped to 0.035s so
+  # roughly two of this recording's own single-frame gaps (not just one)
+  # survive before the floor takes over, while still shrinking the 0.066s/
+  # 0.06s base budgets substantially for genuinely violent multi-frame
+  # losses. Coincides exactly with cold_pending_shrink_s_per_*'s own
+  # already-fit "fast motion" landing point (frame 39's real numbers were
+  # deliberately anchored to land the display budget at 0.035s, see that
+  # key's own comment) -- this floor bump doesn't change that consumer's
+  # behavior at frame 39's own violence level, only for motion MORE violent
+  # than that (previously floored to 0.025s, now floors to 0.035s instead).
   coast_trust_accel_calm_floor_mps2: 0.0
   coast_trust_gyro_calm_floor_dps: 0.0
   coast_trust_shrink_s_per_mps2: 0.001145
   coast_trust_shrink_s_per_dps: 0.000058
-  coast_trust_min_budget_s: 0.025
+  coast_trust_min_budget_s: 0.035
+
+  # _report_if_still_usable's OWN shrink rate (2026-09-15, user-directed --
+  # see cold_pending_report_max_gap_s's own comment for the real case).
+  # Deliberately NOT the same as coast_trust_shrink_s_per_mps2/_dps above:
+  # those two are shared by the degenerate-fallback CORE-STATE gate
+  # (try_update) and, via their matching: mirror, ControllerTracker._mark_
+  # all_lost's SEARCH-ANCHOR budget -- both already validated against real
+  # cases (right_controller frame 71) at their current (steeper) strength,
+  # so gentling them to fix this DISPLAY-only value would have silently
+  # un-done that validated behavior too. This rate is scaled down from the
+  # original coast_trust_shrink_s_per_mps2/_dps by (0.06-0.035)/0.1233 ~=
+  # 0.203 (both terms scaled by the same factor, preserving their original
+  # relative accel/gyro balance) so that frame 39's own real numbers
+  # (1363deg/s peak gyro, 38.6 m/s^2 peak accel -- "fast, not extreme"
+  # motion) land the effective budget at exactly 0.035s, not immediately
+  # at the (unchanged, shared) 0.025s floor -- reaching that floor now
+  # takes real motion beyond frame 39's own level (~2970deg/s peak gyro
+  # alone, roughly this recording's own observed maximum). Calm floors and
+  # the min_budget_s floor stay shared (coast_trust_accel_calm_floor_mps2/
+  # _gyro_calm_floor_dps/_min_budget_s above) -- a pure rate rescaling
+  # doesn't change where "calm" starts, and the target floor (25ms) is
+  # identical either way.
+  cold_pending_shrink_s_per_mps2: 0.000232
+  cold_pending_shrink_s_per_dps: 0.0000118
+
+  # try_update's degenerate w_sum<=0 fallback (vision quality AND w_imu both
+  # zero, e.g. cost_weight_imu=0.0 above -- see that branch's own comment) --
+  # base budget (before the SAME coast_trust_* accel/gyro shrink above, split
+  # per-axis via _effective_coast_budget_s's axis param) for whether p_pred
+  # is still trustworthy enough to blindly become the new tracked state, or
+  # whether to route through _try_cold_reacquire's weak-candidate buffer
+  # instead. Added 2026-09-15 (user-directed, real case: right_controller,
+  # walk_hard, frame 71, cam3) after mocap ground truth showed a 3-frame
+  # coast that hit this exact branch was 406mm off in POSITION but only
+  # 4.24deg off in ROTATION -- the old unconditional fallback couldn't tell
+  # the difference. Deliberately mirrors matching.imu_only_propagation_max_s
+  # (0.066s) rather than the more lenient cold_pending_report_max_gap_s
+  # (0.25s, above) -- this decides the CORE tracked state (the anchor every
+  # subsequent implausibility check measures against), not a display-only
+  # value, so it starts at the stricter search-anchor tier. Reuses the
+  # already-validated coast_trust_* shrink formula/constants as an MVP
+  # starting point for this THIRD consumer -- not independently re-fit for
+  # this specific (higher-stakes) question yet; revisit if live validation
+  # ever shows it's miscalibrated here specifically (same "reuse the
+  # mechanism, don't assume the numbers transfer" standard this project
+  # applied when a different session asked whether to reuse these same
+  # constants for static_lamp_mask.recent_memory_max_s and decided not to).
+  degenerate_fallback_max_s: 0.066
 
   # Long-gap damping (see HeuristicPoseFusionFilter._gap_vision_scale) -- scales
   # w_vision down as the elapsed gap since the last accepted update (dt_s)
@@ -1732,21 +1807,34 @@ matching:
   # ControllerTracker._mark_all_lost's own accel/gyro-aware shrink of the
   # budget above -- same mechanism/question as
   # fusion_heuristic.coast_trust_* (see that block's own comment for the
-  # fit, and for coast_trust_min_budget_s's own 2026-09-14 revision from
-  # 0.011 to 0.025 -- caught right here: a single ordinary lost frame
-  # (left_controller, this recording, frame 57) at peak_gyro_dps=1564.6 --
-  # fast but ordinary hand rotation -- floored the old 0.011s budget below
-  # this frame's own real 22.2ms gap, showing no IMU-only pose at all
-  # through one perfectly normal lost frame), reused here unchanged since
-  # it's the same underlying "is IMU-only dead-reckoning still credible
-  # right now" question at a different layer (a genuine no-candidate-at-all
-  # loss here, vs. a buffered weak candidate there) -- the fit came out
-  # naturally shareable, not two separately re-derived numbers.
+  # fit, and for coast_trust_min_budget_s's own revision history -- 0.011
+  # ->0.025 (2026-09-14, a single ordinary lost frame at peak_gyro_dps=
+  # 1564.6 floored the old 0.011s below that frame's own real 22.2ms gap)
+  # ->0.035 (2026-09-16, user-directed: "25 seems too small, it's only 1
+  # frame. Let's trust it 2 consecutive frames")), reused here unchanged
+  # since it's the same underlying "is IMU-only dead-reckoning still
+  # credible right now" question at a different layer (a genuine
+  # no-candidate-at-all loss here, vs. a buffered weak candidate there) --
+  # the fit came out naturally shareable, not two separately re-derived
+  # numbers.
   coast_trust_accel_calm_floor_mps2: 0.0
   coast_trust_gyro_calm_floor_dps: 0.0
   coast_trust_shrink_s_per_mps2: 0.001145
   coast_trust_shrink_s_per_dps: 0.000058
-  coast_trust_min_budget_s: 0.025
+  coast_trust_min_budget_s: 0.035
+
+  # TrackingSystem._detect_cold_identity_swap (2026-09-16): when two
+  # controllers go cold and reacquire in the SAME cold-batch round, compares
+  # each new candidate against BOTH controllers' own last-known position --
+  # flags a suspected identity swap (routed into the same weak-buffer path
+  # as winner_was_contested, see HeuristicPoseFusionFilter._try_cold_
+  # reacquire's own swap_suspected comment) whenever swapped_cost <
+  # cold_swap_margin * direct_cost. Real case this was built for (right_
+  # controller, walk_hard, ts=102100993595532): swapped/direct ratio ~=0.71.
+  # Value below pending Part-A empirical fit across both recordings
+  # (cross-checked against mocap ground truth); set conservatively above the
+  # real case's own ratio for now.
+  cold_swap_margin: 0.85
   # --------------------------------------------------------------------------
   # Pose validation
   # --------------------------------------------------------------------------

@@ -416,5 +416,127 @@ class ContestedWinnersTests(unittest.TestCase):
         self.assertEqual(contested, {"ctrl_warm"})
 
 
+def _T3(x: float, y: float, z: float) -> Transform:
+    """Like _T() but with a full 3D position -- identity-swap detection
+    reads solution['T_world_ctrl'].t in all 3 axes, unlike
+    _resolve_cold_conflicts' own physical-overlap check above (2D-only in
+    these tests' own synthetic setups)."""
+    return Transform(np.eye(3), np.array([x, y, z]))
+
+
+class _FakeFusionFilter:
+    def __init__(self, p):
+        self.p = p
+
+
+class _FakeCtrlTracker:
+    def __init__(self, p):
+        self._fusion_filter = _FakeFusionFilter(p) if p is not None else None
+
+
+def _make_tracking_system_with_trackers(last_positions: dict, matching_cfg=None):
+    """Same as _make_tracking_system, but with ctrl_trackers wired to a
+    stand-in _fusion_filter.p for each name -- last_positions maps
+    ctrl_name -> np.ndarray | None (None reproduces "no prior reference
+    yet", i.e. a fresh double-bootstrap, via either no fusion filter at all
+    or a filter whose own .p is still None)."""
+    ctrl_trackers = {name: _FakeCtrlTracker(p) for name, p in last_positions.items()}
+    return _make_tracking_system(matching_cfg=matching_cfg, ctrl_trackers=ctrl_trackers)
+
+
+class DetectColdIdentitySwapTests(unittest.TestCase):
+    """Regression for TrackingSystem._detect_cold_identity_swap
+    (2026-09-16) -- flags simultaneously-cold candidates whose new
+    positions fit the OTHER controller's own last-known position better
+    than their own. A different conflict shape than anything
+    _resolve_cold_conflicts checks (see that method's own tests above):
+    no shared camera evidence or spot collision required, just each side's
+    own position history. See src/controller.py's own docstring for the
+    real case this was built from (right_controller/left_controller,
+    walk_hard, ts=102100993595532)."""
+
+    def test_real_swap_case_flags_both_controllers(self):
+        # Reconstructed from the real event: left_controller's own last
+        # real position before the simultaneous loss was ~(-0.11, 0, 0),
+        # right_controller's was ~(0.31, 0, 0). Both then "strong"-
+        # reacquired onto the WRONG side -- left's new candidate actually
+        # matches where right last was (and vice versa). direct/swapped
+        # here reproduce the real numbers noted during investigation
+        # (direct~=2.20m, swapped~=1.57m, ratio~=0.71).
+        candidates = {
+            "left_controller": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "right_controller": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "left_controller": np.array([-0.11, 0.0, 0.0]),
+            "right_controller": np.array([0.31, 0.0, 0.0]),
+        }, matching_cfg={"cold_swap_margin": 0.85})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, {"left_controller", "right_controller"})
+
+    def test_ordinary_simultaneous_reacquire_is_not_flagged(self):
+        # Both controllers reacquire close to their OWN last position --
+        # the direct assignment fits far better than swapped, well outside
+        # the margin. Must not be flagged.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.05, 0.0, 0.0)},
+            "ctrl_b": {"T_world_ctrl": _T3(1.05, 0.0, 0.0)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": np.array([0.0, 0.0, 0.0]),
+            "ctrl_b": np.array([1.0, 0.0, 0.0]),
+        }, matching_cfg={"cold_swap_margin": 0.85})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, set())
+
+    def test_missing_prior_reference_skips_cleanly(self):
+        # ctrl_b has no fusion filter yet at all (fresh double-bootstrap,
+        # e.g. very first frames of a session) -- nothing to compare
+        # against; must not crash and must not flag anything.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "ctrl_b": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": np.array([-0.11, 0.0, 0.0]),
+            "ctrl_b": None,
+        }, matching_cfg={"cold_swap_margin": 0.85})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, set())
+
+    def test_fusion_filter_p_none_skips_cleanly(self):
+        # A controller HAS a fusion filter (unlike the test above) but its
+        # own .p is still None -- e.g. constructed but never yet accepted a
+        # real update. Same "nothing to compare against" outcome.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "ctrl_b": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": np.array([-0.11, 0.0, 0.0]),
+            "ctrl_b": np.array([0.31, 0.0, 0.0]),
+        }, matching_cfg={"cold_swap_margin": 0.85})
+        ts.ctrl_trackers["ctrl_b"]._fusion_filter.p = None
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, set())
+
+    def test_only_flags_the_pair_involved_with_a_third_uninvolved_controller(self):
+        # Three simultaneously-cold controllers: a/b are the real swap
+        # pair, c reacquires ordinarily near its own last position and
+        # must not get swept into the flagged set.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "ctrl_b": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+            "ctrl_c": {"T_world_ctrl": _T3(5.02, 0.0, 0.0)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": np.array([-0.11, 0.0, 0.0]),
+            "ctrl_b": np.array([0.31, 0.0, 0.0]),
+            "ctrl_c": np.array([5.0, 0.0, 0.0]),
+        }, matching_cfg={"cold_swap_margin": 0.85})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, {"ctrl_a", "ctrl_b"})
+
+
 if __name__ == "__main__":
     unittest.main()

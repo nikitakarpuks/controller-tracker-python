@@ -1,5 +1,6 @@
 import copy
 import csv
+import itertools
 import os
 import time
 import cv2
@@ -2193,7 +2194,7 @@ class ControllerTracker:
             _gyro_calm_floor = float(self._matching_cfg.get("coast_trust_gyro_calm_floor_dps", 900.0))
             _per_accel = float(self._matching_cfg.get("coast_trust_shrink_s_per_mps2", 0.0))
             _per_gyro = float(self._matching_cfg.get("coast_trust_shrink_s_per_dps", 0.0))
-            _min_budget_s = float(self._matching_cfg.get("coast_trust_min_budget_s", 0.025))
+            _min_budget_s = float(self._matching_cfg.get("coast_trust_min_budget_s", 0.035))
             _shrink = (_per_accel * max(0.0, _peak_accel_mps2 - _accel_calm_floor)
                        + _per_gyro * max(0.0, _peak_gyro_dps - _gyro_calm_floor))
             _imu_only_max_s = max(_min_budget_s, _imu_only_max_s - _shrink)
@@ -2808,6 +2809,7 @@ class ControllerTracker:
         frame_ts_ns: int,
         self_cal=None,
         winner_was_contested: bool = False,
+        swap_suspected: bool = False,
     ) -> None:
         """Side effects for a solution already chosen as the accepted result
         for this controller this frame: designated-primary bookkeeping,
@@ -2842,6 +2844,15 @@ class ControllerTracker:
         same evidence). Always False for the two single-candidate call
         sites (ControllerTracker.update(), TrackingSystem.update_warm_batch)
         -- no cross-controller conflict resolution runs there at all.
+
+        swap_suspected: True when TrackingSystem._detect_cold_identity_swap
+        flagged this controller's candidate as plausibly belonging to a
+        cross-controller identity swap with another simultaneously-cold
+        candidate this frame (both new positions fit each OTHER controller's
+        own last-known position better than their own). Also routed into
+        the fusion filter's weak-buffer path, same as winner_was_contested,
+        but kept as its own separate signal rather than OR'd together --
+        see the comment where this is written into the solution dict below.
 
         Pose-fusion filter (see src/pose_fusion.py): when self._fusion_filter
         exists, the incoming solution is gated through PoseFusionFilter.try_update
@@ -2895,6 +2906,16 @@ class ControllerTracker:
         # along on the solution dict" convention coverage_fallback already
         # uses, not a new plumbing pattern.
         solution["winner_was_contested"] = winner_was_contested
+        # Same "read-only signal riding along on the solution dict" convention
+        # as winner_was_contested above -- see TrackingSystem._detect_cold_
+        # identity_swap and _try_cold_reacquire's own swap_suspected comment.
+        # Deliberately NOT merged into winner_was_contested: the contested-
+        # winner-strong-exemption (_try_cold_reacquire) lets a genuinely
+        # strong contested winner bypass buffering, which would also let a
+        # strong-looking SWAPPED candidate slip through immediately -- a
+        # swap-suspected candidate must always buffer regardless of its own
+        # inlier/error stats.
+        solution["swap_suspected"] = swap_suspected
 
         accepted = True
         if self._fusion_filter is not None:
@@ -4488,6 +4509,7 @@ class TrackingSystem:
             _all_for_conflict_check, fixed_names=set(_committed.keys()),
             blob_geometry=_blob_geometry,
         )
+        swap_suspected = self._detect_cold_identity_swap(candidates, frame_ts_ns=frame_ts_ns)
 
         results: Dict[str, Optional[Dict]] = {}
         for ctrl_name, solution in candidates.items():
@@ -4512,12 +4534,62 @@ class TrackingSystem:
                 solution, cam_solutions_of[ctrl_name], obs_src,
                 claimed_blobs=None, frame_ts_ns=frame_ts_ns, self_cal=self._self_cal,
                 winner_was_contested=(ctrl_name in contested_winners),
+                swap_suspected=(ctrl_name in swap_suspected),
             )
             results[ctrl_name] = solution
 
         for ctrl_name in ctrl_names:
             results.setdefault(ctrl_name, None)
         return results
+
+    def _detect_cold_identity_swap(self, candidates: Dict[str, Dict], frame_ts_ns: int = 0) -> Set[str]:
+        """Flag simultaneously-cold candidates that plausibly swapped
+        identity with each other this frame -- e.g. left_controller's
+        reacquired pose actually belongs to right_controller and vice
+        versa. This is a DIFFERENT shape of conflict than anything
+        _resolve_cold_conflicts checks: that method's four conflict types
+        (physical overlap, shared blob, cross-occlusion, aux-projection
+        collision) all require the two candidates to share camera evidence
+        or collide at the same spot -- a swap instead puts each new
+        candidate FAR from the other, near where the OTHER controller
+        itself last was, with zero shared evidence between the two
+        cameras that produced them (found investigating a real case: left
+        matched only cam3, right only cam2, no overlap at all, yet the
+        pair's own pre-loss positions fit the SWAPPED assignment far
+        better than the direct one -- swapped total distance ~1.57m vs.
+        direct ~2.22m).
+
+        Compares each pair's new position against BOTH controllers' own
+        last real position (self.ctrl_trackers[name]._fusion_filter.p) --
+        not against each other's current candidate, which is what
+        _resolve_cold_conflicts already does. Skips any pair where either
+        side has no prior reference yet (fresh bootstrap, self.p is None)
+        -- a same-frame double-bootstrap swap is a real but out-of-scope
+        residual gap; there is nothing to compare against in that case.
+        """
+        suspected: Set[str] = set()
+        margin = float(self._matching_cfg.get('cold_swap_margin', 0.85))
+        names = list(candidates.keys())
+        for a, b in itertools.combinations(names, 2):
+            filt_a = self.ctrl_trackers[a]._fusion_filter
+            filt_b = self.ctrl_trackers[b]._fusion_filter
+            p_a = filt_a.p if filt_a is not None else None
+            p_b = filt_b.p if filt_b is not None else None
+            if p_a is None or p_b is None:
+                continue
+            new_a = candidates[a]["T_world_ctrl"].t
+            new_b = candidates[b]["T_world_ctrl"].t
+            direct = np.linalg.norm(new_a - p_a) + np.linalg.norm(new_b - p_b)
+            swapped = np.linalg.norm(new_a - p_b) + np.linalg.norm(new_b - p_a)
+            if swapped < margin * direct:
+                suspected.add(a)
+                suspected.add(b)
+                logger.bind(cat="occlusion").info(
+                    f"[cold-batch] identity swap suspected between {a}/{b}: "
+                    f"direct={direct:.3f}m swapped={swapped:.3f}m — "
+                    f"buffering both instead of trusting immediately"
+                )
+        return suspected
 
     def _resolve_cold_conflicts(
         self, candidates: Dict[str, Dict], fixed_names: Optional[Set[str]] = None,

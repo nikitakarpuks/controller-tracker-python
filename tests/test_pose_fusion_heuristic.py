@@ -188,14 +188,26 @@ class AgreementWeakBoundsTests(unittest.TestCase):
         self.assertAlmostEqual(pos_weak, 0.03, places=6)
         self.assertAlmostEqual(rot_weak, 3.0, places=6)
 
-    def test_never_exceeds_hard_gate_ceiling(self):
+    def test_never_reaches_the_raw_ceiling_even_with_absurdly_noisy_history(self):
+        """Regression (2026-09-15, real case: right_controller, walk_hard,
+        frame 34): this clip used to bound at the raw ceiling itself, which
+        can land pos_weak==pos_ceil_m exactly for a noisy-enough history --
+        _ramp_down's own degenerate-input rule ("if weak<=strong: return
+        1.0" unconditionally) then silently disables Case A's pushback
+        entirely, regardless of how large the real disagreement is. Now
+        clips to 0.9*ceiling (the SAME margin the thin-history fallback
+        above already used, for the exact same reason) so weak < strong is
+        always strictly true once history is populated too."""
         f = _make_filter()
         for _ in range(10):
             f._pos_innov_hist.append(10.0)  # absurdly noisy recent history
             f._rot_innov_hist.append(500.0)
         pos_weak, rot_weak = f._agreement_weak_bounds(0)
-        self.assertEqual(pos_weak, 0.3)
-        self.assertEqual(rot_weak, 60.0)
+        self.assertAlmostEqual(pos_weak, 0.27, places=6)
+        self.assertAlmostEqual(rot_weak, 54.0, places=6)
+        pos_ceiling, rot_ceiling = f._implausible_jump_thresholds(0)
+        self.assertLess(pos_weak, pos_ceiling)
+        self.assertLess(rot_weak, rot_ceiling)
 
 
 class CaseAWarmSoftTrustTests(unittest.TestCase):
@@ -1055,20 +1067,52 @@ class ContestedWinnerWeakRoutingTests(unittest.TestCase):
     1.63m wrong vs mocap ground truth -- the solve itself looked completely
     ordinary; only the fact that another controller's candidate contested
     the same evidence this frame flagged it. Routes through the exact same
-    weak-pair buffer/confirm machinery WeakBootstrapBufferTests covers."""
+    weak-pair buffer/confirm machinery WeakBootstrapBufferTests covers.
+
+    EXEMPTION (2026-09-15, user-directed, real case: left_controller,
+    walk_hard, frame 29): a GENUINELY strong winner (n_inliers>=
+    vision_weight_strong_inliers AND error_px<=vision_weight_strong_
+    error_px -- the SAME bar _vision_weight itself uses for full trust, not
+    just "not weak") is now approved immediately despite being contested --
+    see _try_cold_reacquire's own updated docstring for the exact
+    real-world case and why this doesn't reopen the 132.7deg bug above
+    (that bootstrap's own n_inliers=6 stays below strong_inliers=8 either
+    way). n_inliers=6 below is deliberately chosen to match that original
+    bug case's own inlier count -- "not weak" (6 > weak_inliers=5) but NOT
+    "genuinely strong" (6 < strong_inliers=8) -- so these tests keep
+    covering the original, still-buffered-and-correctly-so regression."""
 
     def _fresh_filter(self, cfg_overrides=None):
         return _make_filter(cfg_overrides)
 
-    def test_contested_bootstrap_is_buffered_despite_strong_inlier_count(self):
+    def test_contested_bootstrap_with_ordinary_inlier_count_is_still_buffered(self):
         f = self._fresh_filter()
-        contested = {**_solution(np.eye(3), np.array([1.0, 2.0, 3.0]), n_inliers=20),
+        # n_inliers=6: matches the real 132.7deg bug case exactly -- "not
+        # weak" (>weak_inliers=5) but NOT "genuinely strong" (<strong_
+        # inliers=8), so the 2026-09-15 exemption must NOT apply here.
+        contested = {**_solution(np.eye(3), np.array([1.0, 2.0, 3.0]), n_inliers=6),
                      "winner_was_contested": True}
         ok = f.try_update(contested, 1 * _NS)
-        self.assertFalse(ok, "a contested winner must not be trusted immediately, even with a strong inlier count")
+        self.assertFalse(ok, "an ordinary (not genuinely strong) contested winner must still buffer")
         self.assertIsNone(f.R, "no tracking state should exist yet")
         self.assertIsNotNone(f._cold_pending)
         self.assertEqual(f._last.get("outcome"), "bootstrap_pending")
+
+    def test_contested_but_genuinely_strong_winner_is_approved_immediately(self):
+        """2026-09-15 regression: real case had n_inliers=11/error=0.11px
+        (well past strong_inliers=8/strong_error_px=0.15) winning a
+        physical-overlap conflict and getting buffered for a full extra
+        frame despite mocap confirming it was correct (21.5mm/5.4deg off
+        truth) -- an unnecessary display-lag cost for a candidate this
+        solid. Must now be trusted immediately, same as an uncontested one."""
+        f = self._fresh_filter()
+        strong_contested = {**_solution(np.eye(3), np.array([1.0, 2.0, 3.0]), n_inliers=20, error_px=0.1),
+                             "winner_was_contested": True}
+        ok = f.try_update(strong_contested, 1 * _NS)
+        self.assertTrue(ok, "a genuinely strong winner must be approved immediately even if contested")
+        self.assertIsNone(f._cold_pending)
+        np.testing.assert_allclose(f.p, np.array([1.0, 2.0, 3.0]))
+        self.assertEqual(f._last.get("outcome"), "bootstrap")
 
     def test_uncontested_strong_bootstrap_unaffected(self):
         """winner_was_contested defaults to False when absent from the
@@ -1085,15 +1129,73 @@ class ContestedWinnerWeakRoutingTests(unittest.TestCase):
 
     def test_two_agreeing_contested_candidates_still_confirm_and_bootstrap(self):
         f = self._fresh_filter()
-        c1 = {**_solution(np.eye(3), np.array([1.000, 0.0, 0.0]), n_inliers=20),
+        # n_inliers=6 (same "ordinary, not genuinely strong" reasoning as
+        # the buffering test above) -- this test is specifically about the
+        # buffer/confirm MECHANISM, which only runs at all for a candidate
+        # that actually gets buffered in the first place.
+        c1 = {**_solution(np.eye(3), np.array([1.000, 0.0, 0.0]), n_inliers=6),
               "winner_was_contested": True}
         ok1 = f.try_update(c1, 1 * _NS)
         self.assertFalse(ok1)
 
-        c2 = {**_solution(np.eye(3), np.array([1.010, 0.0, 0.0]), n_inliers=20),  # 10mm away -- agrees
+        c2 = {**_solution(np.eye(3), np.array([1.010, 0.0, 0.0]), n_inliers=6),  # 10mm away -- agrees
               "winner_was_contested": True}
         ok2 = f.try_update(c2, 2 * _NS)
         self.assertTrue(ok2, "two independent contested-but-agreeing solves must still confirm each other")
+        np.testing.assert_allclose(f.p, np.array([1.010, 0.0, 0.0]))
+        self.assertEqual(f._last.get("outcome"), "bootstrap")
+
+
+class SwapSuspectedWeakRoutingTests(unittest.TestCase):
+    """Regression for swap_suspected as a FOURTH "weak" trigger
+    (2026-09-16) -- see TrackingSystem._detect_cold_identity_swap's own
+    docstring for the real case (both controllers simultaneously cold,
+    each landing on the OTHER's own last-known position). Deliberately NOT
+    given the same strong-exemption winner_was_contested gets above: a
+    swap can look individually clean (high inliers, low error) on BOTH
+    sides at once, since each side really is a valid geometric solve, just
+    assigned to the wrong controller -- letting a "strong" swap bypass
+    buffering would defeat the whole point of the check."""
+
+    def _fresh_filter(self, cfg_overrides=None):
+        return _make_filter(cfg_overrides)
+
+    def test_swap_suspected_buffers_even_with_strong_solve_stats(self):
+        f = self._fresh_filter()
+        # n_inliers=20/error_px=0.1 clears strong_inliers/strong_error_px
+        # comfortably -- exactly the profile that lets a contested winner
+        # bypass buffering (see test_contested_but_genuinely_strong_winner_
+        # is_approved_immediately above). swap_suspected must NOT get the
+        # same exemption.
+        strong_swap = {**_solution(np.eye(3), np.array([1.0, 2.0, 3.0]), n_inliers=20, error_px=0.1),
+                       "swap_suspected": True}
+        ok = f.try_update(strong_swap, 1 * _NS)
+        self.assertFalse(ok, "a swap-suspected candidate must buffer regardless of its own inlier/error stats")
+        self.assertIsNotNone(f._cold_pending)
+        self.assertEqual(f._last.get("outcome"), "bootstrap_pending")
+
+    def test_swap_suspected_absent_defaults_to_false(self):
+        """swap_suspected defaults to False when absent from the solution
+        dict (every non-cold-batch call site) -- must not change today's
+        common-case behavior."""
+        f = self._fresh_filter()
+        strong = _solution(np.eye(3), np.array([1.0, 2.0, 3.0]), n_inliers=20)
+        self.assertNotIn("swap_suspected", strong)
+        ok = f.try_update(strong, 1 * _NS)
+        self.assertTrue(ok)
+        self.assertEqual(f._last.get("outcome"), "bootstrap")
+
+    def test_two_agreeing_swap_suspected_candidates_still_confirm_and_bootstrap(self):
+        f = self._fresh_filter()
+        c1 = {**_solution(np.eye(3), np.array([1.000, 0.0, 0.0]), n_inliers=20, error_px=0.1),
+              "swap_suspected": True}
+        ok1 = f.try_update(c1, 1 * _NS)
+        self.assertFalse(ok1)
+
+        c2 = {**_solution(np.eye(3), np.array([1.010, 0.0, 0.0]), n_inliers=20, error_px=0.1),  # 10mm away
+              "swap_suspected": True}
+        ok2 = f.try_update(c2, 2 * _NS)
+        self.assertTrue(ok2, "two independent swap-suspected-but-agreeing solves must still confirm each other")
         np.testing.assert_allclose(f.p, np.array([1.010, 0.0, 0.0]))
         self.assertEqual(f._last.get("outcome"), "bootstrap")
 
@@ -1512,9 +1614,14 @@ class EffectiveCoastBudgetTests(unittest.TestCase):
         inside the FLAT budget but outside the SHRUNK one must still clear
         reported_R/reported_p via _report_if_still_usable's own (2b)
         clearing branch -- ties this method into the real bug this was
-        added for, not just testing it in isolation."""
+        added for, not just testing it in isolation.
+
+        Uses cold_pending_shrink_s_per_dps (2026-09-15) -- _report_if_still_
+        usable now reads its OWN rate (rate_prefix="cold_pending"), not the
+        shared coast_trust_shrink_s_per_dps the other two consumers use --
+        see _effective_coast_budget_s's own rate_prefix docstring."""
         f = self._filter_with_imu(peak_accel_dynamic_mps2=10.0, peak_gyro_dps=3000.0,
-                                   coast_trust_shrink_s_per_dps=0.001,  # (3000-900)*0.001=2.1s -- wipes 0.25s
+                                   cold_pending_shrink_s_per_dps=0.001,  # (3000-900)*0.001=2.1s -- wipes 0.25s
                                    coast_trust_min_budget_s=0.005,  # below the real dt_s=0.01s so the
                                    # shrunk budget (not just the floor) is what's actually exercised here
                                    cold_pending_report_max_gap_s=0.25)
@@ -1541,6 +1648,249 @@ class EffectiveCoastBudgetTests(unittest.TestCase):
         ok = f.try_update(weak, 10_000_000)  # dt_s=0.01s -- well inside the FLAT 0.25s budget
         self.assertFalse(ok)
         self.assertIsNone(f.reported_p, "the accel/gyro-shrunk budget must have cleared it despite the short elapsed time")
+
+
+class EffectiveCoastBudgetAxisTests(unittest.TestCase):
+    """Regression for _effective_coast_budget_s's axis param (2026-09-15,
+    user-directed, real case: right_controller, walk_hard, frame 71) --
+    lets a caller ask "how long is POSITION still credible" (accel-only
+    shrink) separately from "how long is ROTATION still credible" (gyro-only
+    shrink), instead of one combined answer. axis="both" (the default) must
+    stay byte-for-byte identical to the pre-existing combined behavior, so
+    the two original callers (_report_if_still_usable, ControllerTracker.
+    _mark_all_lost) are unaffected."""
+
+    def _filter_with_imu(self, peak_accel_dynamic_mps2, peak_gyro_dps, **cfg_overrides):
+        accel_z = peak_accel_dynamic_mps2 + 9.81
+        _, accel_data = _imu_arrays([(0, [0.0, 0.0, 0.0])], [(0, [0.0, 0.0, accel_z])])
+        gyro_data = (np.array([0, 10_000_000]),
+                     np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        cfg = {
+            "coast_trust_accel_calm_floor_mps2": 40.0,
+            "coast_trust_gyro_calm_floor_dps": 900.0,
+            "coast_trust_shrink_s_per_mps2": 0.01,
+            "coast_trust_shrink_s_per_dps": 0.0001,
+            "coast_trust_min_budget_s": 0.011,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(gyro_data=gyro_data, accel_data=accel_data,
+                                       lever_arm=None, g_world_estimator=None,
+                                       cfg={"fusion_heuristic": cfg})
+        f.last_update_ts_ns = 0
+        return f
+
+    def test_accel_axis_ignores_gyro_shrink(self):
+        # accel excess=10-40 clipped to 0 -> accel shrink=0; gyro excess=2000-900=1100
+        # would shrink 0.11s under "both", but axis="accel" must ignore it entirely.
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=10.0, peak_gyro_dps=2000.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="accel")
+        self.assertAlmostEqual(budget, 0.066, places=6)
+
+    def test_gyro_axis_ignores_accel_shrink(self):
+        # gyro excess=500-900 clipped to 0 -> gyro shrink=0; accel excess=80-40=40
+        # would shrink 0.4s under "both", but axis="gyro" must ignore it entirely.
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=80.0, peak_gyro_dps=500.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro")
+        self.assertAlmostEqual(budget, 0.066, places=6)
+
+    def test_accel_axis_shrinks_on_its_own_excess(self):
+        # accel excess=80-40=40 -> shrink=0.01*40=0.4s
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=80.0, peak_gyro_dps=500.0)
+        budget = f._effective_coast_budget_s(0.5, 10_000_000, axis="accel")
+        self.assertAlmostEqual(budget, 0.5 - 0.4, places=6)
+
+    def test_gyro_axis_shrinks_on_its_own_excess(self):
+        # gyro excess=2000-900=1100 -> shrink=0.0001*1100=0.11s
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=10.0, peak_gyro_dps=2000.0)
+        budget = f._effective_coast_budget_s(0.5, 10_000_000, axis="gyro")
+        self.assertAlmostEqual(budget, 0.5 - 0.11, places=6)
+
+    def test_default_axis_both_unchanged_from_pre_axis_behavior(self):
+        # accel shrink=0.4s + gyro shrink=0.11s = 0.51s -- combined, same as
+        # omitting axis entirely (the two pre-existing callers' own usage).
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=80.0, peak_gyro_dps=2000.0)
+        budget_default = f._effective_coast_budget_s(1.0, 10_000_000)
+        budget_explicit_both = f._effective_coast_budget_s(1.0, 10_000_000, axis="both")
+        self.assertAlmostEqual(budget_default, 1.0 - 0.51, places=6)
+        self.assertAlmostEqual(budget_explicit_both, budget_default, places=9)
+
+
+class EffectiveCoastBudgetRatePrefixTests(unittest.TestCase):
+    """Regression for _effective_coast_budget_s's rate_prefix param
+    (2026-09-15, user-directed: "0.25s is crazy big... for high speed/accel
+    sequences we should not go over 35ms; for slow motion maybe 60ms").
+    _report_if_still_usable's DISPLAY-only budget now reads its own
+    cold_pending_shrink_s_per_mps2/_dps instead of sharing coast_trust_
+    shrink_s_per_mps2/_dps with the degenerate-fallback CORE-STATE gate and
+    ControllerTracker._mark_all_lost's SEARCH-ANCHOR budget -- gentling the
+    display's own rate must not also gentle those two already-validated,
+    tighter consumers (real case: right_controller frame 71)."""
+
+    def _filter_with_imu(self, peak_accel_dynamic_mps2, peak_gyro_dps, **cfg_overrides):
+        accel_z = peak_accel_dynamic_mps2 + 9.81
+        _, accel_data = _imu_arrays([(0, [0.0, 0.0, 0.0])], [(0, [0.0, 0.0, accel_z])])
+        gyro_data = (np.array([0, 10_000_000]),
+                     np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        cfg = {
+            "coast_trust_accel_calm_floor_mps2": 0.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_min_budget_s": 0.025,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(gyro_data=gyro_data, accel_data=accel_data,
+                                       lever_arm=None, g_world_estimator=None,
+                                       cfg={"fusion_heuristic": cfg})
+        f.last_update_ts_ns = 0
+        return f
+
+    def test_default_rate_prefix_uses_coast_trust_keys_unaffected_by_cold_pending(self):
+        """The degenerate-fallback/search-anchor consumers (default
+        rate_prefix="coast_trust") must be COMPLETELY unaffected by however
+        cold_pending_shrink_s_per_* is configured -- different key
+        namespace entirely."""
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=38.61, peak_gyro_dps=1363.36,
+                                   coast_trust_shrink_s_per_mps2=0.001145,
+                                   coast_trust_shrink_s_per_dps=0.000058,
+                                   cold_pending_shrink_s_per_mps2=999.0,  # absurd -- must be ignored here
+                                   cold_pending_shrink_s_per_dps=999.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000)  # default rate_prefix="coast_trust"
+        expected_shrink = 0.001145 * 38.61 + 0.000058 * 1363.36
+        self.assertAlmostEqual(budget, max(0.025, 0.066 - expected_shrink), places=6)
+
+    def test_cold_pending_rate_prefix_uses_its_own_keys(self):
+        """rate_prefix="cold_pending" reads cold_pending_shrink_s_per_*, not
+        coast_trust_shrink_s_per_* -- direct regression for the real case
+        (right_controller, walk_hard, frame 39): 1363.36deg/s peak gyro,
+        38.61 m/s^2 peak accel must land the effective budget at exactly
+        0.035s (not the old rate's immediate floor-out at 0.025s)."""
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=38.61, peak_gyro_dps=1363.36,
+                                   coast_trust_shrink_s_per_mps2=999.0,  # absurd -- must be ignored here
+                                   coast_trust_shrink_s_per_dps=999.0,
+                                   cold_pending_shrink_s_per_mps2=0.000232,
+                                   cold_pending_shrink_s_per_dps=0.0000118)
+        budget = f._effective_coast_budget_s(0.06, 10_000_000, rate_prefix="cold_pending")
+        self.assertAlmostEqual(budget, 0.035, places=3)
+
+    def test_cold_pending_rate_defaults_to_zero_shrink_if_unconfigured(self):
+        """Safe fail-open: an unconfigured cold_pending_shrink_s_per_* (this
+        method's own _hc_get default) means no shrink at all, not an error
+        or a fall-through to coast_trust_shrink_s_per_*."""
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=38.61, peak_gyro_dps=1363.36,
+                                   coast_trust_shrink_s_per_mps2=0.001145,
+                                   coast_trust_shrink_s_per_dps=0.000058)
+        budget = f._effective_coast_budget_s(0.06, 10_000_000, rate_prefix="cold_pending")
+        self.assertAlmostEqual(budget, 0.06, places=6)
+
+
+class DegenerateFallbackCoastGateTests(unittest.TestCase):
+    """Regression for try_update's degenerate w_sum<=0 fallback gaining an
+    accel/gyro-aware budget check (2026-09-15, user-directed, real case:
+    right_controller, walk_hard, frame 71, cam3). Before this fix, once
+    vision's own quality ramps both bottomed out (n_inliers/error_px at/
+    below their weak floors, quality=0.0 -- and w_imu is ALSO always 0 in
+    this project's real config, cost_weight_imu=0.0), try_update fell back
+    to the bare IMU prediction UNCONDITIONALLY -- no time/accel/gyro decay
+    of any kind, unlike every other "how long is a coast still trustworthy"
+    question in this file. Mocap ground truth on the real case: that pure-
+    IMU pose was 406mm off in POSITION but only 4.24deg off in ROTATION --
+    each axis wrong by a different amount, which the old unconditional
+    fallback couldn't express. Now checks degenerate_fallback_max_s (shrunk
+    per-axis via _effective_coast_budget_s's axis param, same already-
+    validated coast_trust_* formula) before accepting p_pred blindly; past
+    either axis's budget, routes through _try_cold_reacquire's existing
+    weak-candidate buffer instead (see that method's own weak/strong routing
+    -- n_inliers<=weak_inliers is guaranteed true whenever quality==0, so
+    this always takes the buffer path, never the immediate-accept path)."""
+
+    def _filter(self, peak_gyro_dps=500.0, peak_accel_dynamic_mps2=10.0,
+                frames_since_update=2, **cfg_overrides):
+        gyro_data = (np.array([0, 10_000_000]),
+                     np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        accel_z = peak_accel_dynamic_mps2 + 9.81
+        accel_data = (np.array([0, 10_000_000]),
+                      np.array([[0.0, 0.0, accel_z], [0.0, 0.0, accel_z]]))
+        cfg = {
+            "cost_weight_imu": 0.0,  # matches this project's real config
+            "cost_weight_vision": 2.0,
+            "vision_weight_weak_inliers": 5,
+            "vision_weight_strong_inliers": 8,
+            "vision_weight_weak_error_px": 0.5,
+            "vision_weight_strong_error_px": 0.15,
+            # Hard gate + gap damping kept as pure no-ops -- this test class
+            # is specifically about the degenerate-fallback routing, not
+            # those other, already-covered mechanisms.
+            "implausible_jump_pos_thresh_base_mm": 1.0e9,
+            "implausible_jump_pos_thresh_per_speed_mm_s": 0.0,
+            "implausible_jump_rot_thresh_base_deg": 1.0e9,
+            "implausible_jump_rot_thresh_per_speed_deg_s": 0.0,
+            "imu_decay_frames": 4,
+            "gap_dt_normal_s": 1.0e9, "gap_dt_full_s": 1.0e9, "gap_vision_weight_floor": 1.0,
+            "agreement_hist_min_samples": 999,
+            "sibling_collision_dist_m": 0.0,
+            "cold_confirm_max_gap_s": 1.0e9,
+            "coast_trust_accel_calm_floor_mps2": 40.0,
+            "coast_trust_gyro_calm_floor_dps": 900.0,
+            "coast_trust_shrink_s_per_mps2": 0.0,
+            "coast_trust_shrink_s_per_dps": 0.0,
+            "coast_trust_min_budget_s": 0.011,
+            "degenerate_fallback_max_s": 0.066,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(gyro_data=gyro_data, accel_data=accel_data,
+                                       lever_arm=np.zeros(3),
+                                       g_world_estimator=Mock(g_world=np.array([0.0, 0.0, -9.81])),
+                                       cfg={"fusion_heuristic": cfg}, ctrl_name="test")
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.last_update_ts_ns = 0
+        f.frames_since_update = frames_since_update  # 2 -> frames_lost=1 -> imu_frame_scale=0.75 (not fully decayed)
+        return f
+
+    def _weak_solution(self, p):
+        return _solution(np.eye(3), p, n_inliers=5, error_px=0.6)  # both at/above weak floors -> quality=0.0
+
+    def test_calm_window_within_budget_still_hits_the_blind_fallback(self):
+        """Calm accel/gyro -> budget stays near the 0.066s base, comfortably
+        above dt_s=0.01s -- unchanged pre-fix behavior: accept p_pred as the
+        new tracked state."""
+        f = self._filter(peak_gyro_dps=500.0, peak_accel_dynamic_mps2=5.0)
+        ok = f.try_update(self._weak_solution(np.array([5.0, 5.0, 5.0])), 10_000_000)
+        self.assertTrue(ok)
+        # p_pred (a real, tiny accel-integrated drift from self.p=0 over
+        # dt_s=0.01s), NOT the wild vision candidate at (5,5,5).
+        np.testing.assert_allclose(f.p, np.zeros(3), atol=1e-3)
+        self.assertEqual(f.last_update_ts_ns, 10_000_000)
+        self.assertIsNone(f._cold_pending)
+
+    def test_violent_gyro_past_budget_routes_to_weak_buffer(self):
+        """A rotation-axis-only violent window (calm accel) shrinks ONLY the
+        gyro-derived budget below dt_s -- must still route to the buffer
+        (either axis exceeding is enough), not blindly accept p_pred."""
+        f = self._filter(peak_gyro_dps=3000.0, peak_accel_dynamic_mps2=5.0,
+                          coast_trust_shrink_s_per_dps=1.0,  # huge -> floors the gyro budget
+                          coast_trust_min_budget_s=0.005)     # below dt_s=0.01s
+        p_vision = np.array([0.05, 0.02, -0.01])
+        ok = f.try_update(self._weak_solution(p_vision), 10_000_000)
+        self.assertFalse(ok)
+        self.assertIsNotNone(f._cold_pending, "must buffer the weak candidate instead of blind-trusting p_pred")
+        np.testing.assert_allclose(f._cold_pending["p"], p_vision)
+        # State must NOT have advanced -- this frame contributed nothing trustworthy.
+        self.assertEqual(f.last_update_ts_ns, 0)
+        np.testing.assert_allclose(f.p, np.zeros(3), atol=1e-9)
+
+    def test_violent_accel_past_budget_also_routes_to_weak_buffer(self):
+        """Same, but a POSITION-axis-only violent window (calm gyro) --
+        confirms the accel axis alone is also sufficient to trigger routing,
+        not just gyro."""
+        f = self._filter(peak_gyro_dps=500.0, peak_accel_dynamic_mps2=200.0,
+                          coast_trust_shrink_s_per_mps2=1.0,  # huge -> floors the accel budget
+                          coast_trust_min_budget_s=0.005)
+        p_vision = np.array([0.05, 0.02, -0.01])
+        ok = f.try_update(self._weak_solution(p_vision), 10_000_000)
+        self.assertFalse(ok)
+        self.assertIsNotNone(f._cold_pending)
+        np.testing.assert_allclose(f._cold_pending["p"], p_vision)
+        self.assertEqual(f.last_update_ts_ns, 0)
 
 
 class StaleTimeWideningTests(unittest.TestCase):
