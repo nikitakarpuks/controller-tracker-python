@@ -18,6 +18,7 @@ from src.debug_config import get_debug_triple, log_all_proximity_hyps, log_all_t
 from src._pnp import _ransac_pnp, _project_points, _check_z_range
 from src._visibility import _visible_mask, _cross_occluded_mask
 from src.transformations import Transform
+from src.camera import radial_taper_weight
 
 # Identity intrinsics / zero distortion for solveP3P/solvePnP calls that
 # operate on already-normalized/undistorted points — these never vary per
@@ -637,6 +638,25 @@ class PoseSearcher:
         self._c_brute_min_vis_cov   = float(_cfg.get('min_vis_coverage',                 0.75))
         self._c_brute_rng_seed      = _cfg.get('rng_seed',                              42)
         self._c_brute_aux_reproj_px = float(_cfg.get('brute_aux_reprojection_threshold_px', 2.0))
+        # See camera.radial_taper_weight's own docstring for the full "why" --
+        # shared between the balanced_coverage LED/blob weighting below and
+        # the proximity-match reprojection widening further down.
+        self._c_edge_inner_fraction = float(_cfg.get('edge_confidence_inner_fraction', 0.8))
+        self._c_edge_conf_floor     = float(_cfg.get('edge_confidence_floor',          0.3))
+        self._c_edge_reproj_widen   = float(_cfg.get('edge_reproj_widen_max',          2.5))
+        # Absolute ceiling on any edge-widened reprojection threshold (both
+        # the proximity widening below and the aux-camera soft-coverage-
+        # credit widening in brute_search_tier) -- found 2026-09-13, critical
+        # review: proximity_reprojection_threshold's REAL config value is
+        # 2.5px (not the 2.0px code-fallback default), so the un-capped
+        # widen_max=2.5x reached 6.25px at the boundary -- looser than every
+        # one of this project's own brute-force thresholds (1.5-2.0px),
+        # directly contradicting proximity_reprojection_threshold's own
+        # config comment ("tighter than brute -- prior is already close").
+        # This bounds the OUTPUT of base*widen regardless of what a given
+        # call site's own base threshold happens to be, rather than trying
+        # to keep the multiplier itself safe across every base value.
+        self._c_edge_reproj_cap_px = float(_cfg.get('edge_reproj_widen_abs_cap_px', 3.5))
         # Own knob (not proximity's proximity_redundancy_ref) -- see the confidence-formula
         # comment in brute_search_tier for why brute needs an independent reference scale.
         self._c_brute_redundancy_ref = float(_cfg.get('brute_redundancy_ref',              6.0))
@@ -664,6 +684,60 @@ class PoseSearcher:
         filter passes it through unconditionally rather than hiding it as untagged."""
         if active:
             logger.bind(cat="_gated").debug(msg)
+
+    def _edge_widened_thresh(self, base_px: float, r_px, cam_rpmax_px: float):
+        """base_px widened by camera.radial_taper_weight's taper at r_px
+        (scalar OR ndarray -- matches that function's own flexibility) given
+        ONE camera's own rpmax_px, capped at edge_reproj_widen_abs_cap_px
+        (see that config key's own comment: a multiplier alone isn't safe
+        across this project's several different base reprojection
+        thresholds) and never narrower than base_px itself (guards against a
+        misconfigured cap smaller than the base). Shared by two different
+        consumers: _edge_widened_reproj_px collapses r_px to a single
+        .max() first (feeding _ransac_pnp's one-scalar-per-call API);
+        brute_search_tier's aux-camera soft-coverage-credit leaves r_px as a
+        full per-LED array (a direct vectorised threshold comparison, no
+        RANSAC call involved, so per-point IS safe there)."""
+        trust = radial_taper_weight(r_px, cam_rpmax_px, self._c_edge_inner_fraction, floor=0.0)
+        widen = 1.0 + (self._c_edge_reproj_widen - 1.0) * (1.0 - trust)
+        widened = base_px * widen
+        if isinstance(widened, np.ndarray):
+            return np.maximum(np.minimum(widened, self._c_edge_reproj_cap_px), base_px)
+        return max(min(widened, self._c_edge_reproj_cap_px), base_px)
+
+    def _edge_widened_reproj_px(self, new_blob_px: np.ndarray) -> float:
+        """proximity_reprojection_threshold widened for this call's own worst-case
+        NEW (not-yet-verified) blob, if any of them sit near this camera's KB4
+        rpmax_px boundary -- see camera.radial_taper_weight's own docstring
+        for the full "why" (same rationale as the balanced_coverage LED/blob
+        weighting in brute_search_tier, applied here as a threshold WIDEN
+        instead of a confidence DISCOUNT, since _ransac_pnp/src/_pnp.py
+        takes one plain scalar threshold per call -- deliberately NOT
+        touched, per-point tolerance inside RANSAC isn't achievable without
+        replacing OpenCV's own solver, out of scope here).
+
+        new_blob_px MUST be only the pairs actually being newly tested this
+        call (e.g. hyp_assignment, NOT locked_assignment + hyp_assignment) --
+        found 2026-09-13, critical review: passing the full locked+hypothesis
+        set meant a single already-CONFIRMED pair that had simply drifted
+        near the edge could widen tolerance for every OTHER pair in the same
+        RANSAC call too, including a brand-new, unverified, center-of-frame
+        pair that should have been held to the tight standard. Empty
+        new_blob_px (nothing new to test this call, e.g. every LED was
+        already locked) intentionally falls back to the flat base threshold,
+        not the widened one -- there's nothing "new near the edge" to
+        justify widening for.
+
+        Uses new_blob_px.max() -- the single worst (closest-to-boundary)
+        point among the ones actually being newly tested -- rather than a
+        per-point array: deliberately coarse, matching "one scalar in, one
+        scalar out," not a per-point RANSAC change. Well inside the frame
+        (the common case), radial_taper_weight returns 1.0 and this is a
+        no-op (today's flat proximity_reprojection_threshold, unchanged)."""
+        if len(new_blob_px) == 0 or self.camera.rpmax_px <= 0:
+            return self._c_prox_reproj_px
+        r_px = np.hypot(new_blob_px[:, 0] - self.camera.cx, new_blob_px[:, 1] - self.camera.cy)
+        return float(self._edge_widened_thresh(self._c_prox_reproj_px, float(r_px.max()), self.camera.rpmax_px))
 
     def _aux_cam_vis(
         self,
@@ -824,6 +898,13 @@ class PoseSearcher:
         # score each by solvePnP reprojection error, pick the best.
         pairs      = []
         locked_obj = []
+        # Mirrors pairs (accumulated below, per-group, "Step 5") but holds ONLY
+        # the new/not-yet-verified hyp_assignment entries, never the already-
+        # confirmed locked_assignment ones -- so the final _edge_widened_
+        # reproj_px call can widen tolerance based on what's actually being
+        # newly tested this frame, not a stale locked pair that happens to
+        # have drifted near the edge (see that method's own docstring).
+        hyp_pairs  = []
         _locked_pose_dbg = None   # DEBUG: (rvec, tvec) from PnP on truly-locked pairs only
 
         if n_model_visible > 0 and len(blobs) > 0:
@@ -1387,9 +1468,15 @@ class PoseSearcher:
                             _o_r = self.model.positions[[l for _, l in _pairs_r]].astype(np.float32)
                             _i_r = blobs[[b for b, _ in _pairs_r]].astype(np.float32)
                             _n_r_norm = _blobs_norm[[b for b, _ in _pairs_r]]
+                            # Widen decision uses ONLY _hyp_r (the new, not-yet-
+                            # verified pairs this rank is testing), not _locked_r
+                            # too -- see _edge_widened_reproj_px's own docstring
+                            # for why a stale locked pair near the edge must not
+                            # widen tolerance for a brand-new center-frame pair.
+                            _hyp_px_r = blobs[[b for b, _ in _hyp_r]].astype(np.float32)
                             _ok_r, _rv_r, _tv_r, _idx_r = _ransac_pnp(
                                 _o_r, _n_r_norm, float(K[0, 0]), rvec_pred, tvec_pred,
-                                reprojection_px=self._c_prox_reproj_px,
+                                reprojection_px=self._edge_widened_reproj_px(_hyp_px_r),
                             )
                             if not _ok_r or _idx_r is None:
                                 logger.bind(cat="proximity_match").debug(
@@ -1445,6 +1532,7 @@ class PoseSearcher:
             for blob_c, led_id in locked_assignment + hyp_assignment:
                 pairs.append((blob_c, led_id))
                 locked_obj.append(self.model.positions[led_id])
+            hyp_pairs.extend(hyp_assignment)
 
         logger.bind(cat="proximity_match").debug(
             f"[{self._ctrl} | cam {self._cam}] Proximity: {len(pairs)}/{len(blobs)} blobs matched "
@@ -1457,10 +1545,14 @@ class PoseSearcher:
 
         lo      = np.array(locked_obj, dtype=np.float32)
         li_norm = _blobs_norm[[b for b, _ in pairs]]
+        # Widen decision uses ONLY hyp_pairs (new/not-yet-verified this frame),
+        # not the full locked+hyp pairs -- see _edge_widened_reproj_px's own
+        # docstring.
+        hyp_px  = blobs[[b for b, _ in hyp_pairs]]
 
         ok, rvec, tvec, ransac_idx = _ransac_pnp(
             lo, li_norm, float(K[0, 0]), rvec_pred, tvec_pred,
-            reprojection_px=self._c_prox_reproj_px,
+            reprojection_px=self._edge_widened_reproj_px(hyp_px),
         )
 
         if not ok or ransac_idx is None:
@@ -2344,6 +2436,15 @@ class PoseSearcher:
                             n_ransac_verified = len(inlier_blobs)
 
                             vis_ids_r = np.where(vis_mask_r)[0]
+                            # Hoisted out of the recovery block below (2026-09-13) --
+                            # was computed only when there were unmatched blobs/LEDs
+                            # to recover, but the new radial-confidence weighting
+                            # further down (see camera.radial_taper_weight) needs
+                            # every visible LED's own projected pixel position
+                            # regardless, so this is now unconditional and shared
+                            # by both consumers instead of being computed twice.
+                            proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc,
+                                                          is_fisheye=self.camera.is_fisheye)
 
                             _t0 = time.perf_counter()
                             # ── 6.5. Post-RANSAC blob recovery ────────────────
@@ -2357,8 +2458,6 @@ class PoseSearcher:
                             unmatched_col_idx = np.array([j for j, lid in enumerate(vis_ids_r) if int(lid) not in matched_led_set], dtype=np.int32)
 
                             if len(unmatched_blobs) > 0 and len(unmatched_col_idx) > 0:
-                                proj_vis_r = _project_points(rvec_r, tvec_r, positions[vis_ids_r], K, dc,
-                                                              is_fisheye=self.camera.is_fisheye)
                                 cost_r     = cdist(blobs, proj_vis_r)
                                 sub_min    = cost_r[np.ix_(unmatched_blobs, unmatched_col_idx)].min(axis=0)
                                 extra_blobs: List[int] = []
@@ -2424,11 +2523,16 @@ class PoseSearcher:
                                     _n_aux = int(_inlier_i.sum())
                                     if dbg_ransac:
                                         _matched_dists = _cost_i[_rows_i, _cols_i]
+                                        _blob_px = _oblobs[_rows_i]
+                                        _blob_r = np.hypot(_blob_px[:, 0] - _ocam.cx, _blob_px[:, 1] - _ocam.cy)
                                         logger.bind(cat="_gated").debug(
                                             f"  sol {sol_i}: aux cam{_ocam.camera_idx} "
                                             f"vis={len(_vis_ids_i)} blobs={len(_oblobs)} "
                                             f"matched_dists={_matched_dists.round(1).tolist()} "
-                                            f"thresh={self._c_brute_aux_reproj_px:.1f}px → {_n_aux} inliers"
+                                            f"thresh={self._c_brute_aux_reproj_px:.1f}px → {_n_aux} inliers "
+                                            f"blob_px={_blob_px.round(1).tolist()} "
+                                            f"blob_r={_blob_r.round(1).tolist()} "
+                                            f"(rpmax_px={_ocam.rpmax_px:.1f})"
                                         )
                                     aux_cameras_current.append((_ocam.camera_idx, _n_aux))
                                     aux_assignments_current[_ocam.camera_idx] = [
@@ -2439,15 +2543,53 @@ class PoseSearcher:
                                     # Facing-weighted visibility/inlier sums -- computed before use so
                                     # aux_blob_denom (precision side) can be weighted the same way
                                     # led_cov (recall side) already is, instead of a flat LED count.
+                                    # Second, independent discount (2026-09-13, see camera.
+                                    # radial_taper_weight's own docstring) alongside the
+                                    # cos(theta) facing weight -- same rationale as the
+                                    # primary-camera weighting above, applied per aux camera
+                                    # using THAT camera's own cx/cy/rpmax_px (_proj_i's rows
+                                    # already correspond 1:1 with _vis_ids_i, same indexing
+                                    # _w_i itself uses).
                                     _led_nrm_i = (_R_i @ normals[_vis_ids_i].T).T
                                     _vdirs_i   = -_led_cam_i / (np.linalg.norm(_led_cam_i, axis=1, keepdims=True) + 1e-9)
-                                    _w_i       = np.clip((_led_nrm_i * _vdirs_i).sum(axis=1), 0.0, 1.0)
+                                    _facing_w_i = np.clip((_led_nrm_i * _vdirs_i).sum(axis=1), 0.0, 1.0)
+                                    _r_i = np.hypot(_proj_i[:, 0] - _ocam.cx, _proj_i[:, 1] - _ocam.cy)
+                                    _radial_w_i = radial_taper_weight(
+                                        _r_i, _ocam.rpmax_px,
+                                        self._c_edge_inner_fraction, self._c_edge_conf_floor,
+                                    )
+                                    _w_i       = _facing_w_i * _radial_w_i
                                     _aux_vis_weight_sum = float(_w_i.sum())
 
                                     extra_inlier_count += _n_aux
                                     aux_blob_denom     += min(float(len(_oblobs)), _aux_vis_weight_sum)
                                     extra_vis_weight    += _aux_vis_weight_sum
                                     extra_inlier_weight += float(_w_i[_cols_i[_inlier_i]].sum())
+
+                                    # Coverage-only soft credit (2026-09-13): a near-miss blob that
+                                    # fails the flat/unwidened _c_brute_aux_reproj_px hard gate but
+                                    # falls within a radially-widened "soft" tolerance still pulls
+                                    # led_cov's numerator up a little (discounted by _w_i, itself
+                                    # already radial-tapered) -- reflects the same "corner blobs are
+                                    # genuinely less accurate, not simply absent" finding as the
+                                    # proximity-threshold widen above, but WITHOUT touching the hard
+                                    # match gate itself. Deliberately never written into
+                                    # aux_assignments_current/aux_cameras_current/extra_inlier_count:
+                                    # those feed cross-controller conflict resolution and tie-breaking
+                                    # in controller.py (_resolve_cold_conflicts, _score's total_pairs)
+                                    # as well as brute-force's own internal best-hypothesis comparison
+                                    # -- a false aux MATCH there could flip which controller wins a
+                                    # blob-ownership dispute, a materially more consequential failure
+                                    # mode than a nudge to balanced_coverage. Critical review (see
+                                    # memory: project_kb4_edge_confidence) confirmed widening the hard
+                                    # gate directly (self._c_brute_aux_reproj_px * edge_reproj_widen_max)
+                                    # was unsafe for exactly this reason; this is the safer alternative.
+                                    _matched_cost_i = _cost_i[_rows_i, _cols_i]
+                                    _soft_thresh_i = self._edge_widened_thresh(
+                                        self._c_brute_aux_reproj_px, _r_i[_cols_i], _ocam.rpmax_px,
+                                    )
+                                    _soft_only_i = (~_inlier_i) & (_matched_cost_i < _soft_thresh_i)
+                                    extra_inlier_weight += float(_w_i[_cols_i[_soft_only_i]].sum())
                             t_aux += time.perf_counter() - _t0
 
                             n_reached_coverage += 1
@@ -2470,7 +2612,22 @@ class PoseSearcher:
                             led_cam_pts    = (R_r @ positions[vis_ids_r].T).T + tvec_r_flat
                             led_cam_normals = (R_r @ normals[vis_ids_r].T).T
                             led_view_dirs  = -led_cam_pts / (np.linalg.norm(led_cam_pts, axis=1, keepdims=True) + 1e-9)
-                            led_vis_weights = np.clip((led_cam_normals * led_view_dirs).sum(axis=1), 0.0, 1.0)
+                            led_facing_weights = np.clip((led_cam_normals * led_view_dirs).sum(axis=1), 0.0, 1.0)
+                            # Second, independent discount (2026-09-13) alongside the
+                            # cos(theta) facing weight above -- see camera.
+                            # radial_taper_weight's own docstring for the full
+                            # "why": a KB4 calibration's own accuracy degrades
+                            # approaching rpmax_px, so an LED projecting near that
+                            # boundary is discounted the same way a grazing-angle
+                            # one already is, rather than trusted at full weight
+                            # right up until a flat reprojection threshold either
+                            # matches or doesn't.
+                            led_r_px = np.hypot(proj_vis_r[:, 0] - self.camera.cx, proj_vis_r[:, 1] - self.camera.cy)
+                            led_radial_weights = radial_taper_weight(
+                                led_r_px, self.camera.rpmax_px,
+                                self._c_edge_inner_fraction, self._c_edge_conf_floor,
+                            )
+                            led_vis_weights = led_facing_weights * led_radial_weights
 
                             # inlier_leds ⊂ vis_ids_r is guaranteed by step 6; searchsorted
                             # maps each inlier LED index to its position in vis_ids_r so we
@@ -2495,6 +2652,24 @@ class PoseSearcher:
                                         if _blob_denom > 0 else 1.0)
                             balanced_coverage = (2.0 * led_cov * blob_cov / (led_cov + blob_cov)
                                                  if led_cov + blob_cov > 0.0 else 0.0)
+                            # DEFERRED (2026-09-13, deliberately not implemented): a set of
+                            # matched points confined to one small region of the image is
+                            # poorly-conditioned for P3P/PnP independent of point count or
+                            # individual point accuracy -- the classic near-collinear
+                            # degeneracy (little constraint on rotation about the
+                            # cluster's own axis, so noise in any one point gets amplified
+                            # into the pose far more than well-spread points would). A
+                            # cheap proxy was considered: the 2x2 pixel-covariance of the
+                            # matched points, sqrt(smaller eigenvalue) as a "worst-
+                            # constrained-direction spread" scalar. Not built -- this would
+                            # touch confidence/scoring immediately adjacent to the PnP
+                            # solve itself, and should not be experimented on without real
+                            # data first (validate sqrt(smaller eigenvalue) against real
+                            # mocap-ground-truth pose error via compare_vision_mocap.py
+                            # before picking any threshold). In practice a strong match
+                            # (enough inliers) rarely ends up edge-clustered anyway --
+                            # this radial weighting above already discounts the specific
+                            # shape that motivated the idea (edge-only weak matches).
                             if balanced_coverage < self._c_brute_min_vis_cov:
                                 if dbg_ransac:
                                     logger.bind(cat="_gated").debug(

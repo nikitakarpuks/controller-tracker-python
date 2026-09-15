@@ -20,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from src.camera import Camera, kb4_rpmax, kb4_theta_max
+from src.camera import Camera, kb4_rpmax, kb4_theta_max, radial_taper_weight
 
 CALIB_PATH = Path(__file__).resolve().parent.parent / "data" / "cameras" / "kb4_calib.json"
 
@@ -131,6 +131,55 @@ class SelfCalibrationDedupTests(unittest.TestCase):
         exp_tan, exp_px = kb4_rpmax(cam.k1, cam.k2, cam.k3, cam.k4, cam.fx, cam.fy)
         self.assertEqual(cam.rpmax, exp_tan)
         self.assertEqual(cam.rpmax_px, exp_px)
+
+
+class RadialTaperWeightTests(unittest.TestCase):
+    """Unit coverage for radial_taper_weight (2026-09-13) -- a pure function,
+    no calibration file needed, so these run regardless of whether
+    data/cameras/kb4_calib.json is present in this environment (the other
+    test classes in this file currently can't run without it)."""
+
+    def test_full_trust_at_or_below_inner_fraction(self):
+        self.assertEqual(radial_taper_weight(0.0, 370.0), 1.0)
+        self.assertEqual(radial_taper_weight(296.0, 370.0, inner_fraction=0.8), 1.0)  # exactly 0.8*370
+
+    def test_floor_at_or_beyond_rpmax_px(self):
+        self.assertAlmostEqual(radial_taper_weight(370.0, 370.0, floor=0.3), 0.3)
+        self.assertAlmostEqual(radial_taper_weight(1000.0, 370.0, floor=0.3), 0.3)  # clamped, not extrapolated
+
+    def test_linear_between(self):
+        # inner=296 (0.8*370), rpmax=370 -> halfway (333) should be halfway between 1.0 and floor
+        w = radial_taper_weight(333.0, 370.0, inner_fraction=0.8, floor=0.3)
+        self.assertAlmostEqual(w, 1.0 - 0.5 * (1.0 - 0.3), places=3)
+
+    def test_vectorised_matches_scalar(self):
+        rs = np.array([100.0, 296.0, 333.0, 370.0, 500.0])
+        vec = radial_taper_weight(rs, 370.0, inner_fraction=0.8, floor=0.3)
+        self.assertIsInstance(vec, np.ndarray)
+        for r, expected in zip(rs, vec):
+            self.assertAlmostEqual(radial_taper_weight(float(r), 370.0, inner_fraction=0.8, floor=0.3),
+                                    float(expected), places=6)
+
+    def test_non_fisheye_camera_rpmax_px_zero_is_a_no_op(self):
+        """radtan8 cameras carry rpmax_px=0.0 (see Camera.__init__'s own
+        comment: "not meaningful for radtan8 -- no such turning point") --
+        must not spuriously discount every point to the floor."""
+        self.assertEqual(radial_taper_weight(500.0, 0.0), 1.0)
+        np.testing.assert_array_equal(
+            radial_taper_weight(np.array([100.0, 500.0]), 0.0),
+            np.array([1.0, 1.0]),
+        )
+
+    def test_degenerate_inner_fraction_one_still_finite(self):
+        """inner_fraction=1.0 collapses the taper span to ~0 -- must not
+        divide by zero, just becomes a near-step function (the exact
+        boundary point r_px==inner_r==rpmax_px is an edge case that can
+        reasonably land on either side; what matters is no NaN/inf and a
+        point clearly beyond the boundary hits the floor)."""
+        w_below = radial_taper_weight(369.9, 370.0, inner_fraction=1.0, floor=0.3)
+        w_beyond = radial_taper_weight(371.0, 370.0, inner_fraction=1.0, floor=0.3)
+        self.assertTrue(np.isfinite(w_below))
+        self.assertAlmostEqual(w_beyond, 0.3, places=3)
 
 
 if __name__ == "__main__":

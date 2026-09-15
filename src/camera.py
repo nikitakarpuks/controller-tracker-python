@@ -51,6 +51,37 @@ def kb4_rpmax(k1: float, k2: float, k3: float, k4: float,
     return rpmax_tan, rpmax_px
 
 
+def radial_taper_weight(r_px, rpmax_px: float, inner_fraction: float = 0.8, floor: float = 0.3):
+    """1.0 for r_px at/below inner_fraction*rpmax_px, linearly tapering to
+    `floor` at/beyond rpmax_px -- how much to trust a point given how close
+    it sits to this camera's own KB4 valid-range boundary.
+
+    Found 2026-09-13 investigating a real coverage_fallback case: a KB4
+    fit's own accuracy degrades approaching rpmax_px (the polynomial's
+    monotonic-range boundary, see kb4_rpmax's own docstring) -- less-
+    constrained calibration-target coverage there, and the true lens
+    distortion genuinely changing faster near the edge than a 4-term
+    polynomial can track. Confirmed on a real frame: 5 blobs at 92-98% of
+    their camera's own rpmax_px, all real detections, none matching a flat
+    2.0px reprojection threshold that was implicitly calibrated against
+    center-of-frame accuracy. This tapers trust down near that boundary
+    instead of the previous implicit "same tolerance everywhere" -- inner_
+    fraction/floor are first-cut, physically-motivated defaults, not yet
+    fit against real radius-binned residual data (unlike e.g. this
+    project's own pose_jump_pred_pos_thresh_base_mm, which was) -- revisit
+    via CONTROLLER_TRACKER_JUMP_STATS_CSV if this needs tightening later.
+
+    r_px may be a scalar or ndarray (vectorised via np.clip)."""
+    is_array = isinstance(r_px, np.ndarray)
+    if rpmax_px <= 0:
+        return np.ones_like(r_px, dtype=np.float64) if is_array else 1.0
+    inner_r = rpmax_px * inner_fraction
+    span = max(rpmax_px - inner_r, 1e-9)  # degenerate inner_fraction>=1.0 -> a razor-thin taper, not a /0
+    frac = np.clip((np.asarray(r_px, dtype=np.float64) - inner_r) / span, 0.0, 1.0)
+    weight = 1.0 - frac * (1.0 - floor)
+    return weight if is_array else float(weight)
+
+
 class Camera:
     def __init__(self, cfg, camera_idx: int = 0, extrinsics_convention: str = "T_imu_cam"):
         """Camera calibration parameters.

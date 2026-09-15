@@ -806,19 +806,23 @@ class ControllerAnimatorRerun:
     # ------------------------------------------------------------------
 
     # Fixed left-to-right order when multiple canvases are present for one
-    # camera/controller — "local" first since it's the *failed* warm-path
-    # attempt (main.py keeps it instead of discarding it when a lost-track
-    # cold re-detect follows), so the panel reads as "what proximity saw" →
-    # "what cold detection found" left to right.
+    # camera/controller — "local" first since it's the warm-path attempt,
+    # "pass1"/"pass2" being the cold path's own two-threshold sequence.
     _BLOB_DEBUG_CANVAS_ORDER = ("local", "pass1", "pass2")
 
     def _log_blob_debug(self, frame_vis: dict, skipped: dict = None) -> None:
         """Log blob detection canvases and a mode summary for the current frame.
 
         frame_vis: {ctrl_name: {cam_idx: {mode_key: canvas_bgr}}}
-        mode_key is "local", "pass1", or "pass2" — any subset/combination may be
-        present for a given camera (e.g. all three when a lost-track cold
-        re-detect ran this frame: the failed warm attempt plus both cold passes).
+        mode_key is "local", "pass1", or "pass2". A camera whose warm-path
+        ("local") attempt fails and triggers a mid-Phase-2 cold re-detect
+        shows ONLY that re-detect's own pass1/pass2 canvases, replacing (not
+        alongside) the failed "local" one -- main.py deliberately does not
+        keep both: the warm/local path never applies the static-lamp mask at
+        all (a cold-path-only feature), so it always shows a real static lamp
+        as an unfiltered "detection" regardless of whether anything is
+        actually wrong, which read as a lamp-tracking bug next to the
+        correctly-filtered cold panel when nothing of the sort happened.
 
         skipped: {ctrl_name: [cam_idx, ...]} — cameras with no detect() call
         this frame (main.py's out-of-scope skip: no prediction for this

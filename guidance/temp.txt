@@ -1398,3 +1398,28 @@ emory saved. Summary of where this stands for tomorrow:
     bearing-space mask) without picking one yet.
 
   Next session I'll pick up by asking what you found in the images.
+
+
+
+
+
+
+
+
+
+
+what to fix/check:
+1) mocap calib bridge for controllers, possibly bring all nearly static frames
+2) fix spatial outlier bug
+3) circularity for speed, blob center calculation, min_streak for circularity
+
+N-1) pnp speed with fable
+N) biases in controller configs
+N+1) Kalman filter
+N+2) clean the code
+
+walk hard 500-1000
+imu imprecision
+211
+397
+429 - fix blob detection (pass2 deegradation on high speeds)

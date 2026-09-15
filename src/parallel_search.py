@@ -35,17 +35,25 @@ from src.pose_search import PoseSearcher, BruteSearchState
 # camera tracker before create_pool().
 _BUILD_SPECS: Dict[Tuple[str, int], tuple] = {}
 
-# Same idea for blob detection: {cam_idx: (blob_detection_cfg, width, height)},
-# populated via register_blob_detector_spec() before create_pool(). width/height
-# are the per-camera image resolution — used only to size the synthetic image
-# _warmup_task detects against, so the pool-startup warmup exercises cv2 on a
-# buffer the same shape as a real frame.
+# Same idea for blob detection: {cam_idx: (blob_detection_cfg, width, height,
+# camera, pose_source)}, populated via register_blob_detector_spec() before
+# create_pool(). width/height are the per-camera image resolution — used only
+# to size the synthetic image _warmup_task detects against, so the
+# pool-startup warmup exercises cv2 on a buffer the same shape as a real
+# frame. camera/pose_source (both picklable -- camera the same object type
+# already sent to workers via _BUILD_SPECS above; pose_source a
+# MocapHeadsetPoseSource wrapping a DeviceMocap, itself just numpy arrays +
+# floats) are for src/lamp_region_memory.py's static-lamp-mask feature only --
+# None/None whenever headset mocap isn't loaded, in which case that feature
+# stays a no-op exactly as it is on the sequential (non-pooled) path.
 _BLOB_BUILD_SPECS: Dict[int, tuple] = {}
 
 # Worker-side registries, built once per worker process by _pool_initializer.
 _POSE_SEARCHERS: Dict[Tuple[str, int], PoseSearcher] = {}
 _BLOB_DETECTORS: Dict[int, "BlobDetector"] = {}
 _BLOB_SHAPES: Dict[int, Tuple[int, int]] = {}   # cam_idx -> (height, width)
+_BLOB_CAMERAS: Dict[int, "Camera"] = {}
+_BLOB_POSE_SOURCES: Dict[int, Optional["HeadsetPoseSource"]] = {}
 
 
 def register_pose_searcher_spec(key: Tuple[str, int], camera, model,
@@ -57,13 +65,15 @@ def register_pose_searcher_spec(key: Tuple[str, int], camera, model,
 
 
 def register_blob_detector_spec(cam_idx: int, blob_detection_cfg: dict,
-                                 width: int, height: int) -> None:
+                                 width: int, height: int, camera=None, pose_source=None) -> None:
     """Register the (picklable) construction args for one camera's BlobDetector.
     Call for every camera before create_pool() — each worker builds its own
     BlobDetector from these specs once, at pool startup. width/height (the
     camera's real image resolution) are carried along purely so _warmup_task
-    can size its synthetic warmup image to match — see _BLOB_BUILD_SPECS."""
-    _BLOB_BUILD_SPECS[cam_idx] = (blob_detection_cfg, width, height)
+    can size its synthetic warmup image to match. camera/pose_source: see
+    _BLOB_BUILD_SPECS's own comment -- only src/lamp_region_memory.py's
+    static-lamp-mask feature needs these, everything else ignores them."""
+    _BLOB_BUILD_SPECS[cam_idx] = (blob_detection_cfg, width, height, camera, pose_source)
 
 
 def _pool_initializer(build_specs: Dict[Tuple[str, int], tuple],
@@ -76,9 +86,11 @@ def _pool_initializer(build_specs: Dict[Tuple[str, int], tuple],
         _POSE_SEARCHERS[key] = PoseSearcher(camera, model, geometry_cfg, matching_cfg)
 
     from src.blob_detector import BlobDetector
-    for cam_idx, (blob_detection_cfg, width, height) in blob_build_specs.items():
-        _BLOB_DETECTORS[cam_idx] = BlobDetector(cam_idx, blob_detection_cfg)
-        _BLOB_SHAPES[cam_idx]    = (height, width)
+    for cam_idx, (blob_detection_cfg, width, height, camera, pose_source) in blob_build_specs.items():
+        _BLOB_DETECTORS[cam_idx]    = BlobDetector(cam_idx, blob_detection_cfg)
+        _BLOB_SHAPES[cam_idx]       = (height, width)
+        _BLOB_CAMERAS[cam_idx]      = camera
+        _BLOB_POSE_SOURCES[cam_idx] = pose_source
 
     # A spawned worker starts with fresh module globals — debug_config's
     # continuous-frames/verbose/log-category flags and loguru's sink (both
@@ -201,6 +213,9 @@ def run_blob_detect(
     img_path=None,
     frame_name: Optional[str] = None,
     memory_in: Optional[dict] = None,
+    frame_ts_ns: Optional[int] = None,
+    region_memory_in=None,
+    has_recent_memory: bool = False,
 ):
     """Top-level, picklable worker task: run BlobDetector.detect() for one camera
     against the resident (per-camera) BlobDetector.
@@ -226,11 +241,25 @@ def run_blob_detect(
     function, so two controllers' calls for the same camera in the same frame
     never race here in the first place.
 
-    Returns (BlobResult, canvases_dict, memory_out, diag). diag = (t_worker_start,
-    t_compute_start, t_compute_end) — wall-clock (time.time(), synchronized with the
-    submitting process on the same machine) timestamps for the blob_diag round-trip
-    breakdown logged by _run_blob_detect_batch_multi in main.py: submitting process
-    measures its own t_submit right before pool.submit() and t_result right after
+    region_memory_in/return value's 5th element: src/lamp_region_memory.py's
+    LampRegionMemory instance (or None), round-tripped for the EXACT same
+    reason as memory_in above -- keyed by cam_idx alone, same dedup-grouping
+    guarantee against two controllers racing on it. camera/pose_source come
+    from the worker-resident _BLOB_CAMERAS/_BLOB_POSE_SOURCES registries
+    (populated once at pool startup, not round-tripped -- they never change
+    mid-run), not from a per-call argument.
+
+    has_recent_memory: forwarded as-is to BlobDetector.detect() -- see its own
+    parameter docstring. Computed by the caller (main.py, per (controller,
+    camera) pair, from that pair's own ControllerTracker.last_good_pose) --
+    this worker has no tracking state of its own to derive it from.
+
+    Returns (BlobResult, canvases_dict, memory_out, region_memory_out, diag).
+    diag = (t_worker_start, t_compute_start, t_compute_end) — wall-clock
+    (time.time(), synchronized with the submitting process on the same
+    machine) timestamps for the blob_diag round-trip breakdown logged by
+    _run_blob_detect_batch_multi in main.py: submitting process measures its
+    own t_submit right before pool.submit() and t_result right after
     fut.result(), so (t_worker_start - t_submit) is dispatch latency (submit-side
     pickle + IPC + worker unpickle + scheduling), (t_compute_end - t_compute_start)
     is BlobDetector.detect()'s own cost, and the remainder is return-trip transit.
@@ -239,6 +268,7 @@ def run_blob_detect(
     t_worker_start = _time.time()
     bd = _BLOB_DETECTORS[cam_idx]
     bd._memory = memory_in if memory_in is not None else {}
+    bd._lamp_region_memory = region_memory_in
     t_compute_start = _time.time()
     result, canvases = bd.detect(
         image,
@@ -250,6 +280,11 @@ def run_blob_detect(
         visualize=visualize,
         img_path=img_path,
         frame_name=frame_name,
+        camera=_BLOB_CAMERAS.get(cam_idx),
+        pose_source=_BLOB_POSE_SOURCES.get(cam_idx),
+        frame_ts_ns=frame_ts_ns,
+        has_recent_memory=has_recent_memory,
     )
     t_compute_end = _time.time()
-    return result, canvases, bd._memory, (t_worker_start, t_compute_start, t_compute_end)
+    return (result, canvases, bd._memory, bd._lamp_region_memory,
+            (t_worker_start, t_compute_start, t_compute_end))

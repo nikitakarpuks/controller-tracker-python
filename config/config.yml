@@ -1,5 +1,6 @@
 data:
-  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826175510_walk_medium/mav0"
+#  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826175510_walk_medium/mav0"
+  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826180039_walk_hard/mav0"
   layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
                            # side-by-side into a single wide image per frame (uses
                            # img_width/total_cameras_number below to slice per camera).
@@ -24,14 +25,14 @@ data:
                       # in the camera folder
   img_width: 2560
   img_height: 481
-  has_technical_row: true  # first pixel row encodes exposure/gain; set false if the row is absent
+  has_technical_row: false  # first pixel row encodes exposure/gain; set false if the row is absent
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 3850  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 690  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 3950  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 750  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -188,12 +189,203 @@ fusion_heuristic:
   # alone still gave it vision share=0.40, corrupting the fused anchor by
   # ~40% of a full 1m jump in one frame, which every subsequent IMU-only-
   # propagated frame then correctly coasted from (looked like "many frames
-  # of nonsense" but was really one bad frame poisoning the anchor). 0.3m
-  # is well above any normal per-frame innovation seen in this recording's
-  # own real motion (typically <70mm even during fast hand motion -- see
-  # FUSED debug lines); 60deg similarly well above normal rotation innovation.
-  implausible_jump_pos_m: 0.3
-  implausible_jump_rot_deg: 60.0
+  # of nonsense" but was really one bad frame poisoning the anchor).
+  #
+  # SPEED-SCALED 2026-09-13 (was a flat implausible_jump_pos_m=0.3/
+  # implausible_jump_rot_deg=60.0 -- "first-cut defaults, not yet validated"
+  # per this key's own prior comment) -- user pointed out this duplicates
+  # vs-predicted_pose's own already-validated, empirically-fit speed-scaled
+  # formula (matching.pose_jump_pred_pos_thresh_base_mm/_per_speed_mm_s and
+  # _rot_thresh_base_deg/_per_speed_deg_s in the matching: section above),
+  # just applied one layer later (to the JOINT-FUSED candidate vs this
+  # filter's own p_pred, rather than per-camera). Ported that formula's
+  # SHAPE here (base + per_speed * |self.v|) rather than duplicating its
+  # exact per-axis numbers outright: that fit was derived from per-camera
+  # PIXEL-space residuals, which don't obviously transfer to this world-
+  # frame FUSED-pose's own residual distribution -- kept scalar (not
+  # per-axis) until/unless a real fit against fused-pose data justifies
+  # otherwise. Position base/per-speed reuse pose_jump_pred_pos_thresh_
+  # base_mm/_per_speed_mm_s directly (61.5mm / 33.0mm per m/s); rotation
+  # base/per-speed are the mean of that per-axis fit's three components
+  # (rx/ry/rz base [8.4,12.1,4.5]deg -> 8.3deg; per-speed [0.55,1.37,0.65]
+  # deg/(m/s) -> 0.86deg/(m/s)) -- a first-cut port, not independently
+  # re-validated against real fused-pose residual data, same epistemic
+  # status the old flat 0.3m/60deg carried.
+  #
+  # Speed input is |self.v|, this filter's OWN measured velocity --
+  # POSITION's gate already requires velocity_established before it runs at
+  # all (see try_update's own _pos_implausible), so self.v is always real
+  # once reached. ROTATION's hard-gate has no such precondition (gyro
+  # integration is valid from frame one -- see try_update's own comment) --
+  # to avoid REMOVING that existing coverage, rotation's threshold falls
+  # back to base-only (no speed term) whenever velocity_established is
+  # False, applying the speed-scaled extra only once a real self.v exists.
+  # RE-DERIVED 2026-09-13 (from the ~8.3/61.5-first-cut-port values above,
+  # same audit as matching.max_plausible_hand_speed_m_s's own comment)
+  # against the same real, quality-filtered, two-recording
+  # CONTROLLER_TRACKER_JUMP_STATS_CSV data (8285 rows after filtering) --
+  # quantile regression (99.9th-percentile envelope, pinball-loss
+  # minimization) of pos_diff_prev_mm / rot_diff_prev_deg against
+  # speed_est_m_s, base+rate shape unchanged. Position's base came out
+  # ~0mm (verified separately: at low speed, the rate term alone already
+  # covers 99.9%+ of the real position-noise distribution with no flat
+  # floor needed) -- a real finding, not a fit artifact. Rotation's base/
+  # rate grew substantially (8.3->21.3, 0.86->6.54) -- the old per-axis-
+  # pixel-space port badly underestimated this world-frame residual's real
+  # spread once genuinely fast (walk_hard-scale) motion was included in the
+  # fit; this is the SAME finding that motivated the accel/gyro-aware terms
+  # below (see _peak_gyro_accel's own docstring in pose_fusion_heuristic.py
+  # for the real rejected-good-vision case that started this investigation).
+  implausible_jump_pos_thresh_base_mm: 0.0
+  implausible_jump_pos_thresh_per_speed_mm_s: 22.4
+  implausible_jump_rot_thresh_base_deg: 21.3
+  implausible_jump_rot_thresh_per_speed_deg_s: 6.54
+
+  # Accel/gyro-aware widening (2026-09-13, new) -- see
+  # HeuristicPoseFusionFilter._peak_gyro_accel/_implausible_jump_thresholds'
+  # own docstrings for the mechanism (additive on top of the two terms
+  # above, using peak real |accel|/|gyro| over this call's own window
+  # instead of self.v -- self.v can be a noisy/short-baseline estimate,
+  # peak accel/gyro is a direct measurement). *_calm_floor values are the
+  # SAME fixed floors used when fitting the two *_per_*_dps/_mps2 rates
+  # below (not independently re-derived -- roughly walk_medium's own real
+  # p90 dynamic range) -- changing a floor without refitting its paired
+  # rate would silently change how much extra budget ordinary motion gets.
+  # pos_thresh_per_accel came out ~0 from the same fit (through-origin
+  # quantile regression against the position-model's own residual) --
+  # over these short (~11-22ms) inter-frame windows, position change is
+  # velocity-dominated (Δp ≈ v·dt to first order); the per_speed term above
+  # already explains it, leaving acceleration no independent residual to
+  # explain. Left wired (not removed) at 0.0 in case future data across a
+  # wider speed/accel range finds a real independent contribution.
+  # rot_thresh_per_gyro DID find real independent signal (0.0046) --
+  # rotation's own per_speed term is a self.v (LINEAR speed) proxy for
+  # angular motion, whereas peak_gyro_dps is a direct angular-rate
+  # measurement, so it explains residual variance self.v alone cannot.
+  implausible_jump_accel_calm_floor_mps2: 40.0
+  implausible_jump_gyro_calm_floor_dps: 900.0
+  implausible_jump_pos_thresh_per_accel_mm_per_mps2: 0.0
+  implausible_jump_rot_thresh_per_gyro_deg_per_dps: 0.0046
+
+  # How many consecutive non-coverage_fallback accepts the rotation hard-gate
+  # (and its Case-A pushback / velocity-establishment counterparts) stays
+  # exempted for after a coverage-fallback seed (bootstrap/fail_open/
+  # _try_cold_reacquire), not just the ONE immediately following it. 1 = the
+  # old, narrower behavior (exempt only the very next accept). Found
+  # insufficient on a real case (2026-09-13): a cold_reacquired
+  # (coverage_fallback) frame was correctly exempted, but the VERY NEXT
+  # frame's own resulting rotation -- itself never checked by the gate,
+  # since gate was off for it too -- was immediately promoted to a trusted
+  # gate REFERENCE, and the frame after THAT got hard-rejected
+  # (rot_innov=61deg) purely from one un-vetted, reacquisition-fresh frame's
+  # worth of gyro integration during genuinely fast/jerky real rotation
+  # (vision was confirmed correct via mocap the whole time). 2 gives that
+  # frame one full real accept to settle before it's trusted as a reference.
+  rotation_seed_grace_frames: 2
+
+  # _try_cold_reacquire's weak-candidate buffer (see its own docstring): a
+  # buffered weak cold-reacquire candidate older than this is dropped as
+  # stale rather than compared against a later, unrelated candidate. Set
+  # comfortably above this recording's normal frame cadence (~11-22ms) so a
+  # single normal gap between the buffered frame and its would-be confirming
+  # next frame never expires it, but well below max_coast_s (1.0s) -- this is
+  # meant to bound "how long can one weak guess wait for corroboration," not
+  # to act as its own separate loss-declaration timer.
+  cold_confirm_max_gap_s: 0.25
+
+  # The weak-pair AGREE/DISAGREE check itself (how much the two buffered
+  # candidates are allowed to plausibly differ by, given confirm_dt_s real
+  # elapsed time between them) -- was a flat implausible_jump_pos_m/_rot_deg
+  # (+ an ungrounded one-off cold_confirm_max_speed_m_s=5.0, position-only).
+  # As of 2026-09-13 (user-directed) this is the SAME "how far could a human
+  # hand plausibly have moved in this much real time" formula as
+  # matching.pose_jump_pos_thresh_base_m/_rot_thresh_base_deg +
+  # max_plausible_hand_speed_m_s/_ang_speed_deg_s (controller.py's checks 1
+  # vs prev_pose / 3 vs last_good_pose) -- this class can't reach the
+  # matching: config block directly (self._hc only sees fusion_heuristic:,
+  # see __init__'s own comment), so these are a deliberate DUPLICATE of the
+  # same values, not a cross-section read -- keep in sync if those change.
+  # One shared formula covers both _try_cold_reacquire's subcases
+  # (bootstrap and a genuine post-loss reacquisition): now that checks 1
+  # and 3 already use this identical shape themselves, there's nothing left
+  # to differentiate between "what a fresh bootstrap pair should agree
+  # within" and "what a reacquisition pair should agree within."
+  #
+  # Position/rotation base now an EXACT match to matching.pose_jump_pos_
+  # thresh_base_m/_rot_thresh_base_deg (2026-09-13, same-day follow-up):
+  # those became scalar Euclidean/total-angle values themselves (see that
+  # key's own config comment for why), and this check was ALREADY scalar
+  # from day one (its own dpos_m/drot_deg is a plain magnitude comparison,
+  # never per-axis) -- so no conversion or approximation is needed here,
+  # just keeping the duplicated numbers in sync.
+  weak_confirm_pos_thresh_base_m: 0.21
+  weak_confirm_rot_thresh_base_deg: 27.0
+  weak_confirm_max_speed_m_s: 3.0
+  weak_confirm_max_ang_speed_deg_s: 2000.0
+
+  # _try_cold_reacquire's weak-candidate buffer: while a candidate is
+  # buffered (not yet accepted), whether to still report() the coasted IMU
+  # prediction predict() already computed for this frame (so the displayed/
+  # logged/CSV'd pose keeps updating instead of freezing at its pre-loss
+  # value) depends on how long the controller has actually been lost, not
+  # just on the fact that it's buffering right now -- reported only if dt_s
+  # (elapsed time since the LAST REAL ANCHOR, i.e. before this whole loss
+  # started) is still within this budget; past it, the dead-reckoned
+  # estimate is no longer credible even just to display, so the frame is
+  # left frozen instead (same "short lost track, IMU still usable" vs. "long
+  # loss, not usable" distinction matching.imu_only_propagation_max_s already
+  # draws for a different mechanism -- see ControllerTracker._mark_all_lost).
+  # 0.25s sized against a real case: the recording's own "64->65" event had
+  # dt_s ~= 0.166s at exactly this point -- a tighter value (e.g. 0.15s,
+  # matching gap_dt_full_s below) would have just missed reporting on it.
+  cold_pending_report_max_gap_s: 0.25
+
+  # HeuristicPoseFusionFilter._effective_coast_budget_s -- shrinks
+  # cold_pending_report_max_gap_s (above) by how violent real measured
+  # gyro/accel was over the coast window, never widens it. Added 2026-09-14
+  # (user-directed, "prove it with stats"): a real case (right_controller,
+  # walk_hard) showed the flat 0.25s budget letting a freshly recomputed
+  # IMU-only coast display over a meter from vision -- the elapsed time
+  # alone looked safe, but the real motion during it wasn't. Fit from real
+  # (dt_s, peak_gyro, peak_accel) vs. actual next-real-correction error
+  # across both available recordings (walk_hard + walk_medium,
+  # n_inliers>=6/error_px<=0.5 quality filter, same standard as every other
+  # empirical fit in this project): binned 95th-percentile position/rotation
+  # error RATE (m/s, deg/s) regressed against peak accel/gyro, then inverted
+  # against a defensible "still credible to display" bound (10cm position --
+  # roughly this controller's own physical size -- or 30deg rotation,
+  # whichever crosses first) to get how much real elapsed time before that
+  # bound is reached at a given peak accel/gyro. The calm floors came out at
+  # 0 -- the fitted BASELINE rate (near-zero accel/gyro) already implies a
+  # bound-crossing time of ~0.246s, i.e. almost exactly this budget's own
+  # 0.25s, so shrinking starts immediately above zero rather than at some
+  # higher "calm" plateau (unlike the accept-gate's own accel/gyro terms,
+  # which use much higher calm floors for a different question -- accepting
+  # a disagreeing vision correction vs. trusting a display with nothing to
+  # correct it).
+  #
+  # coast_trust_min_budget_s: originally set to the user's own initially-
+  # suggested "~11ms" floor (2026-09-14). REVISED same day after a real case
+  # (left_controller, walk_hard, frame 57 -- a single ordinary TRACKING-LOST
+  # frame, not an extreme loss): peak_gyro_dps=1564.6 alone (fast but
+  # ordinary hand rotation, nowhere near the ~3000dps+ that originally
+  # motivated this fit) already shrank the budget by 0.095s -- more than
+  # enough to fully wipe a 0.066s base and floor at the old 0.011s, which is
+  # LESS than this single frame's own real elapsed gap (0.0222s). Result: no
+  # IMU-only pose shown/propagated through even one perfectly ordinary lost
+  # frame -- too harsh, caught by the user asking "or we got a 22ms frame
+  # there?". This recording's own single-frame gaps alternate ~11.1ms/22.2ms
+  # (see matching.imu_only_propagation_max_s's own "4*16.5ms" comment) --
+  # 0.025s (a touch above the larger 22.2ms alternate, for timestamp jitter
+  # margin) guarantees at least one ordinary lost frame's worth of coast
+  # survives regardless of alternation phase, while still shrinking the
+  # 0.066s/0.25s base budgets by more than half for genuinely violent
+  # multi-frame losses.
+  coast_trust_accel_calm_floor_mps2: 0.0
+  coast_trust_gyro_calm_floor_dps: 0.0
+  coast_trust_shrink_s_per_mps2: 0.001145
+  coast_trust_shrink_s_per_dps: 0.000058
+  coast_trust_min_budget_s: 0.025
 
   # Long-gap damping (see HeuristicPoseFusionFilter._gap_vision_scale) -- scales
   # w_vision down as the elapsed gap since the last accepted update (dt_s)
@@ -502,7 +694,42 @@ blob_detection:
   max_area: 500
   min_split_dist: 4.0
   split_valley_ratio: 0.6           # saddle_min/lower_peak must be below this to allow splitting
-  min_circularity: 0.5              # 4π·area/perimeter² must exceed this; rejects elongated shapes
+  min_circularity: 0.4              # 4π·area/perimeter² must exceed this; rejects elongated shapes
+  # Motion-blur "tail" rescue: a circularity-failed blob is kept anyway if its
+  # own minAreaRect shape (long/short side ratio + fill of that rect) matches
+  # a genuine LED streak instead of some other non-circular artifact. When the
+  # lamp-fixture line-finder is in scope (see lamp_blob_filter below), a
+  # streak-shaped blob is additionally required to NOT have been swept into a
+  # line detect_lamp_blobs actually recognized+removed -- on this project's
+  # own recordings, some individual (non-merged) lamp elements are themselves
+  # naturally elongated ovals, indistinguishable from a real streak by shape
+  # alone; see _looks_like_motion_streak's own callers in src/blob_detector.py
+  # for the full mechanism.
+  #
+  # Values derived 2026-09-12 from real cold-detect circularity-reject logging
+  # (probe_streak_elongation.py, not committed) over frames 3890-3894 cam0+1
+  # (confirmed fast-motion LED tails, visually verified genuine on every
+  # sampled blob): elongation 2.11-4.43, fill_ratio 0.343-0.666 across 41
+  # real streaks. Cross-checked against cam3 frames 600-700's known lamp
+  # fixture population (both the multi-bead chain and the merged-row blob,
+  # tests/test_lamp_pass2_merged_blob_context.py's own real-recording
+  # reference): the line-context check above correctly excludes both those
+  # classes at these thresholds. Residual accepted risk: a handful of tiny
+  # (<10px) blobs from a THIRD, more widely-spaced real ceiling structure on
+  # cam3 still get rescued, since its own point spacing exceeds
+  # lamp_blob_filter.spacing_max_px (25px at the time this was accepted,
+  # since raised to 32px 2026-09-13 -- itself a deliberately-tuned, jointly
+  # re-validated-with-min_points safety bound against controller-ring
+  # geometry, not to be casually widened further -- see spacing_max_px's own
+  # comment) so detect_lamp_blobs never recognizes it as a line at all; not
+  # observed on cam0/cam1. Re-check this residual-risk call if that third
+  # structure's own spacing turns out to fall inside the new 32px bound.
+  # Accepted 2026-09-12: isolated spurious blobs like these are exactly what
+  # brute-force matching's own geometric consistency check is the backstop
+  # for (see lamp_blob_filter.py's module docstring).
+  min_streak_elongation: 2.0
+  max_streak_elongation: 4.5
+  min_streak_fill_ratio: 0.30
   min_circularity_angle_factor: 0.2
   min_circularity_floor: 0.1
   required_threshold_factor: 2.0   # required_threshold = clip(pixel_threshold * factor, 255)
@@ -611,7 +838,25 @@ blob_detection:
     # real safety margin here -- several pixels of headroom against every
     # controller pose tested, not a fraction of a pixel like the old design.
     area_min: 0.4
-    area_max: 50.0   # RAISED AGAIN 2026-09-11 from 25.0 -- 25.0 (set 2026-09-10, see the case below)
+    area_max: 70.0   # RAISED A THIRD TIME 2026-09-13 from 50.0 -- a real, individually-valid lamp
+                     # element (cam3, right, frame_range 5350-5400 relative frame 3, region
+                     # ~[500,350,635,400]) merged/widened to contourArea=52.0 at this recording's own
+                     # pass-1 threshold, just 2px^2 over the previous 50.0 ceiling -- otherwise a
+                     # perfectly ordinary row member (10.8px from its nearest real neighbor, well
+                     # inside spacing_max_px), silently excluded from area_ok and left permanently
+                     # unremovable (a KEPT, blob_detection-legitimate candidate excluded ONLY by this
+                     # filter's own inner area check, not blob_detection's own much larger max_area=500
+                     # -- so it never reaches the too-large-blob split-peak context path either).
+                     # 70.0 gives ~35% margin over the observed 52.0, matching this fix's own established
+                     # margin philosophy (~28% then ~39%, now ~35%). Confirmed via a direct A/B
+                     # comparison on this recording: fixes exactly this one case (17->16 leaked
+                     # candidates over the region/frame range above), no effect on any other frame.
+                     # Same non-safety-relevant reasoning as both prior increases below: area was never
+                     # part of the 100k-pose controller-ring simulation (only 2D projected-position
+                     # spacing/count/residual were), so widening this again cannot newly let a
+                     # controller-ring pose satisfy it.
+                     #
+                     # RAISED AGAIN 2026-09-11 from 25.0 -- 25.0 (set 2026-09-10, see the case below)
                      # turned out to be a second instance of the SAME underestimate, not a one-off:
                      # confirmed on a real 5-frame sequence (frame_range 1785-1790, cam1 right,
                      # bbox ~[510,90,635,160]) across FOUR separate frames, all the same fixture --
@@ -635,12 +880,33 @@ blob_detection:
                      # frame 1) had 8 points area 7-10px^2 (correctly caught) and 6 points area
                      # 13.5-19.5px^2 (silently excluded) -- same mechanism, smaller numbers.
     spacing_min_px: 4.0    # tighter than this = a real controller ring's tightly-bunched silhouette edge
-    spacing_max_px: 25.0   # covers this project's own confirmed real physical fixture gaps (Euclidean,
-                            # not just horizontal -- measured up to ~20.6px on cam3's own frame 0),
-                            # with margin. Re-verified safe: even at this wider bound, no controller
-                            # pose in the simulation above ever reached n=8 with lamp-like spacing, and
-                            # n=7 still needs residual >= 14.7px (vs. this file's max_line_residual_px below)
-    min_points: 6          # RAISED 2026-09-11 from 6 -- min_points=6 was re-validated back then only
+    spacing_max_px: 32.0   # RAISED 2026-09-13 from 25.0 -- cam3's own upper lamp row (frame_range
+                            # 5350-5400 relative frames 1-3) has a genuine ~30px physical gap (verified
+                            # by direct pixel inspection: pure background noise in between, no hidden
+                            # signal at any threshold), just past the old 25.0 ceiling, permanently
+                            # leaking that row's leftmost real element. 32.0 gives ~2px margin over the
+                            # observed 30.5px. Paired with min_points raised 5->6 below in the SAME
+                            # change -- re-validated together via this project's own random-pose
+                            # methodology (30,000 real-LED-ring trials, probe_spacing_max_px_safety.py,
+                            # throwaway/not committed): min_points=6 + spacing_max_px=32 measures
+                            # 2.61% false-positive rate, LOWER than the 14.86% the actually-shipped
+                            # min_points=5 + spacing_max_px=25 combination measured in the same run --
+                            # i.e. this change is a net safety IMPROVEMENT despite widening spacing,
+                            # because min_points=6 dominates. Never raise spacing_max_px again without
+                            # re-running this same real-LED-ring simulation (not just the edge-on-only
+                            # ControllerRingSafetyTests sweep) at whatever min_points is shipped at the
+                            # time -- the two parameters interact, isolated reasoning about either one
+                            # alone is not sufficient (see min_points=5's own history below: it was
+                            # NEVER re-validated against this simulation at all, only against min_points
+                            # itself changing spacing_max_px=25 fixed).
+    min_points: 6           # RAISED 2026-09-13 from 5 (paired with spacing_max_px above) -- see that
+                            # key's own comment for the joint re-validation. The 2026-09-11 rationale for
+                            # 5 below is now superseded (this project's own real random-LED-ring
+                            # simulation, not just the theoretical edge-on sweep, showed 5 carried a
+                            # 14.86% false-positive rate, far higher than anyone had actually measured
+                            # before shipping it) -- kept for history.
+                            #
+                            # SUPERSEDED 2026-09-11 rationale for min_points=5 (RAISED then from 6):
                             # against RANDOM SCATTER points (500 trials of 80 random points each, zero
                             # false positives), never against the real controller-LED-ring geometry
                             # itself projected through many poses -- a materially weaker test, since a
@@ -755,6 +1021,376 @@ blob_detection:
                                  # but not deep enough) -- pass 2 then re-discovered it, un-filtered.
                                  # 22.0 = interior_edge_margin_px(10) + 12px margin.
 
+    static_lamp_mask:              # src/lamp_region_memory.py -- once a lamp fixture is recognized
+                                    # (still via detect_lamp_blobs above, unchanged), remembers its 2D
+                                    # bounding box as a 3D RECTANGLE at ceiling_height_m and hard-masks
+                                    # it out of every future frame via mocap reprojection. Deliberately
+                                    # rough/coarse on purpose -- REPLACES an earlier point-level anchor
+                                    # system (src/lamp_anchor_memory.py, removed 2026-09-13) that
+                                    # reprojected individual points into this SAME dim-context pool,
+                                    # hoping detect_lamp_blobs' own line-finder (spacing/residual/
+                                    # min_points) re-recognized the row every frame -- that required a
+                                    # long chain of fragile point-level fixes (merge-radius blur,
+                                    # anchor/real-point spacing collisions) and still wasn't fully
+                                    # reliable. This hard mask bypasses the line-finder entirely for
+                                    # persistence, at the cost of precision the user explicitly said is
+                                    # fine to give up ("rough estimate... I trust it"). No-op unless
+                                    # main.py's caller also supplies a camera/pose_source/frame_ts_ns
+                                    # (requires mocap.enabled). EXCLUSION (region_exclude_blobs, actually
+                                    # rejecting a candidate) is still cold-path-only, by design, and
+                                    # always will be -- see warm_lamp_refresh_interval_s below for why.
+                                    # TRACKING (update()/sustain_and_expire(), keeping a region's own
+                                    # hits/bounds fresh) used to ALSO be cold-only, purely for cost
+                                    # reasons -- CHANGED 2026-09-14 (user-proposed design): a region's
+                                    # lifecycle could freeze mid-stream for an arbitrarily long
+                                    # warm-tracked stretch, so whenever a controller eventually DID lose
+                                    # track and fall back to cold re-detection, whatever region state
+                                    # existed however long ago the last cold frame happened is what got
+                                    # used -- confirmed as a real contributing cause of a reported bug (a
+                                    # region sitting at hits=2, below min_hits_to_exclude, at exactly the
+                                    # moment a lost-track cold re-detection needed it most). See
+                                    # BlobDetector._run_warm_lamp_shadow_pass's own docstring in
+                                    # src/blob_detector.py for the full design and its accepted tradeoffs.
+                                    # Properly supported under matching.parallel_blob_detection_enabled:
+                                    # true as of 2026-09-13 (camera/pose_source registered with the worker
+                                    # pool, LampRegionMemory round-tripped like _memory).
+                                    #
+                                    # LIFECYCLE REWRITTEN 2026-09-13: a region is now a LIVE,
+                                    # continuously re-measured thing, not a permanent memory. Once
+                                    # created (detect_lamp_blobs' own strict recognition, unchanged),
+                                    # every lamp-region-active frame checks each held region against
+                                    # THAT frame's own raw candidate pool (see sustain_min_points) and
+                                    # either refits it tightly to just the currently-supporting points,
+                                    # or counts one frame of "no support" toward
+                                    # expire_after_no_support_frames, after which it is deleted outright
+                                    # -- see src/lamp_region_memory.py's own module docstring for the
+                                    # full reasoning (an earlier freeze_after_hits/regrowth_confirmations
+                                    # design, both now REMOVED, tried to manage a permanent accumulated
+                                    # union instead; a real bad-freeze case, cam2 right [0,330,230,360],
+                                    # showed that a box established from a near-static/low-parallax
+                                    # initial view could just be wrong and never self-correct).
+      enabled: true                # opt-in, matches this project's convention for new features
+      warm_lamp_refresh_interval_s: 0.15   # NEW 2026-09-14: minimum spacing, in the RECORDING's own
+                                     # clock (frame_ts_ns, not wall-clock -- this pipeline processes
+                                     # prerecorded sequences offline, often far from real-time), between
+                                     # BlobDetector._run_warm_lamp_shadow_pass's full-frame pass1-only
+                                     # "shadow" detections during a warm-tracked stretch. Lamps are
+                                     # static -- they don't need per-frame freshness, only "not too stale
+                                     # by the time a cold fallback needs them" -- so a modest real-time
+                                     # cadence gets most of the benefit of always-on tracking at a
+                                     # fraction of its cost. Deliberately NOT per-frame: a real full
+                                     # detection pass (threshold + connected components + circularity)
+                                     # every single frame, on top of the already-cheap warm/local per-LED
+                                     # search, is a real, measurable CPU cost on the most common
+                                     # (warm-tracked) frame this whole mechanism was originally exempted
+                                     # from for exactly that reason -- benchmark before lowering this much
+                                     # further. This ONLY feeds region tracking (update()/
+                                     # sustain_and_expire()) -- it never gates the warm/local path's own
+                                     # LED matching, which stays completely lamp-unaware by design: LEDs
+                                     # sit in a ring around the controller body, so a lamp visible behind
+                                     # the controller is the common case the controller's own body
+                                     # already occludes; a real LED and a real lamp element being
+                                     # simultaneously visible AND close enough to be confused is rare
+                                     # enough that gating the hot per-LED search on an (imperfectly-tight)
+                                     # mask would trade a rare true positive for a routine false negative.
+      recent_memory_max_s: 0.05     # NEW 2026-09-15 (user-proposed design: skip lamp EXCLUSION -- never
+                                     # tracking -- on a cold re-detect if the controller has a recent,
+                                     # strong last_good_pose, since ControllerTracker's own
+                                     # vs-last_good_pose jump-gate already independently corroborates that
+                                     # kind of candidate). Read by main.py's own _has_recent_memory
+                                     # helper, NOT by anything in this file's own blob-detection code.
+                                     # Deliberately tight, fixed after a 3-agent critique found the first
+                                     # version (checked ONLY "is last_good_pose set at all," no recency
+                                     # requirement) unsafe: last_good_pose is retained indefinitely across
+                                     # loss events by design, while the jump-gate it leans on
+                                     # (matching.max_plausible_hand_speed_m_s/_ang_speed_deg_s-based
+                                     # widening, src/controller.py) has NO cap and, at this project's own
+                                     # REAL shipped matching.* values, reaches its rotation ceiling (180
+                                     # degrees -- a total no-op) after roughly 70ms of staleness. 0.05s
+                                     # sits comfortably under that so the corroborating check still has
+                                     # real discriminative power whenever this returns true. See
+                                     # _has_recent_memory's own (long) docstring in main.py for the full
+                                     # story, including a second, independent fix (also requiring
+                                     # last_good_pose_quality to already be strong, closing a separate
+                                     # _quality_rescue outright-bypass gap) and a known, deliberately
+                                     # accepted residual risk this does NOT fully close.
+      ceiling_height_m: 3.15        # unchanged from the removed point-anchor system's own calibration
+                                     # (probe_lamp_anchor_height.py, cam3 frames 0-13 of this recording)
+                                     # -- room frame is Y-up (MOCAP_ROOM_G_WORLD, src/imu_data.py), NOT
+                                     # Z; a region's 4 corners sit on the plane Y=ceiling_height_m.
+      bbox_pad_m: 0.2                # REPLACED 2026-09-13 (was bbox_pad_px, a PIXEL padding applied
+                                     # before ray-casting) -- padding is now applied AFTER ray-casting,
+                                     # directly in room-frame meters. Real bug found on live usage
+                                     # (cam2, right): the same fixed pixel padding translated to wildly
+                                     # different REAL margins ("some lamps get ok offsets, some get very
+                                     # wide ones") because this camera's pixel-to-ceiling-plane
+                                     # projection is highly anisotropic -- a near-grazing ray amplifies a
+                                     # few pixels into a huge real distance, a near-vertical ray barely
+                                     # amplifies it at all. A fixed metric padding guarantees every lamp
+                                     # gets the same real-world margin regardless of viewing angle.
+      max_region_size_m: 3.0        # NEW 2026-09-13, RAISED from 1.5 same day -- a single region's own
+                                     # XZ extent may never exceed this: used both at CREATION (update()
+                                     # rejects a large/noisy structure -- a wall reflection or other
+                                     # big-area spurious blob that happened to satisfy detect_lamp_blobs'
+                                     # own spacing/residual checks -- outright) and at every per-frame
+                                     # REFIT (sustain_and_expire() distrusts an implausibly-large fresh
+                                     # measurement rather than applying it -- see that method's own
+                                     # comment). 1.5 (derived from a single ~0.8m row on cam3, see
+                                     # project_lamp_row_leak_frames1_13 memory) turned out FAR too tight
+                                     # once tested on a different camera/fixture: real single-recognition
+                                     # footprints on cam2 (right) routinely reached ~1.4m on their own,
+                                     # meaning almost every merge attempt between clearly-the-same-fixture
+                                     # regions got rejected by this cap, permanently fragmenting one real
+                                     # fixture into several near-duplicate, never-consolidating boxes
+                                     # (the ~0.9 IoU duplicates the user kept seeing). 3.0 gives real
+                                     # headroom while size_cap_bypass_iou below is the actual fix for
+                                     # that fragmentation (this cap now only matters for LOW-confidence,
+                                     # center-distance-only merges). No separate "absolute, never-
+                                     # bypassed" ceiling anymore (an earlier `absolute_max_region_size_m`
+                                     # existed only to bound a CHAIN of ever-growing merges under a
+                                     # permanent-union/freeze model that no longer exists -- see
+                                     # src/lamp_region_memory.py's own module docstring).
+      size_cap_bypass_iou: 0.5      # NEW 2026-09-13: a merge triggered by IoU at or above this value is
+                                     # exempt from max_region_size_m -- two regions overlapping this much
+                                     # are unambiguously the same physical object no matter how "big" it
+                                     # is. This is the actual fix for the "0.9 IoU duplicates never merge"
+                                     # bug found on live usage (cam2, right) -- lower-confidence merges
+                                     # (below this IoU, or triggered only by merge_center_distance_m)
+                                     # still respect max_region_size_m as a sanity check.
+                                     # Safe again as of recent_quad_window below (2026-09-14): this bypass
+                                     # used to be able to push a region PERMANENTLY past max_region_size_m
+                                     # (confirmed on real data: a 4.97m x 4.63m runaway) since nothing
+                                     # ever shrank it back. Now bounded by the same trailing window every
+                                     # other growth path is, so a bypassed merge can only inflate a region
+                                     # temporarily -- it self-corrects over the next recent_quad_window
+                                     # sustained frames as older quads age out.
+      recent_quad_window: 20        # NEW 2026-09-14 (independent code review + real ground-truth
+                                     # evaluation, seq1/walk_hard): quad_room is now recomputed from only
+                                     # the last N per-observation quads (creation's own quad, or each
+                                     # sustained frame's own fresh_quad -- see LampRegion.recent_quads),
+                                     # not an ever-growing all-time union. Root problem this fixes: the
+                                     # old all-time union had NO way back down -- sustain_and_expire's own
+                                     # size check only ever blocked FURTHER growth once a region got too
+                                     # big, it never shrank anything, so a single bypassed merge (see
+                                     # size_cap_bypass_iou above) could inflate a region permanently.
+                                     # Confirmed on real data: a region with hits=80 had grown to 4.97m x
+                                     # 4.63m (~23 square meters) -- physically absurd, and the direct
+                                     # cause of two real complaints: (1) a room-space box that size
+                                     # reprojects through this camera's wide-FOV fisheye lens with its 4
+                                     # corners at wildly different viewing angles, which straight
+                                     # pixel-space edges render as a grotesquely skewed/twisted shape (NOT
+                                     # a kb4 math bug -- a symptom of the box itself being absurd), and (2)
+                                     # the extra area masked far more background/noise as "lamp" than the
+                                     # real fixture ever covered. 20 is a middle ground: small enough that
+                                     # a stale oversized quad actually ages out within a real recording's
+                                     # own timescale (re-validated against ground truth after this
+                                     # change), large enough to still tolerate several consecutive
+                                     # partial-visibility frames without prematurely shrinking a
+                                     # still-real fixture (the exact regression "union, not replace" was
+                                     # originally fixed for -- see sustain_and_expire's own docstring).
+      min_hits_to_exclude: 3         # NEW 2026-09-13: a region only actually excludes anything (see
+                                     # reprojected_contours()) once recognized/sustained this many times
+                                     # -- update()/sustaining still happens from hits=1, but a region
+                                     # doesn't get to mask anything out until reinforced. Found on live
+                                     # usage: a one-off line-finder false positive (e.g. off a wall
+                                     # reflection) would otherwise immediately become a permanent hard
+                                     # mask; a real static lamp gets re-recognized/sustained across many
+                                     # consecutive frames essentially for free, so this costs it nothing.
+                                     # FIXED 2026-09-14 (independent code review, 3-agent critique):
+                                     # this shipped as 1 -- and LampRegion.hits starts at 1 -- so the
+                                     # documented protection above was a complete no-op in production
+                                     # (every region excluded on its own first frame, with ZERO
+                                     # reinforcement). tests/test_lamp_region_memory.py already asserted
+                                     # 3 is required to block exclusion at hits=1, and
+                                     # LampRegionMemory.__init__'s own code default was already 3 --
+                                     # only this config value had silently drifted. Now guarded by
+                                     # tests/test_lamp_mask_config_sanity.py, which reads THIS file
+                                     # directly (a constructor-level assertion was tried first but
+                                     # reverted -- it also blocked 27 unrelated unit tests that
+                                     # deliberately construct LampRegionMemory with min_hits_to_exclude=1
+                                     # as a documented convenience).
+      sustain_min_points: 3           # NEW 2026-09-13 (lifecycle rewrite), RENAMED from sustain_min_kept
+                                     # same day after a real bug: per-frame liveness bar for an
+                                     # ALREADY-HELD region -- deliberately much lower than
+                                     # detect_lamp_blobs' own from-scratch min_points (e.g. 6). Once a
+                                     # fixture is already known, seeing this many of its own elements
+                                     # again each frame is enough proof it's still there; the strict
+                                     # spacing/residual line-fit only has to pass once, at creation, not
+                                     # every single frame after. Counts KEPT (bright) and DIM points
+                                     # TOGETHER -- the original version counted only kept ones (mirroring
+                                     # detect_lamp_blobs' own "dim points are context, never
+                                     # independently sufficient" philosophy for FRESH recognition), but
+                                     # that turned out to be a real bug, not a safety feature: confirmed
+                                     # via e2e tracing (cam0, left lamp) that a frame with 20 real dim
+                                     # points and only 2 kept ones was counted as "no support" under the
+                                     # kept-only rule, expiring a region with overwhelming real evidence
+                                     # and forcing it to be re-created from scratch repeatedly. Dim points
+                                     # landing inside an ALREADY-established region's own tight footprint
+                                     # aren't the same false-positive risk as dim noise trying to seed a
+                                     # brand-new recognition from nothing, so they're trusted here.
+      expire_after_no_support_frames: 30   # NEW 2026-09-13 (lifecycle rewrite): a region that fails
+                                     # sustain_min_points this many CONSECUTIVE frames (out of view
+                                     # counts as zero support too; resets to 0 on any single sustained
+                                     # frame in between -- an earlier version of this comment said "not
+                                     # necessarily consecutive", which did not match the code and was
+                                     # fixed 2026-09-14, see LampRegion.no_support_streak's own comment)
+                                     # is DELETED outright. User's own framing: "if there are not enough
+                                     # blobs anymore, this bbox must be gone" / "if it goes out of view,
+                                     # you can also let it go" -- no more permanent mocap-only memory
+                                     # once real evidence stops backing a region up.
+                                     # RAISED 2026-09-14 from 10 (independent code review + ground-truth
+                                     # evaluation against 350 hand-labeled real frames, seq1/walk_hard):
+                                     # a region's quad_room bounds NEVER change while unsustained (only
+                                     # no_support_streak increments) -- so a longer grace period carries
+                                     # no drift risk, only a longer wait before deleting a truly-gone
+                                     # fixture. The measured cost of the OLD value of 10 was severe: a
+                                     # region with hits in the dozens expired mid-pan (real elements
+                                     # briefly falling below sustain_min_points as the row approached the
+                                     # image edge -- KB4 fisheye compression/vignetting), and
+                                     # RE-CREATION requires clearing detect_lamp_blobs' full from-scratch
+                                     # bar (min_points=6 + spacing/residual) in a single cold frame --
+                                     # much harder than the sustain bar that was just failing -- so the
+                                     # region didn't reform until the pan finished, ~50 frames later. Over
+                                     # that whole gap, the real lamp's own bright pixels were fully
+                                     # unmasked (measured: 24% of a real 350-frame walk-hard sequence had
+                                     # ZERO mask coverage of a real, GT-labeled, visible lamp). The
+                                     # region-level safety nets that should bound the cost of a long-lived
+                                     # STALE region (min_hits_to_exclude, max_brightness below) were
+                                     # ALSO found broken as shipped in this same review and have been
+                                     # fixed alongside this change -- see their own comments.
+      interior_margin_px: -6.0       # H1-style margin (mirrors blob_detection.interior_edge_margin_px):
+                                     # a candidate is only excluded once MORE than this deep inside the
+                                     # reprojected mask, protecting a real LED grazing its edge. NEGATIVE
+                                     # since 2026-09-13's rotated-rect-to-real-points revert (see
+                                     # lamp_region_memory's own module docstring): update() now ray-casts
+                                     # a candidate's own real recognized points instead of a bounding
+                                     # rectangle's 4 corners, which produces a region so tight (no leftover
+                                     # rectangle-corner slack at all) that a genuinely-the-same lamp row
+                                     # re-recognized a few frames later, with a few px of mocap/reprojection
+                                     # jitter, can land measurably OUTSIDE the stored box rather than just
+                                     # near its inside edge. Confirmed on the real recording (cam3,
+                                     # frame_range 5350-5400, bbox [575,330,635,370]) by sweeping this value:
+                                     # 0 -> 72 leaked, -1 -> 42, -2 -> 19, -3 -> 4, -4 -> 1, -5 -> 0 (first
+                                     # value to fully close the leak over 51 frames); -6.0 keeps one extra
+                                     # pixel of headroom beyond that minimum. bbox_pad_m was tried first
+                                     # (the room-space-metric fix that worked for other issues on this
+                                     # camera) but is NON-monotonic here for the same reason it was
+                                     # rejected during the rotated-rect episode -- this camera's fisheye
+                                     # projection is highly anisotropic, so a uniform metric pad distorts
+                                     # unpredictably across viewing angles; this per-frame PIXEL-space
+                                     # margin sidesteps that entirely. The real safety net against clipping
+                                     # a genuine controller LED is max_brightness below, not this margin --
+                                     # a real LED is expected to be much brighter than a lamp element
+                                     # regardless of how deep inside (or, now, how far outside) the mask it
+                                     # might sit.
+      sustain_cluster_max_m: 0.3     # NEW 2026-09-14, prompted by a classical-ML feature analysis
+                                     # (analyze_lamp_features.py / fit_lamp_classifier.py, not committed)
+                                     # run against real hand-labeled ground truth (seq1/walk_hard, a dark
+                                     # real recording): during sustain_and_expire()'s per-frame refit, the
+                                     # ray-cast room-space points are reduced to only their SINGLE LARGEST
+                                     # connected cluster (any two points within this many meters of each
+                                     # other are linked, transitively -- see
+                                     # src/lamp_region_memory.py's _largest_cluster_xz) before taking
+                                     # bounds -- a spatially-separate group of points (a second real
+                                     # structure, or a spatially-distinct patch of correlated noise) that
+                                     # also falls inside an already-big region's contour is dropped
+                                     # wholesale, however internally dense it is on its own.
+                                     #
+                                     # Two things had to be discovered to land on this design. First:
+                                     # brightness turned out to be nearly USELESS for telling a real lamp
+                                     # element apart from noise on this recording (every single raw
+                                     # candidate blob measured <= 210, this project's own max_brightness
+                                     # gate -- lamp mean max_pix=14, everything-else mean=50, so that gate
+                                     # accepted 100% of candidates here). What actually separated the two
+                                     # classes was nearest-neighbor distance (lamp median 7.6px vs 13.8px)
+                                     # and local row-collinearity (lamp median residual 2.7px vs 5.9px) --
+                                     # "close to other points, in a line" is what characterizes a real lamp
+                                     # element here, not brightness. Second: a first implementation applied
+                                     # this filter in PIXEL space, directly on the points gathered inside
+                                     # src/blob_detector.py -- confirmed INEFFECTIVE on real data, because
+                                     # this camera's fisheye projection is highly anisotropic at oblique
+                                     # viewing angles (the very same effect bbox_pad_m's own comment already
+                                     # documents for a different reason): the same real-world gap can span
+                                     # far more pixels near the image edge than near center, so a fixed
+                                     # pixel-space threshold failed to separate two genuinely distinct
+                                     # clusters exactly where it mattered (a region sitting at 24-58 degree
+                                     # viewing angles). Moved to room-space METERS, applied after
+                                     # ray-casting inside _ray_cast_points_to_quad, which is immune to that
+                                     # anisotropy by construction. Confirmed on real data: without this
+                                     # (in either form), a region with hits=80 had grown to a physically-
+                                     # absurd 4.97m x 4.63m (~23 square meter) footprint -- a
+                                     # self-reinforcing feedback loop (a bigger region catches more of
+                                     # whatever else is nearby, which then keeps it big). 0.3m is generous
+                                     # enough that single-linkage clustering still keeps one genuinely long,
+                                     # continuous fixture together (chained via its own adjacent-element
+                                     # gaps -- this project's own real recordings show roughly 0.1-0.3m bead
+                                     # spacing at typical viewing distance -- not the row's total span),
+                                     # while rejecting a truly separate structure or noise patch.
+                                     #
+                                     # NOTE (separate, NOT acted on here): this same analysis also shows
+                                     # lamp_blob_filter.max_brightness's own 210 is a near-total no-op on
+                                     # THIS recording's actual brightness scale -- deliberately NOT retuned
+                                     # as part of this change, since that constant is shared with
+                                     # detect_lamp_blobs' own creation-time recognition and is validated
+                                     # against a separate, extensive controller-LED-ring safety simulation
+                                     # (probe_spacing_max_px_safety.py) that would need re-running against
+                                     # this recording's own real brightness range before touching it --
+                                     # flagged for a future, deliberate pass, not bundled in.
+      # max_brightness: intentionally NOT set here (was 255 -- REMOVED
+      # 2026-09-14, independent code review). This is the safety guard: a
+      # real, bright controller LED that later wanders through a remembered
+      # lamp region must still survive (src/blob_detector.py's region-
+      # exclusion check only excludes when max_pix <= this value). Blob
+      # brightness is an 8-bit pixel value (0-255), so the old 255 made
+      # `max_pix <= 255` unconditionally true -- the guard could NEVER fire,
+      # for any blob including a fully-saturated real LED. The comment above
+      # even said this was meant to "mirror lamp_blob_filter.max_brightness's
+      # own intent" (210) while shipping a value that did the opposite of
+      # that intent. Rather than keep two independently-settable numbers for
+      # the same purpose (the exact drift that caused this bug), this key is
+      # now simply absent: src/blob_detector.py's own fallback
+      # (`region_cfg.get("max_brightness", lamp_cfg.get("max_brightness",
+      # 210.0))`) already inherits lamp_blob_filter.max_brightness directly
+      # above. Re-add this key only with a real, deliberately-chosen value
+      # below 255, never to "match" a value that is already inherited.
+      merge_iou_threshold: 0.2       # NEW 2026-09-13: two regions merge (union, hits summed) once their
+                                     # XZ bounding-box IoU reaches this -- deliberately fairly low so a
+                                     # genuinely partial overlap (not just near-total duplicates) still
+                                     # merges. Regression fix: near-duplicate regions at ~0.9 IoU were
+                                     # persisting indefinitely under the earlier design, which only ever
+                                     # compared a brand-new incoming box against its single nearest
+                                     # existing region -- two regions that ended up overlapping EACH
+                                     # OTHER (independently created, or a merge once skipped for size)
+                                     # were never reconciled. Now every update() runs a full NMS-like
+                                     # dedup pass over ALL current regions (see
+                                     # LampRegionMemory._dedupe_and_cap), not just the new arrival.
+      merge_center_distance_m: 0.5  # XZ room-frame distance under which two regions merge even with LOW
+                                     # or zero IoU -- the "real fixture recognized as two disconnected
+                                     # pieces" case (e.g. split by a physical gap the line-finder
+                                     # couldn't bridge in one frame; see project_lamp_row_leak_frames1_13
+                                     # memory). Either this, merge_iou_threshold, or
+                                     # merge_containment_threshold below is sufficient to trigger a merge
+                                     # -- merge always takes the UNION of the two rectangles' extents
+                                     # (never an average), since a hard mask must stay a safe superset of
+                                     # everything ever recognized there.
+      merge_containment_threshold: 0.8   # NEW 2026-09-13: a THIRD merge trigger -- fraction of the
+                                          # SMALLER region's own area that must overlap the larger one.
+                                          # IoU and center-distance both miss the case of a small region
+                                          # sitting almost entirely inside a much larger one: found on live
+                                          # usage (cam2, right) -- a small region's box was 100% inside a
+                                          # much larger region's box, yet IoU was only ~0.19 (the union is
+                                          # dominated by the big box's own area, even at full containment)
+                                          # and their centers were 1.2m apart (the small box sat in a
+                                          # corner of the big one, not near its center) -- past
+                                          # merge_center_distance_m too. Two regions clearly covering the
+                                          # same area never merged. A containment-triggered merge also
+                                          # bypasses max_region_size_m (like size_cap_bypass_iou) -- it
+                                          # can't meaningfully grow the union past the larger region's own
+                                          # size anyway.
+      max_regions_per_camera: 5    # circuit breaker: a real room has a handful of fixtures, not
+                                     # dozens -- guards against a systematically-wrong ceiling_height_m
+                                     # spawning a new never-merging region every frame.
+
   # ── Cold path – pass 2 (adaptive re-threshold, optional) ──────────────────
   pass2_threshold_factor: 0.7       # 0 = disabled; pixel_threshold_2 = percentile(mean_per_blob) * factor
   pass2_required_factor: 1.2        # required_threshold_2 = percentile(mean_per_blob) * factor; must be > pass2_threshold_factor
@@ -842,7 +1478,7 @@ matching:
                                    # completeness/robustness in general, not that one case specifically.
     - [2, 3]
     - [2, 3, "edge"]
-#    - [2, 4]
+    - [3, 3, "edge"]
 
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
@@ -916,6 +1552,74 @@ matching:
                                               # separate from joint_aux_prefilter_px (unrelated
                                               # joint-LM/snap_camera mechanism) so the two can be
                                               # tuned independently.
+
+  # edge_confidence_*/edge_reproj_widen_max: how much to distrust a point the
+  # closer it sits to a KB4 camera's own rpmax_px boundary (see camera.
+  # radial_taper_weight's own docstring for the full derivation) -- found
+  # 2026-09-13 investigating a real coverage_fallback case (right_controller
+  # frame 63): 5 real, correctly-detected cam3 blobs sat at 92-98% of cam3's
+  # own rpmax_px (the literal corner of the frame), none matching a flat
+  # 2.0px aux-reprojection threshold that was implicitly calibrated against
+  # center-of-frame accuracy -- dragging balanced_coverage to 0.59, just
+  # under the 0.6 floor, despite cam1 (primary) and cam0 (aux) both being
+  # individually strong. Checked all 4 cameras' live calibration: every one
+  # has rpmax_px measurably smaller than its own image-corner distance, so
+  # this is a structural property of the wide-FOV KB4 fit (less-constrained,
+  # less-accurate calibration near its own validity boundary), not specific
+  # to cam3.
+  #
+  # inner_fraction (shared by both uses below): full trust up to this
+  # fraction of rpmax_px, then tapers/widens linearly out to rpmax_px
+  # itself.
+  #
+  # confidence_floor: the balanced_coverage LED/blob weighting (brute_
+  # search_tier, both the primary-camera and aux-camera weight arrays) gets
+  # a SECOND, independent multiplicative discount alongside the existing
+  # cos(theta) grazing-angle weight -- a point at/beyond rpmax_px keeps this
+  # fraction of its facing-weight instead of being either fully trusted or
+  # hard-gated by the flat aux reprojection threshold alone.
+  #
+  # reproj_widen_max: proximity-tracking's own RANSAC reprojection threshold
+  # (proximity_reprojection_threshold below) gets multiplied by up to this
+  # much for a call whose worst (closest-to-boundary) matched blob sits at
+  # rpmax_px -- a WIDEN rather than a discount, since _ransac_pnp (src/
+  # _pnp.py) takes one plain scalar threshold per call and is deliberately
+  # NOT touched here (per-point tolerance inside RANSAC isn't achievable
+  # without replacing OpenCV's own solver -- explicitly out of scope).
+  #
+  # All three are first-cut, physically-motivated defaults -- not yet fit
+  # against real radius-binned residual data the way e.g. pose_jump_pred_
+  # pos_thresh_base_mm was (CONTROLLER_TRACKER_JUMP_STATS_CSV, src/
+  # controller.py) -- revisit if this needs tightening later.
+  #
+  # reproj_widen_abs_cap_px: 2026-09-13 critical review found the multiplier
+  # alone unsafe -- proximity_reprojection_threshold's own live value here
+  # (2.5px) * edge_reproj_widen_max (2.5x) reaches 6.25px, looser than every
+  # one of this project's brute-force thresholds (1.5-2.0px), contradicting
+  # proximity_reprojection_threshold's own comment ("tighter than brute --
+  # prior is already close"). This caps the WIDENED value regardless of the
+  # multiplier; _edge_widened_thresh (src/pose_search.py) never returns
+  # narrower than the call's own base threshold either. Same fix also scopes
+  # the widen decision to only the NEW/not-yet-verified pairs a proximity
+  # RANSAC call is testing (hyp_pairs), never pairs already locked in from a
+  # prior frame -- a stale locked pair drifted near the edge must not widen
+  # tolerance for an unrelated, brand-new, center-of-frame candidate pair.
+  #
+  # This same taper/cap is also reused (still gated by inner_fraction/
+  # reproj_widen_max/reproj_widen_abs_cap_px above) as a COVERAGE-ONLY soft
+  # credit in brute_search_tier's aux-camera loop: a near-miss blob that
+  # fails the flat/unwidened brute_aux_reprojection_threshold_px hard gate
+  # but falls within the radially-widened soft tolerance still pulls led_cov
+  # up a little, but is never written into aux_assignments/extra_inlier_
+  # count -- those feed cross-controller conflict resolution/tie-breaking
+  # (src/controller.py) and brute-force's own best-hypothesis comparison, so
+  # a false aux MATCH there is far more consequential than a coverage nudge;
+  # widening the hard gate itself was considered and rejected for this
+  # reason.
+  edge_confidence_inner_fraction: 0.8
+  edge_confidence_floor: 0.3
+  edge_reproj_widen_max: 2.5
+  edge_reproj_widen_abs_cap_px: 3.5
   brute_redundancy_ref: 6   # same "extra inlier pairs beyond the 3-point minimal fit needed for
                              # full redundancy trust" idea as proximity_redundancy_ref below, but
                              # its own independent knob -- brute-force's committed solution's
@@ -1024,36 +1728,95 @@ matching:
   # horizon is far longer, see HeuristicPoseFusionFilter's own docstring --
   # this budget was always deliberately conservative relative to it).
   imu_only_propagation_max_s: 0.066
+
+  # ControllerTracker._mark_all_lost's own accel/gyro-aware shrink of the
+  # budget above -- same mechanism/question as
+  # fusion_heuristic.coast_trust_* (see that block's own comment for the
+  # fit, and for coast_trust_min_budget_s's own 2026-09-14 revision from
+  # 0.011 to 0.025 -- caught right here: a single ordinary lost frame
+  # (left_controller, this recording, frame 57) at peak_gyro_dps=1564.6 --
+  # fast but ordinary hand rotation -- floored the old 0.011s budget below
+  # this frame's own real 22.2ms gap, showing no IMU-only pose at all
+  # through one perfectly normal lost frame), reused here unchanged since
+  # it's the same underlying "is IMU-only dead-reckoning still credible
+  # right now" question at a different layer (a genuine no-candidate-at-all
+  # loss here, vs. a buffered weak candidate there) -- the fit came out
+  # naturally shareable, not two separately re-derived numbers.
+  coast_trust_accel_calm_floor_mps2: 0.0
+  coast_trust_gyro_calm_floor_dps: 0.0
+  coast_trust_shrink_s_per_mps2: 0.001145
+  coast_trust_shrink_s_per_dps: 0.000058
+  coast_trust_min_budget_s: 0.025
   # --------------------------------------------------------------------------
   # Pose validation
   # --------------------------------------------------------------------------
   accept_error_px: 1.5                          # max mean reprojection error to accept any solution
-  # pose_jump_pos_thresh_m TIGHTENED 2026-09-06 from [0.25, 0.25, 0.30] --
-  # empirically retuned against walk_medium (5546 real predicted-vs-actual
-  # position-diff samples, 2536 of them quality-filtered: n_inliers>=8,
-  # error_px<=0.8) via CONTROLLER_TRACKER_JUMP_STATS_CSV (src/controller.py)
-  # instead of guessing. Real predicted(prev_pose)-vs-actual position diff on
-  # GENUINE tracked frames: p50=15mm p90=36mm p95=43mm p99=54mm p99.5=59mm
-  # max=70mm (quality-filtered); including the noisier rows the quality
-  # filter excludes (not necessarily wrong, just below the quality bar):
-  # p99=100mm p99.5=131mm (max well into the hundreds of mm on real
-  # outlier/wrong matches -- exactly what this gate exists to catch). Old
-  # 250-300mm was 2-4x looser than even that noisy-inclusive p99.5.
-  # Re-verified directly (not just estimated) against the same data using the
-  # actual OR-logic (accept if EITHER prev_pose OR predicted_pose check
-  # passes, magnitude-based approximation of the real per-axis check): on the
-  # quality-filtered subset, 0/2536 would be rejected under EITHER the old or
-  # the new threshold (zero new false-reject risk on genuine frames); on the
-  # full noisy-inclusive set, catch rate roughly triples (4/5546 -> 12/5546)
-  # while staying a small fraction overall. pose_jump_rot_thresh_deg left
-  # UNCHANGED -- quality-filtered real data already reaches
-  # p99.5=22.6deg/max=26.4deg, not far under the existing 30deg, so there's
-  # little room to tighten it without risking false rejects on genuine
-  # frames. Full percentile breakdown and speed-bucketed analysis not
-  # persisted anywhere -- rerun via CONTROLLER_TRACKER_JUMP_STATS_CSV
-  # (src/controller.py) if this needs revisiting later.
-  pose_jump_pos_thresh_m: [0.18, 0.18, 0.20]    # per-axis translation jump limit [x, y, z] in metres -- vs prev_pose only
-  pose_jump_rot_thresh_deg: [30.0, 30.0, 30.0]  # per-axis rotation jump limit [rx, ry, rz] in degrees -- vs prev_pose only
+  # pose_jump_pos/rot_thresh_base (below) -- HISTORY: originally a flat
+  # per-axis budget. TIGHTENED 2026-09-06 (position) from [0.25,0.25,0.30]
+  # to [0.18,0.18,0.20], empirically retuned against walk_medium (5546 real
+  # predicted(prev_pose)-vs-actual position-diff samples, 2536 quality-
+  # filtered: n_inliers>=8, error_px<=0.8) via CONTROLLER_TRACKER_JUMP_
+  # STATS_CSV (src/controller.py): quality-filtered residuals reached
+  # p50=15mm p90=36mm p95=43mm p99=54mm p99.5=59mm max=70mm; re-verified
+  # zero new false-rejects under the actual OR-logic (accept if EITHER
+  # prev_pose OR predicted_pose check passes). Rotation LEFT at a flat
+  # 30deg that same pass (quality data only reached p99.5=22.6deg/
+  # max=26.4deg on that walking-pace recording) -- but found TOO TIGHT
+  # 2026-09-13 on a real "hard" (near-maximum-effort fast hand motion)
+  # recording, needing a live bump to 60deg to stop false-rejecting
+  # genuine fast motion.
+  #
+  # TIME-SCALED 2026-09-13: rather than re-flattening at a new constant
+  # that would eventually prove wrong again for some other motion speed,
+  # this is now base + max_plausible_hand_speed_m_s/_ang_speed_deg_s
+  # (below) * dt_s, where dt_s is REAL elapsed time since prev_pose's own
+  # timestamp (not an assumed cadence) -- same "widen from t=0, no
+  # baseline free pass" pattern already validated for the last_good_pose
+  # widening below (see that key's own comment for why a baseline-then-
+  # widen version was tried and found wrong on a real case). base values
+  # are DERIVED, not re-picked from scratch: base = (the old, already-
+  # validated flat value) - shared_rate * 0.022s (this recording's own
+  # typical frame gap -- the timescale both the 2026-09-06 walk_medium fit
+  # AND the 2026-09-13 30->60deg hard-recording finding were tuned
+  # against), so the new formula reproduces the already-validated number
+  # at that reference cadence and scales properly for any other real gap
+  # instead of staying flat:
+  #   position: 0.18/0.18/0.20m - 3.0m/s*0.022s = 0.114/0.114/0.134m
+  #   rotation: 60deg - 2000deg/s*0.022s ~= 15.6deg (all 3 axes, matching
+  #     the old value's own uniformity)
+  #
+  # SCALAR (Euclidean distance / total rotation angle) 2026-09-13, same day
+  # -- was still per-axis immediately above (each axis checked
+  # independently), which the user caught producing an absurd asymmetry: a
+  # candidate offset (563,36,31)mm -- Euclidean magnitude ~566mm -- got
+  # REJECTED (x alone over its own axis budget), while one offset
+  # (440,440,440)mm -- Euclidean magnitude ~762mm, i.e. MORE total real
+  # displacement -- would have been ACCEPTED (every axis individually under
+  # its own budget). Per-axis independence lets diagonal motion "hide"
+  # arbitrary extra distance the check exists to catch. Matches the
+  # project's own established precedent: matching.pose_jump_pred_pos_
+  # thresh_base_mm (vs-predicted_pose, check 2) already treats POSITION as
+  # a magnitude/scalar check for exactly this reason ("position (magnitude):
+  # raw max-fit..." -- see that key's own comment) -- only ROTATION stayed
+  # per-axis there, because real per-axis empirical data showed genuinely
+  # different noise per rotation axis (y noisier than x/z). No such
+  # per-axis empirical backing exists for THIS check's numbers -- the base
+  # values above were already uniform (rotation exactly, position within
+  # ~15%), so nothing axis-specific is lost converting to scalar.
+  #
+  # Value = norm() of the per-axis values immediately above (0.114,0.114,
+  # 0.134 -> 0.2096m; 15.6,15.6,15.6 -> 27.02deg) -- a deliberate first-cut,
+  # not a re-derivation: this is the box's own corner-to-corner diagonal, so
+  # it's guaranteed AT LEAST as permissive as the old per-axis box in every
+  # direction (no new false-rejects vs. before), but is necessarily MORE
+  # permissive along a single-axis-only direction than the tight per-axis
+  # value was (that specific tightness is what caused the asymmetry, so
+  # losing it here is the fix, not a regression) -- revisit via
+  # CONTROLLER_TRACKER_JUMP_STATS_CSV for a properly re-derived scalar
+  # radius later, the same way checks 1/2's own per-axis numbers were
+  # originally derived.
+  pose_jump_pos_thresh_base_m: 0.21   # scalar Euclidean-distance budget, at dt=0 -- vs prev_pose only
+  pose_jump_rot_thresh_base_deg: 27.0  # scalar total-rotation-angle budget, at dt=0 -- vs prev_pose only
                                                   # (see pose_jump_pred_rot_thresh_base_deg below for the separate,
                                                   # much tighter vs-predicted_pose rotation bound added 2026-09-10)
   # vs-predicted_pose position AND rotation tolerance (CameraTracker.
@@ -1105,18 +1868,76 @@ matching:
   pose_jump_pred_pos_thresh_per_speed_mm_s: 33.0
   pose_jump_pred_rot_thresh_base_deg: [8.4, 12.1, 4.5]         # [rx, ry, rz] at speed=0
   pose_jump_pred_rot_thresh_per_speed_deg_s: [0.55, 1.37, 0.65] # [rx, ry, rz] per m/s
-  # Cold-start plausibility check (CameraTracker.finalize_search) widening --
-  # once a loss runs longer than imu_only_propagation_max_s (same clock, same
-  # units -- see that key's own comment), predicted_pose goes
-  # stale/unavailable and only last_good_pose (frozen at the last real vision
-  # accept) is left; these two rates widen its threshold per additional
-  # elapsed second past that budget instead of dropping the check entirely.
-  # Deliberately generous (fast-hand-motion-scale, not tuned tight)
-  # -- this widening only matters once already past the point of having a
-  # live reference, so its job is "still catch a wildly wrong candidate," not
-  # "stay precise."
-  cold_start_stale_max_speed_m_s: 3.0
-  cold_start_stale_max_ang_speed_deg_s: 720.0
+  # max_plausible_hand_speed_m_s / max_plausible_hand_ang_speed_deg_s: shared
+  # "how far could a human hand plausibly have moved in this much real time"
+  # rate. Consolidated 2026-09-13 (full audit of every jump-check in this
+  # project) from THREE previously-independent, drifting numbers that all
+  # answered this exact same question: pose_jump_pos/rot_thresh_base above
+  # (vs prev_pose, now time-scaled from t=0 -- was flat), this cold-start/
+  # last_good_pose widening (was cold_start_stale_max_speed_m_s/
+  # _ang_speed_deg_s, a separate 720deg/s that was inconsistent with the
+  # ~2000deg/s check 1 needed -- folded into this), and
+  # HeuristicPoseFusionFilter's own bootstrap/cold-reacquire weak-pair
+  # confirm check (fusion_heuristic section, pose_fusion_heuristic.py --
+  # was a separate, ungrounded cold_confirm_max_speed_m_s=5.0, now retired).
+  #
+  # FOURTH consumer, added 2026-09-13 (turning-point-overshoot fix):
+  # HeuristicPoseFusionFilter._implausible_jump_thresholds' own stale-time
+  # widening term (elapsed seconds since last_update_ts_ns * this rate,
+  # added to the ceiling on top of its existing |self.v|-scaled term) --
+  # deliberately reuses these SAME two constants (fusion_cfg now threads
+  # matching: through into that filter, see main.py's TrackingSystem
+  # construction) rather than adding a FOURTH drifting copy of this exact
+  # concept. Fixes a real reject cascade at a genuine motion reversal
+  # (swing turning point): predict()'s dead-reckoning uses self.v as a
+  # ONE-STEP-STALE initial velocity, overshooting past the reversal, and
+  # each subsequent rejected frame's growing elapsed time (last_update_ts_ns
+  # doesn't advance on a reject) compounded the divergence further every
+  # frame -- see that method's own docstring for the full real trace.
+  #
+  # Once a loss runs longer than imu_only_propagation_max_s (same clock,
+  # same units -- see that key's own comment), predicted_pose goes
+  # stale/unavailable and only last_good_pose (frozen at the last real
+  # vision accept) is left; this rate widens ITS threshold per additional
+  # elapsed second past that point.
+  #
+  # RE-DERIVED 2026-09-13 (accel/gyro-aware jump-threshold audit, user-
+  # directed) from real CONTROLLER_TRACKER_JUMP_STATS_CSV data across BOTH
+  # available recordings (walk_medium AND walk_hard, not walk_medium alone
+  # as the previous 3.0/2000.0 values effectively were) -- 10113 real
+  # per-camera warm-frame rows, quality-filtered to n_inliers>=6/error_px<=
+  # 0.5 (this project's own "strong_match" bar) to exclude weak/degenerate
+  # solves whose own large position/rotation delta is solve noise, not real
+  # motion (confirmed by inspecting the largest raw outliers before this
+  # filter: n_inliers 4-9, error_px up to 7.4px; after filtering, the
+  # largest outliers instead pair low error_px with genuinely high measured
+  # peak_gyro_dps/peak_accel_mps2 -- real violent motion, not noise).
+  #
+  # Position: 99.9th-percentile speed_est_m_s (real per-frame |Δp|/dt from
+  # accepted solves) across the filtered set was 6.99 m/s -- found by
+  # investigating a real case where 3 mocap-confirmed-CORRECT vision
+  # candidates got rejected as "implausible" during a genuine ~14g/~2900deg/s
+  # swing in walk_hard; the OLD 3.0 m/s cap sat below even walk_medium's own
+  # p90 raw speed (3.3-3.8 m/s), let alone walk_hard's. 7.5 m/s keeps a small
+  # margin above the fitted 6.99.
+  #
+  # Rotation: 99.9th-percentile of rot_diff_prev_deg/dt_prev_s (real
+  # per-frame angular rate) across the filtered set was 2034.8 deg/s --
+  # close to the old 2000 (that one was already reasonably placed, per its
+  # own prior research-grounded derivation below); 2200 keeps a small margin
+  # above the fitted value the same way position's does.
+  #
+  # Prior research-grounded cross-check (still holds): isolated wrist-flick
+  # studies alone only support 300-700deg/s (https://pmc.ncbi.nlm.nih.gov/
+  # articles/PMC4689593/), well under this -- but that's ISOLATED wrist
+  # rotation, not a full wrist+forearm(+shoulder) VR swing/slash gesture,
+  # which uses the same kinetic-chain effect that gets OTHER fast human
+  # motions (elite pitcher shoulder internal rotation ~7500deg/s,
+  # finger-snap ~7800deg/s -- https://www.syfy.com/syfy-wire/finger-
+  # snapping-acceleration-is-the-fastest-motion-in-humans) into the
+  # thousands-of-deg/s range.
+  max_plausible_hand_speed_m_s: 7.5
+  max_plausible_hand_ang_speed_deg_s: 2200.0
 
   # --------------------------------------------------------------------------
   # Joint multi-camera optimisation
@@ -1229,10 +2050,15 @@ debug:
   # --------------------------------------------------------------------------
   log_startup: true              # startup line (mode/data root), calibration CSV open/close paths
   log_frame_summary: true        # per-frame per-controller accept line (cam/err/matches/method), TRACKING LOST
-  log_timings: true              # blob-detect / pose-search / rerun timings, slow-frame notices,
-                                  # per-tier brute-force bench + P3P-call summaries
+  log_timings: false             # blob-detect / pose-search / rerun timings, slow-frame notices,
+                                  # per-tier brute-force bench + P3P-call summaries -- pure perf/speed
+                                  # noise (pool_rt=[...], "Brute tier_X bench: p3p=...gate=...", "update
+                                  # timing: cheap=...", cold/warm detect ms), not tracking-decision info;
+                                  # turned off 2026-09-14 (user request) to cut console noise during
+                                  # investigation. Flip back to true for perf debugging specifically.
   log_blob_detection: true      # blob-dedup grouping (controllers sharing a camera collapse to one detect call)
-  log_blob_diag: true           # per-call pool round-trip breakdown: dispatch latency / compute / return transit
+  log_blob_diag: false          # per-call pool round-trip breakdown: dispatch latency / compute / return transit
+                                  # -- same "pure speed noise" reasoning as log_timings above, off 2026-09-14.
   log_matching_decisions: true  # per-camera proximity/brute attempt, accept/reject, cold-start,
                                   # cold brute-force gating streak, warm-cam-cap candidate/demotion
   log_batch_orchestration: true # warm-batch/cold-batch round summaries, per-tier pool submissions
