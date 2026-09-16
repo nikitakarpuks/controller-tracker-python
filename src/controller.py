@@ -2195,9 +2195,24 @@ class ControllerTracker:
             _per_accel = float(self._matching_cfg.get("coast_trust_shrink_s_per_mps2", 0.0))
             _per_gyro = float(self._matching_cfg.get("coast_trust_shrink_s_per_dps", 0.0))
             _min_budget_s = float(self._matching_cfg.get("coast_trust_min_budget_s", 0.035))
-            _shrink = (_per_accel * max(0.0, _peak_accel_mps2 - _accel_calm_floor)
-                       + _per_gyro * max(0.0, _peak_gyro_dps - _gyro_calm_floor))
-            _imu_only_max_s = max(_min_budget_s, _imu_only_max_s - _shrink)
+            # ROTATION axis's own, steeper shrink rate + lower floor
+            # (2026-09-16, "big IMU investigation" -- same fix as
+            # HeuristicPoseFusionFilter._effective_coast_budget_s's
+            # rate_prefix="coast_trust_rot", now applied here too). Falls
+            # back to the shared coast_trust_shrink_s_per_dps/_min_budget_s
+            # when unset, same backward-compatible default either key uses.
+            # See that method's own docstring for the full derivation: a
+            # single COMBINED accel+gyro shrink let a fast gyro burst's
+            # excess get diluted by summing it with a calm accel term, and
+            # even a pure-rotation-only violent window was floored back up
+            # to the shared 35ms regardless of how much faster gyro got.
+            _per_gyro_rot = float(self._matching_cfg.get("coast_trust_rot_shrink_s_per_dps", _per_gyro))
+            _rot_min_budget_s = float(self._matching_cfg.get("coast_trust_rot_min_budget_s", _min_budget_s))
+            _accel_shrink = _per_accel * max(0.0, _peak_accel_mps2 - _accel_calm_floor)
+            _gyro_shrink = _per_gyro_rot * max(0.0, _peak_gyro_dps - _gyro_calm_floor)
+            _pos_budget_s = max(_min_budget_s, _imu_only_max_s - _accel_shrink)
+            _rot_budget_s = max(_rot_min_budget_s, _imu_only_max_s - _gyro_shrink)
+            _imu_only_max_s = min(_pos_budget_s, _rot_budget_s)
 
         _imu_pose = None
         _already_handled_this_frame = (frame_ts_ns == self._last_imu_propagate_ts_ns)
@@ -2243,7 +2258,8 @@ class ControllerTracker:
             if self._debug_pose_fusion:
                 logger.bind(cat="pose_fusion").debug(
                     f"[{self.ctrl_name}] IMU-only propagation "
-                    f"({_elapsed_since_real_update_s:.3f}s/{_imu_only_max_s:.3f}s): "
+                    f"({_elapsed_since_real_update_s:.3f}s/{_imu_only_max_s:.3f}s "
+                    f"pos_budget={_pos_budget_s:.3f}s rot_budget={_rot_budget_s:.3f}s): "
                     f"keeping search anchor warm during vision loss, pos={_imu_pose.t}"
                 )
 

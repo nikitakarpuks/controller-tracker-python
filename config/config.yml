@@ -1,6 +1,6 @@
 data:
-#  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826175510_walk_medium/mav0"
-  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826180039_walk_hard/mav0"
+  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173103_static_dark/mav0"
+#  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826180039_walk_hard/mav0"
   layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
                            # side-by-side into a single wide image per frame (uses
                            # img_width/total_cameras_number below to slice per camera).
@@ -29,10 +29,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: null  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 280  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: null  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 310  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -461,6 +461,49 @@ fusion_heuristic:
   # applied when a different session asked whether to reuse these same
   # constants for static_lamp_mask.recent_memory_max_s and decided not to).
   degenerate_fallback_max_s: 0.066
+
+  # ROTATION axis's own shrink rate + floor for the degenerate-fallback gate
+  # above (2026-09-16, "big IMU investigation" -- read via _effective_coast_
+  # budget_s's rate_prefix="coast_trust_rot", axis="gyro" only, so only the
+  # _dps key below is actually read live; _mps2 exists for symmetry/future
+  # use but has no live effect on this axis). Fit from a systematic sweep:
+  # real mocap ground truth vs. BLIND gyro-only rotation dead-reckoning
+  # (src.imu_data.predict_headset_relative_pose, the same primitive predict()
+  # itself uses), ~217k (anchor, dt) samples across all 8 available
+  # recordings (not one hand-picked case) -- see imu_trust_analysis.py /
+  # run_imu_trust_analysis_all.py / synthesize_imu_trust.py (repo root,
+  # scratch tools, not shipped) for the sweep itself.
+  #
+  # Why a SEPARATE floor, not just a steeper rate under the existing shared
+  # coast_trust_min_budget_s (0.035s): that shared floor is a LOWER BOUND
+  # (max(floor, base-shrink)), so past whatever gyro speed makes the raw
+  # shrink exceed base-0.035s, the formula was silently being clamped back
+  # UP to 35ms regardless of how much faster gyro got -- e.g. at ~1000deg/s
+  # the raw shrink already computes ~8ms remaining, but the old shared floor
+  # overrode that back to 35ms. The sweep's own real numbers: median rotation
+  # error already clears 10deg by just 11ms (the shortest gap tested) once
+  # peak gyro is past ~350-550deg/s, and stays there (0ms "safe" duration)
+  # for every faster bucket tested up to >3000deg/s -- so a 35ms floor was
+  # letting genuinely-no-longer-credible gyro coasts get blindly accepted as
+  # tracked state for 3-4x longer than the data supports.
+  #
+  # Fit (rate=0.00018, floor=0.003s) chosen to track the real per-gyro-bucket
+  # trust-duration curve closely through the range where it still matters
+  # (calm/slow: 35ms real vs 34.5ms formula at ~175deg/s; 22ms real vs 21ms
+  # formula at ~250deg/s) while collapsing to its floor by ~350deg/s,
+  # matching where the real data already shows ~0-11ms safe duration --
+  # deliberately conservative (formula budget <= real safe duration
+  # everywhere checked), never the reverse. floor=0.003s (not 0.0) keeps a
+  # tiny nonzero budget for a genuinely near-zero dt_s edge case rather than
+  # rejecting on principle; in practice any real single-frame gap in these
+  # recordings (~11ms+) already exceeds it once gyro clears the collapse
+  # point, so this behaves as "essentially no blind-trust window" exactly as
+  # intended. POSITION/accel axis (_pos_budget_s, rate_prefix="coast_trust"
+  # default) was NOT re-fit -- the same sweep's accel-vs-position numbers
+  # already tracked the existing shared rate/floor reasonably well.
+  coast_trust_rot_shrink_s_per_mps2: 0.0
+  coast_trust_rot_shrink_s_per_dps: 0.00018
+  coast_trust_rot_min_budget_s: 0.003
 
   # Long-gap damping (see HeuristicPoseFusionFilter._gap_vision_scale) -- scales
   # w_vision down as the elapsed gap since the last accepted update (dt_s)
@@ -1822,6 +1865,24 @@ matching:
   coast_trust_shrink_s_per_mps2: 0.001145
   coast_trust_shrink_s_per_dps: 0.000058
   coast_trust_min_budget_s: 0.035
+
+  # ROTATION axis's own shrink rate + floor for the search-anchor budget
+  # above (2026-09-16, "big IMU investigation" -- same fit/derivation as
+  # fusion_heuristic.coast_trust_rot_shrink_s_per_dps/_min_budget_s, now
+  # applied here too so ControllerTracker._mark_all_lost's search-anchor
+  # propagation gets the same fix as the degenerate-fallback core-state
+  # gate). ControllerTracker._mark_all_lost now computes pos_budget_s
+  # (accel-only shrink off the shared floor above) and rot_budget_s
+  # (gyro-only shrink off THIS floor) SEPARATELY and propagates only while
+  # elapsed < BOTH (min of the two) -- previously accel+gyro shrink were
+  # summed into one combined budget, which (a) let a calm accel term dilute
+  # a violent gyro-only window's own excess, and (b) still floored back up
+  # to the shared 35ms regardless of how much faster gyro got, same bug as
+  # the degenerate-fallback gate had. See that config key's own comment for
+  # the fit derivation (~217k real mocap-vs-blind-gyro-dead-reckoning
+  # samples across all 8 recordings).
+  coast_trust_rot_shrink_s_per_dps: 0.00018
+  coast_trust_rot_min_budget_s: 0.003
 
   # TrackingSystem._detect_cold_identity_swap (2026-09-16): when two
   # controllers go cold and reacquire in the SAME cold-batch round, compares

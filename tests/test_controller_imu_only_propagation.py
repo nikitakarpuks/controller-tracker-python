@@ -375,5 +375,105 @@ class AccelGyroAwareBudgetShrinkTests(unittest.TestCase):
         self.assertEqual(len(calls), 1, "zero shrink rates must reproduce today's flat-budget behavior exactly")
 
 
+class RotationAxisOwnBudgetTests(unittest.TestCase):
+    """Regression for the ROTATION axis's own coast_trust_rot_shrink_s_per_dps/
+    _min_budget_s (2026-09-16, "big IMU investigation" -- same fix applied to
+    HeuristicPoseFusionFilter._effective_coast_budget_s's degenerate-fallback
+    gate, now applied here too). Before this fix, accel and gyro shrink were
+    SUMMED into one combined budget floored at the single shared
+    coast_trust_min_budget_s -- a calm accel term could dilute a violent
+    gyro-only window's own excess, and even a pure-rotation violent window
+    got floored back UP to the shared 35ms regardless of how much faster
+    gyro got (same bug the degenerate-fallback gate had -- see that fix's
+    own memory/config comment for the full derivation). Now pos_budget_s
+    (accel-only, shared floor) and rot_budget_s (gyro-only, its OWN floor)
+    are computed separately and propagation requires elapsed < BOTH."""
+
+    def _make_tracker_with_imu(self, gyro_samples, accel_samples, **cfg_overrides):
+        matching_cfg = {
+            "imu_only_propagation_max_s": 0.066,
+            "tracking_lost_grace_frames": 1,
+            "coast_trust_accel_calm_floor_mps2": 0.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_shrink_s_per_mps2": 0.0,
+            "coast_trust_shrink_s_per_dps": 0.0,
+            "coast_trust_min_budget_s": 0.035,
+            **cfg_overrides,
+        }
+        tracker = ControllerTracker(
+            "test", {}, {}, matching_cfg=matching_cfg,
+            fusion_cfg={"enabled": True, "filter_type": "heuristic"},
+        )
+        tracker._fusion_filter.velocity_established = True
+        tracker._fusion_filter.last_update_ts_ns = 0
+        t_g = np.array([t for t, _ in gyro_samples], dtype=np.int64)
+        g = np.array([v for _, v in gyro_samples], dtype=np.float64)
+        t_a = np.array([t for t, _ in accel_samples], dtype=np.int64)
+        a = np.array([v for _, v in accel_samples], dtype=np.float64)
+        tracker._gyro_data = (t_g, g)
+        tracker._accel_data = (t_a, a)
+        tracker._g_world_estimator = Mock(g_world=np.array([0.0, 0.0, 9.81]))
+        return tracker
+
+    def test_moderate_gyro_no_longer_floored_back_up_to_the_shared_budget(self):
+        """~1000deg/s (this project's own "moderate" bucket, per the sweep):
+        with the SHARED coast_trust_shrink_s_per_dps/_min_budget_s, this
+        would floor back up to 35ms (comfortably above a 20ms elapsed gap,
+        wrongly propagating). With the ROT-specific rate/floor (the actual
+        shipped defaults), the budget must correctly collapse below 20ms."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.02 * _NS), [0.0, 0.0, np.radians(1000.0)])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.02 * _NS), [0.0, 0.0, 9.81])],
+            coast_trust_shrink_s_per_dps=0.000058,   # old shared rate -- would floor at 0.035s (>20ms elapsed)
+            coast_trust_rot_shrink_s_per_dps=0.00018,  # shipped rot-specific rate
+            coast_trust_rot_min_budget_s=0.003,        # shipped rot-specific floor
+        )
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.02 * _NS))  # 20ms elapsed
+
+        self.assertEqual(len(calls), 0,
+                          "the rot-specific rate/floor must shrink the budget below the 20ms elapsed gap, "
+                          "not let the shared floor silently re-grant it")
+        self.assertIsNone(tracker._last_imu_only_pose)
+
+    def test_gyro_axis_falls_back_to_shared_rate_and_floor_when_unconfigured(self):
+        """No coast_trust_rot_* override at all -- must reproduce the exact
+        pre-fix combined-shrink numeric behavior for a gyro-only violent
+        window (backward-compatible default)."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.05 * _NS), [0.0, 0.0, np.radians(3000.0)])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.05 * _NS), [0.0, 0.0, 9.81])],
+            coast_trust_shrink_s_per_dps=0.0001,  # (3000-0)*0.0001 = 0.3s shrink -- wipes the 66ms budget
+        )  # no coast_trust_rot_* override
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.05 * _NS))
+
+        self.assertEqual(len(calls), 0, "an unconfigured rot-specific rate must fall back to the shared one")
+
+    def test_accel_axis_unaffected_by_rot_specific_keys(self):
+        """A pure ACCEL-only violent window (calm gyro) must be governed
+        entirely by the existing shared coast_trust_shrink_s_per_mps2/
+        _min_budget_s -- coast_trust_rot_* keys have no effect on this axis
+        at all, even set to absurd values."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.02 * _NS), [0.0, 0.0, 0.0])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.02 * _NS), [0.0, 0.0, 209.81])],  # 200 m/s^2 dynamic accel
+            coast_trust_shrink_s_per_mps2=1.0,   # (200-0)*1.0 -- wipes the budget
+            coast_trust_min_budget_s=0.003,
+            coast_trust_rot_shrink_s_per_dps=999.0,  # absurd -- must be ignored (calm gyro, zero excess)
+            coast_trust_rot_min_budget_s=999.0,      # absurd -- must be ignored (this is the accel axis)
+        )
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        # 3ms elapsed -- inside the accel axis's own 3ms floor.
+        tracker._mark_all_lost(frame_ts_ns=int(0.003 * _NS))
+        self.assertEqual(len(calls), 1, "accel axis must still floor at its own coast_trust_min_budget_s")
+
+
 if __name__ == "__main__":
     unittest.main()

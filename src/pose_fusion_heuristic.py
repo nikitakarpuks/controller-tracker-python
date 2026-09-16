@@ -426,13 +426,35 @@ class HeuristicPoseFusionFilter:
         floor (0.025s, unchanged, user-directed: "min budget should stay
         at 25ms") is identical either way, and the calm floors (0.0 for
         both axes) don't change under a pure rate rescaling, so there was
-        nothing case-specific left to duplicate for those two."""
+        nothing case-specific left to duplicate for those two.
+
+        min_budget_s is ALSO now rate_prefix-aware (2026-09-16, "big IMU
+        investigation"): reads f"{rate_prefix}_min_budget_s" first, falling
+        back to the shared coast_trust_min_budget_s when that key is unset
+        -- lets a caller give ONE axis its own floor without touching the
+        shared one every other caller still reads. Added because a broad,
+        systematic sweep (real mocap ground truth vs blind gyro-only
+        rotation dead-reckoning, ~217k anchor/dt samples across all 8
+        available recordings, not just one hand-picked case) found the
+        shared 0.035s floor was silently overriding an already-correctly-
+        shrunk ROTATION budget back UP for any moderate-or-faster gyro
+        burst: at ~1000deg/s the raw shrink formula already computes
+        ~8ms of remaining budget, but max(min_budget_s, ...) was clamping
+        that back to 35ms -- 3-4x longer than gyro dead-reckoning is
+        actually still credible there (median rotation error already
+        >=10deg by just 11ms once peak gyro clears ~350-550deg/s). See
+        coast_trust_rot_min_budget_s/coast_trust_rot_shrink_s_per_dps in
+        config.yml for the specific fit and the degenerate-fallback call
+        site below for where this is actually wired in (axis="gyro" only
+        -- the POSITION/accel axis's existing floor/rate already tracked
+        the same sweep's accel-vs-position findings reasonably well and
+        was left unchanged)."""
         peak_gyro_dps, peak_accel_mps2 = self._peak_gyro_accel(frame_ts_ns)
         accel_calm_floor = float(self._hc_get("coast_trust_accel_calm_floor_mps2", 40.0))
         gyro_calm_floor = float(self._hc_get("coast_trust_gyro_calm_floor_dps", 900.0))
         per_accel = float(self._hc_get(f"{rate_prefix}_shrink_s_per_mps2", 0.0))
         per_gyro = float(self._hc_get(f"{rate_prefix}_shrink_s_per_dps", 0.0))
-        min_budget_s = float(self._hc_get("coast_trust_min_budget_s", 0.035))
+        min_budget_s = float(self._hc_get(f"{rate_prefix}_min_budget_s", self._hc_get("coast_trust_min_budget_s", 0.035)))
         accel_shrink = per_accel * max(0.0, peak_accel_mps2 - accel_calm_floor)
         gyro_shrink = per_gyro * max(0.0, peak_gyro_dps - gyro_calm_floor)
         if axis == "accel":
@@ -1363,7 +1385,17 @@ class HeuristicPoseFusionFilter:
             # existing one.
             _degenerate_base_s = float(self._hc_get("degenerate_fallback_max_s", 0.066))
             _pos_budget_s = self._effective_coast_budget_s(_degenerate_base_s, frame_ts_ns, axis="accel")
-            _rot_budget_s = self._effective_coast_budget_s(_degenerate_base_s, frame_ts_ns, axis="gyro")
+            # rate_prefix="coast_trust_rot" (2026-09-16, "big IMU investigation"):
+            # the ROTATION axis gets its own, steeper shrink rate + lower floor,
+            # fit from a systematic real-mocap-vs-blind-gyro-dead-reckoning sweep
+            # across all 8 recordings -- see _effective_coast_budget_s's own
+            # docstring for why the shared coast_trust_min_budget_s floor was
+            # silently overriding an already-correctly-shrunk rotation budget
+            # back up for moderate-or-faster gyro bursts. axis="gyro" here means
+            # only per_gyro/coast_trust_rot_shrink_s_per_dps is actually read;
+            # coast_trust_rot_shrink_s_per_mps2 stays unused.
+            _rot_budget_s = self._effective_coast_budget_s(_degenerate_base_s, frame_ts_ns,
+                                                             axis="gyro", rate_prefix="coast_trust_rot")
             if dt_s > _pos_budget_s or dt_s > _rot_budget_s:
                 return self._try_cold_reacquire(
                     R_meas, p_meas, frame_ts_ns, confidence,

@@ -1781,6 +1781,89 @@ class EffectiveCoastBudgetRatePrefixTests(unittest.TestCase):
         budget = f._effective_coast_budget_s(0.06, 10_000_000, rate_prefix="cold_pending")
         self.assertAlmostEqual(budget, 0.06, places=6)
 
+    def test_min_budget_s_is_also_rate_prefix_aware(self):
+        """2026-09-16 ("big IMU investigation"): min_budget_s now reads
+        f"{rate_prefix}_min_budget_s" first, falling back to the shared
+        coast_trust_min_budget_s -- an unset prefix-specific floor must NOT
+        silently clamp the budget back up past a huge configured shrink."""
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=0.0, peak_gyro_dps=1000.0,
+                                   coast_trust_min_budget_s=0.035,      # shared floor -- must be IGNORED here
+                                   some_prefix_shrink_s_per_dps=1.0,    # huge -> would floor without a prefix floor
+                                   some_prefix_min_budget_s=0.003)      # the prefix-specific floor actually used
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="some_prefix")
+        self.assertAlmostEqual(budget, 0.003, places=6)
+
+    def test_min_budget_s_falls_back_to_shared_key_when_prefix_specific_one_is_unset(self):
+        """A rate_prefix with its own shrink rate but NO f"{prefix}_min_budget_s"
+        override must fall back to the shared coast_trust_min_budget_s, not 0.0
+        or a crash -- backward-compatible default for any future prefix that
+        doesn't need its own floor."""
+        f = self._filter_with_imu(peak_accel_dynamic_mps2=0.0, peak_gyro_dps=1000.0,
+                                   coast_trust_min_budget_s=0.025,
+                                   some_prefix_shrink_s_per_dps=1.0)  # huge, no some_prefix_min_budget_s set
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="some_prefix")
+        self.assertAlmostEqual(budget, 0.025, places=6)
+
+
+class CoastTrustRotPrefixTests(unittest.TestCase):
+    """Regression for the ROTATION axis's own coast_trust_rot_shrink_s_per_dps
+    / coast_trust_rot_min_budget_s (2026-09-16, "big IMU investigation") --
+    fit from a systematic real-mocap-vs-blind-gyro-dead-reckoning sweep
+    across all 8 available recordings (~217k anchor/dt samples), not one
+    hand-picked case. See _effective_coast_budget_s's own docstring and
+    config.yml's coast_trust_rot_* comment for the full derivation: the
+    shared coast_trust_min_budget_s (0.035s) floor was silently overriding
+    an already-correctly-shrunk rotation budget back UP for any moderate-
+    or-faster gyro burst, letting a genuinely-no-longer-credible gyro coast
+    get blindly accepted as tracked state for 3-4x longer than the sweep's
+    own data supports."""
+
+    def _filter_with_imu(self, peak_gyro_dps, **cfg_overrides):
+        _, accel_data = _imu_arrays([(0, [0.0, 0.0, 0.0])], [(0, [0.0, 0.0, 9.81])])
+        gyro_data = (np.array([0, 10_000_000]),
+                     np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        cfg = {
+            "coast_trust_accel_calm_floor_mps2": 0.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_min_budget_s": 0.035,
+            "coast_trust_rot_shrink_s_per_dps": 0.00018,
+            "coast_trust_rot_min_budget_s": 0.003,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(gyro_data=gyro_data, accel_data=accel_data,
+                                       lever_arm=None, g_world_estimator=None,
+                                       cfg={"fusion_heuristic": cfg})
+        f.last_update_ts_ns = 0
+        return f
+
+    def test_moderate_gyro_floors_at_the_new_lower_rot_floor_not_the_shared_one(self):
+        """~1000deg/s (this project's own "moderate" bucket): the sweep found
+        ~0ms real safe duration there -- the new rate/floor must floor the
+        budget at 0.003s, not silently clamp back up to the shared 0.035s
+        the old (pre-fix) shared-prefix behavior would have produced."""
+        f = self._filter_with_imu(peak_gyro_dps=1000.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        self.assertAlmostEqual(budget, 0.003, places=6)
+
+    def test_calm_gyro_stays_near_the_base_budget(self):
+        """~25deg/s (this project's own "calm" bucket): shrink is tiny, must
+        stay comfortably above the floor -- the new rate must not be so
+        aggressive it also over-shrinks genuinely calm motion."""
+        f = self._filter_with_imu(peak_gyro_dps=25.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        self.assertAlmostEqual(budget, 0.066 - 0.00018 * 25.0, places=6)
+        self.assertGreater(budget, 0.05)
+
+    def test_position_axis_default_prefix_is_unaffected(self):
+        """The POSITION/accel axis (default rate_prefix="coast_trust") must
+        stay on the pre-existing shared rate/floor -- this fix is scoped to
+        rotation only, per the sweep's own finding that accel/position
+        already tracked reasonably well."""
+        f = self._filter_with_imu(peak_gyro_dps=1000.0, coast_trust_shrink_s_per_mps2=0.001145,
+                                   coast_trust_accel_calm_floor_mps2=0.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="accel")  # default rate_prefix
+        self.assertAlmostEqual(budget, 0.066, places=6)  # accel excess is 0 here -- no shrink either way
+
 
 class DegenerateFallbackCoastGateTests(unittest.TestCase):
     """Regression for try_update's degenerate w_sum<=0 fallback gaining an
@@ -1865,10 +1948,14 @@ class DegenerateFallbackCoastGateTests(unittest.TestCase):
     def test_violent_gyro_past_budget_routes_to_weak_buffer(self):
         """A rotation-axis-only violent window (calm accel) shrinks ONLY the
         gyro-derived budget below dt_s -- must still route to the buffer
-        (either axis exceeding is enough), not blindly accept p_pred."""
+        (either axis exceeding is enough), not blindly accept p_pred.
+        Uses coast_trust_rot_shrink_s_per_dps/_min_budget_s (2026-09-16) --
+        the ROTATION axis's OWN keys, not the shared coast_trust_* ones the
+        accel axis (and the other two coast-budget consumers) still read;
+        see _effective_coast_budget_s's own docstring for why."""
         f = self._filter(peak_gyro_dps=3000.0, peak_accel_dynamic_mps2=5.0,
-                          coast_trust_shrink_s_per_dps=1.0,  # huge -> floors the gyro budget
-                          coast_trust_min_budget_s=0.005)     # below dt_s=0.01s
+                          coast_trust_rot_shrink_s_per_dps=1.0,  # huge -> floors the gyro budget
+                          coast_trust_rot_min_budget_s=0.005)     # below dt_s=0.01s
         p_vision = np.array([0.05, 0.02, -0.01])
         ok = f.try_update(self._weak_solution(p_vision), 10_000_000)
         self.assertFalse(ok)
