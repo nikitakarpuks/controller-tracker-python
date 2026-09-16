@@ -15,7 +15,8 @@ from src.camera import Camera
 from src.debug_config import is_continuous_sequence
 from src.transformations import Transform
 from src._self_calibration import SelfCalibrator
-from src.imu_data import integrate_gyro_segment, slice_imu_to_window, peak_gyro_accel_over_window
+from src.imu_data import integrate_gyro_segment, slice_imu_to_window, peak_gyro_accel_over_window, \
+    effective_coast_budget_s
 from src.mocap_data import world_pose
 from src.pose_fusion import PoseFusionFilter
 from src.pose_fusion_heuristic import HeuristicPoseFusionFilter
@@ -214,16 +215,60 @@ def _weak_solo_accept_cids(cam_solutions: List[dict], eligible_cids: List[int],
 # 3. TRACKER (per camera + controller)
 # =========================================================
 
-def _gyro_rel_R_for(gyro_data: Optional[tuple], pose_history, frame_ts_ns: int):
+def _gyro_rel_R_for(gyro_data: Optional[tuple], pose_history, frame_ts_ns: int, *,
+                     matching_cfg: dict):
     """gyro_data: (t_gyro, gyro_body) for one controller, already calibrated,
     axis-corrected into body frame, and clock-offset-corrected into the vision
     timestamp domain (see main.py) -- or None if no IMU data was loaded for this
     controller/run. Returns the (3,3) rel-rotation integrate_gyro_segment
     computes over [pose_history[0]'s timestamp, frame_ts_ns], or None (no gyro
-    data, no pose history yet, or frame_ts_ns outside the gyro's covered range)."""
+    data, no pose history yet, frame_ts_ns outside the gyro's covered range, or
+    -- added 2026-09-16, Phase 3 of that day's IMU-trust follow-up -- the
+    elapsed time since pose_history[0] has exceeded matching.imu_only_
+    propagation_max_s).
+
+    Credibility gate, CORRECTED same day: the first version of this gate
+    reused effective_coast_budget_s's gyro-SPEED shrink term -- the same
+    formula the anchor-staleness consumers (_mark_all_lost's search anchor,
+    the degenerate-fallback gate, _try_cold_reacquire's CONFIRM veto) use to
+    distrust a MULTI-FRAME-STALE dead-reckon under violent motion. Wrong fit
+    here: pose_history is refreshed on every frame that produces any
+    candidate pose (accepted or rejected) via _propagate_pose_history, so
+    the realistic elapsed_s for THIS consumer is just the ordinary frame
+    cadence (~11-22ms this recording), not a stale multi-frame gap -- but
+    the shrink formula floors to coast_trust_rot_min_budget_s (0.003s)
+    whenever peak gyro exceeds ~350deg/s within the window, which is BELOW
+    ordinary frame cadence. Verified on real data: walk_hard's median gyro
+    rate is ~660-670deg/s (p90 ~1300-1540deg/s), so the shrunk gate was
+    firing on the large majority of ordinary, uninterrupted frames in that
+    recording -- silently stripping gyro-based rotation prediction from the
+    warm/proximity search neighborhood exactly during the fast motion it's
+    needed most for. Live-measured regression this caused: walk_hard
+    anomalies nearly doubled vs. the pre-Phase-3 baseline (left 26->50,
+    right 74->100 anomalous frames) -- caught by re-running the exact
+    fast-motion regression case this phase's own plan named for
+    verification, before this fix.
+
+    Fixed with a flat elapsed-time ceiling instead (matching.imu_only_
+    propagation_max_s, same ~0.066s value the OTHER consumers use as their
+    UNSHRUNK starting point) -- no gyro-speed shrink, no calm-extension:
+    this gate exists only to catch a genuine multi-frame-stale pose_history
+    (already rare -- a real loss streak clears pose_history for free via
+    _mark_all_lost's own clear_prior(), see the `not pose_history` check
+    above), not to second-guess an ordinary single-frame gyro segment's own
+    accuracy under fast motion -- that's each proximity search's own job
+    (RANSAC/inlier gating on the resulting candidate), not this prior's.
+
+    matching_cfg is required (keyword-only, no default) so every call site
+    must opt in explicitly -- a future call site can't silently reintroduce
+    the original zero-gating gap by forgetting to pass it."""
     if gyro_data is None or not pose_history:
         return None
     ts0 = int(pose_history[0][2])
+    elapsed_s = max(0.0, (frame_ts_ns - ts0) / 1e9)
+    max_gap_s = float(matching_cfg.get('imu_only_propagation_max_s', 0.066))
+    if elapsed_s >= max_gap_s:
+        return None
     return integrate_gyro_segment(gyro_data[0], gyro_data[1], ts0, frame_ts_ns)
 
 
@@ -2208,10 +2253,25 @@ class ControllerTracker:
             # to the shared 35ms regardless of how much faster gyro got.
             _per_gyro_rot = float(self._matching_cfg.get("coast_trust_rot_shrink_s_per_dps", _per_gyro))
             _rot_min_budget_s = float(self._matching_cfg.get("coast_trust_rot_min_budget_s", _min_budget_s))
-            _accel_shrink = _per_accel * max(0.0, _peak_accel_mps2 - _accel_calm_floor)
-            _gyro_shrink = _per_gyro_rot * max(0.0, _peak_gyro_dps - _gyro_calm_floor)
-            _pos_budget_s = max(_min_budget_s, _imu_only_max_s - _accel_shrink)
-            _rot_budget_s = max(_rot_min_budget_s, _imu_only_max_s - _gyro_shrink)
+            # Calm-motion extension (2026-09-16, same-day follow-up to the
+            # rotation shrink fix above): shares src.imu_data.effective_
+            # coast_budget_s with HeuristicPoseFusionFilter._effective_
+            # coast_budget_s's own axis="gyro" case, rather than a second
+            # inlined copy of this formula -- see that shared function's own
+            # docstring for the full derivation (shrink-only can never
+            # exceed _imu_only_max_s no matter how calm real motion is,
+            # even though the same sweep found calm gyro stays credible for
+            # 50ms-1000ms+, far past a flat 66ms base). POSITION axis stays
+            # plain shrink-only (no extend term) -- calling the shared
+            # helper with its own extend args defaulted to 0.0 keeps that
+            # byte-identical to before.
+            _rot_calm_extend_ceiling_s = float(self._matching_cfg.get("coast_trust_rot_calm_extend_ceiling_s", 0.0))
+            _rot_calm_extend_max_dps = float(self._matching_cfg.get("coast_trust_rot_calm_extend_max_dps", 0.0))
+            _pos_budget_s = effective_coast_budget_s(_imu_only_max_s, _peak_accel_mps2, _accel_calm_floor,
+                                                       _per_accel, _min_budget_s)
+            _rot_budget_s = effective_coast_budget_s(_imu_only_max_s, _peak_gyro_dps, _gyro_calm_floor,
+                                                       _per_gyro_rot, _rot_min_budget_s,
+                                                       _rot_calm_extend_ceiling_s, _rot_calm_extend_max_dps)
             _imu_only_max_s = min(_pos_budget_s, _rot_budget_s)
 
         _imu_pose = None
@@ -2360,7 +2420,8 @@ class ControllerTracker:
                         'vel_ema':         _vel_ema_with_imu_fallback(
                             tracker, _predicted_world, self.cameras[cid], frame_ts_ns),
                         'prev_assignment': tracker.prev_assignment,
-                        'gyro_rel_R':      _gyro_rel_R_for(self._gyro_data, tracker.pose_history, frame_ts_ns),
+                        'gyro_rel_R':      _gyro_rel_R_for(self._gyro_data, tracker.pose_history, frame_ts_ns,
+                                                            matching_cfg=self._matching_cfg),
                     }
                     _futures[cid] = pool.submit(
                         run_cheap_search, (self.ctrl_name, cid), self._matching_cfg, prior,
@@ -2377,7 +2438,8 @@ class ControllerTracker:
                         obs_full, frame_ts_ns, blob_radii=rad_full, blob_brightnesses=brt_full,
                         other_cameras_blobs=None, blob_mask=mask,
                         occluders_per_cam=occluders_per_cam,
-                        gyro_rel_R=_gyro_rel_R_for(self._gyro_data, tracker.pose_history, frame_ts_ns),
+                        gyro_rel_R=_gyro_rel_R_for(self._gyro_data, tracker.pose_history, frame_ts_ns,
+                                                    matching_cfg=self._matching_cfg),
                         vel_ema_override=_vel_ema_with_imu_fallback(
                             tracker, _predicted_world, self.cameras[cid], frame_ts_ns),
                     )
@@ -2745,6 +2807,12 @@ class ControllerTracker:
         # above, exposed here for consumers (e.g. visualization) that want to
         # reflect actual per-camera contribution rather than a primary/aux label.
         solution["camera_importance"] = {cid: w / _w_total for cid, w in _raw_w.items()}
+        # Per-camera search method this frame -- "proximity", "p3p_systematic"
+        # (brute), or "prior_constrained_P2P"/"prior_constrained_P1P" (low-blob-
+        # count fallback, see run_cheap_search's own comment) -- exposed for
+        # visualization (2026-09-16: replaced the old importance-gradient ray
+        # coloring with discrete per-method colors, see _method_color).
+        solution["camera_method"] = {cs["cam_id"]: cs["solution"].get("method") for cs in cam_solutions}
         _other_assignments = {
             cs["cam_id"]: cs["solution"]["assignment"]
             for cs in cam_solutions if cs["cam_id"] != primary_cam_id
@@ -4200,7 +4268,8 @@ class TrackingSystem:
                     'vel_ema':         _vel_ema_with_imu_fallback(
                         tracker, _predicted_world_by_ctrl[ctrl_name], self.cameras[cid], frame_ts_ns),
                     'prev_assignment': tracker.prev_assignment,
-                    'gyro_rel_R':      _gyro_rel_R_for(self._gyro_data.get(ctrl_name), tracker.pose_history, frame_ts_ns),
+                    'gyro_rel_R':      _gyro_rel_R_for(self._gyro_data.get(ctrl_name), tracker.pose_history, frame_ts_ns,
+                                                        matching_cfg=self._matching_cfg),
                 }
                 futures[(ctrl_name, cid)] = self._pool.submit(
                     run_cheap_search, (ctrl_name, cid), self._matching_cfg, prior,
@@ -4219,7 +4288,8 @@ class TrackingSystem:
                 (ctrl_name, cid): tracker.search_cheap(
                     obs, frame_ts_ns, blob_radii=rad, blob_brightnesses=brt,
                     occluders_per_cam=occluders_by_ctrl.get(_other_ctrl(ctrl_name)),
-                    gyro_rel_R=_gyro_rel_R_for(self._gyro_data.get(ctrl_name), tracker.pose_history, frame_ts_ns),
+                    gyro_rel_R=_gyro_rel_R_for(self._gyro_data.get(ctrl_name), tracker.pose_history, frame_ts_ns,
+                                                matching_cfg=self._matching_cfg),
                     vel_ema_override=_vel_ema_with_imu_fallback(
                         tracker, _predicted_world_by_ctrl[ctrl_name], self.cameras[cid], frame_ts_ns),
                 )
@@ -4578,19 +4648,46 @@ class TrackingSystem:
         Compares each pair's new position against BOTH controllers' own
         last real position (self.ctrl_trackers[name]._fusion_filter.p) --
         not against each other's current candidate, which is what
-        _resolve_cold_conflicts already does. Skips any pair where either
-        side has no prior reference yet (fresh bootstrap, self.p is None)
-        -- a same-frame double-bootstrap swap is a real but out-of-scope
-        residual gap; there is nothing to compare against in that case.
+        _resolve_cold_conflicts already does. When a side's own self.p is
+        None (freshly reset, not just a normal cold loss -- e.g. via the
+        should_force_cold_start/max_consecutive_rejects escape hatch, which
+        wipes HeuristicPoseFusionFilter.p entirely), falls back to that
+        filter's _last_known_p (2026-09-16) -- the last real position
+        before the reset, deliberately preserved through reset() for
+        exactly this purpose (see reset()'s own comment) -- gated by
+        matching.cold_swap_stale_reference_max_s so a very old reference
+        from an unrelated part of the session doesn't get compared
+        against. Uses getattr with a None default so a minimal test double
+        without these attributes degrades to today's skip behavior instead
+        of raising. Only when NEITHER self.p NOR a fresh-enough
+        _last_known_p exists does the pair get skipped entirely (a same-
+        frame double-bootstrap swap where BOTH controllers are being seen
+        for the very first time ever is still a real but out-of-scope
+        residual gap; there is nothing to compare against in that case).
         """
         suspected: Set[str] = set()
         margin = float(self._matching_cfg.get('cold_swap_margin', 0.85))
+        stale_max_ns = int(float(self._matching_cfg.get('cold_swap_stale_reference_max_s', 5.0)) * 1e9)
+
+        def _reference_p(filt):
+            if filt is None:
+                return None
+            if filt.p is not None:
+                return filt.p
+            last_p = getattr(filt, "_last_known_p", None)
+            last_ts = getattr(filt, "_last_known_p_ts_ns", None)
+            if last_p is None or last_ts is None:
+                return None
+            if frame_ts_ns - last_ts > stale_max_ns:
+                return None
+            return last_p
+
         names = list(candidates.keys())
         for a, b in itertools.combinations(names, 2):
             filt_a = self.ctrl_trackers[a]._fusion_filter
             filt_b = self.ctrl_trackers[b]._fusion_filter
-            p_a = filt_a.p if filt_a is not None else None
-            p_b = filt_b.p if filt_b is not None else None
+            p_a = _reference_p(filt_a)
+            p_b = _reference_p(filt_b)
             if p_a is None or p_b is None:
                 continue
             new_a = candidates[a]["T_world_ctrl"].t

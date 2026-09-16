@@ -696,6 +696,101 @@ class RotationSeedGraceFramesTests(unittest.TestCase):
         self.assertEqual(f._rotation_seed_grace_frames, 5)
 
 
+class HighRiskSeedSuppressesGraceTests(unittest.TestCase):
+    """Regression for a real identity-swap bug (2026-09-16, static_dark,
+    right_controller): a coverage_fallback candidate that ALSO won a
+    contested cross-controller conflict (winner_was_contested) landed
+    through the ORDINARY warm blend path (imu_frame_scale still > 0 --
+    frames_lost hadn't yet crossed imu_decay_frames) and re-armed the
+    SAME blanket rotation_seed_grace exemption a plain coverage_fallback
+    seed gets -- exempting the very next frame's hard rotation-
+    implausibility gate. The next frame then brought a real ~129deg
+    identity-swap jump, which sailed straight through because the gate
+    was exempted. Fix: winner_was_contested/swap_suspected on the SEEDING
+    solution force grace to 0 instead -- see _seed_rotation_grace's own
+    docstring."""
+
+    def test_high_risk_seed_forces_zero_grace_even_with_coverage_fallback(self):
+        f = _make_filter()
+        f.try_update(_solution(np.eye(3), np.array([0.0, 0.0, 0.0])), 0)
+        f.predict = _stub_predict(np.eye(3), np.array([0.0, 0.0, 0.0]))
+        # A small-rotation candidate (well under the 60deg flat ceiling --
+        # must not itself hard-reject) that's BOTH coverage_fallback and a
+        # contested-conflict winner -- exactly the real bug's own seed
+        # shape.
+        seed = {**_solution(Rotation.from_euler('z', 5, degrees=True).as_matrix(),
+                             np.array([0.0, 0.0, 0.0]), n_inliers=6, error_px=0.3),
+                "coverage_fallback": True, "winner_was_contested": True}
+        ok = f.try_update(seed, 1 * _NS)
+        self.assertTrue(ok, "the seed itself must still be accepted (small rotation, not implausible on its own)")
+        self.assertEqual(f._rotation_seed_grace_frames, 0,
+                          "a high-risk seed must NOT get the ordinary coverage_fallback grace period")
+
+        # The next frame brings a wild ~129deg rotation, mirroring the real
+        # swap jump -- must now be hard-rejected (gate fully armed), not
+        # exempted.
+        f.predict = _stub_predict(np.eye(3), np.array([0.0, 0.0, 0.0]))
+        R_swap_jump = Rotation.from_euler('z', 129, degrees=True).as_matrix()
+        ok2 = f.try_update(_solution(R_swap_jump, np.array([0.0, 0.0, 0.0])), 2 * _NS)
+        self.assertFalse(ok2, "the fix: an un-exempted hard gate must reject the identity-swap-shaped jump")
+
+    def test_swap_suspected_seed_forces_zero_grace(self):
+        f = _make_filter()
+        f.try_update(_solution(np.eye(3), np.array([0.0, 0.0, 0.0])), 0)
+        f.predict = _stub_predict(np.eye(3), np.array([0.0, 0.0, 0.0]))
+        seed = {**_solution(Rotation.from_euler('z', 5, degrees=True).as_matrix(),
+                             np.array([0.0, 0.0, 0.0]), n_inliers=6, error_px=0.3),
+                "coverage_fallback": True, "swap_suspected": True}
+        ok = f.try_update(seed, 1 * _NS)
+        self.assertTrue(ok)
+        self.assertEqual(f._rotation_seed_grace_frames, 0)
+
+    def test_plain_coverage_fallback_seed_unaffected_by_high_risk_change(self):
+        """Regression pin: a coverage_fallback seed with neither
+        winner_was_contested nor swap_suspected must keep getting the
+        ordinary grace period -- the high_risk change must not touch this
+        case at all."""
+        f = _make_filter()
+        f.try_update(_solution(np.eye(3), np.array([0.0, 0.0, 0.0])), 0)
+        f.predict = _stub_predict(np.eye(3), np.array([0.0, 0.0, 0.0]))
+        seed = {**_solution(Rotation.from_euler('z', 5, degrees=True).as_matrix(),
+                             np.array([0.0, 0.0, 0.0]), n_inliers=6, error_px=0.3),
+                "coverage_fallback": True}
+        ok = f.try_update(seed, 1 * _NS)
+        self.assertTrue(ok)
+        self.assertEqual(f._rotation_seed_grace_frames, 2,
+                          "a plain coverage_fallback seed (no contested/swap flag) keeps the normal grace period")
+
+    def test_confirmed_weak_contested_cold_reacquire_suppresses_grace(self):
+        """A coverage_fallback + winner_was_contested candidate is always
+        weak (coverage_fallback forces it, regardless of _contested_but_
+        strong -- see _try_cold_reacquire's own weak= formula), so it
+        buffers first; once a second agreeing candidate confirms it,
+        _accept_cold_reacquire is reached with coverage_fallback=True AND
+        high_risk=True. Without threading high_risk through that call site,
+        this is exactly where the OLD code would still grant the ordinary
+        2-frame grace (coverage_fallback=True) despite the contested flag --
+        the two single-candidate tests above can't catch this, since
+        _try_cold_reacquire's own strong-exemption path REQUIRES
+        coverage_fallback=False to bypass buffering at all, which already
+        gave grace=0 under the old code too."""
+        f = _make_filter()
+        f.try_update(_solution(np.eye(3), np.array([0.0, 0.0, 0.0])), 0)
+        f.frames_since_update = 1000  # forces imu_frame_scale == 0 -> cold routing
+        f.predict = _stub_predict(np.eye(3), np.array([0.0, 0.0, 0.0]))
+        weak_contested = {
+            **_solution(Rotation.from_euler('z', 5, degrees=True).as_matrix(),
+                        np.array([1.0, 0.0, 0.0]), n_inliers=6, error_px=0.3),
+            "coverage_fallback": True, "winner_was_contested": True,
+        }
+        ok0 = f.try_update(weak_contested, 1 * _NS)
+        self.assertFalse(ok0, "coverage_fallback forces weak -- must buffer, not accept immediately")
+        ok1 = f.try_update(weak_contested, 2 * _NS)  # self-confirming (same pose) -> accepted
+        self.assertTrue(ok1)
+        self.assertEqual(f._rotation_seed_grace_frames, 0,
+                          "confirmed but still contested -- must NOT get the ordinary coverage_fallback grace")
+
+
 class ColdReacquireWeakBufferTests(unittest.TestCase):
     """Regression for the most common real failure shape (user-reported,
     2026-09-13, "64->65" / "66->67"): a controller at the edge of camera
@@ -1198,6 +1293,343 @@ class SwapSuspectedWeakRoutingTests(unittest.TestCase):
         self.assertTrue(ok2, "two independent swap-suspected-but-agreeing solves must still confirm each other")
         np.testing.assert_allclose(f.p, np.array([1.010, 0.0, 0.0]))
         self.assertEqual(f._last.get("outcome"), "bootstrap")
+
+
+def _dense_calm_imu_arrays():
+    """Near-zero gyro / gravity-only accel, sampled every 10ms out to 500ms
+    -- dense enough that slice_imu_to_window's own pad_ns=200ms default
+    always leaves multiple real samples in whatever [ts_lo, ts_hi] window a
+    test queries (a sparse 2-endpoint array can get windowed down to a
+    SINGLE surviving sample for a short-dt query, which integrate_gyro_
+    segment then rejects as "out of coverage" -- found by a real test
+    failure: dt_s=0.05s failed to predict at all with only 2 samples 500ms
+    apart, while dt_s=0.3s happened to still clear the padded window)."""
+    ts = list(range(0, 500_000_001, 10_000_000))
+    return _imu_arrays(
+        [(t, [0.0, 0.0, 0.0]) for t in ts],
+        [(t, [0.0, 0.0, 9.81]) for t in ts],
+    )
+
+
+class RotPredImplausibleSignalTests(unittest.TestCase):
+    """Regression for try_update's rot_pred_implausible signal (2026-09-16,
+    real case: right_controller, static_dark -- see _try_cold_reacquire's
+    own docstring/config comment for the full real-case numbers). Exercises
+    the SIGNAL COMPUTATION itself (real gyro/accel data through predict(),
+    not a stubbed R_pred) -- ConfirmStepRotPredVetoTests below covers the
+    CONFIRM-step veto logic directly. Uses near-zero (calm) gyro throughout
+    so predict()'s gyro integration leaves R_pred == self.R == identity
+    essentially unchanged, letting tests choose an exact, known rot_innov_
+    deg via R_meas alone rather than modeling real gyro dynamics."""
+
+    def _filter(self, frames_since_update=5, **cfg_overrides):
+        gyro_data, accel_data = _dense_calm_imu_arrays()
+        cfg = {
+            "imu_decay_frames": 4,
+            "cold_reacquire_rot_veto_max_s": 0.25,
+            "cold_reacquire_rot_veto_thresh_deg": 100.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_rot_shrink_s_per_dps": 0.00018,
+            "coast_trust_rot_min_budget_s": 0.003,
+            "vision_weight_weak_inliers": 5,
+            "vision_weight_strong_inliers": 8,
+            "vision_weight_strong_error_px": 0.15,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(
+            gyro_data=gyro_data, accel_data=accel_data, lever_arm=np.zeros(3),
+            g_world_estimator=Mock(g_world=np.array([0.0, 0.0, -9.81])),
+            cfg={"fusion_heuristic": cfg}, ctrl_name="test",
+        )
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.last_update_ts_ns = 0
+        f.frames_since_update = frames_since_update  # >=5 -> imu_frame_scale<=0 (imu_decay_frames=4)
+        return f
+
+    def test_wild_rotation_disagreement_hard_rejects_despite_strong_stats(self):
+        """~170deg from self.R=identity, calm gyro (R_pred~=identity) --
+        n_inliers=20/error_px=0.1 would otherwise be "strong". UPDATED
+        2026-09-16 (Phase 2, same-day follow-up): at the imu_frame_scale<=0
+        boundary, rot_pred_implausible is now a genuine HARD REJECT (same
+        shape as the warm-path's own _rot_implausible gate), not just a
+        weak-buffer-forcing signal -- a wildly-implausible candidate here
+        has an independent, still-credible gyro reference saying it's
+        wrong, so there's no need to wait for a second candidate to
+        confirm/refuse via the buffer mechanism (that mechanism still
+        exists and is covered separately -- see ConfirmStepRotPredVetoTests
+        -- for cases where rot_pred_implausible is False at this point but
+        the CONFIRM step itself later disagrees)."""
+        f = self._filter()
+        R_meas = Rotation.from_rotvec(np.radians(170.0) * np.array([0.0, 0.0, 1.0])).as_matrix()
+        sol = _solution(R_meas, np.array([0.01, 0.01, 0.01]), n_inliers=20, error_px=0.1)
+        ok = f.try_update(sol, 50_000_000)  # dt_s=0.05s -- well within the 0.25s veto budget
+        self.assertFalse(ok, "a wild rotation disagreement vs a still-credible gyro prediction must hard-reject")
+        self.assertIsNone(f._cold_pending, "a hard reject does not buffer anything")
+        self.assertEqual(f.consecutive_rejects, 1)
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_past_its_own_credibility_window_the_veto_does_not_engage(self):
+        """Same wild disagreement, but dt_s=0.3s is past the 0.25s veto
+        budget (zero shrink here since gyro is calm) -- rot_pred_implausible
+        must NOT force buffering; the otherwise-strong candidate is trusted
+        immediately, same as before this fix existed."""
+        f = self._filter()
+        R_meas = Rotation.from_rotvec(np.radians(170.0) * np.array([0.0, 0.0, 1.0])).as_matrix()
+        sol = _solution(R_meas, np.array([0.01, 0.01, 0.01]), n_inliers=20, error_px=0.1)
+        ok = f.try_update(sol, 300_000_000)  # dt_s=0.3s -- past the credibility window
+        self.assertTrue(ok, "past its own credibility window, the veto must not block an otherwise-strong candidate")
+
+    def test_small_rotation_disagreement_does_not_trigger_the_veto(self):
+        """A modest, plausible rotation offset (well under the 100deg
+        threshold) must not be flagged -- this isn't a blanket rotation
+        gate, only a veto for gross disagreement."""
+        f = self._filter()
+        R_meas = Rotation.from_rotvec(np.radians(5.0) * np.array([0.0, 0.0, 1.0])).as_matrix()
+        sol = _solution(R_meas, np.array([0.01, 0.01, 0.01]), n_inliers=20, error_px=0.1)
+        ok = f.try_update(sol, 50_000_000)
+        self.assertTrue(ok, "an ordinary small disagreement must not be vetoed")
+
+    def test_end_to_end_real_bug_shape_two_weak_candidates_agree_but_disagree_with_gyro(self):
+        """Full try_update-level replay of the real bug's shape (right_
+        controller, static_dark): two consecutive weak candidates
+        (n_inliers=6, coverage_fallback=True, matching the real case's own
+        numbers) agree with each other (~1.65deg apart, reconstructed to
+        match the real case's own drot) but both disagree wildly (~160deg)
+        with a still-credible calm-gyro R_pred (R_pred~=self.R=identity
+        here) -- dt_s~0.09s/0.101s mirror the real case's own 88.7ms/
+        99.8ms. UPDATED 2026-09-16 (Phase 2, same-day follow-up): Phase 2's
+        warm-gate hard-reject now catches this real bug shape even earlier
+        than the buffer/CONFIRM dance this test originally exercised --
+        BOTH candidates hard-reject outright on their own, since each one
+        individually disagrees wildly with the still-credible gyro
+        reference. Nothing ever gets buffered; the CONFIRM-step veto this
+        test used to exercise is still covered directly and in isolation
+        by ConfirmStepRotPredVetoTests below (for the case where a
+        candidate looks plausible in isolation but the CONFIRM comparison
+        against the pending one disagrees)."""
+        f = self._filter()
+        R_A = Rotation.from_rotvec(np.radians(160.0) * np.array([0.3, 0.7, 0.6467])).as_matrix()
+        R_B = Rotation.from_rotvec(np.radians(1.65) * np.array([0.1, 0.2, 0.9701])).as_matrix() @ R_A
+        p_A = np.array([0.5, 0.5, 0.3])
+        p_B = p_A + np.array([0.005, 0.003, -0.002])
+
+        sol_A = _solution(R_A, p_A, n_inliers=6, error_px=0.85)
+        sol_A["coverage_fallback"] = True
+        ok_A = f.try_update(sol_A, 90_000_000)
+        self.assertFalse(ok_A, "first weak candidate must hard-reject, not accept")
+        self.assertIsNone(f._cold_pending, "a hard reject does not buffer anything")
+        self.assertEqual(f.consecutive_rejects, 1)
+
+        sol_B = _solution(R_B, p_B, n_inliers=6, error_px=0.87)
+        sol_B["coverage_fallback"] = True
+        ok_B = f.try_update(sol_B, 101_000_000)
+        self.assertFalse(ok_B, "second weak candidate also disagrees wildly with gyro -- must also hard-reject")
+        self.assertIsNone(f._cold_pending, "still nothing buffered -- both candidates were rejected outright")
+        self.assertEqual(f.consecutive_rejects, 2)
+        np.testing.assert_allclose(f.R, np.eye(3), err_msg="tracked state must stay at its pre-loss value, never advance to R_A/R_B")
+
+
+def _violent_imu_arrays(peak_rad_s=40.0):
+    """Dense, high-rate gyro (peak ~2292dps once converted) + gravity-only
+    accel, sampled every 10ms out to 500ms -- same shape as _dense_calm_
+    imu_arrays but violent enough to shrink coast_trust_rot's own budget
+    (shrink_s_per_dps=0.00018, min_budget_s=0.003 per RotPredImplausible
+    SignalTests' fixture) from its 0.25s base down to the 0.003s floor:
+    0.00018 * 2292 = 0.41s of shrink, comfortably past the 0.25s base."""
+    ts = list(range(0, 500_000_001, 10_000_000))
+    return _imu_arrays(
+        [(t, [0.0, 0.0, peak_rad_s]) for t in ts],
+        [(t, [0.0, 0.0, 9.81]) for t in ts],
+    )
+
+
+class WarmGateSpeedAwareHardRejectTests(unittest.TestCase):
+    """Regression for the imu_frame_scale<=0 hard-reject branch added
+    2026-09-16 (Phase 2, same-day follow-up to RotPredImplausibleSignalTests
+    above): rot_pred_implausible now hard-rejects past imu_decay_frames,
+    not just forces weak buffering. See try_update's own comment on the
+    `if imu_frame_scale <= 0.0:` branch for the full real-case rationale."""
+
+    def _filter(self, frames_since_update=5, gyro_data=None, accel_data=None, **cfg_overrides):
+        if gyro_data is None or accel_data is None:
+            gyro_data, accel_data = _dense_calm_imu_arrays()
+        cfg = {
+            "imu_decay_frames": 4,
+            "cold_reacquire_rot_veto_max_s": 0.25,
+            "cold_reacquire_rot_veto_thresh_deg": 100.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_rot_shrink_s_per_dps": 0.00018,
+            "coast_trust_rot_min_budget_s": 0.003,
+            "vision_weight_weak_inliers": 5,
+            "vision_weight_strong_inliers": 8,
+            "vision_weight_strong_error_px": 0.15,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(
+            gyro_data=gyro_data, accel_data=accel_data, lever_arm=np.zeros(3),
+            g_world_estimator=Mock(g_world=np.array([0.0, 0.0, -9.81])),
+            cfg={"fusion_heuristic": cfg}, ctrl_name="test",
+        )
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.last_update_ts_ns = 0
+        f.frames_since_update = frames_since_update
+        return f
+
+    def _wild_solution(self, n_inliers=20, error_px=0.1):
+        R_meas = Rotation.from_rotvec(np.radians(170.0) * np.array([0.0, 0.0, 1.0])).as_matrix()
+        return _solution(R_meas, np.array([0.01, 0.01, 0.01]), n_inliers=n_inliers, error_px=error_px)
+
+    def test_1_calm_past_threshold_within_budget_hard_rejects_state_left_at_prediction(self):
+        f = self._filter(frames_since_update=5)
+        ok = f.try_update(self._wild_solution(), 50_000_000)  # dt_s=0.05s, well within the 0.25s budget
+        self.assertFalse(ok)
+        self.assertEqual(f.consecutive_rejects, 1)
+        self.assertIsNone(f._cold_pending)
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+        np.testing.assert_allclose(f.R, np.eye(3), err_msg="tracking state must stay at its pre-call value")
+        np.testing.assert_allclose(f.p, np.zeros(3), err_msg="tracking state must stay at its pre-call value")
+
+    def test_2_violent_gyro_shrinks_budget_below_dt_s_falls_through_unchanged(self):
+        """Regression guard on today's earlier fix: violent real motion
+        shrinks coast_trust_rot's own budget down to its floor (0.003s),
+        well under this call's dt_s (0.05s) -- rot_pred_implausible must
+        go False and this must fall through to ordinary cold routing
+        (_try_cold_reacquire), NOT hard-reject."""
+        gyro_data, accel_data = _violent_imu_arrays()
+        f = self._filter(frames_since_update=5, gyro_data=gyro_data, accel_data=accel_data)
+        ok = f.try_update(self._wild_solution(), 50_000_000)
+        self.assertTrue(ok, "not forced weak (rot_pred_implausible=False) -- an otherwise-strong "
+                            "candidate must fall through to _try_cold_reacquire's own strong-accept path, "
+                            "not the hard-reject branch")
+        self.assertEqual(f.consecutive_rejects, 0, "must fall through to _try_cold_reacquire, not the hard-reject branch")
+
+    def test_3_rot_innov_just_under_threshold_no_reject_normal_cold_routing(self):
+        f = self._filter(frames_since_update=5)
+        R_meas = Rotation.from_rotvec(np.radians(95.0) * np.array([0.0, 0.0, 1.0])).as_matrix()
+        sol = _solution(R_meas, np.array([0.01, 0.01, 0.01]), n_inliers=20, error_px=0.1)
+        ok = f.try_update(sol, 50_000_000)
+        self.assertEqual(f.consecutive_rejects, 0, "must not hard-reject when rot_innov_deg is under threshold")
+
+    def test_4_rotation_seed_grace_frames_exempts_even_a_huge_disagreement(self):
+        f = self._filter(frames_since_update=5)
+        f._rotation_seed_grace_frames = 2
+        ok = f.try_update(self._wild_solution(), 50_000_000)
+        self.assertTrue(ok, "grace-frame exemption must fall through to _try_cold_reacquire's own strong-accept "
+                            "path (not forced weak, not hard-rejected)")
+        self.assertEqual(f.consecutive_rejects, 0, "grace-frame exemption must fall through, not hard-reject")
+
+    def test_5_no_behavior_cliff_between_frames_lost_3_and_frames_lost_4(self):
+        """Same wild candidate under calm motion at frames_lost=3 (still
+        warm, imu_frame_scale>0 -- hits the EXISTING _rot_implausible gate
+        further down in try_update) vs. frames_lost=4 (imu_frame_scale<=0
+        -- hits this NEW Phase 2 branch): both must reject, with no
+        behavior cliff at the boundary."""
+        # predict() bumps frames_since_update by 1 for THIS frame before the
+        # frames_lost/imu_frame_scale computation below runs (see try_
+        # update's own comment on the -1 correction) -- so the pre-call
+        # value here is one less than the resulting frames_lost count.
+        f_warm = self._filter(frames_since_update=3)  # -> frames_lost=3, imu_frame_scale=0.25>0 (existing gate)
+        ok_warm = f_warm.try_update(self._wild_solution(), 50_000_000)
+        self.assertFalse(ok_warm)
+        self.assertEqual(f_warm.consecutive_rejects, 1)
+        self.assertEqual(f_warm._last.get("outcome"), "implausible_reject")
+
+        f_cold = self._filter(frames_since_update=4)  # -> frames_lost=4, imu_frame_scale<=0 (this new branch)
+        ok_cold = f_cold.try_update(self._wild_solution(), 50_000_000)
+        self.assertFalse(ok_cold)
+        self.assertEqual(f_cold.consecutive_rejects, 1)
+        self.assertEqual(f_cold._last.get("outcome"), "implausible_reject")
+
+    def test_6_dt_s_far_past_the_floor_budget_no_reject(self):
+        """A long-stale loss (dt_s=0.3s, past even the 0.25s calm base)
+        keeps trusting vision -- unchanged from before Phase 2: rot_pred_
+        implausible goes False past its own credibility window, falling
+        through to ordinary cold routing rather than a hard reject."""
+        f = self._filter(frames_since_update=5)
+        ok = f.try_update(self._wild_solution(), 300_000_000)
+        self.assertTrue(ok, "past its own credibility window, an otherwise-strong candidate must not be blocked")
+        self.assertEqual(f.consecutive_rejects, 0)
+
+
+class ConfirmStepRotPredVetoTests(unittest.TestCase):
+    """Direct tests of _try_cold_reacquire's CONFIRM-step veto -- the part
+    that actually closes the real bug. Forcing weak=True alone (see
+    RotPredImplausibleSignalTests above) is NOT sufficient: two candidates
+    sharing the SAME systematic rotation error still "agree" with each
+    other regardless of each one's own weak/strong status, so the CONFIRM
+    comparison (which only ever checks the two candidates against each
+    OTHER) needed its own, separate veto."""
+
+    def _filter(self):
+        return HeuristicPoseFusionFilter(gyro_data=None, accel_data=None, lever_arm=None,
+                                          g_world_estimator=None, cfg={"fusion_heuristic": {}}, ctrl_name="test")
+
+    def _seed_pending(self, f, R1, p1):
+        f._cold_pending = {"R": R1, "p": p1, "confidence": 0.5, "coverage_fallback": True,
+                            "frame_ts_ns": 1 * _NS, "n_inliers": 6}
+
+    def test_confirm_blocked_despite_candidates_agreeing_with_each_other(self):
+        """Direct regression for the real bug: two weak candidates agree
+        with each other (1deg/5mm apart, well within the confirm budget)
+        but the newer one is flagged rot_pred_implausible -- must NOT
+        confirm, must stay buffered (with the newer candidate, not the
+        old one), state must never advance."""
+        f = self._filter()
+        R1 = np.eye(3)
+        p1 = np.array([1.0, 0.0, 0.0])
+        self._seed_pending(f, R1, p1)
+        R2 = Rotation.from_rotvec(np.radians(1.0) * np.array([0.0, 0.0, 1.0])).as_matrix() @ R1
+        p2 = p1 + np.array([0.005, 0.0, 0.0])
+        ok = f._try_cold_reacquire(R2, p2, 1 * _NS + 20_000_000, confidence=0.5, coverage_fallback=True, n_inliers=6,
+                                    rot_pred_implausible=True)
+        self.assertFalse(ok, "must NOT confirm despite the two candidates agreeing with each other")
+        self.assertIsNotNone(f._cold_pending, "must stay buffered, not accepted")
+        np.testing.assert_allclose(f._cold_pending["p"], p2, atol=1e-9)
+        self.assertIsNone(f.R, "tracked state must never advance on a vetoed confirm")
+
+    def test_confirm_proceeds_normally_when_rot_pred_plausible(self):
+        """Regression guard: the exact same agreeing pair, WITHOUT the
+        veto flagged, must confirm and accept exactly as before this fix."""
+        f = self._filter()
+        R1 = np.eye(3)
+        p1 = np.array([1.0, 0.0, 0.0])
+        self._seed_pending(f, R1, p1)
+        R2 = Rotation.from_rotvec(np.radians(1.0) * np.array([0.0, 0.0, 1.0])).as_matrix() @ R1
+        p2 = p1 + np.array([0.005, 0.0, 0.0])
+        ok = f._try_cold_reacquire(R2, p2, 1 * _NS + 20_000_000, confidence=0.5, coverage_fallback=True, n_inliers=6,
+                                    rot_pred_implausible=False)
+        self.assertTrue(ok, "unchanged behavior when rot_pred_implausible is False")
+        np.testing.assert_allclose(f.p, p2)
+
+    def test_rotation_seed_grace_exempts_the_veto(self):
+        """Mirrors the existing warm-path hard gate's own exemption
+        (_rot_seed_untrustworthy): while _rotation_seed_grace_frames > 0
+        (right after a coverage-fallback seed), a wild rotation
+        disagreement must NOT be treated as implausible -- the seed
+        orientation gyro is integrating from isn't itself trustworthy yet.
+        This test exercises the SIGNAL side (try_update), since that's
+        where _rotation_seed_grace_frames is actually read."""
+        gyro_data, accel_data = _dense_calm_imu_arrays()
+        f = HeuristicPoseFusionFilter(
+            gyro_data=gyro_data, accel_data=accel_data, lever_arm=np.zeros(3),
+            g_world_estimator=Mock(g_world=np.array([0.0, 0.0, -9.81])),
+            cfg={"fusion_heuristic": {"imu_decay_frames": 4, "cold_reacquire_rot_veto_max_s": 0.25,
+                                       "cold_reacquire_rot_veto_thresh_deg": 100.0,
+                                       "coast_trust_gyro_calm_floor_dps": 0.0,
+                                       "vision_weight_weak_inliers": 5, "vision_weight_strong_inliers": 8}},
+            ctrl_name="test",
+        )
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.last_update_ts_ns = 0
+        f.frames_since_update = 5
+        f._rotation_seed_grace_frames = 2  # simulates "right after a coverage-fallback seed"
+        R_meas = Rotation.from_rotvec(np.radians(170.0) * np.array([0.0, 0.0, 1.0])).as_matrix()
+        sol = _solution(R_meas, np.array([0.01, 0.01, 0.01]), n_inliers=20, error_px=0.1)
+        ok = f.try_update(sol, 50_000_000)
+        self.assertTrue(ok, "the rotation-seed-grace exemption must suppress the veto, same as the warm-path gate")
 
 
 class OneEuroBypassTests(unittest.TestCase):
@@ -1863,6 +2295,96 @@ class CoastTrustRotPrefixTests(unittest.TestCase):
                                    coast_trust_accel_calm_floor_mps2=0.0)
         budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="accel")  # default rate_prefix
         self.assertAlmostEqual(budget, 0.066, places=6)  # accel excess is 0 here -- no shrink either way
+
+
+class CoastTrustRotCalmExtendTests(unittest.TestCase):
+    """Regression for the calm-motion extension term (2026-09-16, same-day
+    follow-up to CoastTrustRotPrefixTests -- real case: right_controller,
+    static_dark, local frames 20-23). The shrink-only formula can only ever
+    REDUCE the budget below its base, never extend it -- even though the
+    same sweep found calm gyro (<100deg/s) stays credible for 50ms-1000ms+,
+    far past a flat 66ms base. See src.imu_data.effective_coast_budget_s's
+    own docstring and config.yml's coast_trust_rot_calm_extend_* comment
+    for the full derivation and numbers."""
+
+    def _filter_with_imu(self, peak_gyro_dps, **cfg_overrides):
+        _, accel_data = _imu_arrays([(0, [0.0, 0.0, 0.0])], [(0, [0.0, 0.0, 9.81])])
+        gyro_data = (np.array([0, 10_000_000]),
+                     np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        cfg = {
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_min_budget_s": 0.035,
+            "coast_trust_rot_shrink_s_per_dps": 0.00018,
+            "coast_trust_rot_min_budget_s": 0.003,
+            "coast_trust_rot_calm_extend_ceiling_s": 0.15,
+            "coast_trust_rot_calm_extend_max_dps": 100.0,
+            **cfg_overrides,
+        }
+        f = HeuristicPoseFusionFilter(gyro_data=gyro_data, accel_data=accel_data,
+                                       lever_arm=None, g_world_estimator=None,
+                                       cfg={"fusion_heuristic": cfg})
+        f.last_update_ts_ns = 0
+        return f
+
+    def test_zero_gyro_gets_the_full_extended_ceiling(self):
+        """dps=0 -> headroom=0.15-0.066=0.084 fully applied -> budget=0.15s
+        (previously capped at the flat 0.066s base regardless of how calm)."""
+        f = self._filter_with_imu(peak_gyro_dps=0.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        self.assertAlmostEqual(budget, 0.15, places=6)
+
+    def test_intermediate_calm_speeds_match_the_real_sweep_numbers(self):
+        """60/80/100deg/s -> 88.8/68.4/48.0ms, matching the real sweep's own
+        conservative-direction fit (formula <= real everywhere checked)."""
+        for dps, expected in [(60.0, 0.0888), (80.0, 0.0684), (100.0, 0.048)]:
+            f = self._filter_with_imu(peak_gyro_dps=dps)
+            budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+            self.assertAlmostEqual(budget, expected, places=4, msg=f"at {dps}deg/s")
+
+    def test_continuous_at_the_merge_point_with_the_shrink_only_formula(self):
+        """dps=100 (calm_extend_max_dps) must land EXACTLY on what the
+        unmodified shrink-only formula gives there -- no discontinuity."""
+        f = self._filter_with_imu(peak_gyro_dps=100.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        shrink_only = max(0.003, 0.066 - 0.00018 * 100.0)
+        self.assertAlmostEqual(budget, shrink_only, places=6)
+
+    def test_above_merge_point_unchanged_from_the_already_validated_shrink_formula(self):
+        """175deg/s (this project's own already-validated real fit point)
+        must be untouched by the extend term -- regression guard."""
+        f = self._filter_with_imu(peak_gyro_dps=175.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        self.assertAlmostEqual(budget, max(0.003, 0.066 - 0.00018 * 175.0), places=6)
+
+    def test_unconfigured_extend_keys_are_a_pure_no_op(self):
+        """No coast_trust_rot_calm_extend_* override at all -- must
+        reproduce the exact pre-extension shrink-only formula, byte-
+        identical (both keys default to 0.0)."""
+        f = self._filter_with_imu(peak_gyro_dps=0.0, coast_trust_rot_calm_extend_ceiling_s=0.0,
+                                   coast_trust_rot_calm_extend_max_dps=0.0)
+        budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        self.assertAlmostEqual(budget, 0.066, places=6)
+
+    def test_a_base_already_above_the_ceiling_gets_zero_bonus_self_limiting(self):
+        """cold_reacquire_rot_veto_max_s's own base (0.25s) already exceeds
+        the 0.15s ceiling -- headroom=max(0, ceiling-base)=0, so this
+        already-tuned, higher-stakes consumer must be COMPLETELY unaffected
+        regardless of how calm gyro is. Direct regression for the exact
+        real-vs-naive-design gap found during this feature's own review."""
+        f = self._filter_with_imu(peak_gyro_dps=0.0)
+        budget = f._effective_coast_budget_s(0.25, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        self.assertAlmostEqual(budget, 0.25, places=6)
+
+    def test_accel_axis_and_default_both_axis_are_unaffected(self):
+        """The extend term is gyro-axis-only -- axis="accel" and the
+        default axis="both" callers must be byte-identical to before this
+        feature, even with the extend keys configured."""
+        f = self._filter_with_imu(peak_gyro_dps=0.0, coast_trust_shrink_s_per_mps2=0.001145,
+                                   coast_trust_accel_calm_floor_mps2=0.0)
+        accel_budget = f._effective_coast_budget_s(0.066, 10_000_000, axis="accel")
+        both_budget = f._effective_coast_budget_s(0.066, 10_000_000)
+        self.assertAlmostEqual(accel_budget, 0.066, places=6)
+        self.assertAlmostEqual(both_budget, 0.066, places=6)
 
 
 class DegenerateFallbackCoastGateTests(unittest.TestCase):

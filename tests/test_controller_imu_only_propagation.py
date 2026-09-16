@@ -475,5 +475,106 @@ class RotationAxisOwnBudgetTests(unittest.TestCase):
         self.assertEqual(len(calls), 1, "accel axis must still floor at its own coast_trust_min_budget_s")
 
 
+class CalmMotionExtendTests(unittest.TestCase):
+    """Regression for the calm-motion extension term (2026-09-16, same-day
+    follow-up -- real case: right_controller, static_dark, local frames
+    20-23) reaching ControllerTracker._mark_all_lost's search-anchor budget
+    via the shared src.imu_data.effective_coast_budget_s helper (no second,
+    hand-derived copy of the formula -- see that function's own docstring
+    and config.yml's coast_trust_rot_calm_extend_* comment)."""
+
+    def _make_tracker_with_imu(self, gyro_samples, accel_samples, **cfg_overrides):
+        matching_cfg = {
+            "imu_only_propagation_max_s": 0.066,
+            "tracking_lost_grace_frames": 1,
+            "coast_trust_accel_calm_floor_mps2": 0.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_shrink_s_per_mps2": 0.0,
+            "coast_trust_shrink_s_per_dps": 0.0,
+            "coast_trust_min_budget_s": 0.035,
+            "coast_trust_rot_shrink_s_per_dps": 0.00018,
+            "coast_trust_rot_min_budget_s": 0.003,
+            "coast_trust_rot_calm_extend_ceiling_s": 0.15,
+            "coast_trust_rot_calm_extend_max_dps": 100.0,
+            **cfg_overrides,
+        }
+        tracker = ControllerTracker(
+            "test", {}, {}, matching_cfg=matching_cfg,
+            fusion_cfg={"enabled": True, "filter_type": "heuristic"},
+        )
+        tracker._fusion_filter.velocity_established = True
+        tracker._fusion_filter.last_update_ts_ns = 0
+        t_g = np.array([t for t, _ in gyro_samples], dtype=np.int64)
+        g = np.array([v for _, v in gyro_samples], dtype=np.float64)
+        t_a = np.array([t for t, _ in accel_samples], dtype=np.int64)
+        a = np.array([v for _, v in accel_samples], dtype=np.float64)
+        tracker._gyro_data = (t_g, g)
+        tracker._accel_data = (t_a, a)
+        tracker._g_world_estimator = Mock(g_world=np.array([0.0, 0.0, 9.81]))
+        return tracker
+
+    def test_combined_propagation_stays_capped_near_the_flat_base_even_when_calm(self):
+        """IMPORTANT, non-obvious consequence of this feature's own scope:
+        _mark_all_lost gates on elapsed < min(pos_budget, rot_budget), and
+        the POSITION axis deliberately does NOT get a calm-extension (the
+        sweep found accel/position already tracks the existing shared rate
+        reasonably well near the flat base -- see config.yml's own
+        coast_trust_rot_calm_extend_* comment). So even under the calmest
+        possible motion on BOTH axes, the combined propagation ceiling for
+        THIS consumer stays capped at the flat ~66ms base -- rotation's own
+        extended budget is real and correct (see CoastTrustRotCalmExtendTests
+        in test_pose_fusion_heuristic.py, which verifies it directly), but
+        it can never raise _mark_all_lost's own combined min() past whatever
+        the (unextended) position axis allows. This is intentional: the real
+        beneficiaries of the rotation-only extension are the ROTATION-ONLY
+        consumers (_try_cold_reacquire's rot_pred_implausible veto, the
+        warm-gate reject, _gyro_rel_R_for) that never AND with position at
+        all. Documented here as a regression guard against a future change
+        accidentally assuming this consumer gets the full extension too."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.15 * _NS), [0.0, 0.0, 0.0])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.15 * _NS), [0.0, 0.0, 9.81])],
+        )
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.05 * _NS))  # under the flat 66ms base -> still propagates
+        self.assertEqual(len(calls), 1)
+        tracker._last_imu_propagate_ts_ns = None
+        calls.clear()
+        tracker._mark_all_lost(frame_ts_ns=int(0.1 * _NS))  # 100ms -- past the flat base, despite calm motion
+        self.assertEqual(len(calls), 0,
+                          "position's own unextended budget must still cap combined propagation near 66ms")
+
+    def test_rot_budget_parity_with_the_fusion_filter_s_own_formula(self):
+        """_mark_all_lost's rot_budget_s and HeuristicPoseFusionFilter.
+        _effective_coast_budget_s(axis="gyro") must agree exactly for
+        identical inputs -- both now call the SAME shared src.imu_data.
+        effective_coast_budget_s, so this is a direct function-level
+        regression guard against either call site's own config-key wiring
+        drifting apart (NOT observable through _mark_all_lost's own
+        combined min()-gated behavior -- see the test above for why)."""
+        from src.imu_data import effective_coast_budget_s
+        from src.pose_fusion_heuristic import HeuristicPoseFusionFilter
+        peak_gyro_dps = 70.0
+        cfg = {
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_rot_shrink_s_per_dps": 0.00018,
+            "coast_trust_rot_min_budget_s": 0.003,
+            "coast_trust_rot_calm_extend_ceiling_s": 0.15,
+            "coast_trust_rot_calm_extend_max_dps": 100.0,
+        }
+        gyro_data = (np.array([0, 10_000_000]),
+                     np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        accel_data = (np.array([0, 10_000_000]),
+                      np.array([[0.0, 0.0, 9.81], [0.0, 0.0, 9.81]]))
+        f = HeuristicPoseFusionFilter(gyro_data=gyro_data, accel_data=accel_data, lever_arm=None,
+                                       g_world_estimator=None, cfg={"fusion_heuristic": cfg})
+        f.last_update_ts_ns = 0
+        via_fusion_filter = f._effective_coast_budget_s(0.066, 10_000_000, axis="gyro", rate_prefix="coast_trust_rot")
+        via_shared_function_directly = effective_coast_budget_s(0.066, peak_gyro_dps, 0.0, 0.00018, 0.003, 0.15, 100.0)
+        self.assertAlmostEqual(via_fusion_filter, via_shared_function_directly, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()

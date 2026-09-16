@@ -85,7 +85,8 @@ from loguru import logger
 from scipy.spatial.transform import Rotation
 
 from src.imu_data import predict_world_pose, slice_imu_to_window, dead_reckon_dense, \
-    predict_headset_relative_pose, MOCAP_ROOM_G_WORLD, peak_gyro_accel_over_window
+    predict_headset_relative_pose, MOCAP_ROOM_G_WORLD, peak_gyro_accel_over_window, \
+    effective_coast_budget_s as _shared_effective_coast_budget_s
 from src.mocap_data import world_pose, headset_angular_velocity, headset_linear_velocity
 from src.one_euro_filter import OneEuroFilter, OneEuroRotationFilter
 
@@ -157,6 +158,20 @@ class HeuristicPoseFusionFilter:
 
         self.R = None
         self.p = None
+        # Last real accepted position + its timestamp, updated alongside
+        # self.p at every genuine accept (fail-open, ordinary blend,
+        # _accept_cold_reacquire) but, UNLIKE self.p, deliberately NOT
+        # cleared by reset() (2026-09-16) -- see reset()'s own comment.
+        # Sole consumer: TrackingSystem._detect_cold_identity_swap, which
+        # needs "where did this controller last look like it genuinely
+        # was, before things went wrong" as a fallback reference once
+        # self.p itself has been wiped by a proven-wrong reset -- exactly
+        # the gap that let a real identity swap go undetected (static_dark,
+        # right_controller: this controller was fully reset, then re-
+        # bootstrapped near where the OTHER controller used to be, with no
+        # surviving reference for the swap-check to compare against).
+        self._last_known_p: np.ndarray | None = None
+        self._last_known_p_ts_ns: int | None = None
         self.v = np.zeros(3)
         # True once self.v has been set from an ACTUAL measured displacement
         # -- a real two-point finite difference over a SHORT, known gap, in
@@ -303,14 +318,31 @@ class HeuristicPoseFusionFilter:
             return per_ctrl[key]
         return self._hc.get(key, default)
 
-    def _seed_rotation_grace(self, coverage_fallback: bool) -> None:
+    def _seed_rotation_grace(self, coverage_fallback: bool, high_risk: bool = False) -> None:
         """(Re)seeds self._rotation_seed_grace_frames after a fresh anchor
         (bootstrap/fail_open/_try_cold_reacquire) -- see that field's own
         __init__ comment for the full rationale. rotation_seed_grace_frames
         (default 2) is how many consecutive non-coverage_fallback accepts
         the hard gate stays exempted for after an untrustworthy seed, not
-        just the one immediately following it."""
-        if coverage_fallback:
+        just the one immediately following it.
+
+        high_risk (2026-09-16): True when the seeding solution was itself
+        winner_was_contested or swap_suspected -- a contested cross-
+        controller conflict winner, or a candidate suspected of belonging
+        to the OTHER controller. The ordinary coverage_fallback exemption's
+        whole justification is "this seed is PROBABLY right, just under-
+        evidenced -- don't let the hard gate false-reject the next good
+        candidate on top of it." That doesn't hold when the seed itself
+        already carries an independent "this might belong to the wrong
+        controller entirely" flag -- granting the same blanket exemption
+        there is exactly what let a real ~129deg identity-swap jump sail
+        through the hard gate one frame later (found investigating a real
+        case: static_dark, right_controller). high_risk always forces zero
+        grace, overriding coverage_fallback -- the next candidate's
+        rotation gets checked normally, no exemption."""
+        if high_risk:
+            self._rotation_seed_grace_frames = 0
+        elif coverage_fallback:
             self._rotation_seed_grace_frames = int(self._hc_get("rotation_seed_grace_frames", 2))
         else:
             self._rotation_seed_grace_frames = 0
@@ -448,22 +480,40 @@ class HeuristicPoseFusionFilter:
         site below for where this is actually wired in (axis="gyro" only
         -- the POSITION/accel axis's existing floor/rate already tracked
         the same sweep's accel-vs-position findings reasonably well and
-        was left unchanged)."""
+        was left unchanged).
+
+        Calm-motion extension (2026-09-16, same-day follow-up): axis="gyro"
+        now ALSO reads f"{rate_prefix}_calm_extend_ceiling_s"/"_max_dps"
+        (both default 0.0, fully inert unless configured) and delegates to
+        the shared src.imu_data.effective_coast_budget_s -- see that
+        function's own docstring for the full formula/derivation. Only
+        axis="gyro" gets this: the shrink-only formula was already found to
+        track the position/accel axis's own sweep data reasonably well, so
+        no extend term was added there. axis="both" (the two original,
+        pre-axis-split callers) is computed exactly as before -- a combined
+        additive shrink with NO extend term, since the two per-axis shrinks
+        don't distribute through max()/floor the same way a per-axis
+        extend-then-sum would; kept as its own explicit branch rather than
+        forcing it through the single-axis shared helper."""
         peak_gyro_dps, peak_accel_mps2 = self._peak_gyro_accel(frame_ts_ns)
         accel_calm_floor = float(self._hc_get("coast_trust_accel_calm_floor_mps2", 40.0))
         gyro_calm_floor = float(self._hc_get("coast_trust_gyro_calm_floor_dps", 900.0))
         per_accel = float(self._hc_get(f"{rate_prefix}_shrink_s_per_mps2", 0.0))
         per_gyro = float(self._hc_get(f"{rate_prefix}_shrink_s_per_dps", 0.0))
         min_budget_s = float(self._hc_get(f"{rate_prefix}_min_budget_s", self._hc_get("coast_trust_min_budget_s", 0.035)))
-        accel_shrink = per_accel * max(0.0, peak_accel_mps2 - accel_calm_floor)
-        gyro_shrink = per_gyro * max(0.0, peak_gyro_dps - gyro_calm_floor)
         if axis == "accel":
-            shrink = accel_shrink
+            return _shared_effective_coast_budget_s(base_budget_s, peak_accel_mps2, accel_calm_floor,
+                                                      per_accel, min_budget_s)
         elif axis == "gyro":
-            shrink = gyro_shrink
+            calm_extend_ceiling_s = float(self._hc_get(f"{rate_prefix}_calm_extend_ceiling_s", 0.0))
+            calm_extend_max_dps = float(self._hc_get(f"{rate_prefix}_calm_extend_max_dps", 0.0))
+            return _shared_effective_coast_budget_s(base_budget_s, peak_gyro_dps, gyro_calm_floor,
+                                                      per_gyro, min_budget_s,
+                                                      calm_extend_ceiling_s, calm_extend_max_dps)
         else:
-            shrink = accel_shrink + gyro_shrink
-        return max(min_budget_s, base_budget_s - shrink)
+            accel_shrink = per_accel * max(0.0, peak_accel_mps2 - accel_calm_floor)
+            gyro_shrink = per_gyro * max(0.0, peak_gyro_dps - gyro_calm_floor)
+            return max(min_budget_s, base_budget_s - accel_shrink - gyro_shrink)
 
     def _implausible_jump_thresholds(self, frame_ts_ns: int) -> tuple:
         """(pos_thresh_m, rot_thresh_deg) for the hard implausibility gate --
@@ -1136,8 +1186,12 @@ class HeuristicPoseFusionFilter:
             self.R, self.p = R_meas, p_meas
             self.v = np.zeros(3)
             self.velocity_established = False
-            self._seed_rotation_grace(bool(solution.get("coverage_fallback", False)))
+            self._seed_rotation_grace(
+                bool(solution.get("coverage_fallback", False)),
+                high_risk=bool(solution.get("winner_was_contested", False))
+                          or bool(solution.get("swap_suspected", False)))
             self.last_update_ts_ns = frame_ts_ns
+            self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
             self._report(frame_ts_ns, self.R, self.p)
             self._trust_window.append(confidence)
             self.frames_since_update = 0
@@ -1156,6 +1210,53 @@ class HeuristicPoseFusionFilter:
         rot_innov = Rotation.from_matrix(R_pred.T @ R_meas).as_rotvec()
         pos_innov_m = float(np.linalg.norm(p_meas - p_pred))
         rot_innov_deg = float(np.degrees(np.linalg.norm(rot_innov)))
+
+        # rot_pred_implausible (2026-09-16, real case: right_controller,
+        # static_dark, a 4-frame/~78ms calm-motion loss where two
+        # consecutive cam1-only 6-inlier P3P solves AGREED with each other
+        # (drot=1.65deg) but were BOTH wrong (150mm/158deg off mocap) --
+        # the same systematic single-camera mirror-branch ambiguity,
+        # repeated, which _try_cold_reacquire's own "two weak candidates
+        # agreeing is corroboration" logic can't distinguish from real
+        # corroboration since it only ever compares the two candidates
+        # against EACH OTHER, never against this rot_innov_deg/R_pred
+        # computed just above -- rot_innov_deg IS the exact right signal
+        # (rot_innov_deg=158deg here), it's just discarded once execution
+        # falls into the imu_frame_scale<=0 branch below (or the
+        # degenerate w_sum<=0 fallback further down), neither of which the
+        # warm-path's own rot_innov_deg-based hard gate reaches (that gate
+        # is deliberately imu_frame_scale>0-gated -- see the comment on
+        # _rot_implausible further down).
+        #
+        # Gated on its OWN gyro-credibility budget (_effective_coast_
+        # budget_s, axis="gyro", rate_prefix="coast_trust_rot" -- the SAME
+        # empirically-fit rate/floor the degenerate-fallback gate already
+        # uses, see that config key's own comment) rather than imu_frame_
+        # scale's flat 4-frame count: the real case's own dt_s (88.7-
+        # 99.8ms, elapsed since the LAST REAL ACCEPT, not since the loss
+        # started) is already past degenerate_fallback_max_s's own 0.066s
+        # base at zero shrink, so THIS veto needs its own, more generous
+        # base (cold_reacquire_rot_veto_max_s, default 0.25s) -- checked
+        # numerically, not assumed, during design review. Threshold
+        # (cold_reacquire_rot_veto_thresh_deg, default 100.0) is NOT
+        # _implausible_jump_thresholds' own rotation ceiling -- that one
+        # widens proportionally to stale_s (elapsed time), which for a
+        # cold-reacquire call (by construction always stale) would swamp
+        # any realistic rot_innov_deg and make the check inert; chosen
+        # instead directly from the real sweep's own false-positive rate
+        # (calm/slow gyro, dt<=100ms: rot_err_deg exceeds 100deg only
+        # 0.013% of the time -- comfortably below this real case's 158deg
+        # with a checked margin). _rotation_seed_grace_frames exemption
+        # mirrors the existing warm-path hard gate's own _rot_implausible
+        # reasoning (don't veto off a just-seeded, itself-untrustworthy
+        # orientation).
+        _rot_pred_budget_s = self._effective_coast_budget_s(
+            float(self._hc_get("cold_reacquire_rot_veto_max_s", 0.25)), frame_ts_ns,
+            axis="gyro", rate_prefix="coast_trust_rot")
+        _rot_veto_thresh_deg = float(self._hc_get("cold_reacquire_rot_veto_thresh_deg", 100.0))
+        rot_pred_implausible = (dt_s <= _rot_pred_budget_s
+                                 and self._rotation_seed_grace_frames <= 0
+                                 and rot_innov_deg > _rot_veto_thresh_deg)
 
         # IMU frame-count decay: w_imu (and, below, the hard implausibility
         # gate's trust in p_pred) fades linearly to 0 over imu_decay_frames
@@ -1187,12 +1288,45 @@ class HeuristicPoseFusionFilter:
         # gate included) and making debug mode behave nothing like what it's
         # named for.
         if imu_frame_scale <= 0.0:
+            # Speed-aware hard reject past imu_decay_frames (2026-09-16,
+            # same-day follow-up to rot_pred_implausible above): the warm-
+            # path's own hard implausibility gate further down (_rot_
+            # implausible) is deliberately imu_frame_scale > 0.0-gated, so
+            # once frames_lost >= imu_decay_frames (flat 4-frame count,
+            # unrelated to real elapsed time or motion violence) this
+            # branch returns BEFORE that gate is ever reached -- a lone
+            # wildly-wrong candidate right at/after the frame-4 cliff was
+            # never hard-rejected the way the identical candidate would
+            # have been one frame earlier, even while gyro is still fully
+            # credible. rot_pred_implausible already answers exactly this
+            # ("does this candidate disagree with a still-credible gyro
+            # prediction") independent of imu_frame_scale -- reused here
+            # verbatim as a genuine hard-reject trigger, not just the
+            # weak-buffer-forcing signal it already is below. Same reject
+            # shape as the warm gate's own _rot_implausible branch further
+            # down -- zero new config, tuning cold_reacquire_rot_veto_*
+            # tunes both this reject and _try_cold_reacquire's own weak/
+            # CONFIRM handling at once. As dt_s grows past the credibility
+            # budget, rot_pred_implausible naturally goes False and control
+            # falls through to ordinary cold routing -- no new cliff.
+            if rot_pred_implausible:
+                self.consecutive_rejects += 1
+                self._report(frame_ts_ns, R_pred, p_pred)
+                self._set_last(outcome="implausible_reject", pos_innov_m=pos_innov_m, rot_innov_deg=rot_innov_deg,
+                                confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
+                _log.info(
+                    f"[{self._ctrl_name}] IMPLAUSIBLE vs still-credible gyro prediction "
+                    f"(past imu_frame_scale decay) ts={frame_ts_ns} — rot_innov={rot_innov_deg:.2f}deg -- "
+                    f"REJECTED (state left at IMU prediction), vision candidate was {_fmt_v(p_meas)}"
+                )
+                return False
             return self._try_cold_reacquire(R_meas, p_meas, frame_ts_ns, confidence,
                                              coverage_fallback=bool(solution.get("coverage_fallback", False)),
                                              n_inliers=n_inliers, error_px=error_px, R_pred=R_pred, p_pred=p_pred,
                                              dt_s=dt_s,
                                              winner_was_contested=bool(solution.get("winner_was_contested", False)),
-                                             swap_suspected=bool(solution.get("swap_suspected", False)))
+                                             swap_suspected=bool(solution.get("swap_suspected", False)),
+                                             rot_pred_implausible=rot_pred_implausible)
 
         # Manual-debug override: fusion_heuristic.vision_only_debug: true forces
         # imu_frame_scale to 0 on EVERY frame, regardless of frames_since_update --
@@ -1402,7 +1536,8 @@ class HeuristicPoseFusionFilter:
                     coverage_fallback=bool(solution.get("coverage_fallback", False)),
                     n_inliers=n_inliers, error_px=error_px, R_pred=R_pred, p_pred=p_pred, dt_s=dt_s,
                     winner_was_contested=bool(solution.get("winner_was_contested", False)),
-                    swap_suspected=bool(solution.get("swap_suspected", False)))
+                    swap_suspected=bool(solution.get("swap_suspected", False)),
+                    rot_pred_implausible=rot_pred_implausible)
             w_imu, w_sum = 1.0, 1.0
 
         p_new = (w_imu * p_pred + w_vision * p_meas) / w_sum
@@ -1555,11 +1690,25 @@ class HeuristicPoseFusionFilter:
         # _rot_seed_untrustworthy was true, so it hasn't been vetted either
         # -- one more grace frame lets it settle before becoming a trusted
         # gate reference.
-        if solution.get("coverage_fallback", False):
+        # high_risk (2026-09-16): a contested-conflict-winner or swap-
+        # suspected accept forces grace to 0 immediately -- even if it's
+        # ALSO coverage_fallback, and even overriding any residual grace
+        # still counting down from an earlier seed -- see _seed_rotation_
+        # grace's own docstring for why granting/leaving an exemption on
+        # top of that independent "might belong to the wrong controller"
+        # flag is unsafe (real case: a contested coverage_fallback accept
+        # here let a ~129deg identity-swap jump through the very next
+        # frame, unexempted by this fix).
+        _high_risk = (bool(solution.get("winner_was_contested", False))
+                      or bool(solution.get("swap_suspected", False)))
+        if _high_risk:
+            self._seed_rotation_grace(bool(solution.get("coverage_fallback", False)), high_risk=True)
+        elif solution.get("coverage_fallback", False):
             self._seed_rotation_grace(True)
         elif self._rotation_seed_grace_frames > 0:
             self._rotation_seed_grace_frames -= 1
         self.last_update_ts_ns = frame_ts_ns
+        self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
         self._report(frame_ts_ns, self.R, self.p)
         self.frames_since_update = 0
 
@@ -1605,6 +1754,7 @@ class HeuristicPoseFusionFilter:
                              error_px: float = 0.0,
                              winner_was_contested: bool = False,
                              swap_suspected: bool = False,
+                             rot_pred_implausible: bool = False,
                              R_pred: np.ndarray | None = None, p_pred: np.ndarray | None = None,
                              dt_s: float | None = None, log_prefix: str = "COLD REACQUIRE",
                              pending_outcome: str = "cold_pending",
@@ -1859,9 +2009,22 @@ class HeuristicPoseFusionFilter:
         # correct geometric solve, just assigned to the wrong controller;
         # letting a "strong" swap bypass buffering would defeat the whole
         # point of this check. Always forces weak/buffered, no exemption.
+        #
+        # rot_pred_implausible (2026-09-16): a FIFTH trigger -- see
+        # try_update's own comment on this signal for the real case (two
+        # single-camera weak solves that agreed with EACH OTHER but were
+        # both 158deg off a still-credible gyro prediction). Same no-
+        # exemption treatment as swap_suspected -- a candidate that
+        # individually looks strong but contradicts an independent gyro
+        # reference shouldn't bypass buffering via the strong fast-path
+        # below. NOTE: forcing weak=True here is necessary but not
+        # sufficient for the real bug this closes -- see the CONFIRM check
+        # further down, which is the part that actually matters (two
+        # candidates sharing the SAME systematic error still "agree" with
+        # each other regardless of each one's own weak/strong status).
         weak = (coverage_fallback or n_inliers <= weak_inliers
                 or (winner_was_contested and not _contested_but_strong)
-                or swap_suspected)
+                or swap_suspected or rot_pred_implausible)
 
         if not weak:
             if pending is not None:
@@ -1872,6 +2035,7 @@ class HeuristicPoseFusionFilter:
                 )
                 self._cold_pending = None
             return self._accept_cold_reacquire(R_meas, p_meas, frame_ts_ns, confidence, coverage_fallback,
+                                                high_risk=winner_was_contested or swap_suspected,
                                                 log_prefix=log_prefix, accept_outcome=accept_outcome)
 
         if pending is None:
@@ -1885,7 +2049,8 @@ class HeuristicPoseFusionFilter:
             _log.info(
                 f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} "
                 f"n_inliers={n_inliers} coverage_fallback={coverage_fallback} "
-                f"winner_was_contested={winner_was_contested} swap_suspected={swap_suspected} — "
+                f"winner_was_contested={winner_was_contested} swap_suspected={swap_suspected} "
+                f"rot_pred_implausible={rot_pred_implausible} — "
                 f"weak candidate, buffering for confirmation instead of trusting immediately"
             )
             return False
@@ -1919,7 +2084,8 @@ class HeuristicPoseFusionFilter:
         _weak_confirm_ang_speed_deg_s = float(self._hc_get("weak_confirm_max_ang_speed_deg_s", 2000.0))
         jump_pos_m = _weak_confirm_pos_base_m + _weak_confirm_speed_m_s * confirm_dt_s
         jump_rot_deg = _weak_confirm_rot_base_deg + _weak_confirm_ang_speed_deg_s * confirm_dt_s
-        if dpos_m <= jump_pos_m and drot_deg <= jump_rot_deg:
+        _agrees_with_pending = dpos_m <= jump_pos_m and drot_deg <= jump_rot_deg
+        if _agrees_with_pending and not rot_pred_implausible:
             self._cold_pending = None
             _log.info(
                 f"[{self._ctrl_name}] {log_prefix} CONFIRMED ts={frame_ts_ns} pos={_fmt_v(p_meas)} — "
@@ -1928,14 +2094,33 @@ class HeuristicPoseFusionFilter:
                 f"{jump_pos_m * 1000:.1f}mm over confirm_dt_s={confirm_dt_s * 1000:.1f}ms), accepting"
             )
             return self._accept_cold_reacquire(R_meas, p_meas, frame_ts_ns, confidence, coverage_fallback,
+                                                high_risk=winner_was_contested or swap_suspected,
                                                 log_prefix=log_prefix, accept_outcome=accept_outcome)
 
-        _log.info(
-            f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — disagrees "
-            f"with buffered weak candidate from ts={pending['frame_ts_ns']} pos={_fmt_v(pending['p'])} "
-            f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg vs. budget {jump_pos_m * 1000:.1f}mm over "
-            f"confirm_dt_s={confirm_dt_s * 1000:.1f}ms) — discarding the stale one, buffering this one instead"
-        )
+        # rot_pred_implausible veto (2026-09-16): the two weak candidates
+        # AGREE with each other (would otherwise have been CONFIRMED above)
+        # but this frame's own candidate independently disagrees with a
+        # still-credible gyro prediction -- the real case this closes:
+        # two same-camera near-degenerate P3P solves sharing the SAME
+        # systematic mirror-branch error "agree" with each other (drot=
+        # 1.65deg) while both being 158deg off truth. Logged distinctly
+        # from an ordinary disagreement so this specific sub-case is
+        # identifiable later, same spirit as swap_suspected's own log line.
+        if _agrees_with_pending and rot_pred_implausible:
+            _log.info(
+                f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — "
+                f"agrees with buffered weak candidate from ts={pending['frame_ts_ns']} on position/rotation "
+                f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg) BUT disagrees with a still-credible "
+                f"gyro prediction (rot_innov > {float(self._hc_get('cold_reacquire_rot_veto_thresh_deg', 100.0)):.0f}deg) "
+                f"— refusing to confirm, buffering this one instead"
+            )
+        else:
+            _log.info(
+                f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — disagrees "
+                f"with buffered weak candidate from ts={pending['frame_ts_ns']} pos={_fmt_v(pending['p'])} "
+                f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg vs. budget {jump_pos_m * 1000:.1f}mm over "
+                f"confirm_dt_s={confirm_dt_s * 1000:.1f}ms) — discarding the stale one, buffering this one instead"
+            )
         self._cold_pending = {
             "R": R_meas, "p": p_meas, "confidence": confidence,
             "coverage_fallback": coverage_fallback, "frame_ts_ns": frame_ts_ns,
@@ -1947,7 +2132,8 @@ class HeuristicPoseFusionFilter:
 
     def _accept_cold_reacquire(self, R_meas: np.ndarray, p_meas: np.ndarray,
                                 frame_ts_ns: int, confidence: float,
-                                coverage_fallback: bool, log_prefix: str = "COLD REACQUIRE",
+                                coverage_fallback: bool, high_risk: bool = False,
+                                log_prefix: str = "COLD REACQUIRE",
                                 accept_outcome: str = "cold_reacquired") -> bool:
         """Actually commits a cold-reacquire (or, via _try_cold_reacquire's
         bootstrap reuse, a bootstrap) candidate as the new tracking anchor --
@@ -1955,6 +2141,14 @@ class HeuristicPoseFusionFilter:
         match path and the confirmed-weak-pair path share one place that
         does this. log_prefix/accept_outcome are passed through unchanged
         from the caller -- see _try_cold_reacquire's own docstring.
+
+        high_risk: winner_was_contested or swap_suspected on the ORIGINAL
+        candidate (threaded through unchanged from _try_cold_reacquire's own
+        params) -- passed straight into _seed_rotation_grace below so a
+        contested/swap-suspected reacquire never grants the next frame's
+        rotation gate a blanket exemption, even once it's reached this
+        "trusted, committing now" point. See _seed_rotation_grace's own
+        docstring for the real case this closes.
 
         Position is trusted immediately once this is reached (see
         _try_cold_reacquire's own docstring for the weak/strong routing that
@@ -1983,8 +2177,9 @@ class HeuristicPoseFusionFilter:
         self.velocity_established = False
 
         self.R, self.p = R_meas, p_meas
-        self._seed_rotation_grace(coverage_fallback)
+        self._seed_rotation_grace(coverage_fallback, high_risk=high_risk)
         self.last_update_ts_ns = frame_ts_ns
+        self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
         self.frames_since_update = 0
         self.consecutive_rejects = 0
         self._report(frame_ts_ns, self.R, self.p)
@@ -2048,3 +2243,13 @@ class HeuristicPoseFusionFilter:
         self._pos_innov_hist.clear()
         self._rot_innov_hist.clear()
         self._last = {}
+        # _last_known_p/_last_known_p_ts_ns deliberately NOT cleared here
+        # (2026-09-16) -- unlike self.p/reported_p above, which correctly get
+        # wiped because "the recent belief was proven wrong" for THEIR
+        # purpose (seeding re-acquisition search / display), this field's
+        # sole consumer is TrackingSystem._detect_cold_identity_swap, which
+        # specifically wants "where did this controller last look like it
+        # genuinely was, before things went wrong" as a fallback once self.p
+        # itself is gone -- a stale-but-real reference is exactly what's
+        # needed there, gated by its own staleness check in the consumer
+        # (cold_swap_stale_reference_max_s) rather than being wiped outright.

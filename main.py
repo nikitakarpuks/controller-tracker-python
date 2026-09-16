@@ -319,6 +319,8 @@ def main():
             matching_cfg=config.get("matching", {}),
             pose_fusion_debug_enabled=bool(
                 config["visualization"].get("pose_fusion_debug", {}).get("enabled", False)),
+            pose_fusion_debug_show_tabs=bool(
+                config["visualization"].get("pose_fusion_debug", {}).get("show_tabs", True)),
         )
         animator.begin(cameras, save_path=config["visualization"].get("save_recording"))
 
@@ -1251,6 +1253,7 @@ def main():
         primary_cams_frame_out    = {}
         aux_assignments_frame_out = {}
         camera_importance_frame_out = {}
+        camera_method_frame_out = {}
         frozen_T_world_ctrl_frame = {}
         # Pose-fusion debug tool (visualization.pose_fusion_debug) -- populated only
         # when a controller's sol actually carries these (fusion enabled + the debug
@@ -1331,6 +1334,7 @@ def main():
                 primary_cams_frame_out[ctrl_name]    = primary_cam_idx
                 aux_assignments_frame_out[ctrl_name] = sol.get("aux_assignments")
                 camera_importance_frame_out[ctrl_name] = sol.get("camera_importance")
+                camera_method_frame_out[ctrl_name] = sol.get("camera_method")
                 if not _no_pose_this_frame:
                     last_good_T_world[ctrl_name] = T_world_ctrl
                     frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
@@ -1531,6 +1535,7 @@ def main():
                 primary_cam_per_ctrl=primary_cams_frame_out,
                 aux_assignments_per_ctrl=aux_assignments_frame_out,
                 camera_importance_per_ctrl=camera_importance_frame_out,
+                camera_method_per_ctrl=camera_method_frame_out,
                 frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
                 blob_vis_frame=(frame_blob_vis if _visualize_rerun else {}),
                 blob_vis_skipped=(skipped_cams_per_ctrl if _visualize_rerun else {}),

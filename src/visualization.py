@@ -82,26 +82,32 @@ def _camera_color(cam_idx: int) -> list:
 # and the aux-camera loop in _log_frame) no longer color-codes by camera identity
 # or by a binary primary/aux label — fusion doesn't work that way anymore (every
 # solved camera contributes a continuous, confidence/√pairs-weighted share, see
-# _compute_fused_solution's camera_importance). Instead every contributing camera
-# is colored by a hue sweep keyed to its actual fusion weight this frame — blue
-# for a camera the fuse barely leaned on, gold for one it leaned on heavily.
-# Hue is a much easier channel to rank at a glance than brightness (two similar
-# brightnesses are hard to tell apart; two different hues aren't), and holding
-# saturation/value constant means even importance=0.0 stays clearly visible
-# instead of fading toward black.
-_IMPORTANCE_HUE_LOW     = 228 / 360   # blue,               importance = 0.0
-_IMPORTANCE_HUE_SPAN    = 177 / 360   # sweep toward gold via violet/magenta/red/orange —
-                                       # NOT through green/cyan (120-180°), which
-                                       # CAMERA_COLORS already uses for per-camera identity.
-_IMPORTANCE_SATURATION  = 0.85
-_IMPORTANCE_VALUE       = 0.95
+# _compute_fused_solution's camera_importance).
+#
+# 2026-09-16 (user-directed): REPLACED a continuous importance-weight hue
+# gradient here (blue->gold sweep by fusion weight) with discrete per-SEARCH-
+# METHOD colors instead -- the gradient was found too hard to read at a
+# glance ("confusing"), and importance weight isn't actually the thing worth
+# seeing here; which METHOD solved each camera this frame (proximity/brute/
+# constrained-fallback) is a much more actionable, already-discrete signal
+# (see ControllerTracker._compute_fused_solution's camera_method, sourced
+# from each cs["solution"]["method"]).
+_METHOD_COLORS = {
+    "proximity":              [ 80, 200, 255],   # cyan-blue  — normal warm-tracked camera
+    "p3p_systematic":         [255, 100,  40],   # orange-red — brute-force cold/recovery solve
+    "prior_constrained_p2p":  [255, 210,  40],   # yellow     — low-blob-count (2-3) fallback
+    "prior_constrained_p1p":  [255, 210,  40],   # same fallback bucket as p2p -- both are the
+                                                  # "not enough blobs for proximity's own floor,
+                                                  # solved via the prior instead" case, see
+                                                  # pose_search.constrained_search's own docstring
+                                                  # (its own mode string is lowercase -- verified
+                                                  # against a real run's log, not assumed).
+}
+_METHOD_COLOR_UNKNOWN = [160, 160, 160]   # gray — no/unrecognised method info this frame
 
 
-def _importance_color(importance: Optional[float]) -> list:
-    imp = 1.0 if importance is None else max(0.0, min(1.0, float(importance)))
-    hue = (_IMPORTANCE_HUE_LOW + _IMPORTANCE_HUE_SPAN * imp) % 1.0
-    r, g, b = colorsys.hsv_to_rgb(hue, _IMPORTANCE_SATURATION, _IMPORTANCE_VALUE)
-    return [int(round(r * 255)), int(round(g * 255)), int(round(b * 255))]
+def _method_color(method: Optional[str]) -> list:
+    return _METHOD_COLORS.get(method, _METHOD_COLOR_UNKNOWN)
 
 
 # One distinct colour per controller index — used for blob contours.
@@ -435,20 +441,36 @@ class ControllerAnimatorRerun:
                  controllers_vis: dict,
                  vis_cfg: dict = None,
                  matching_cfg: dict = None,
-                 pose_fusion_debug_enabled: bool = False):
+                 pose_fusion_debug_enabled: bool = False,
+                 pose_fusion_debug_show_tabs: bool = True):
         """
         controllers_vis: {ctrl_name: {"positions": np.ndarray,   # model-frame LED positions
                                       "normals":   np.ndarray,   # model-frame LED normals
                                       "T_model_ctrl": Transform, # controller→model transform
                                       "side": "right"|"left"}}   # informational only
-        pose_fusion_debug_enabled: adds a "Pose Fusion" tab (see _build_blueprint)
-                                    and enables _log_frame's corresponding logging —
+        pose_fusion_debug_enabled: enables _log_frame's pose-fusion logging (the
+                                    dense IMU-predicted path in the 3D world view,
+                                    the raw pre-fusion vision-position marker, and
+                                    the underlying per-frame scalars) —
                                     config/config.yml visualization.pose_fusion_debug.enabled.
+        pose_fusion_debug_show_tabs: separately gates the 4 curated "Fusion ·
+                                    Position/Orientation/Filter Internals/Status"
+                                    TABS in the blueprint (see _build_blueprint) —
+                                    config/config.yml visualization.pose_fusion_debug.
+                                    show_tabs (2026-09-17, user-directed: disable the
+                                    tabs specifically, keep the 3D-view logging).
+                                    False here does NOT stop the underlying scalars
+                                    from being logged (same "log it, just don't give
+                                    it a curated tab" convention _build_blueprint's
+                                    own comment already uses for raw innovation) --
+                                    only whether these 4 tabs get added to the Tabs
+                                    view at all.
         """
         self.vis_cfg         = vis_cfg if vis_cfg is not None else dict(VIS_CONFIG)
         self._matching_cfg   = matching_cfg or {}
         self._controllers_vis = controllers_vis
         self._pose_fusion_debug_enabled = pose_fusion_debug_enabled
+        self._pose_fusion_debug_show_tabs = pose_fusion_debug_show_tabs
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
         raw_mesh = load_trimesh(mesh_path)
@@ -557,7 +579,7 @@ class ControllerAnimatorRerun:
         # as one chart, e.g. pose_fusion/{ctrl}/pos/x/{vision,fused,imu} all
         # land on one chart -- same grouping convention visualize_imu.py's
         # build_blueprint uses.
-        if self._pose_fusion_debug_enabled:
+        if self._pose_fusion_debug_enabled and self._pose_fusion_debug_show_tabs:
             _pf_groups = [
                 ("Fusion · Position",    [("Position X (m)", "pos/x"), ("Position Y (m)", "pos/y"),
                                            ("Position Z (m)", "pos/z")]),
@@ -705,6 +727,7 @@ class ControllerAnimatorRerun:
                   primary_cam_per_ctrl: dict = None,
                   aux_assignments_per_ctrl: dict = None,
                   camera_importance_per_ctrl: dict = None,
+                  camera_method_per_ctrl: dict = None,
                   frozen_T_world_ctrl_per_ctrl: dict = None,
                   blob_vis_frame: dict = None,
                   blob_vis_skipped: dict = None,
@@ -782,12 +805,16 @@ class ControllerAnimatorRerun:
         camera_importance_frame = {
             n: (camera_importance_per_ctrl or {}).get(n) for n in self._controllers_vis
         }
+        camera_method_frame = {
+            n: (camera_method_per_ctrl or {}).get(n) for n in self._controllers_vis
+        }
 
         self._log_frame(idx, T_world_ctrl_per_ctrl, assignments_frame,
                         blobs_per_ctrl=blobs_per_ctrl, contours_per_ctrl=contours_per_ctrl,
                         primary_cam_per_ctrl=primary_cams_frame,
                         aux_assignments_per_ctrl=aux_assignments_frame,
                         camera_importance_per_ctrl=camera_importance_frame,
+                        camera_method_per_ctrl=camera_method_frame,
                         ghost_T_world_model_per_ctrl=ghost_T_world_model_per_ctrl,
                         vision_T_world_ctrl_per_ctrl=vision_T_world_ctrl_per_ctrl)
 
@@ -1195,6 +1222,7 @@ class ControllerAnimatorRerun:
                    primary_cam_per_ctrl: dict = None,
                    aux_assignments_per_ctrl: dict = None,
                    camera_importance_per_ctrl: dict = None,
+                   camera_method_per_ctrl: dict = None,
                    ghost_T_world_model_per_ctrl: dict = None,
                    vision_T_world_ctrl_per_ctrl: dict = None):
 
@@ -1298,8 +1326,8 @@ class ControllerAnimatorRerun:
             cam_path  = f"{ctrl_path}/camera_{primary_cam_idx}"
 
             camera = self._cameras[primary_cam_idx]
-            ctrl_importance = (camera_importance_per_ctrl or {}).get(ctrl_name) or {}
-            primary_color   = _importance_color(ctrl_importance.get(primary_cam_idx))
+            ctrl_method   = (camera_method_per_ctrl or {}).get(ctrl_name) or {}
+            primary_color = _method_color(ctrl_method.get(primary_cam_idx))
 
             # Primary camera frame pose (for projection and visibility)
             T_cam_ctrl  = camera.T_world_cam.inverse().compose(T_world_ctrl)
@@ -1570,7 +1598,7 @@ class ControllerAnimatorRerun:
                 _T_aux_ctrl  = _aux_cam.T_world_cam.inverse().compose(T_world_ctrl)
                 _T_aux_model = _T_aux_ctrl.compose(T_ctrl_model)
                 _pts_aux_cam = _T_aux_model.apply(model_positions)
-                _aux_color   = _importance_color(ctrl_importance.get(_aux_ci))
+                _aux_color   = _method_color(ctrl_method.get(_aux_ci))
                 _aux_blobs_raw = (blobs_per_ctrl or {}).get(ctrl_name, {}).get(_aux_ci)
                 _aux_blobs_arr = (np.asarray(_aux_blobs_raw, dtype=np.float32)
                                   if _aux_blobs_raw is not None and len(_aux_blobs_raw) > 0 else None)

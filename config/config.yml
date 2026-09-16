@@ -1,5 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173103_static_dark/mav0"
+  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173350_walk_dark/mav0"
 #  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826180039_walk_hard/mav0"
   layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
                            # side-by-side into a single wide image per frame (uses
@@ -29,10 +29,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 280  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: 310  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: null  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -104,17 +104,57 @@ fusion_heuristic:
   # moving" without going as far as 300; rot beta scaled by the same 10x
   # factor (3 -> 30) rather than re-deriived from a rotation-specific sweep --
   # re-check by feel, rotation lag wasn't independently measured here.
-  one_euro_pos_min_cutoff_hz: 1.0
+  #
+  # 2026-09-16 re-derivation (user-directed design goal: near-ZERO effect at
+  # medium/high speed, real smoothing only at rest/low speed): first
+  # investigated a real-looking "frame 20-21" static_dark jitter report, but
+  # full-precision inspection (not the 3-decimal rounded debug-log printout
+  # that first flagged it) showed that specific case was smooth, monotonic
+  # real hand motion (consecutive-delta sign-flip rate ~10%), not noise --
+  # retracted that read. Broader check found static_dark isn't actually
+  # motionless throughout (median speed ~0.5-0.6 m/s / ~160-180deg/s --
+  # "static" means the person isn't walking, not that the hand never moves);
+  # genuine stillness (v<0.05m/s) is only ~2% of frames, but IS real jitter
+  # there (sign-flip rate 47-70%, matching white noise) at a small raw
+  # magnitude: ~0.5-1.4mm / ~0.2-0.45deg median step.
+  #
+  # Grid-swept min_cutoff x beta directly against real logged tracking-state
+  # sequences (static_dark for the still-window metric, walk_hard for the
+  # fast-window lag metric -- both controllers, no pipeline rerun needed to
+  # iterate). Position: beta dominates cutoff almost entirely once above
+  # ~10-20 (still-window jitter is ~flat across min_cutoff at fixed beta=150,
+  # 0.30-0.33mm regardless of min_cutoff=0.1..1.0) -- min_cutoff lowered to
+  # 0.1 since it costs nothing on the fast side (walk_hard fast-lag mean
+  # 3.17->3.19mm, p95 8.2->8.3mm, both controllers) for a small extra bit of
+  # rest-state smoothing; beta left at 150 (already near the noise floor of
+  # this pipeline's own ~24mm median tracking error vs mocap).
+  #
+  # Rotation: the existing beta=30 was flagged in this same comment block as
+  # "not independently measured, re-check by feel" -- it wasn't a good guess.
+  # Direct sweep shows rotation's still-window jitter is roughly FLAT across
+  # beta=30..150 (no real static-vs-speed tradeoff at this noise level,
+  # unlike position), while fast-window lag drops sharply with higher beta
+  # (walk_hard: beta=30 -> 1.46-1.64deg mean/4.7-5.3deg p95, beta=150 ->
+  # 0.42-0.46deg mean/1.3-1.4deg p95 -- a ~3.5x reduction, both controllers).
+  # Matched to pos_beta=150 -- a clean win with no measured downside.
+  one_euro_pos_min_cutoff_hz: 0.1
   one_euro_pos_beta: 150.0
   one_euro_pos_d_cutoff_hz: 1.0
-  one_euro_rot_min_cutoff_hz: 1.0
-  one_euro_rot_beta: 30.0
+  one_euro_rot_min_cutoff_hz: 0.3
+  one_euro_rot_beta: 150.0
   one_euro_rot_d_cutoff_hz: 1.0
   # Debug bypass (see HeuristicPoseFusionFilter._report), same spirit as
   # vision_only_debug below -- false makes reported_R/reported_p exactly the
   # unsmoothed tracking-state output, for isolating vision/IMU investigation
   # from smoothing lag. Not a tuning knob -- put back to true when done.
-  one_euro_enabled: false
+  # Enabled 2026-09-16 after the re-derivation above (was left off since
+  # rotation beta was never validated) -- see this project's own note on
+  # pose_history/proximity-search being seeded from THIS reported pose, not
+  # the raw tracking state (controller.py's own comment, ~3015) -- re-run
+  # both static_dark and walk_hard through the full pipeline (not just this
+  # filter in isolation) before trusting this enabled, to check for a
+  # closed-loop regression the isolated-filter sweep above can't see.
+  one_euro_enabled: true
 
   # w_imu's own decay (see HeuristicPoseFusionFilter.frames_since_update): fades
   # linearly from full cost_weight_imu at 0 consecutive lost/coasted REAL FRAMES
@@ -504,6 +544,84 @@ fusion_heuristic:
   coast_trust_rot_shrink_s_per_mps2: 0.0
   coast_trust_rot_shrink_s_per_dps: 0.00018
   coast_trust_rot_min_budget_s: 0.003
+
+  # Calm-motion extension (2026-09-16, same-day follow-up to the fix above --
+  # real case: right_controller, static_dark, local frames 20-23 -- see
+  # src.imu_data.effective_coast_budget_s's own docstring for the full
+  # formula). The shrink-only formula above can only ever REDUCE the budget
+  # below degenerate_fallback_max_s/matching.imu_only_propagation_max_s
+  # (0.066s), never extend it -- but the SAME 217k-sample sweep that
+  # validated the shrink rate above also found calm gyro (<100deg/s) stays
+  # credible for 50ms-1000ms+, far past a flat 66ms base (e.g. real median
+  # trust at just 40-60deg/s is 200ms, ~3.5x what the shrink-only formula
+  # gives there). Adds a SEPARATE, additive bonus (headroom = ceiling -
+  # base, ramping linearly to 0 exactly at calm_extend_max_dps -- continuous
+  # merge with the shrink formula, no jump), active only for axis="gyro".
+  # ceiling=0.15s chosen deliberately conservative -- comfortably under
+  # BOTH fusion.max_coast_s (0.3s, the full-reset escape hatch, ~50% margin)
+  # and cold_confirm_max_gap_s (0.25s, the cold-reacquire buffer's own
+  # staleness window, ~40% margin) -- not chasing the sweep's own untested
+  # >=1000ms calm-bucket ceiling, since this feeds core-state-adjacent
+  # consumers (the anchor everything else measures against). max_dps=100.0
+  # is the merge point with the already-validated shrink formula (150-
+  # 200deg/s real trust already matches the shrink-only formula almost
+  # exactly, confirming 100 is a safe, non-disruptive handoff point).
+  # Checked conservative-direction against the sweep at each bucket's WORSE
+  # edge (formula <= real everywhere): 0dps -> 150ms vs >=1000ms real;
+  # 60dps -> 88.8ms vs 200ms; 80dps -> 68.4ms vs 100ms; 100dps -> 48ms vs
+  # 75ms (and exactly matches the unmodified shrink formula's own 48ms at
+  # the merge point -- continuity confirmed numerically, not just by
+  # construction). Defaults to 0.0/0.0 (fully inert) so every OTHER
+  # rate_prefix="coast_trust_rot" consumer (e.g. cold_reacquire_rot_veto_
+  # max_s below, whose own base 0.25s already exceeds this ceiling) gets
+  # exactly zero bonus, not a regression push past its own already-tuned
+  # numbers -- headroom=max(0, ceiling-base) is self-limiting by
+  # construction, verified this specific case doesn't get disturbed.
+  coast_trust_rot_calm_extend_ceiling_s: 0.15
+  coast_trust_rot_calm_extend_max_dps: 100.0
+
+  # HeuristicPoseFusionFilter._try_cold_reacquire's rot_pred_implausible veto
+  # (2026-09-16, real case: right_controller, static_dark -- a 4-frame/~78ms
+  # calm-motion loss where two consecutive cam1-only 6-inlier P3P solves
+  # AGREED with each other (drot=1.65deg) but were BOTH wrong (150mm/158deg
+  # off mocap) -- the same systematic single-camera mirror-branch ambiguity,
+  # repeated. try_update already computes rot_innov_deg = angle(R_pred,
+  # R_meas) for the warm-path's own hard implausibility gate, but that gate
+  # only runs while imu_frame_scale>0; _try_cold_reacquire's own buffer/
+  # confirm logic only ever compares the two WEAK candidates against EACH
+  # OTHER, never against this independent gyro reference, so two candidates
+  # sharing the same systematic error look like corroboration.
+  #
+  # cold_reacquire_rot_veto_max_s: the BASE budget for "is R_pred's rotation
+  # still credible enough to veto with" (fed through the same _effective_
+  # coast_budget_s/coast_trust_rot_shrink_s_per_dps/_min_budget_s machinery
+  # above, axis="gyro", rate_prefix="coast_trust_rot"). Deliberately its OWN
+  # base, NOT degenerate_fallback_max_s (0.066s) or cold_pending_report_
+  # max_gap_s (0.06s) -- both checked and found too tight: the real case's
+  # own dt_s (elapsed since the LAST REAL ACCEPT, not since the loss
+  # started) is 88.7-99.8ms, already past either of those bases at zero
+  # shrink, which would make the veto never fire on the very case it exists
+  # for. 0.25s (comfortably covers the real case; at its own 193.7deg/s peak
+  # gyro the effective budget comes out to ~215ms) mirrors cold_confirm_
+  # max_gap_s's own order of magnitude for "how long a cold-reacquire
+  # sequence stays a single coherent event."
+  #
+  # cold_reacquire_rot_veto_thresh_deg: how big a rot_innov_deg disagreement
+  # counts as implausible. Deliberately NOT _implausible_jump_thresholds'
+  # own rotation ceiling -- that one widens proportionally to stale_s
+  # (elapsed time since last accept, via matching.max_plausible_hand_ang_
+  # speed_m_s), built for a different consumer (reject-cascade staleness);
+  # since _try_cold_reacquire is BY CONSTRUCTION always in a stale-last_
+  # update_ts_ns state, reusing it would swamp any realistic rot_innov_deg
+  # and make this veto inert (checked numerically during design review, not
+  # assumed). Chosen instead directly from the same 217k-sample sweep's own
+  # false-positive rate: for calm/slow gyro (<500deg/s) at dt<=100ms (this
+  # real case's own regime), rot_err_deg exceeds 100deg only 0.013% of the
+  # time -- comfortably below the real case's own 158deg with a checked
+  # margin, and rare enough that ordinary gyro drift essentially never
+  # trips it.
+  cold_reacquire_rot_veto_max_s: 0.25
+  cold_reacquire_rot_veto_thresh_deg: 100.0
 
   # Long-gap damping (see HeuristicPoseFusionFilter._gap_vision_scale) -- scales
   # w_vision down as the elapsed gap since the last accepted update (dt_s)
@@ -1884,6 +2002,14 @@ matching:
   coast_trust_rot_shrink_s_per_dps: 0.00018
   coast_trust_rot_min_budget_s: 0.003
 
+  # Calm-motion extension (2026-09-16, same-day follow-up -- see the
+  # fusion_heuristic block's own identically-named keys for the full
+  # derivation/numbers; shared verbatim here since ControllerTracker._mark_
+  # all_lost's rot_budget_s now calls the exact same src.imu_data.
+  # effective_coast_budget_s helper, not a second hand-derived fit).
+  coast_trust_rot_calm_extend_ceiling_s: 0.15
+  coast_trust_rot_calm_extend_max_dps: 100.0
+
   # TrackingSystem._detect_cold_identity_swap (2026-09-16): when two
   # controllers go cold and reacquire in the SAME cold-batch round, compares
   # each new candidate against BOTH controllers' own last-known position --
@@ -1896,6 +2022,25 @@ matching:
   # (cross-checked against mocap ground truth); set conservatively above the
   # real case's own ratio for now.
   cold_swap_margin: 0.85
+  # TrackingSystem._detect_cold_identity_swap fallback reference (2026-09-16):
+  # when a controller's own self.p is None (fully reset -- e.g. via the
+  # should_force_cold_start/max_consecutive_rejects escape hatch, which wipes
+  # HeuristicPoseFusionFilter.p entirely), the swap-check falls back to that
+  # filter's _last_known_p -- the last real position before the reset --
+  # gated by this staleness window. A REASONED default, not a data fit: needs
+  # to be an order of magnitude above max_coast_s (0.3s) and
+  # cold_confirm_max_gap_s (0.25s), since the reference must survive a full
+  # reset-to-rebootstrap gap (the real case this closes spanned several
+  # seconds: static_dark, right_controller -- a contested-conflict-won,
+  # ungated rotation jump left tracking corrupted, right lost track again,
+  # and by the time it cold-reacquired near LEFT's own old position, left had
+  # separately been fully reset and had no self.p left for the existing
+  # swap-check to compare against), but bounded enough to not anchor against
+  # a reference from an unrelated, much-earlier part of the session. The
+  # cached IMU-trust sweeps (imu_trust_all.csv) measure dead-reckoning drift
+  # vs. elapsed time, capped at 1.0s -- a different question, doesn't apply
+  # here.
+  cold_swap_stale_reference_max_s: 5.0
   # --------------------------------------------------------------------------
   # Pose validation
   # --------------------------------------------------------------------------
@@ -2240,7 +2385,7 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
   3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
@@ -2270,6 +2415,15 @@ visualization:
                       # HTML export, decoupled from the live tracking run entirely).
                       # Lower = smoother 3D path, higher per-frame cost (the integration is
                       # O(samples^2), see src/imu_data.py's dead_reckon_dense).
+    # show_tabs (2026-09-17, user-directed): separately gates just the 4
+    # curated "Fusion · Position/Orientation/Filter Internals/Status" TABS
+    # in the rerun blueprint -- false here does NOT stop the underlying
+    # per-frame scalars, the dense IMU-predicted path (purple line), or the
+    # raw vision-position marker from being logged into the 3D world view;
+    # it only stops these 4 tabs from being added to the Tabs view. Same
+    # "log it, just don't give it a curated tab" convention this block's
+    # own comment already describes for raw innovation.
+    show_tabs: false
 
 # Static-light (ceiling-lamp) exclusion -- mocap-grounded voxel-vote map, hard-excludes
 # cold-start/brute-force blob candidates only (never the production warm-tracking

@@ -425,22 +425,46 @@ def _T3(x: float, y: float, z: float) -> Transform:
 
 
 class _FakeFusionFilter:
-    def __init__(self, p):
+    def __init__(self, p, last_known_p=None, last_known_p_ts_ns=None):
         self.p = p
+        # Only set as real attributes when the caller actually passes them --
+        # a bare _FakeFusionFilter(p=None) (the common "no prior reference"
+        # case in older tests) must NOT gain these attributes, so
+        # _detect_cold_identity_swap's getattr(..., None) fallback exercises
+        # the exact same "minimal double, no such attribute" path a real
+        # HeuristicPoseFusionFilter never produces but must still degrade
+        # safely against.
+        if last_known_p is not None:
+            self._last_known_p = last_known_p
+            self._last_known_p_ts_ns = last_known_p_ts_ns
 
 
 class _FakeCtrlTracker:
-    def __init__(self, p):
-        self._fusion_filter = _FakeFusionFilter(p) if p is not None else None
+    def __init__(self, p, last_known_p=None, last_known_p_ts_ns=None):
+        self._fusion_filter = (
+            _FakeFusionFilter(p, last_known_p, last_known_p_ts_ns)
+            if (p is not None or last_known_p is not None) else None
+        )
 
 
-def _make_tracking_system_with_trackers(last_positions: dict, matching_cfg=None):
+def _make_tracking_system_with_trackers(last_positions: dict, matching_cfg=None, last_known: dict = None):
     """Same as _make_tracking_system, but with ctrl_trackers wired to a
     stand-in _fusion_filter.p for each name -- last_positions maps
     ctrl_name -> np.ndarray | None (None reproduces "no prior reference
     yet", i.e. a fresh double-bootstrap, via either no fusion filter at all
-    or a filter whose own .p is still None)."""
-    ctrl_trackers = {name: _FakeCtrlTracker(p) for name, p in last_positions.items()}
+    or a filter whose own .p is still None).
+
+    last_known: optional {ctrl_name: (last_known_p, last_known_p_ts_ns)} --
+    simulates a controller that's been fully reset (p=None) but still has a
+    pre-reset _last_known_p/_last_known_p_ts_ns for the fallback path
+    (2026-09-16) to read. Names absent from this dict get a bare
+    _FakeFusionFilter with no such attributes at all, same as before this
+    fallback existed."""
+    last_known = last_known or {}
+    ctrl_trackers = {
+        name: _FakeCtrlTracker(p, *last_known.get(name, (None, None)))
+        for name, p in last_positions.items()
+    }
     return _make_tracking_system(matching_cfg=matching_cfg, ctrl_trackers=ctrl_trackers)
 
 
@@ -518,6 +542,62 @@ class DetectColdIdentitySwapTests(unittest.TestCase):
         }, matching_cfg={"cold_swap_margin": 0.85})
         ts.ctrl_trackers["ctrl_b"]._fusion_filter.p = None
         suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, set())
+
+    def test_stale_last_known_p_used_when_p_is_none(self):
+        # ctrl_b has been fully reset (self.p is None -- e.g. the
+        # should_force_cold_start escape hatch) but still has a fresh
+        # _last_known_p from before that reset (2026-09-16 fallback) --
+        # the swap check must fall back to it instead of skipping the pair,
+        # closing the real gap that let left/right's identities swap
+        # undetected (see src/controller.py's own docstring).
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "ctrl_b": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+        }
+        frame_ts_ns = 10_000_000_000
+        ts = _make_tracking_system_with_trackers(
+            {"ctrl_a": np.array([-0.11, 0.0, 0.0]), "ctrl_b": None},
+            matching_cfg={"cold_swap_margin": 0.85, "cold_swap_stale_reference_max_s": 5.0},
+            last_known={"ctrl_b": (np.array([0.31, 0.0, 0.0]), frame_ts_ns - 2_000_000_000)},
+        )
+        suspected = ts._detect_cold_identity_swap(candidates, frame_ts_ns=frame_ts_ns)
+        self.assertEqual(suspected, {"ctrl_a", "ctrl_b"})
+
+    def test_last_known_p_too_stale_is_ignored(self):
+        # Same setup as above, but the reset happened long enough ago that
+        # _last_known_p is past cold_swap_stale_reference_max_s -- must
+        # fall back to today's skip behavior, not compare against a
+        # reference from an unrelated part of the session.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "ctrl_b": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+        }
+        frame_ts_ns = 10_000_000_000
+        ts = _make_tracking_system_with_trackers(
+            {"ctrl_a": np.array([-0.11, 0.0, 0.0]), "ctrl_b": None},
+            matching_cfg={"cold_swap_margin": 0.85, "cold_swap_stale_reference_max_s": 5.0},
+            last_known={"ctrl_b": (np.array([0.31, 0.0, 0.0]), frame_ts_ns - 6_000_000_000)},
+        )
+        suspected = ts._detect_cold_identity_swap(candidates, frame_ts_ns=frame_ts_ns)
+        self.assertEqual(suspected, set())
+
+    def test_missing_last_known_p_attrs_skip_cleanly(self):
+        # A bare fusion filter with self.p=None and NEITHER of the new
+        # _last_known_p* attributes at all (the exact shape of the real
+        # bug: left was reset via a path this test double doesn't model
+        # any further detail of) -- must not crash (getattr default path),
+        # must skip exactly like before this fallback existed.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.702, 0.512, -0.407)},
+            "ctrl_b": {"T_world_ctrl": _T3(-0.721, 0.523, -0.063)},
+        }
+        ts = _make_tracking_system_with_trackers(
+            {"ctrl_a": np.array([-0.11, 0.0, 0.0]), "ctrl_b": np.array([0.0, 0.0, 0.0])},
+            matching_cfg={"cold_swap_margin": 0.85, "cold_swap_stale_reference_max_s": 5.0},
+        )
+        ts.ctrl_trackers["ctrl_b"]._fusion_filter.p = None
+        suspected = ts._detect_cold_identity_swap(candidates, frame_ts_ns=10_000_000_000)
         self.assertEqual(suspected, set())
 
     def test_only_flags_the_pair_involved_with_a_third_uninvolved_controller(self):

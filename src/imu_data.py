@@ -416,6 +416,54 @@ def peak_gyro_accel_over_window(gyro_data, accel_data, ts_lo: int, ts_hi: int,
     return peak_gyro_dps, peak_accel_mps2
 
 
+def effective_coast_budget_s(base_budget_s: float, peak_dps: float, calm_floor_dps: float,
+                              shrink_per_dps: float, min_budget_s: float,
+                              calm_extend_ceiling_s: float = 0.0,
+                              calm_extend_max_dps: float = 0.0) -> float:
+    """Single-axis "how long is a gyro-only rotation prediction still
+    credible" budget -- the shared math behind HeuristicPoseFusionFilter.
+    _effective_coast_budget_s's axis="gyro" case and ControllerTracker.
+    _mark_all_lost's own rot_budget_s (previously each kept its own inlined
+    copy of this formula; factored out 2026-09-16 the same way peak_gyro_
+    accel_over_window already was, for the same "one drifting copy is worse
+    than a shared function" reason -- see that function's own docstring).
+
+    Two independent pieces, both driven by peak_dps (the real peak gyro
+    magnitude measured over the window in question, e.g. via peak_gyro_
+    accel_over_window):
+
+    1. SHRINK (validated earlier today against real cross-recording data):
+       for peak_dps above calm_floor_dps, the budget shrinks linearly at
+       shrink_per_dps, floored at min_budget_s. Never disturbed by the
+       extend term below -- see (2)'s own note on why.
+
+    2. CALM EXTEND (2026-09-16, this same day's own follow-up finding): the
+       shrink-only formula can never exceed base_budget_s, no matter how
+       calm real motion is -- but the same empirical sweep that validated
+       (1) also found calm gyro (<100deg/s) stays credible for 50ms-1000ms+,
+       far past a flat 66ms base. calm_extend_ceiling_s/calm_extend_max_dps
+       add a SEPARATE, additive bonus, active only below calm_extend_max_dps,
+       ramping linearly to 0 exactly at that speed (continuous merge with
+       the shrink formula above -- no jump). Deliberately shaped as
+       headroom = max(0, ceiling - base) rather than a flat extend-in-
+       seconds constant: this makes the mechanism SELF-LIMITING for any
+       caller whose base_budget_s already exceeds the ceiling (e.g. a
+       caller with a more generous base than this consumer's own tuned
+       ceiling gets exactly zero bonus, not a regression push past its own
+       already-validated numbers) -- found to matter for real during
+       design review, not a hypothetical: a flat-seconds bonus would have
+       pushed one real, already-tuned 0.25s-base consumer past two OTHER
+       unrelated safety constants (fusion.max_coast_s, cold_confirm_max_gap_s).
+       calm_extend_ceiling_s/calm_extend_max_dps both default to 0.0 (fully
+       inert, byte-identical to the shrink-only formula) so every existing
+       caller that doesn't opt in is completely unaffected."""
+    shrink = shrink_per_dps * max(0.0, peak_dps - calm_floor_dps)
+    headroom_s = max(0.0, calm_extend_ceiling_s - base_budget_s)
+    ramp = max(0.0, 1.0 - peak_dps / calm_extend_max_dps) if calm_extend_max_dps > 0.0 else 0.0
+    extend = headroom_s * ramp
+    return max(min_budget_s, base_budget_s + extend - shrink)
+
+
 def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,
                         ts0, ts1, R0, p0, v0):
     """Single-endpoint BLIND dead-reckoning prediction at ts1, given a known state
