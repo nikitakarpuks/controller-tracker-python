@@ -1532,6 +1532,14 @@ blob_detection:
                                      # partial-visibility frames without prematurely shrinking a
                                      # still-real fixture (the exact regression "union, not replace" was
                                      # originally fixed for -- see sustain_and_expire's own docstring).
+      share_across_cameras: true     # NEW 2026-09-20 (user-requested): regions live in the ROOM frame, so a lamp region
+                                     # already CONFIRMED (hits >= min_hits_to_exclude) by one camera is also reprojected
+                                     # into every other camera's view and used for exclusion there (read-only: it never
+                                     # seeds or sustains the other camera's own memory, so a region's lifetime is still
+                                     # decided by the camera that owns it). Real case (walk_medium, relative frame 24-32,
+                                     # right_controller): lamp confirmed in cam3, never recognised in cam1 -- its blobs
+                                     # stayed as candidates there and brute-force fitted the controller to them
+                                     # (a pose 1.3 m / 171deg off mocap). Needs the same mocap as the mask itself.
       min_hits_to_exclude: 3         # NEW 2026-09-13: a region only actually excludes anything (see
                                      # reprojected_contours()) once recognized/sustained this many times
                                      # -- update()/sustaining still happens from hits=1, but a region

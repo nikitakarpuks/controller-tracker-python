@@ -343,6 +343,28 @@ def _ray_cast_points_to_quad(points_px: np.ndarray, camera: Camera, T_room_cam: 
     ], dtype=np.float64)
 
 
+def _reproject_quad(quad_room: np.ndarray, camera: Camera, T_room_cam: Transform) -> Optional[np.ndarray]:
+    """(4,2) float32 pixel contour of a room-frame quad, or None when its
+    reprojected bbox misses the image entirely."""
+    px = room_point_to_pixel(camera, T_room_cam, quad_room)
+    x0, y0 = px[:, 0].min(), px[:, 1].min()
+    x1, y1 = px[:, 0].max(), px[:, 1].max()
+    if x1 < 0 or y1 < 0 or x0 >= camera.width or y0 >= camera.height:
+        return None
+    return px.astype(np.float32)
+
+
+def reproject_room_quads(quads, camera: Camera, T_room_cam: Transform) -> List[np.ndarray]:
+    """Pixel contours (in-view ones only) for room-frame (4,3) quads taken from
+    ANOTHER camera's LampRegionMemory.confirmed_quads()."""
+    out = []
+    for q in (quads or []):
+        px = _reproject_quad(np.asarray(q, dtype=np.float64), camera, T_room_cam)
+        if px is not None:
+            out.append(px)
+    return out
+
+
 class LampRegionMemory:
     """One instance per camera, same ownership model as BlobDetector._memory."""
 
@@ -680,16 +702,15 @@ class LampRegionMemory:
         pixel contour otherwise. Used by sustain_and_expire(), which must
         consider every tracked region (not just ones already reinforced
         enough to exclude, unlike reprojected_contours())."""
-        out: List[Optional[np.ndarray]] = []
-        for r in self._regions:
-            px = room_point_to_pixel(camera, T_room_cam, r.quad_room)
-            x0, y0 = px[:, 0].min(), px[:, 1].min()
-            x1, y1 = px[:, 0].max(), px[:, 1].max()
-            if x1 < 0 or y1 < 0 or x0 >= camera.width or y0 >= camera.height:
-                out.append(None)
-            else:
-                out.append(px.astype(np.float32))
-        return out
+        return [_reproject_quad(r.quad_room, camera, T_room_cam) for r in self._regions]
+
+    def confirmed_quads(self) -> List[np.ndarray]:
+        """Room-frame (4,3) quads of every region already reinforced enough
+        to exclude (hits >= min_hits_to_exclude), as copies. Regions live in
+        the ROOM frame, not any camera's, so another camera can reproject them
+        into its own view (reproject_room_quads) -- how a lamp confirmed by
+        one camera masks the same lamp in a neighbour that never recognised it."""
+        return [r.quad_room.copy() for r in self._regions if r.hits >= self._min_hits_to_exclude]
 
     def reprojected_contours(self, camera: Camera, T_room_cam: Transform) -> List[np.ndarray]:
         """Project every SUFFICIENTLY-REINFORCED held region's (hits >=

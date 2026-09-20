@@ -379,7 +379,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    region_exclude_blobs=None,
                    region_sustain_contours=None,
                    region_hits=None,
-                   lamp_protect_rects=None):
+                   lamp_protect_rects=None,
+                   region_foreign_from=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -1588,6 +1589,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                                       # keeps its own documented promise (see C_REGION_MASK's comment:
                                       # "you can see where the mask thinks the lamp is independent of its
                                       # effect") even on a frame where region_exclude_blobs is empty.
+        C_REGION_MASK_FOREIGN = (255, 150, 0)  # azure -- a region confirmed by ANOTHER camera, reprojected here
+                                      # (see BlobDetector.detect's foreign_lamp_quads)
         C_REGION_MASK_RECENT = (255, 0, 0)  # blue — a region IS reinforced enough to exclude
                                       # (hits >= min_hits_to_exclude) but isn't excluding THIS frame
                                       # because the caller has has_recent_memory=True (see detect()'s own
@@ -1657,7 +1660,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             for cnt in det_rej_interior: _draw_cnt(cnt, C_INTERIOR)
             for cnt in det_rej_lamp:     _draw_cnt(cnt, C_LAMP)
             if region_exclude_blobs:
-                for cnt in region_exclude_blobs: _draw_cnt(cnt, C_REGION_MASK, thickness=2)
+                _n_own = len(region_exclude_blobs) if region_foreign_from is None else region_foreign_from
+                for cnt in region_exclude_blobs[:_n_own]: _draw_cnt(cnt, C_REGION_MASK, thickness=2)
+                for cnt in region_exclude_blobs[_n_own:]: _draw_cnt(cnt, C_REGION_MASK_FOREIGN, thickness=2)
             for cnt in _region_held_unconfirmed:
                 _draw_cnt(cnt, C_REGION_MASK_HELD, thickness=1)
             for cnt in _region_held_recent:
@@ -1730,8 +1735,10 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                 strip_entries.append((C_LAMP, "lamp (removed)"))
             if _protect_rects:
                 strip_entries.append(((255, 255, 0), "lamp-protected zone (predicted pose)"))
-            if region_exclude_blobs:
+            if region_exclude_blobs and (region_foreign_from is None or region_foreign_from > 0):
                 strip_entries.append((C_REGION_MASK, "static lamp mask (excluding)"))
+            if region_exclude_blobs and region_foreign_from is not None and region_foreign_from < len(region_exclude_blobs):
+                strip_entries.append((C_REGION_MASK_FOREIGN, "static lamp mask (from other camera)"))
             if _region_held_unconfirmed:
                 strip_entries.append((C_REGION_MASK_HELD, "static lamp mask (held: not confirmed)"))
             if _region_held_recent:
@@ -2351,6 +2358,7 @@ class BlobDetector:
         frame_ts_ns: Optional[int] = None,
         has_recent_memory: bool = False,
         lamp_protect_rects=None,
+        foreign_lamp_quads=None,
     ) -> BlobResult:
         cfg     = self._cfg
         cam_idx = self.camera_idx
@@ -2417,6 +2425,16 @@ class BlobDetector:
         # -> 1 after the cold redetect's lamp filter). None/empty = no zone.
         # Tracking of lamp regions (LampRegionMemory) is unaffected.
         lamp_protect_rects = [tuple(r) for r in (lamp_protect_rects or [])]
+        # foreign_lamp_quads: room-frame (4,3) quads of lamp regions ALREADY
+        # CONFIRMED by other cameras (LampRegionMemory.confirmed_quads(), each
+        # camera keeps its own memory). Reprojected into this camera and used
+        # for exclusion exactly like this camera's own confirmed regions (same
+        # margin/brightness guard), so a lamp one camera recognised is also
+        # masked in a neighbour that only ever sees it as loose blobs (real
+        # case, walk_medium: lamp confirmed in cam3, never recognised in cam1,
+        # where brute-force then fitted the controller to the lamp blobs).
+        # Read-only: never seeds or sustains THIS camera's own memory, so a
+        # region's life is still decided by the camera that owns it.
 
         # Static ceiling-lamp region memory (see src/lamp_region_memory.py):
         # complete no-op unless lamp_blob_filter.static_lamp_mask.enabled AND
@@ -2449,6 +2467,7 @@ class BlobDetector:
         region_exclude_blobs = None
         region_all_contours = None
         region_hits = None
+        region_foreign_from = None
         T_room_cam = None
         if lamp_region_active:
             T_room_headsetImu = pose_source.room_pose_at(frame_ts_ns)
@@ -2477,6 +2496,11 @@ class BlobDetector:
                 region_hits = [r.hits for r in self._lamp_region_memory._regions]
                 if lamp_exclusion_active:
                     region_exclude_blobs = self._lamp_region_memory.reprojected_contours(camera, T_room_cam)
+                    if foreign_lamp_quads:
+                        from src.lamp_region_memory import reproject_room_quads
+                        region_foreign_from = len(region_exclude_blobs)
+                        region_exclude_blobs = list(region_exclude_blobs) + reproject_room_quads(
+                            foreign_lamp_quads, camera, T_room_cam)
 
         def _update_lamp_regions(removed_point_sets) -> None:
             if lamp_region_active and removed_point_sets:
@@ -2743,7 +2767,8 @@ class BlobDetector:
                                region_exclude_blobs=region_exclude_blobs,
                                region_sustain_contours=region_all_contours,
                                region_hits=region_hits,
-                               lamp_protect_rects=lamp_protect_rects)
+                               lamp_protect_rects=lamp_protect_rects,
+                               region_foreign_from=region_foreign_from)
         large_blobs_pass1 = result[6]
         lamp_blobs_pass1  = result[8]
         canvases = {}
@@ -2828,6 +2853,7 @@ class BlobDetector:
                         region_sustain_contours=region_all_contours,
                         region_hits=region_hits,
                         lamp_protect_rects=lamp_protect_rects,
+                        region_foreign_from=region_foreign_from,
                     )
                     if result2[7] is not None:
                         canvases["pass2"] = result2[7]
@@ -2892,6 +2918,7 @@ class BlobDetector:
                 region_sustain_contours=region_all_contours,
                 region_hits=region_hits,
                 lamp_protect_rects=lamp_protect_rects,
+                region_foreign_from=region_foreign_from,
             )
             if result2[7] is not None:
                 canvases["pass2"] = result2[7]

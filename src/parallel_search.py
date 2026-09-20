@@ -217,6 +217,7 @@ def run_blob_detect(
     region_memory_in=None,
     has_recent_memory: bool = False,
     lamp_protect_rects=None,
+    foreign_lamp_quads=None,
 ):
     """Top-level, picklable worker task: run BlobDetector.detect() for one camera
     against the resident (per-camera) BlobDetector.
@@ -259,6 +260,10 @@ def run_blob_detect(
     parameter comment. Computed by the caller from the failed warm attempt's
     predicted LED projections.
 
+    foreign_lamp_quads: forwarded as-is to BlobDetector.detect() -- see its own
+    parameter comment. Other cameras' confirmed lamp regions (room-frame quads),
+    gathered by the caller from its per-camera region-memory cache.
+
     Returns (BlobResult, canvases_dict, memory_out, region_memory_out, diag).
     diag = (t_worker_start, t_compute_start, t_compute_end) — wall-clock
     (time.time(), synchronized with the submitting process on the same
@@ -290,6 +295,7 @@ def run_blob_detect(
         frame_ts_ns=frame_ts_ns,
         has_recent_memory=has_recent_memory,
         lamp_protect_rects=lamp_protect_rects,
+        foreign_lamp_quads=foreign_lamp_quads,
     )
     t_compute_end = _time.time()
     return (result, canvases, bd._memory, bd._lamp_region_memory,

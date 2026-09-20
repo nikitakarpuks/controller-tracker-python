@@ -356,6 +356,26 @@ def main():
     # calls, same as _cold_memory above) -- keyed by cam_idx alone.
     _cold_region_memory: dict = {}
 
+    # Cross-camera lamp-region sharing (static_lamp_mask.share_across_cameras): each
+    # camera keeps its own LampRegionMemory, but regions live in the ROOM frame, so a
+    # lamp another camera has already CONFIRMED can mask the same lamp here even when
+    # this camera never recognised it (see BlobDetector.detect's foreign_lamp_quads).
+    _share_lamp_regions = bool(((config["blob_detection"].get("lamp_blob_filter") or {})
+                                .get("static_lamp_mask") or {}).get("share_across_cameras", False))
+
+    def _foreign_lamp_quads(cam_idx: int):
+        if not _share_lamp_regions:
+            return None
+        quads = []
+        for other_idx in blob_detectors:
+            if other_idx == cam_idx:
+                continue
+            mem = (_cold_region_memory.get(other_idx) if (pool is not None and blob_parallel)
+                   else getattr(blob_detectors[other_idx], "_lamp_region_memory", None))
+            if mem is not None:
+                quads.extend(mem.confirmed_quads())
+        return quads or None
+
     _csv_path = debug_cfg.get("calibration_csv")
     _csv_file = _csv_writer = None
     if _csv_path:
@@ -675,6 +695,7 @@ def main():
                         _cold_region_memory.get(cam_idx),
                         kwargs.get("has_recent_memory", False),
                         kwargs.get("lamp_protect_rects"),
+                        _foreign_lamp_quads(cam_idx),
                     )
                 for (ctrl_name, cam_idx), fut in futures.items():
                     result, canvases, memory_out, region_memory_out, diag = fut.result()
@@ -715,6 +736,7 @@ def main():
                         frame_ts_ns=frame_ts_ns,
                         has_recent_memory=kwargs.get("has_recent_memory", False),
                         lamp_protect_rects=kwargs.get("lamp_protect_rects"),
+                        foreign_lamp_quads=_foreign_lamp_quads(cam_idx),
                     )
                     results_by_ctrl[ctrl_name][cam_idx] = det_result
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - _t0) * 1000
