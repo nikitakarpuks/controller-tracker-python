@@ -668,6 +668,11 @@ fusion_heuristic:
   # left_controller frame_idx 2988 (155.9deg off mocap, gravity 163deg off).
   # Cannot see a flip about the vertical axis. 0 disables.
   bootstrap_gravity_veto_thresh_deg: 65.0
+  # bootstrap_gravity_veto_accel_tol_ms2: the veto only applies while |accel| is within
+  # this of 9.81 (quiet motion). During fast motion the accelerometer reads 13-20 m/s^2
+  # and its direction is not gravity (static_medium right_controller frames 52-56:
+  # correct poses sit 84-98deg from "down"), so the check abstains there.
+  bootstrap_gravity_veto_accel_tol_ms2: 1.5
 
   # reject_streak_override: two consecutive STRONG candidates (n_inliers >=
   # vision_weight_strong_inliers, error below the weak floor, not fallback/
@@ -753,7 +758,8 @@ fusion_heuristic:
   # shared value above it.
   per_controller:
     right_controller:
-      vision_weight_weak_error_px: 1.1    # right's own p90~1.04/p95~1.12 (frames 0-1000) --
+      vision_weight_weak_error_px: 0.9    # was 1.1 (right's p90~1.04/p95~1.12 on an older recording); static_medium's right p99 is 0.86.
+                                          # 0.9 buffers weak 6-inlier/1.02px bootstraps (static_medium frame_idx 2852: 37mm/80deg flip) --
       vision_weight_strong_error_px: 0.2  # p10~0.14 -- own typical range runs higher than left's.
 
 

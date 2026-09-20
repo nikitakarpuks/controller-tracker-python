@@ -1681,6 +1681,18 @@ class BootstrapConfirmVetoTests(unittest.TestCase):
         f, ok = self._confirm_pair(np.eye(3), a)
         self.assertTrue(ok)
 
+    def test_flipped_orientation_with_non_quiet_accel_is_not_vetoed(self):
+        """|a| = 19.8 m/s^2 (fast motion): the direction is not gravity, so the
+        veto abstains even though the flipped orientation would put "down" 180deg off."""
+        f, ok = self._confirm_pair(np.eye(3), -2.0 * self.UP_ACCEL)
+        self.assertTrue(ok)
+
+    def test_quiet_gate_tolerance_is_configurable(self):
+        f = _make_filter({"bootstrap_gravity_veto_accel_tol_ms2": 15.0})
+        f.try_update(self._weak(np.eye(3), np.array([1.0, 0.0, 0.0]), self.UP_ACCEL), 1 * _NS)
+        ok = f.try_update(self._weak(np.eye(3), np.array([1.01, 0.0, 0.0]), -2.0 * self.UP_ACCEL), 2 * _NS)
+        self.assertFalse(ok, "with a wide tolerance the same flipped candidate is vetoed again")
+
     def test_no_accel_sample_means_veto_does_not_apply(self):
         f, ok = self._confirm_pair(np.eye(3), None)
         self.assertTrue(ok)

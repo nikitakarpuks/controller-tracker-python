@@ -2284,7 +2284,15 @@ class HeuristicPoseFusionFilter:
         if log_prefix == "BOOTSTRAP" and accel_now is not None:
             _a = np.asarray(accel_now, dtype=float)
             _a_norm = float(np.linalg.norm(_a))
-            if _a_norm > 1e-6:
+            # Quiet-motion gate (2026-09-20, real case: static_medium, right_controller,
+            # frames 52-56): during fast motion the accelerometer reads 13-20 m/s^2
+            # (linear acceleration on top of gravity), so its direction is not
+            # gravity -- correct poses there sit 84-98deg from "down" and a flipped one
+            # 79deg. The check only means something while |a| is close to g; with
+            # |a| within tol of 9.81 the worst-case direction error from the
+            # perpendicular linear acceleration stays well under the 65deg threshold.
+            _quiet = abs(_a_norm - 9.81) <= float(self._hc_get("bootstrap_gravity_veto_accel_tol_ms2", 1.5))
+            if _a_norm > 1e-6 and _quiet:
                 _g_world = R_meas @ (_a / _a_norm)
                 _bootstrap_gravity_angle_deg = float(np.degrees(np.arccos(np.clip(-_g_world[1], -1.0, 1.0))))
         # Thin-candidate check (2026-09-20, real case: static_medium, left_
