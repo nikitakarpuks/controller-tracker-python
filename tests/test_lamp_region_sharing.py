@@ -131,13 +131,42 @@ class ConfirmedQuadsAndReprojectionTests(unittest.TestCase):
         q[:] = 0.0
         self.assertFalse(np.allclose(self.mem._regions[0].quad_room, 0.0))
 
-    def test_reprojection_matches_direct_projection(self):
+    def test_reprojection_covers_the_direct_projection(self):
+        """In-view region: the sampled hull must contain the 4 directly
+        projected corners (it may be slightly larger: fisheye edges bow)."""
         self.mem._regions[0].hits = 1000
         T_room_cam1 = camera_room_pose(self.T_head, self.cam1)
         (px,) = reproject_room_quads(self.mem.confirmed_quads(), self.cam1, T_room_cam1)
         direct = room_point_to_pixel(self.cam1, T_room_cam1, self.mem._regions[0].quad_room)
-        np.testing.assert_allclose(px, direct.astype(np.float32), atol=1e-3)
-        self.assertEqual(px.shape, (4, 2))
+        hull = px.reshape(-1, 1, 2).astype(np.float32)
+        for c in direct:
+            self.assertGreaterEqual(cv2.pointPolygonTest(hull, (float(c[0]), float(c[1])), True), -2.0)
+        self.assertLess(cv2.contourArea(hull), 4 * cv2.contourArea(direct.astype(np.float32)))
+
+    def test_quad_behind_the_camera_is_dropped_not_smeared(self):
+        """KB4 theta_max clamping used to turn a quad wholly outside the FOV
+        into a huge/degenerate boundary polygon. It must now yield nothing."""
+        T = camera_room_pose(self.T_head, self.cam1)
+        cam_pos = np.asarray(T.t, dtype=float)
+        behind = np.array([[-1, 3.15, -1], [1, 3.15, -1], [1, 3.15, 1], [-1, 3.15, 1]], dtype=float)
+        pc = T.inverse().apply(behind)
+        # Flip the test quad across the camera so every corner is behind it.
+        flipped = T.apply(np.stack([pc[:, 0], pc[:, 1], -np.abs(pc[:, 2]) - 1.0], axis=1))
+        self.assertEqual(reproject_room_quads([flipped], self.cam1, T), [])
+        del cam_pos
+
+    def test_no_contour_covers_a_large_part_of_the_image(self):
+        """Sweep quads around the camera: nothing may ever mask a big chunk."""
+        T = camera_room_pose(self.T_head, self.cam1)
+        area = float(self.cam1.width * self.cam1.height)
+        rng = np.random.default_rng(0)
+        for _ in range(200):
+            c = rng.uniform(-6, 6, 2)
+            h = rng.uniform(0.1, 0.5)
+            q = np.array([[c[0]-h, 3.15, c[1]-h], [c[0]+h, 3.15, c[1]-h],
+                          [c[0]+h, 3.15, c[1]+h], [c[0]-h, 3.15, c[1]+h]])
+            for px in reproject_room_quads([q], self.cam1, T):
+                self.assertLess(cv2.contourArea(px.reshape(-1, 1, 2)), 0.15 * area)
 
     def test_empty_or_none_input(self):
         T = camera_room_pose(self.T_head, self.cam1)

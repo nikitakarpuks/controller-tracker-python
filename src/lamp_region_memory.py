@@ -128,6 +128,7 @@ before.
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from src.camera import Camera
@@ -354,12 +355,64 @@ def _reproject_quad(quad_room: np.ndarray, camera: Camera, T_room_cam: Transform
     return px.astype(np.float32)
 
 
+_FOV_THETA_MARGIN = 0.97   # keep points a little inside theta_max: rho(theta) flattens (and the calibration degrades) at the very rim
+_QUAD_SAMPLES = 7          # 7x7 grid over a quad's XZ extent
+
+
+def _reproject_quad_fov_safe(quad_room: np.ndarray, camera: Camera, T_room_cam: Transform) -> Optional[np.ndarray]:
+    """Pixel contour of the part of a room-frame quad that is actually VISIBLE
+    to `camera`, or None when none of it is.
+
+    Written for FOREIGN regions (another camera's memory), which can sit
+    anywhere relative to this camera -- including behind it. The 4-corner
+    reprojection (_reproject_quad) is only safe for a region this camera itself
+    saw: room_point_to_pixel clamps any corner beyond the KB4 theta_max onto the
+    image-boundary ring, so a quad wholly BEHIND the camera turns into a fan of
+    chord-connected boundary points -- measured on walk_medium: cam3's lamp
+    seen from cam2 (all four corners 139-170deg off the optical axis) became a
+    70,000 px^2 polygon covering 23% of the frame, and another became an 80 px^2
+    sliver.
+
+    Instead: sample the quad's XZ extent on a grid, keep only the points inside
+    the camera's valid domain (KB4: angle from the optical axis <=
+    _FOV_THETA_MARGIN * theta_max, where rho(theta) is still monotonic; pinhole:
+    in front of the camera), project those with the real model (no clamping
+    involved), and take the convex hull. Fisheye edges of a straight room quad
+    bow, which a 4-corner polygon cannot represent; the sampled hull can. The
+    region is assumed axis-aligned in X/Z at one height (LampRegion's invariant).
+    """
+    q = np.asarray(quad_room, dtype=np.float64).reshape(-1, 3)
+    xs = np.linspace(q[:, 0].min(), q[:, 0].max(), _QUAD_SAMPLES)
+    zs = np.linspace(q[:, 2].min(), q[:, 2].max(), _QUAD_SAMPLES)
+    X, Z = np.meshgrid(xs, zs)
+    pts = np.stack([X.ravel(), np.full(X.size, q[:, 1].mean()), Z.ravel()], axis=1)
+    pc = T_room_cam.inverse().apply(pts)
+    if camera.is_fisheye and camera.rpmax > 0.0:
+        theta = np.arctan2(np.hypot(pc[:, 0], pc[:, 1]), pc[:, 2])
+        valid = theta <= _FOV_THETA_MARGIN * np.arctan(camera.rpmax)
+    else:
+        valid = pc[:, 2] > 1e-6
+    if int(valid.sum()) < 3:
+        return None
+    px, _ = camera.project_points(pc[valid], rvec=np.zeros(3), tvec=np.zeros(3))
+    px = np.asarray(px, dtype=np.float32).reshape(-1, 2)
+    hull = cv2.convexHull(px).reshape(-1, 2)
+    if len(hull) < 3:
+        return None
+    x0, y0 = hull.min(axis=0)
+    x1, y1 = hull.max(axis=0)
+    if x1 < 0 or y1 < 0 or x0 >= camera.width or y0 >= camera.height:
+        return None
+    return hull.astype(np.float32)
+
+
 def reproject_room_quads(quads, camera: Camera, T_room_cam: Transform) -> List[np.ndarray]:
-    """Pixel contours (in-view ones only) for room-frame (4,3) quads taken from
-    ANOTHER camera's LampRegionMemory.confirmed_quads()."""
+    """Pixel contours (visible ones only, see _reproject_quad_fov_safe) for
+    room-frame (4,3) quads taken from ANOTHER camera's
+    LampRegionMemory.confirmed_quads()."""
     out = []
     for q in (quads or []):
-        px = _reproject_quad(np.asarray(q, dtype=np.float64), camera, T_room_cam)
+        px = _reproject_quad_fov_safe(np.asarray(q, dtype=np.float64), camera, T_room_cam)
         if px is not None:
             out.append(px)
     return out
