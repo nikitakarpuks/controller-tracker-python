@@ -1013,6 +1013,10 @@ blob_detection:
   min_split_dist: 4.0
   split_valley_ratio: 0.6           # saddle_min/lower_peak must be below this to allow splitting
   min_circularity: 0.4              # 4π·area/perimeter² must exceed this; rejects elongated shapes
+  min_circularity_pixels: 4         # circularity is only applied to blobs with >= this many FILLED pixels. 2-3 px blobs
+                                   # (esp. a straight run along one axis, contour area 0 -> circularity 0) carry no
+                                   # meaningful shape and used to be rejected outright. Also applies to the warm
+                                   # per-LED path (its relaxed per-LED min_circularity goes through the same block).
   # Motion-blur "tail" rescue: a circularity-failed blob is kept anyway if its
   # own minAreaRect shape (long/short side ratio + fill of that rect) matches
   # a genuine LED streak instead of some other non-circular artifact. When the
@@ -1338,6 +1342,22 @@ blob_detection:
                                  # left a real lamp point at pointPolygonTest distance 7.0 (inside,
                                  # but not deep enough) -- pass 2 then re-discovered it, un-filtered.
                                  # 22.0 = interior_edge_margin_px(10) + 12px margin.
+
+    # Lamp-protect zones around the predicted LEDs (2026-09-20, user-requested). When the warm
+    # (proximity) attempt for a controller fails and main.py falls back to a cold RE-detect for
+    # brute-force, a small square is drawn around EACH LED the failed warm attempt predicted for that
+    # camera (half-size = pad_px + warm_failed_extra_px), so the union hugs the LED ring rather than
+    # the whole controller, and NO lamp mechanism may remove a blob inside it: not the structural
+    # line-finder (blobs there are still seen as context, so rows crossing a zone are recognised as
+    # before, but are never removed or used to seed a lamp region), not pass 2's propagation of it,
+    # not the static_lamp_mask region mask. Real case (static_medium, right_controller, cam3,
+    # relative frames 27-30): a real LED cluster next to a lamp column got swept into the column's
+    # line and removed -- 9 warm blobs became 1 for brute-force. A true cold start (no prediction)
+    # has no zone. Lamp REGION tracking is unaffected. Set enabled: false to switch it off.
+    predicted_pose_protect:
+      enabled: true
+      pad_px: 10.0                 # half-size of the square around each predicted LED projection
+      warm_failed_extra_px: 10.0   # added on top because the prediction just failed (so it is less trustworthy)
 
     static_lamp_mask:              # src/lamp_region_memory.py -- once a lamp fixture is recognized
                                     # (still via detect_lamp_blobs above, unchanged), remembers its 2D
@@ -1986,7 +2006,12 @@ matching:
   proximity_max_hypotheses: 32          # cap on valid hypothesis evaluations before best-so-far is accepted
   proximity_none_penalty_px: 0.4        # px cost for the first unmatched LED
   proximity_none_penalty_factor: 1.5    # geometric growth per None level: k-th None costs penalty * factor^(k-1); 1.0 = flat (linear)
-  proximity_strong_match_px: 0.5        # 0-None hypothesis below this error triggers early termination
+  proximity_strong_match_px: 0.5        # NO LONGER the proximity early-stop threshold (2026-09-18): early termination now uses the
+                                          # same test as brute-force's strong_found -- error <= strong_match_error_px AND this
+                                          # camera's own pairs >= strong_match_inliers (PoseSearcher._prox_is_strong). Only read now
+                                          # as the "confidently good fit" error reference in the proximity confidence's err_factor.
+                                          # Old error-only test also fired at any None level and let a 5-pair, 2-None fit
+                                          # (0.37px) cut the search short before the better hypothesis -- see _prox_is_strong.
   proximity_branch_k: 2                 # top-K hypotheses per None level to branch from at the next level
   proximity_none_branch_width: 4
   proximity_level0_max_hyp: 8

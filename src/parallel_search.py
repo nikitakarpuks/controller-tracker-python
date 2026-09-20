@@ -216,6 +216,7 @@ def run_blob_detect(
     frame_ts_ns: Optional[int] = None,
     region_memory_in=None,
     has_recent_memory: bool = False,
+    lamp_protect_rects=None,
 ):
     """Top-level, picklable worker task: run BlobDetector.detect() for one camera
     against the resident (per-camera) BlobDetector.
@@ -254,6 +255,10 @@ def run_blob_detect(
     camera) pair, from that pair's own ControllerTracker.last_good_pose) --
     this worker has no tracking state of its own to derive it from.
 
+    lamp_protect_rects: forwarded as-is to BlobDetector.detect() -- see its own
+    parameter comment. Computed by the caller from the failed warm attempt's
+    predicted LED projections.
+
     Returns (BlobResult, canvases_dict, memory_out, region_memory_out, diag).
     diag = (t_worker_start, t_compute_start, t_compute_end) — wall-clock
     (time.time(), synchronized with the submitting process on the same
@@ -284,6 +289,7 @@ def run_blob_detect(
         pose_source=_BLOB_POSE_SOURCES.get(cam_idx),
         frame_ts_ns=frame_ts_ns,
         has_recent_memory=has_recent_memory,
+        lamp_protect_rects=lamp_protect_rects,
     )
     t_compute_end = _time.time()
     return (result, canvases, bd._memory, bd._lamp_region_memory,

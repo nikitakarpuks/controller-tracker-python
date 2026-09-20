@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from src import debug_config
 from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods,
-                               _compute_led_search_radii)
+                               _compute_led_search_radii, predicted_leds_protect_rects)
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP, \
@@ -563,11 +563,12 @@ def main():
 
             cam_kwargs_per_ctrl: {ctrl_name: {cam_idx: {predicted_leds,
             local_search_radius_px, threshold_scale, velocity_px,
-            has_recent_memory}}} — only predicted_leds is required per
+            has_recent_memory, lamp_protect_rects}}} — only predicted_leds is required per
             camera, the rest default to the cold-path values.
             has_recent_memory participates in the dedup grouping key below
             (not just forwarded) since it changes detect()'s own exclusion
-            behavior -- see that key's own comment.
+            behavior -- see that key's own comment. lamp_protect_rects
+            likewise (it changes what detect() removes).
 
             images_override: optional {ctrl_name: {cam_idx: image}} — used by
             the cross-controller blackout (_build_blackout_images) to hand a
@@ -624,6 +625,9 @@ def main():
                             kwargs.get("threshold_scale", 1.0),
                             kwargs.get("velocity_px", 0.0),
                             bool(kwargs.get("has_recent_memory", False)),
+                            # Two controllers with different protect zones on the
+                            # same camera are different computations too.
+                            tuple(tuple(r) for r in (kwargs.get("lamp_protect_rects") or ())),
                         )
                     groups.setdefault(key, []).append((ctrl_name, cam_idx, kwargs))
 
@@ -670,6 +674,7 @@ def main():
                         frame_ts_ns,
                         _cold_region_memory.get(cam_idx),
                         kwargs.get("has_recent_memory", False),
+                        kwargs.get("lamp_protect_rects"),
                     )
                 for (ctrl_name, cam_idx), fut in futures.items():
                     result, canvases, memory_out, region_memory_out, diag = fut.result()
@@ -709,6 +714,7 @@ def main():
                         pose_source=_headset_pose_source,
                         frame_ts_ns=frame_ts_ns,
                         has_recent_memory=kwargs.get("has_recent_memory", False),
+                        lamp_protect_rects=kwargs.get("lamp_protect_rects"),
                     )
                     results_by_ctrl[ctrl_name][cam_idx] = det_result
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - _t0) * 1000
@@ -895,6 +901,25 @@ def main():
                 cam_tracker.last_good_pose_quality, frame_ts_ns,
                 _recent_memory_max_s, _recent_memory_min_inliers, _recent_memory_max_error_px)
 
+        # Lamp-protect zones for a cold RE-detect after a failed warm attempt
+        # (blob_detection.lamp_blob_filter.predicted_pose_protect): one small
+        # square around EACH LED the failed warm attempt predicted for this
+        # camera (the union hugs the LED ring, not the whole controller), so
+        # the lamp filters can't remove the real LED blobs standing there.
+        # The prediction just failed, so each square gets the base padding
+        # PLUS warm_failed_extra_px. Only cameras that had predicted LEDs get
+        # one; a true cold start (no prior) has nothing to protect.
+        _pp_cfg = (_blob_cfg.get("lamp_blob_filter") or {}).get("predicted_pose_protect") or {}
+        _pp_enabled = bool(_pp_cfg.get("enabled", False))
+        _pp_pad_px = float(_pp_cfg.get("pad_px", 20.0)) + float(_pp_cfg.get("warm_failed_extra_px", 20.0))
+
+        def _lamp_protect_rects(ctrl_name: str, cam_idx: int):
+            if not _pp_enabled:
+                return None
+            _pred_leds = _cam_kwargs_per_ctrl.get(ctrl_name, {}).get(cam_idx, {}).get("predicted_leds")
+            _h, _w = cam_images[cam_idx].shape[:2]
+            return predicted_leds_protect_rects(_pred_leds, _pp_pad_px, _w, _h) or None
+
         # Pass A: figure out each controller's per-camera detection kwargs
         # (and out-of-scope skips) independently — no cross-controller
         # dependency here, so this loop stays per-controller; only the actual
@@ -938,7 +963,10 @@ def main():
                     local_search_radius_px=radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r),
                     threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
                     velocity_px=_v_px,
-                    has_recent_memory=_has_recent_memory(ctrl_name, cam_idx),
+                    # has_recent_memory DISABLED 2026-09-20 (superseded by the lamp-protect zone,
+                    # see _lamp_protect_rects; user will re-check on more recordings). To restore,
+                    # uncomment this line and the matching one in the mid-Phase-2 redetect below.
+                    # has_recent_memory=_has_recent_memory(ctrl_name, cam_idx),
                 )
 
             skipped_cams_per_ctrl[ctrl_name] = list(_skipped_cams)
@@ -1151,7 +1179,8 @@ def main():
                 _t_redetect0 = time()
                 _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
                     ctrl_name, {c: {"predicted_leds": None,
-                                     "has_recent_memory": _has_recent_memory(ctrl_name, c)}
+                                     # "has_recent_memory": _has_recent_memory(ctrl_name, c),  # disabled, see Pass A
+                                     "lamp_protect_rects": _lamp_protect_rects(ctrl_name, c)}
                                 for c in _cold_cams},
                     images_override=_build_blackout_images(ctrl_name, _cold_cams),
                 )

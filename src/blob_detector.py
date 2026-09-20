@@ -180,6 +180,113 @@ def _filled_px_area(cnt) -> float:
     return float(np.count_nonzero(m))
 
 
+_LEGEND_FONT, _LEGEND_SCALE = cv2.FONT_HERSHEY_SIMPLEX, 0.35
+
+
+def _legend_rows(entries, width: int):
+    """Greedy wrap of (color, label) legend entries into rows that fit `width`
+    px (swatch 13px + measured text + 10px gap each, 6px left margin)."""
+    rows, x = [[]], 6
+    for color, label in entries:
+        (tw, _), _ = cv2.getTextSize(label, _LEGEND_FONT, _LEGEND_SCALE, 1)
+        need = 13 + tw + 10
+        if x + need > width and rows[-1]:
+            rows.append([])
+            x = 6
+        rows[-1].append((color, label))
+        x += need
+    return rows
+
+
+def _render_legend_strip(entries, width: int, info_label: str, row_h: int = 20) -> np.ndarray:
+    """Debug-canvas legend strip: swatches wrapped onto as many rows as the
+    canvas width needs (measured text width, not a fixed 2-row split -- the
+    cold canvas has up to ~16 entries and the old fixed split ran labels off
+    the right edge), then one info line underneath."""
+    rows = _legend_rows(entries, width)
+    strip = np.zeros((row_h * (len(rows) + 1), width, 3), dtype=np.uint8)
+    for row_idx, row in enumerate(rows):
+        x = 6
+        y_top = row_idx * row_h + 5
+        for color, label in row:
+            cv2.rectangle(strip, (x, y_top), (x + 10, y_top + 10), color, -1)
+            x += 13
+            cv2.putText(strip, label, (x, y_top + 9), _LEGEND_FONT, _LEGEND_SCALE, (200, 200, 200), 1, cv2.LINE_AA)
+            (tw, _), _ = cv2.getTextSize(label, _LEGEND_FONT, _LEGEND_SCALE, 1)
+            x += tw + 10
+    cv2.putText(strip, info_label, (6, row_h * len(rows) + 14), _LEGEND_FONT, _LEGEND_SCALE,
+                (200, 200, 200), 1, cv2.LINE_AA)
+    return strip
+
+
+def predicted_leds_protect_rects(predicted_leds, pad_px: float, width: int, height: int):
+    """One small pixel rectangle (x0, y0, x1, y1) per predicted LED
+    projection (BlobDetector's predicted_leds: one row per LED, columns 0/1 =
+    x/y), grown by pad_px on every side and clipped to the image -- the union
+    hugs the LED ring itself rather than a bounding box around the whole
+    controller (which, padded, also swallows any lamp near the controller).
+    Empty list when there are no predicted LEDs. Used to keep the lamp
+    filters away from where the LEDs were just predicted to be -- see
+    BlobDetector.detect()'s lamp_protect_rects."""
+    if predicted_leds is None or len(predicted_leds) == 0:
+        return []
+    pts = np.asarray(predicted_leds, dtype=np.float64).reshape(len(predicted_leds), -1)[:, :2]
+    return [(float(max(x - pad_px, 0.0)), float(max(y - pad_px, 0.0)),
+             float(min(x + pad_px, width - 1)), float(min(y + pad_px, height - 1)))
+            for x, y in pts]
+
+
+def _points_in_rects(points: np.ndarray, rects) -> np.ndarray:
+    """Bool (N,) -- True for a point inside any (x0, y0, x1, y1) rectangle."""
+    points = np.asarray(points).reshape(-1, 2)
+    inside = np.zeros(len(points), dtype=bool)
+    for x0, y0, x1, y1 in (rects or []):
+        inside |= ((points[:, 0] >= x0) & (points[:, 0] <= x1)
+                   & (points[:, 1] >= y0) & (points[:, 1] <= y1))
+    return inside
+
+
+def _spare_protected_from_lamp_result(lamp_result, protect_mask: np.ndarray):
+    """Exempt protect-zone points from a LampFilterResult, in place. The
+    line-finder still SAW them (a lamp row crossing the zone is recognised
+    exactly as before, so everything outside the zone is filtered exactly as
+    before -- pulling them out of the pool instead splits such a row and
+    leaves a too-short fragment that then survives as "real" blobs), but a
+    protected point is: never removed (keep_mask), never listed as a removed
+    lamp element, and never part of the point set that seeds a remembered
+    lamp region or a pass-2 exclusion footprint -- so it cannot grow a lamp
+    region over the controller. A candidate line made only of protected
+    points disappears entirely."""
+    lamp_result.keep_mask = np.asarray(lamp_result.keep_mask, dtype=bool) | protect_mask
+    survivors = []
+    for cand in lamp_result.rejected_candidates:
+        idx = [int(i) for i in cand.blob_indices if not protect_mask[i]]
+        if not idx:
+            continue
+        cand.blob_indices = idx
+        for line in cand.lines:
+            line.blob_indices = [int(i) for i in line.blob_indices if not protect_mask[i]]
+        survivors.append(cand)
+    lamp_result.rejected_candidates = survivors
+    return lamp_result
+
+
+def _spatial_outlier_keep(points: np.ndarray, outlier_factor: float) -> np.ndarray:
+    """DBSCAN-style 1-NN spatial filter: bool keep-mask over `points` (N,2).
+    A point is rejected when its nearest-neighbour distance exceeds
+    outlier_factor * median(nearest-neighbour distances) of the SAME set, so
+    the cutoff is only as meaningful as the population it is measured on --
+    see _detect_blobs' section 3b for why that population must not contain
+    lamp fixtures. Fewer than 2 points: nothing to compare, all kept."""
+    n = len(points)
+    if n < 2:
+        return np.ones(n, dtype=bool)
+    sq = ((points[:, None, :] - points[None, :, :]) ** 2).sum(axis=-1)
+    np.fill_diagonal(sq, np.inf)
+    min_nn = np.sqrt(sq.min(axis=1))
+    return min_nn <= outlier_factor * float(np.median(min_nn))
+
+
 def _looks_like_motion_streak(cnt, area, cfg) -> bool:
     """True if a circularity-failed blob's own boundary shape matches a
     genuine motion-blur streak: elongated AND solid. Only ever called for a
@@ -270,7 +377,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                    vis_offset=(0, 0),
                    neighborhoods=None,
                    region_exclude_blobs=None,
-                   region_sustain_contours=None):
+                   region_sustain_contours=None,
+                   region_hits=None,
+                   lamp_protect_rects=None):
     """
     Detect LED blobs and return their intensity-weighted centroids.
 
@@ -305,7 +414,9 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     finds its nearest neighbour distance.  Any blob whose 1-NN distance
     exceeds outlier_factor × median(1-NN distances) is rejected as spatially
     isolated noise.  Epsilon is derived from the surviving blob distances, so
-    it scales naturally with depth.  Skipped when fewer than 2 blobs survive,
+    it scales naturally with depth.  When the lamp-fixture filter runs, this
+    filter is applied AFTER it (lamp rows would otherwise set the median --
+    see _spatial_outlier_keep).  Skipped when fewer than 2 blobs survive,
     or when warm_mode/skip_spatial_outlier is set — in practice this makes it
     cold-path only: the `fit`/local warm path and hybrid's union-of-
     neighborhoods crop both have spatially spread-out LED priors, where an
@@ -350,6 +461,11 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     min_circularity    = (float(min_circularity_override)
                           if min_circularity_override is not None
                           else float(cfg.get("min_circularity", 0.5)))
+    # Blobs with fewer than this many FILLED pixels skip the circularity test
+    # entirely: 2-3 pixels can't form a meaningful shape (a straight run of
+    # 2-3 px on one axis has contour area 0 -> circularity 0, so a perfectly
+    # good tiny LED was always rejected). See section 3a.
+    min_circularity_pixels = int(cfg.get("min_circularity_pixels", 4))
 
     # H1: interior-of-large-blob exclusion — the shared 2-pass path only
     # (cold or hybrid warm); never the per-LED fit/local path. Applies
@@ -443,6 +559,11 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     region_masked_centroids_out = []
     intensities = image.astype(np.float32)
 
+    # Predicted-pose protect zones (see BlobDetector.detect's lamp_protect_rects):
+    # inside them none of the lamp mechanisms -- H1b/H1c below, and the
+    # structural line-finder (section 3b) -- may remove a candidate.
+    _protect_rects = [tuple(float(v) for v in r) for r in (lamp_protect_rects or [])]
+
     def _finish_candidate(cnt, label_id, x_b, y_b, w_b, h_b):
         """Pixel list + intensity-weighted centroid (greysum) + H1 exclusion
         for one blob that already survived area/brightness filtering. Appends
@@ -502,7 +623,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         # H1a above (own C_LAMP color/legend entry, not C_INTERIOR's) since
         # this candidate wasn't rejected for being "deep in a large blob",
         # it was rejected for being lamp.
-        if lamp_filter_scope_ok and _exclude_if_inside(
+        _in_protect = bool(_protect_rects) and bool(_points_in_rects(np.array([[cx, cy]]), _protect_rects)[0])
+        if lamp_filter_scope_ok and not _in_protect and _exclude_if_inside(
                 lamp_exclude_blobs, interior_edge_margin_px, None, det_rej_lamp):
             return
 
@@ -517,7 +639,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         # H1a/H1b it needs its OWN brightness gate: a real, bright controller
         # LED that later wanders through the remembered region must still
         # survive.
-        if lamp_filter_scope_ok and region_exclude_blobs:
+        if lamp_filter_scope_ok and region_exclude_blobs and not _in_protect:
             region_cfg = (cfg.get("lamp_blob_filter") or {}).get("static_lamp_mask") or {}
             region_margin_px = float(region_cfg.get("interior_margin_px", 15.0))
             region_max_brightness = float(region_cfg.get(
@@ -932,7 +1054,6 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
 
     keep_mask      = np.ones(len(centroids_arr), dtype=bool)
     circ_keep_mask = np.ones(len(centroids_arr), dtype=bool)
-    epsilon        = np.inf
 
     # A circularity-failed blob that looks like a motion-blur streak (see
     # _looks_like_motion_streak) is only safe to rescue unconditionally when
@@ -950,17 +1071,24 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     streak_ok_mask = np.zeros(len(blob_contours), dtype=bool)
 
     # ── 3a. Circularity filter: reject non-circular blobs (4π·area/perimeter²)
+    # Only blobs of >= min_circularity_pixels FILLED pixels are subject to it
+    # (exact pixel count via _filled_px_area, NOT areas_arr's contourArea: that
+    # shoelace area is 0 for a 2-3 px straight run and ~0.5 for a 3 px L, which
+    # is exactly why such blobs used to fail). Checked only for a blob that
+    # would otherwise fail, so passing blobs pay nothing extra.
     for i, cnt in enumerate(blob_contours):
         perimeter = cv2.arcLength(cnt.reshape(-1, 1, 2), closed=True)
         if perimeter > 0:
             circularity = 4 * np.pi * areas_arr[i] / (perimeter ** 2)
             if circularity < min_circularity:
+                if _filled_px_area(cnt) < min_circularity_pixels:
+                    continue   # too few pixels for shape to mean anything -- keep
                 streak_ok_mask[i] = _looks_like_motion_streak(cnt, areas_arr[i], cfg)
                 if lamp_active:
                     circ_keep_mask[i] = False  # deferred -- see promotion block below
                 elif not streak_ok_mask[i]:
                     circ_keep_mask[i] = False
-        else:
+        elif _filled_px_area(cnt) >= min_circularity_pixels:
             circ_keep_mask[i] = False
     keep_mask &= circ_keep_mask
 
@@ -1057,17 +1185,19 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # alone (real, just far from its neighbors) would be wrongly rejected as
     # spatially isolated noise — this filter is only meaningful when detection
     # runs over a single tightly-clustered controller with no prior spread.
-    candidates   = centroids_arr[keep_mask]
-    min_nn_full  = np.full(len(centroids_arr), np.inf)
-    if not (warm_mode or skip_spatial_outlier) and len(candidates) > 1:
-        diffs    = candidates[:, None, :] - candidates[None, :, :]
-        sq_dists = (diffs ** 2).sum(axis=-1)
-        np.fill_diagonal(sq_dists, np.inf)
-        min_nn      = np.sqrt(sq_dists.min(axis=1))
-        epsilon     = outlier_factor * float(np.median(min_nn))
-        cand_idx    = np.where(keep_mask)[0]
-        min_nn_full[cand_idx] = min_nn
-        keep_mask[cand_idx[min_nn > epsilon]] = False
+    #
+    # When the lamp-fixture filter is going to run (lamp_active), this filter is
+    # DEFERRED until after it (see "3c" below): the cutoff is a multiple of the
+    # MEDIAN nearest-neighbour distance over everything in the frame, and lamp
+    # rows are the tightest structures around (5-9px spacing) -- left in the
+    # population they drag the median down and the cutoff with it, so a real
+    # controller LED cloud (11-31px spacing when the controller is close) gets
+    # rejected as "isolated" (real case, static_medium frame 89, cam3: 11 lamp
+    # blobs set a 19.7px cutoff, 6 of 9 real LEDs rejected). Without the lamp
+    # filter there is nothing to wait for, so it runs here as before.
+    if not (warm_mode or skip_spatial_outlier or lamp_active):
+        _cand_idx = np.where(keep_mask)[0]
+        keep_mask[_cand_idx[~_spatial_outlier_keep(centroids_arr[_cand_idx], outlier_factor)]] = False
 
     kept_indices     = np.where(keep_mask)[0]
     rejected_indices = np.where(~keep_mask)[0]
@@ -1172,7 +1302,12 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
         ) if combined_contours else np.empty(0, dtype=np.float32)
         cand_blobs = BlobResult(centroids=combined_centroids, radii=combined_radii,
                                  brightnesses=combined_brightnesses, contours=combined_contours)
-        lamp_result = detect_lamp_blobs(cand_blobs, lamp_cfg)
+        _protect_pool = _points_in_rects(combined_centroids, _protect_rects) if _protect_rects else None
+        if _protect_pool is not None and _protect_pool.any():
+            lamp_result = _spare_protected_from_lamp_result(
+                detect_lamp_blobs(cand_blobs, lamp_cfg), _protect_pool)
+        else:
+            lamp_result = detect_lamp_blobs(cand_blobs, lamp_cfg)
 
         # Every combined-space pixel actually recognized+removed as a real
         # lamp element this frame -- kept or dim origin, no need to
@@ -1284,6 +1419,33 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                     filtered_brightnesses  = np.append(filtered_brightnesses, blob_max_pixels_arr[oi])
                     _r = float(np.sqrt(max(float(areas_arr[oi]), 1.0) / np.pi))
                     filtered_radii         = np.append(filtered_radii, np.float32(_r))
+
+        # ── 3c. Spatial-outlier filter, deferred from 3b (see there): now run
+        # on what survives the lamp filter and streak promotion, so the median
+        # nearest-neighbour distance describes the controller candidates, not
+        # the lamp rows just removed. Newly rejected blobs are appended to the
+        # rejected_* lists so they still show up (as spatial outliers) in the
+        # debug canvas.
+        _surv_idx = np.concatenate([
+            np.asarray(kept_indices, dtype=int)[kept_keep_mask],
+            np.asarray(rescued_orig_indices if streak_dim_coords else [], dtype=int),
+        ]) if len(kept_indices) or streak_dim_coords else np.empty(0, dtype=int)
+        if len(_surv_idx) > 1 and len(_surv_idx) == len(filtered_centroids):
+            _sp_keep = _spatial_outlier_keep(filtered_centroids, outlier_factor)
+            if not _sp_keep.all():
+                _new_rej = _surv_idx[~_sp_keep]
+                filtered_centroids    = filtered_centroids[_sp_keep]
+                filtered_contours     = [c for c, k in zip(filtered_contours, _sp_keep) if k]
+                filtered_is_split     = (filtered_is_split[_sp_keep]
+                                          if len(filtered_is_split) else filtered_is_split)
+                filtered_split_group  = (filtered_split_group[_sp_keep]
+                                          if len(filtered_split_group) else filtered_split_group)
+                filtered_brightnesses = filtered_brightnesses[_sp_keep]
+                filtered_radii        = filtered_radii[_sp_keep]
+                _rej_all = np.sort(np.concatenate([np.asarray(rejected_indices, dtype=int), _new_rej]))
+                rejected_indices   = _rej_all
+                rejected_centroids = centroids_arr[_rej_all]
+                rejected_contours  = [blob_contours[i] for i in _rej_all]
 
         # A removed lamp candidate's neighborhood must also be excluded from
         # pass 2 -- own exclusion set (lamp_exclude_blobs), kept separate from
@@ -1418,18 +1580,25 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
                                       # when nothing inside it gets excluded this frame, so you can see
                                       # where the mask thinks the lamp is independent of its effect)
         C_REGION_MASK_HELD = (0, 200, 255)  # amber — a region LampRegionMemory is tracking but that
-                                      # ISN'T currently excluding anything, either because it's not yet
-                                      # reinforced enough (hits < min_hits_to_exclude) OR because this
-                                      # frame's caller has has_recent_memory=True (see detect()'s own
+                                      # ISN'T currently excluding anything because it's NOT YET reinforced
+                                      # enough (hits < min_hits_to_exclude) -- still in the "sustain but
+                                      # don't bite" phase. Thinner (1px, not 2px) and a different color
+                                      # from C_REGION_MASK so it's unmistakably "this region exists but
+                                      # isn't biting right now" -- added 2026-09-15 so the debug canvas
+                                      # keeps its own documented promise (see C_REGION_MASK's comment:
+                                      # "you can see where the mask thinks the lamp is independent of its
+                                      # effect") even on a frame where region_exclude_blobs is empty.
+        C_REGION_MASK_RECENT = (255, 0, 0)  # blue — a region IS reinforced enough to exclude
+                                      # (hits >= min_hits_to_exclude) but isn't excluding THIS frame
+                                      # because the caller has has_recent_memory=True (see detect()'s own
                                       # docstring: a re-acquisition with a usable last_good_pose skips
                                       # exclusion, relying on ControllerTracker's own jump-gate instead,
-                                      # but tracking itself never stops). Thinner (1px, not 2px) and a
-                                      # different color from C_REGION_MASK so it's unmistakably "this
-                                      # region exists but isn't biting right now" -- added 2026-09-15 so
-                                      # the debug canvas keeps its own documented promise (see
-                                      # C_REGION_MASK's comment: "you can see where the mask thinks the
-                                      # lamp is independent of its effect") even on a frame where
-                                      # region_exclude_blobs is deliberately empty.
+                                      # but tracking itself never stops). Split from C_REGION_MASK_HELD
+                                      # 2026-09-15 (user request) so "not confirmed yet" (1) and "confirmed
+                                      # but has_recent_memory held it back" (2) read as visually distinct
+                                      # states instead of one ambiguous "held" color -- their causes and
+                                      # implications are unrelated (one is about evidence, the other is
+                                      # about trusting a fresh independent corroboration instead).
         C_KEPT     = (255, 255, 255) # white       — kept
         C_SPLT     = (0, 255, 128)   # cyan        — kept (split)
         C_SPLT_CUT = (0, 0, 0)       # black       — divider mark between a split pair
@@ -1438,33 +1607,61 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             c = cnt if (vis_ox == 0 and vis_oy == 0) else cnt + np.array([vis_ox, vis_oy], dtype=cnt.dtype)
             cv2.drawContours(vis, [c.reshape(-1, 1, 2).astype(np.int32)], -1, color, thickness)
 
+        if not warm_mode:
+            for _x0, _y0, _x1, _y1 in _protect_rects:
+                cv2.rectangle(vis, (int(round(_x0 + vis_ox)), int(round(_y0 + vis_oy))),
+                              (int(round(_x1 + vis_ox)), int(round(_y1 + vis_oy))), (255, 255, 0), 1)
         for cnt in det_rej_area_small: _draw_cnt(cnt, C_AREA_SM)
         for cnt in det_rej_area_large: _draw_cnt(cnt, C_AREA_LG)
         for cnt in det_rej_threshold:  _draw_cnt(cnt, C_THRESH)
         # Every region LampRegionMemory currently holds, minus the ones also
-        # actively excluding -- see C_REGION_MASK_HELD's own comment for why
-        # this exists (keeps the canvas honest on a has_recent_memory=True
-        # frame, where region_exclude_blobs is deliberately empty but regions
-        # are still very much alive and tracked). VALUE equality, not
-        # identity -- region_exclude_blobs and region_sustain_contours come
-        # from two SEPARATE reprojection calls in detect() (see its own
-        # comment), so the same region's contour is a different array object
-        # in each list even when numerically identical. Computed once,
-        # up-front, so the legend entry below reflects exactly what got
-        # drawn instead of merely what COULD have been drawn this frame.
+        # actively excluding -- see C_REGION_MASK_HELD/C_REGION_MASK_RECENT's
+        # own comments for why this exists (keeps the canvas honest on a
+        # has_recent_memory=True frame, where region_exclude_blobs is
+        # deliberately empty but regions are still very much alive and
+        # tracked). VALUE equality, not identity -- region_exclude_blobs and
+        # region_sustain_contours come from two SEPARATE reprojection calls
+        # in detect() (see its own comment), so the same region's contour is
+        # a different array object in each list even when numerically
+        # identical. Computed once, up-front, so the legend entries below
+        # reflect exactly what got drawn instead of merely what COULD have
+        # been drawn this frame.
+        #
+        # Split into "not yet confirmed" (hits < min_hits_to_exclude, still
+        # earning trust) vs "confirmed but held back by has_recent_memory"
+        # (hits already clears the bar -- the ONLY other way a region with
+        # enough hits ends up here instead of in region_exclude_blobs is
+        # detect()'s own lamp_exclusion_active=False, i.e. has_recent_memory
+        # was True this call) using region_hits, one entry per
+        # region_sustain_contours position (see LampRegionMemory.
+        # all_reprojected_contours' own docstring: same order/length as
+        # self._regions). region_hits is None whenever the caller didn't
+        # thread it through (e.g. the periodic shadow-refresh call, which
+        # never visualizes) -- fall back to the old undifferentiated bucket
+        # rather than crash or silently miscategorize.
         _active = [c for c in (region_exclude_blobs or []) if c is not None]
-        _region_held_contours = [
-            cnt for cnt in (region_sustain_contours or [])
-            if cnt is not None and not any(np.array_equal(cnt, ac) for ac in _active)
-        ]
+        _region_cfg_vis = (cfg.get("lamp_blob_filter") or {}).get("static_lamp_mask") or {}
+        _min_hits_to_exclude = int(_region_cfg_vis.get("min_hits_to_exclude", 3))
+        _region_held_unconfirmed = []
+        _region_held_recent = []
+        for _i, cnt in enumerate(region_sustain_contours or []):
+            if cnt is None or any(np.array_equal(cnt, ac) for ac in _active):
+                continue
+            _hits = region_hits[_i] if region_hits is not None and _i < len(region_hits) else None
+            if _hits is not None and _hits >= _min_hits_to_exclude:
+                _region_held_recent.append(cnt)
+            else:
+                _region_held_unconfirmed.append(cnt)
 
         if not warm_mode:
             for cnt in det_rej_interior: _draw_cnt(cnt, C_INTERIOR)
             for cnt in det_rej_lamp:     _draw_cnt(cnt, C_LAMP)
             if region_exclude_blobs:
                 for cnt in region_exclude_blobs: _draw_cnt(cnt, C_REGION_MASK, thickness=2)
-            for cnt in _region_held_contours:
+            for cnt in _region_held_unconfirmed:
                 _draw_cnt(cnt, C_REGION_MASK_HELD, thickness=1)
+            for cnt in _region_held_recent:
+                _draw_cnt(cnt, C_REGION_MASK_RECENT, thickness=1)
 
         for i in rejected_indices:
             if not circ_keep_mask[i]:
@@ -1516,7 +1713,7 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             strip_entries = [
                 (C_KEPT,     "kept"),
                 (C_SPLT,     "split (black seam divides pair)"),
-                (C_CIRC,     f"not circular (< {min_circularity})"),
+                (C_CIRC,     f"not circular (< {min_circularity}, >= {min_circularity_pixels}px)"),
             ]
             if not skip_spatial_outlier:
                 # DBSCAN spatial-outlier filter never runs when
@@ -1531,30 +1728,18 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
             ]
             if lamp_cfg.get("enabled", False):
                 strip_entries.append((C_LAMP, "lamp (removed)"))
+            if _protect_rects:
+                strip_entries.append(((255, 255, 0), "lamp-protected zone (predicted pose)"))
             if region_exclude_blobs:
                 strip_entries.append((C_REGION_MASK, "static lamp mask (excluding)"))
-            if _region_held_contours:
-                strip_entries.append((C_REGION_MASK_HELD, "static lamp mask (held, not excluding)"))
-            row_h = 20
-            half = len(strip_entries) // 2 + len(strip_entries) % 2
-            rows = [strip_entries[:half], strip_entries[half:]]
-            strip = np.zeros((row_h * 3, vis.shape[1], 3), dtype=np.uint8)
-            for row_idx, row in enumerate(rows):
-                x = 6
-                y_sq_top = row_idx * row_h + 5
-                y_sq_bot = y_sq_top + 10
-                y_text   = y_sq_bot - 1
-                for color, label in row:
-                    cv2.rectangle(strip, (x, y_sq_top), (x + 10, y_sq_bot), color, -1)
-                    x += 13
-                    cv2.putText(strip, label, (x, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
-                    (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-                    x += tw + 10
+            if _region_held_unconfirmed:
+                strip_entries.append((C_REGION_MASK_HELD, "static lamp mask (held: not confirmed)"))
+            if _region_held_recent:
+                strip_entries.append((C_REGION_MASK_RECENT, "static lamp mask (held: has_recent_memory)"))
             thr_label = f"pixel_thr={pixel_threshold}  required_thr={required_threshold}"
             if frame_name:
                 thr_label += f"   [{frame_name}]"
-            cv2.putText(strip, thr_label, (6, row_h * 2 + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+            strip = _render_legend_strip(strip_entries, vis.shape[1], thr_label)
             vis = np.vstack([vis, strip])
 
             if img_path is not None:
@@ -2046,27 +2231,10 @@ def _detect_blobs_local(image, led_projections, cfg,
             (C_AREA_LG,  f"area > max_area"),
             (C_AREA_SM,  "pixels < min_area"),
         ]
-        row_h = 20
-        half  = len(strip_entries) // 2 + len(strip_entries) % 2
-        rows  = [strip_entries[:half], strip_entries[half:]]
-        strip = np.zeros((row_h * 3, canvas.shape[1], 3), dtype=np.uint8)
-        for row_idx, row in enumerate(rows):
-            x = 6
-            y_sq_top = row_idx * row_h + 5
-            y_sq_bot = y_sq_top + 10
-            y_text   = y_sq_bot - 1
-            for color, label in row:
-                cv2.rectangle(strip, (x, y_sq_top), (x + 10, y_sq_bot), color, -1)
-                x += 13
-                cv2.putText(strip, label, (x, y_text),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
-                (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-                x += tw + 10
         info_label = f"warm: {n_leds} LEDs  base_r={base_px:.1f}px  NMS min_dist={min_split_dist:.1f}px"
         if frame_name:
             info_label += f"   [{frame_name}]"
-        cv2.putText(strip, info_label,
-                    (6, row_h * 2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+        strip = _render_legend_strip(strip_entries, canvas.shape[1], info_label)
         stack_parts = [canvas]
         if grid_canvas is not None:
             stack_parts.append(grid_canvas)
@@ -2182,6 +2350,7 @@ class BlobDetector:
         pose_source=None,
         frame_ts_ns: Optional[int] = None,
         has_recent_memory: bool = False,
+        lamp_protect_rects=None,
     ) -> BlobResult:
         cfg     = self._cfg
         cam_idx = self.camera_idx
@@ -2234,6 +2403,20 @@ class BlobDetector:
         # floor everywhere, occluded or not -- no usable signal) before
         # landing on this state-based rule instead.
         has_recent_memory = bool(has_recent_memory)
+        # lamp_protect_rects: [(x0, y0, x1, y1), ...] pixel rectangles (image
+        # coordinates) in which NO lamp mechanism may remove a candidate --
+        # neither detect_lamp_blobs' structural line-finder (protected points
+        # are still seen as context but never removed or used to seed
+        # anything -- see _spare_protected_from_lamp_result), nor pass 2's
+        # same-frame propagation of it (H1b), nor the remembered-region mask (H1c).
+        # Supplied by main.py for a cold RE-detect that follows a failed warm
+        # (proximity) attempt: the controller was just predicted to be there,
+        # and a real LED cluster sitting near a lamp row gets swept into the
+        # row's line and removed, leaving brute-force with almost nothing
+        # (real case, static_medium, right_controller, cam3: 9 warm blobs
+        # -> 1 after the cold redetect's lamp filter). None/empty = no zone.
+        # Tracking of lamp regions (LampRegionMemory) is unaffected.
+        lamp_protect_rects = [tuple(r) for r in (lamp_protect_rects or [])]
 
         # Static ceiling-lamp region memory (see src/lamp_region_memory.py):
         # complete no-op unless lamp_blob_filter.static_lamp_mask.enabled AND
@@ -2265,6 +2448,7 @@ class BlobDetector:
         lamp_exclusion_active = lamp_region_active and not has_recent_memory
         region_exclude_blobs = None
         region_all_contours = None
+        region_hits = None
         T_room_cam = None
         if lamp_region_active:
             T_room_headsetImu = pose_source.room_pose_at(frame_ts_ns)
@@ -2284,6 +2468,13 @@ class BlobDetector:
                 # new region too, not only established ones. Computed
                 # regardless of lamp_exclusion_active -- tracking always runs.
                 region_all_contours = self._lamp_region_memory.all_reprojected_contours(camera, T_room_cam)
+                # Same order/length as region_all_contours (both walk
+                # self._regions directly) -- lets the debug visualization
+                # tell "not yet confirmed" apart from "confirmed but held
+                # back by has_recent_memory" for an otherwise-identical
+                # "held, not excluding" contour (see C_REGION_MASK_RECENT's
+                # own comment in _detect_blobs).
+                region_hits = [r.hits for r in self._lamp_region_memory._regions]
                 if lamp_exclusion_active:
                     region_exclude_blobs = self._lamp_region_memory.reprojected_contours(camera, T_room_cam)
 
@@ -2550,7 +2741,9 @@ class BlobDetector:
                                vis_background=image, vis_offset=(offset_x, offset_y),
                                neighborhoods=_neighborhoods,
                                region_exclude_blobs=region_exclude_blobs,
-                               region_sustain_contours=region_all_contours)
+                               region_sustain_contours=region_all_contours,
+                               region_hits=region_hits,
+                               lamp_protect_rects=lamp_protect_rects)
         large_blobs_pass1 = result[6]
         lamp_blobs_pass1  = result[8]
         canvases = {}
@@ -2633,6 +2826,8 @@ class BlobDetector:
                         neighborhoods=_neighborhoods,
                         region_exclude_blobs=region_exclude_blobs,
                         region_sustain_contours=region_all_contours,
+                        region_hits=region_hits,
+                        lamp_protect_rects=lamp_protect_rects,
                     )
                     if result2[7] is not None:
                         canvases["pass2"] = result2[7]
@@ -2695,6 +2890,8 @@ class BlobDetector:
                 neighborhoods=_neighborhoods,
                 region_exclude_blobs=region_exclude_blobs,
                 region_sustain_contours=region_all_contours,
+                region_hits=region_hits,
+                lamp_protect_rects=lamp_protect_rects,
             )
             if result2[7] is not None:
                 canvases["pass2"] = result2[7]

@@ -605,6 +605,9 @@ class PoseSearcher:
         self._c_prox_max_hyp        = int(  _cfg.get('proximity_max_hypotheses',          256))
         self._c_prox_none_penalty    = float(_cfg.get('proximity_none_penalty_px',        0.3))
         self._c_prox_none_factor     = float(_cfg.get('proximity_none_penalty_factor',    1.0))
+        # NOT the early-stop threshold any more (see _prox_is_strong, which shares brute-force's
+        # strong_match_error_px/strong_match_inliers) -- now only the "confidently good fit" error
+        # reference for _proximity_confidence's err_factor.
         self._c_prox_strong_match_px = float(_cfg.get('proximity_strong_match_px',        0.2))
         self._c_prox_branch_k       = int(  _cfg.get('proximity_branch_k',                3))
         self._c_prox_level0_max_hyp = int(  _cfg.get('proximity_level0_max_hyp',          16))
@@ -833,6 +836,28 @@ class PoseSearcher:
                 pairs.append((j, lid))
                 used.add(j)
         return pairs
+
+    def _prox_is_strong(self, score: float, n_pairs: int) -> bool:
+        """Early-termination test for proximity_search's hypothesis loop --
+        deliberately the SAME two conditions brute-force uses for its own
+        strong_found (brute_search_tier): error <= strong_match_error_px AND
+        at least strong_match_inliers of THIS camera's own pairs (locked +
+        matched hypothesis LEDs; not pooled with aux cameras).
+
+        Was: `score <= proximity_strong_match_px`, error only, applied at every
+        None level with no penalty for the Nones. Real case (static_easy,
+        right_controller, cam3, ts=100830361704073): a hypothesis that dropped
+        2 of 5 ambiguous LEDs scored 0.37px on just 5 pairs and stopped the
+        search before it reached the better hypothesis, so the search kept one
+        that put LED 19 onto LED 11's blob; that single off-axis pair dragged the
+        pose 15deg about the near-collinear axis of the other five, and the
+        weak solve poisoned the next two frames (both lost). Any fit built
+        from too few pairs can hit a low residual regardless of correctness,
+        which is exactly what the pair-count floor guards against. When fewer
+        than strong_match_inliers pairs are even achievable the search simply
+        never stops early and is bounded by proximity_max_hypotheses instead.
+        """
+        return score <= self._c_brute_strong_err and n_pairs >= self._c_brute_strong_in
 
     def proximity_search(
         self,
@@ -1297,11 +1322,13 @@ class PoseSearcher:
                         )
                         break
 
-                    if score <= self._c_prox_strong_match_px:
+                    _n_pairs_0 = len(truly_locked_k) + len(hyp_k)
+                    if self._prox_is_strong(score, _n_pairs_0):
                         _stopped_early = True
                         logger.bind(cat="proximity_match").debug(
                             f"[{self._ctrl} | cam {self._cam}] Proximity: early stop "
-                            f"(0-None score {score:.2f}px <= {self._c_prox_strong_match_px:.2f}px)"
+                            f"(0-None score {score:.2f}px <= {self._c_brute_strong_err:.2f}px, "
+                            f"{_n_pairs_0} pairs >= {self._c_brute_strong_in})"
                         )
                         break
 
@@ -1394,11 +1421,13 @@ class PoseSearcher:
                                 _cap_hit = True
                                 break
 
-                            if score <= self._c_prox_strong_match_px:
+                            _n_pairs_b = len(truly_locked_k) + len(hyp_k) - n_none
+                            if self._prox_is_strong(score, _n_pairs_b):
                                 _stopped_early = True
                                 logger.bind(cat="proximity_match").debug(
                                     f"[{self._ctrl} | cam {self._cam}] Proximity: early stop "
-                                    f"({n_none}-None score {score:.2f}px <= {self._c_prox_strong_match_px:.2f}px)"
+                                    f"({n_none}-None score {score:.2f}px <= {self._c_brute_strong_err:.2f}px, "
+                                    f"{_n_pairs_b} pairs >= {self._c_brute_strong_in})"
                                 )
                                 _cap_hit = True
                                 break
