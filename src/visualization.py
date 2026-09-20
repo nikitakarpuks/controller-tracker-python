@@ -476,6 +476,8 @@ class ControllerAnimatorRerun:
         self._pose_fusion_debug_show_tabs = pose_fusion_debug_show_tabs
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
+        self._mesh_path_for_occ = mesh_path
+        self._occ_mesh = None
         raw_mesh = load_trimesh(mesh_path)
         self._mesh_faces = raw_mesh.faces
         self._mesh_vertex_normals = (raw_mesh.vertex_normals
@@ -485,6 +487,41 @@ class ControllerAnimatorRerun:
         self._mesh_verts: dict = {}
         for ctrl_name in controllers_vis:
             self._mesh_verts[ctrl_name] = raw_mesh.vertices.astype(np.float32).copy()
+
+    def _mesh_occluded(self, cam_origin_world, pts_world, T_world_model_occ) -> np.ndarray:
+        """Bool mask: does the segment camera->point cross the occluder's full
+        (decimated) mesh before reaching the point? Display-only."""
+        n = len(pts_world)
+        out = np.zeros(n, dtype=bool)
+        try:
+            if getattr(self, "_occ_mesh", None) is None:
+                # Full mesh: quadric decimation opened holes (rays leaked through).
+                self._occ_mesh = load_trimesh(self._mesh_path_for_occ)
+            m = self._occ_mesh
+            Rm, tm = T_world_model_occ.R, T_world_model_occ.t
+            o = Rm.T @ (np.asarray(cam_origin_world, dtype=np.float64) - tm)
+            p = (np.asarray(pts_world, dtype=np.float64) - tm) @ Rm   # R^T (p - t)
+            d = p - o
+            dist = np.linalg.norm(d, axis=1)
+            dirs = d / np.maximum(dist[:, None], 1e-12)
+            # Cheap gate: only rays whose segment passes within the mesh's
+            # bounding sphere go to the (slow) exact ray test.
+            ctr = m.bounds.mean(axis=0)
+            rad = 0.5 * float(np.linalg.norm(m.bounds[1] - m.bounds[0])) * 1.05
+            s_ = np.clip((ctr - o) @ dirs.T, 0.0, dist)
+            near = np.linalg.norm(o + dirs * s_[:, None] - ctr, axis=1) < rad
+            idx = np.where(near)[0]
+            if len(idx) == 0:
+                return out
+            locs, ray_idx, _ = m.ray.intersects_location(
+                np.tile(o, (len(idx), 1)), dirs[idx], multiple_hits=False)
+            for loc, ri in zip(locs, ray_idx):
+                k = idx[ri]
+                if np.linalg.norm(loc - o) < dist[k] - 1e-3:
+                    out[k] = True
+        except Exception as e:
+            logger.warning(f"[viz] full-mesh occlusion test unavailable: {e}")
+        return out
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -1401,6 +1438,14 @@ class ControllerAnimatorRerun:
                         _br, _br, _focal_px, _gate_margin,
                     )
                     vis_scores[_cross_occ_vis] = 0.0
+                    # Display-only: the tracker's occluder models the handle only,
+                    # so rays behind the ring/halo still drew through the other
+                    # controller. Re-test the drawn LEDs against its full mesh.
+                    _cand = np.where(vis_scores >= 1.0)[0]
+                    if len(_cand):
+                        _T_world_model_occ = _T_world_ctrl_occ.compose(_occ_cs["T_ctrl_model"])
+                        vis_scores[_cand[self._mesh_occluded(
+                            camera.T_world_cam.t, pts_disp_real[_cand], _T_world_model_occ)]] = 0.0
             vis_set = set(np.where(vis_scores >= 1.0)[0].tolist())
 
             # ── LED disks (geometry is static, just update the pose — the
