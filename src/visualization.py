@@ -65,13 +65,16 @@ VIS_CONFIG = {
     "ghost_led_color":       [110, 110, 130],  # dim blue-gray LEDs
 }
 
-# One distinct colour per camera index (cyan / orange / purple / green).
+# One distinct colour per camera index (cyan / orange / purple / violet).
 # Used for frustum outlines, filled image planes, centre balls, and blob contours.
+# cam 3 was green ([50, 255, 50]) until 2026-09-20 -- indistinguishable from the
+# lime left_controller vision-prediction colour. Violet here is bluer/lighter
+# than cam 2's magenta-purple so the two stay distinguishable.
 CAMERA_COLORS = [
     [  0, 220, 255],   # cam 0 — cyan
     [255, 120,   0],   # cam 1 — orange
     [180,   0, 255],   # cam 2 — purple
-    [ 50, 255,  50],   # cam 3 — green
+    [140,  80, 255],   # cam 3 — violet
 ]
 
 def _camera_color(cam_idx: int) -> list:

@@ -307,6 +307,40 @@ fusion_heuristic:
   implausible_jump_pos_thresh_per_accel_mm_per_mps2: 0.0
   implausible_jump_rot_thresh_per_gyro_deg_per_dps: 0.0046
 
+  # Quality-aware POSITION shrink on the hard implausibility gate's own
+  # ceiling above (2026-09-17, real case: right_controller, walk_dark, frame
+  # 251 -- mocap-confirmed a moderate-quality vision candidate, quality~0.53,
+  # landed 22mm off truth while this filter's own p_pred was only ~3-5mm
+  # off, but the flat 61.5mm base ceiling never noticed since it doesn't
+  # depend on vision's own quality at all). Multiplies the FULL pos_thresh_m
+  # (base + speed + accel + stale widening) by a factor that's 1.0 (no
+  # change) at/above implausible_jump_pos_quality_full_trust_at, and
+  # implausible_jump_pos_quality_min_scale at quality=0, linear in between.
+  # ROTATION is untouched (out of scope -- both confirmed real cases were
+  # position disagreements; rotation already has its own dedicated gates,
+  # rot_pred_implausible/_rot_implausible).
+  #
+  # Fit (2026-09-17) against a fresh sweep of this session's own full
+  # 5400-frame walk_dark run: real pos_innov_m (vision vs p_pred -- the
+  # EXACT quantity this gate checks), binned by the same quality score
+  # _vision_weight already computes, warm-tracking (outcome=fused) frames
+  # only. p99 pos_innov_m falls from ~50-80mm at quality<0.6 down to ~20mm
+  # at quality>=0.7 (both controllers) -- see this session's own scratch
+  # sweep script for the full per-band table.
+  #
+  # CALIBRATED CONSERVATIVELY (user-directed, real tradeoff surfaced during
+  # design): min_scale=0.6 sits close to each band's own p99, not p90 --
+  # this keeps the false-reject risk on legitimate quality~0.5-0.7
+  # candidates low, at the explicit cost of NOT catching a single-frame
+  # case as mild as frame 251's own 17.8mm pos_innov_m (that band's own
+  # p90, not p99) -- a p90-level cutoff would also reject ~10% of OTHER
+  # quality~0.5 candidates with no mocap check confirming those are wrong
+  # too. Revisit with a tighter min_scale only after checking a broader
+  # mocap-validated sample, not from this one flagged frame alone.
+  implausible_jump_pos_quality_shrink_enabled: true
+  implausible_jump_pos_quality_full_trust_at: 0.7
+  implausible_jump_pos_quality_min_scale: 0.6
+
   # How many consecutive non-coverage_fallback accepts the rotation hard-gate
   # (and its Case-A pushback / velocity-establishment counterparts) stays
   # exempted for after a coverage-fallback seed (bootstrap/fail_open/
@@ -622,6 +656,54 @@ fusion_heuristic:
   # trips it.
   cold_reacquire_rot_veto_max_s: 0.25
   cold_reacquire_rot_veto_thresh_deg: 100.0
+
+  # bootstrap_gravity_veto_thresh_deg: at BOOTSTRAP only, refuse to confirm two
+  # agreeing weak candidates when the accelerometer reading rotated through the
+  # candidate's R points more than this many degrees away from world down (-y).
+  # Catches rotation-flipped bootstraps that agree with each other (both
+  # candidates share one mirror-branch error) and that coverage_fallback does
+  # not catch. Checked on every bootstrap candidate of a full static_easy run
+  # (80, labelled vs mocap): good ones sit 0-51deg from -y (median 15), 19 of
+  # 22 flipped ones sit >=65deg; 65 blocks 0/58 good. Real case: static_medium
+  # left_controller frame_idx 2988 (155.9deg off mocap, gravity 163deg off).
+  # Cannot see a flip about the vertical axis. 0 disables.
+  bootstrap_gravity_veto_thresh_deg: 65.0
+
+  # reject_streak_override: two consecutive STRONG candidates (n_inliers >=
+  # vision_weight_strong_inliers, error below the weak floor, not fallback/
+  # contested/swap) that are both rejected against the IMU/gyro prediction but
+  # AGREE WITH EACH OTHER (weak_confirm_* budget) re-anchor on vision through
+  # _try_cold_reacquire's strong path (sibling-collision check still runs).
+  # Real case: static_medium right_controller frames 4720-4727 -- a flipped
+  # cold reacquire left the IMU state wrong, so three correct 11-inlier
+  # candidates were each rejected (rot_innov=155deg) while the reported pose
+  # sat 99-140mm / 157deg off mocap. false disables.
+  reject_streak_override_enabled: true
+  reject_streak_override_min_agreeing: 2
+  reject_streak_override_max_gap_s: 0.25
+
+  # Cold-reacquire / bootstrap confirmation hardening (2026-09-20, real case:
+  # static_medium left_controller relative frames 42 -> 47): a 2-inlier
+  # prior-constrained P1P candidate (rotation COPIED from the prediction) was
+  # buffered, then a poor 5-inlier/0.69px P3P candidate "agreed" with it inside a
+  # 476mm/~190deg time-scaled budget and became a 65mm/58deg-wrong anchor.
+  # cold_confirm_min_inliers / cold_confirm_ignore_prior_constrained: such
+  # candidates are neither buffered nor able to confirm or supersede anything
+  # (the frame is just a wait). cold_confirm_require_solid_member: a confirmed
+  # pair needs at least one member with error_px < vision_weight_weak_error_px.
+  # Set the three to 0 / false / false for the old behaviour.
+  cold_confirm_min_inliers: 3
+  cold_confirm_ignore_prior_constrained: true
+  cold_confirm_require_solid_member: true
+
+  # reject_report_respect_display_budget: a hard-rejected vision candidate used to
+  # ALWAYS re-display the coasted IMU prediction, even far past
+  # cold_pending_report_max_gap_s (real case: static_medium left_controller,
+  # frame_idx 4085 -- 189ms after the last accept, 243mm off mocap, right after
+  # 10 correctly pose-less frames). Now the reported pose is cleared instead once
+  # the coast exceeds the same (accel/gyro-shrunk) display budget the buffered-
+  # candidate path already uses. false = old behaviour.
+  reject_report_respect_display_budget: true
 
   # Long-gap damping (see HeuristicPoseFusionFilter._gap_vision_scale) -- scales
   # w_vision down as the elapsed gap since the last accepted update (dt_s)
@@ -1771,7 +1853,22 @@ matching:
                              # -- median ratio is 1.0 (most accepts use every detected blob), only 4.04%
                              # ever fall below 0.7 -- low enough to essentially never fire on a normal,
                              # healthy single-camera accept.
-  score_error_floor_px: 0.5   # _inlier_discounted_error's error floor, used when comparing
+  weak_solo_prediction_agree_enabled: true   # ADDED 2026-09-19 (static_medium, left_controller,
+                             # frame_idx 3497/3498): a solo solution that sits within
+                             # weak_solo_agree_pos_m / weak_solo_agree_rot_deg of the prediction it was
+                             # searched around is NOT treated as "weak" by the guard above -- the guard
+                             # had discarded cam2 proximity solutions that mocap puts at 6.0mm/2.1deg
+                             # and 8.4mm/2.2deg off truth because cam0's own pairs had been dropped by a
+                             # visibility re-check (nothing contradicted cam2), and brute-force then
+                             # either found nothing or a 58mm/37deg-wrong pose. false = old behaviour.
+  weak_solo_agree_pos_m: 0.04
+  weak_solo_agree_rot_deg: 12.0
+  constrained_search_max_blobs: 6   # ADDED 2026-09-19: the prior-constrained (P2P/P1P) fallback used to run
+                             # only for 2-3 detected blobs. cam0 at that same frame had 4 blobs, all
+                             # matching (0.22px), but a post-RANSAC visibility drop left 3 pairs (< 4 =
+                             # proximity minimum) and the fallback never ran because it counted BLOBS,
+                             # not surviving pairs. Now runs for up to this many blobs. 3 = old behaviour.
+  score_error_floor_px: 0.5  # _inlier_discounted_error's error floor, used when comparing
                               # competing candidates (_resolve_cold_conflicts across
                               # controllers, _select_best_cam_solution across one
                               # controller's own cameras): errors below this are clamped
@@ -1783,6 +1880,16 @@ matching:
                               # Defaults to strong_match_error_px's value but is kept
                               # independently tunable (omit to just track that value).
   min_vis_coverage: 0.6
+  brute_finish_tier_after_strong: true   # ADDED 2026-09-19: a brute-force candidate that clears strong_match_
+                             # error_px / min_vis_coverage / strong_match_inliers used to stop the search
+                             # on the spot. Real case (static_medium, right_controller, frame_idx 4720):
+                             # the first such candidate -- 6 inliers, 0.109px, coverage 0.72, matched 6 of
+                             # 10 visible LEDs -- was a 157.7deg mirror flip; the true solution (8
+                             # inliers, 0.115px, coverage 0.96, matched 8/10) was found 33ms later in the
+                             # SAME tier. Error barely separates them (0.109 vs 0.115px). Now the rest of
+                             # the current tier is still scanned and the search stops at the tier's end;
+                             # later tiers are still skipped. Costs the remainder of one tier (~100-150ms
+                             # on that frame) per cold/brute search. false = stop at the first hit (old).
   brute_aux_reprojection_threshold_px: 2.0   # aux-camera Hungarian match threshold for cross-camera
                                               # coverage gating (brute_search_tier's aux block); kept
                                               # separate from joint_aux_prefilter_px (unrelated
@@ -2010,6 +2117,47 @@ matching:
   coast_trust_rot_calm_extend_ceiling_s: 0.15
   coast_trust_rot_calm_extend_max_dps: 100.0
 
+  # ANCHOR-specific overrides for _mark_all_lost's rot_budget_s ONLY
+  # (2026-09-17, walk_dark frame-64 jump investigation). The 4 coast_trust_
+  # rot_* keys just above are tuned for HeuristicPoseFusionFilter's OWN rot
+  # consumers (the degenerate w_sum<=0 fallback and the rot_pred_implausible
+  # gate widening) -- a precision-sensitive blend/gate use where a stale
+  # anchor directly corrupts the fused pose. _mark_all_lost's own use is
+  # coarser: keeping SOME predicted_pose available for finalize_search's
+  # vs-predicted-pose jump check, not blend precision -- sharing one number
+  # meant a real, only-moderately-fast loss (210deg/s peak gyro measured
+  # over the real gap, accel calm) shrunk the budget to 28ms, just under a
+  # real 33ms two-real-frame gap at this recording's oscillating 11/22ms
+  # cadence -- so IMU-only propagation declined, pose_history got legitimately
+  # cleared (2 consecutive real losses > tracking_lost_grace_frames), and the
+  # eventual reacquisition candidate reached finalize_search with NO
+  # predicted_pose at all, letting a 178.8mm/86.34deg jump through the much
+  # looser fusion-level gate uncaught. Falls back to the coast_trust_rot_*
+  # keys above when unset, same backward-compatible chain those keys
+  # themselves use against the shared coast_trust_* family.
+  #
+  # Fit (2026-09-17) against a fresh 217k-sample re-run of this session's
+  # own IMU-trust sweep (imu_trust_analysis.py / run_imu_trust_analysis_all.
+  # py, real mocap vs. blind gyro dead-reckoning via predict_headset_
+  # relative_pose, all 8 recordings): target p90 real rotation error <=
+  # 20deg -- an order of magnitude below the real uncaught jump (86.34deg,
+  # ample separating margin) while comfortably above ordinary reacquisition
+  # noise. Least-squares fit of calm_extend_max_dps/shrink_s_per_dps against
+  # the resulting "safe dt vs. peak gyro" curve (holding calm_extend_ceiling_s
+  # at the same 0.15s as coast_trust_rot_calm_extend_ceiling_s, and
+  # min_budget_s at the same 3ms floor -- both only bind at the curve's own
+  # low/high ends, not the moderate band this refit targets). Confirmed the
+  # new curve still converges to that same 3ms floor by ~700deg/s, same as
+  # the shared coast_trust_rot_* curve -- genuinely violent rotation still
+  # shrinks hard; this refit only widens the moderate ~100-600deg/s band the
+  # shared (precision-tuned) curve was over-shrinking for this coarser use.
+  # At the real case's 210.8deg/s: old shared numbers gave 28ms (< the real
+  # 33.3ms gap, propagation declined); these give 46.9ms (comfortably above).
+  coast_trust_anchor_rot_shrink_s_per_dps: 0.00009
+  coast_trust_anchor_rot_min_budget_s: 0.003
+  coast_trust_anchor_rot_calm_extend_ceiling_s: 0.15
+  coast_trust_anchor_rot_calm_extend_max_dps: 200.0
+
   # TrackingSystem._detect_cold_identity_swap (2026-09-16): when two
   # controllers go cold and reacquire in the SAME cold-batch round, compares
   # each new candidate against BOTH controllers' own last-known position --
@@ -2041,6 +2189,22 @@ matching:
   # vs. elapsed time, capped at 1.0s -- a different question, doesn't apply
   # here.
   cold_swap_stale_reference_max_s: 5.0
+
+  # _detect_cold_identity_swap's one-sided case (2026-09-17): a fresh
+  # bootstrap (no self.p, no _last_known_p -- genuinely never tracked before,
+  # distinct from the reset-then-stale-reference case cold_swap_stale_
+  # reference_max_s covers above) landing within this absolute distance of
+  # the OTHER controller's own recent real position gets flagged
+  # swap_suspected. No "direct vs swapped" ratio is computable with only one
+  # side's reference, so this is a plain distance check, not a margin like
+  # cold_swap_margin. Reasoned default, not data-fit: two VR controllers held
+  # one per hand are essentially never this close together during normal use
+  # except during exactly this kind of near-simultaneous cold-start
+  # collision -- real case (walk_dark frame ~2011): left_controller's very
+  # first-ever bootstrap landed 4.8cm from right_controller's own real
+  # position captured 78ms earlier; 0.12m keeps comfortable margin above
+  # that for real positional noise/motion during the gap.
+  cold_swap_bootstrap_max_dist_m: 0.12
   # --------------------------------------------------------------------------
   # Pose validation
   # --------------------------------------------------------------------------
@@ -2232,6 +2396,28 @@ matching:
   # thousands-of-deg/s range.
   max_plausible_hand_speed_m_s: 7.5
   max_plausible_hand_ang_speed_deg_s: 2200.0
+
+  # CameraTracker.finalize_search's re-acquisition ROTATION widening
+  # (2026-09-17, walk_dark frame-64 jump investigation): the flat
+  # max_plausible_hand_ang_speed_deg_s rate above is a worst-case-ANY-
+  # possible-motion placeholder, applied to this widening regardless of how
+  # calm real measured gyro actually was over the coast window -- found
+  # letting an 86.34deg candidate through with real peak gyro only
+  # ~211deg/s (real p95 rotation error at these exact conditions, per a
+  # 217k-sample re-run of this session's own IMU-trust sweep,
+  # imu_trust_analysis.py: ~15.8deg -- the flat rate's own +73deg allowance
+  # was ~5x too generous). This is the k in error_deg ~= k * peak_gyro_dps *
+  # dt_s -- the sweep found this bilinear relationship holds consistently
+  # (k clustering 1.9-2.3, p95) across gyro=75-450deg/s and dt=11-100ms;
+  # 3.0 keeps margin above that empirical median. Only ever TIGHTENS the
+  # widening (min() against the flat rate above in code, never exceeds it)
+  # and falls back to exactly the flat rate whenever gyro/accel data isn't
+  # available. POSITION widening deliberately untouched -- the same
+  # bilinear model checked against peak accel found no clean fit (k ranged
+  # 30-1076 depending on accel/dt, unlike rotation's tight cluster), and
+  # position wasn't the determining factor in the real case this was found
+  # from (178.8mm was well inside even a much tighter threshold).
+  pose_jump_pred_reacquire_widen_k_deg_per_dps_s: 3.0
 
   # --------------------------------------------------------------------------
   # Joint multi-camera optimisation

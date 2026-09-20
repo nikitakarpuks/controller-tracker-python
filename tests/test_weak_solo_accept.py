@@ -109,6 +109,45 @@ class WeakSoloAcceptTests(unittest.TestCase):
             cam_solutions, eligible_cids=[0, 1, 2], av_count_by_cid={1: 8}, matching_cfg=_CFG)
         self.assertEqual(sorted(result), [0, 2])
 
+    def _agreeing(self, cam_id, n_inliers, dpos, drot):
+        cs = _cs(cam_id, n_inliers)
+        cs["solution"]["pred_dpos_m"] = dpos
+        cs["solution"]["pred_drot_deg"] = drot
+        return cs
+
+    def test_solo_solution_agreeing_with_prediction_is_not_flagged(self):
+        """Real case (static_medium, left_controller, frame_idx 3497): a 4-
+        inlier cam2 proximity solution 6mm/2deg from mocap truth was discarded
+        because cam0 had no solution. Sitting within a few cm/degrees of the
+        prediction it was searched around, it must not count as weak."""
+        cam_solutions = [self._agreeing(2, 4, dpos=0.010, drot=3.0)]
+        result = _weak_solo_accept_cids(
+            cam_solutions, eligible_cids=[0, 2], av_count_by_cid={2: 5}, matching_cfg=_CFG)
+        self.assertEqual(result, [])
+
+    def test_solo_solution_far_from_prediction_still_flagged(self):
+        cam_solutions = [self._agreeing(2, 4, dpos=0.090, drot=3.0)]
+        result = _weak_solo_accept_cids(
+            cam_solutions, eligible_cids=[0, 2], av_count_by_cid={2: 5}, matching_cfg=_CFG)
+        self.assertEqual(result, [0])
+        cam_solutions = [self._agreeing(2, 4, dpos=0.010, drot=40.0)]
+        result = _weak_solo_accept_cids(
+            cam_solutions, eligible_cids=[0, 2], av_count_by_cid={2: 5}, matching_cfg=_CFG)
+        self.assertEqual(result, [0])
+
+    def test_agreement_exemption_can_be_disabled(self):
+        cfg = {**_CFG, "weak_solo_prediction_agree_enabled": False}
+        cam_solutions = [self._agreeing(2, 4, dpos=0.010, drot=3.0)]
+        result = _weak_solo_accept_cids(
+            cam_solutions, eligible_cids=[0, 2], av_count_by_cid={2: 5}, matching_cfg=cfg)
+        self.assertEqual(result, [0])
+
+    def test_missing_deviation_fields_keep_old_behaviour(self):
+        cam_solutions = [_cs(cam_id=2, n_inliers=4)]
+        result = _weak_solo_accept_cids(
+            cam_solutions, eligible_cids=[0, 2], av_count_by_cid={2: 5}, matching_cfg=_CFG)
+        self.assertEqual(result, [0])
+
 
 if __name__ == "__main__":
     unittest.main()

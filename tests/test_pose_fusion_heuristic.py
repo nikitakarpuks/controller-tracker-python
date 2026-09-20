@@ -1038,6 +1038,94 @@ class ImplausibleJumpThresholdsTests(unittest.TestCase):
         self.assertEqual(rot_deg, 10.0)  # exactly the base -- no speed term leaking in
 
 
+class QualityAwareImplausibleGateTests(unittest.TestCase):
+    """Regression for the 2026-09-17 quality-aware POSITION shrink on
+    _implausible_jump_thresholds (real case: right_controller, walk_dark,
+    frame 251 -- mocap-confirmed a moderate-quality vision candidate landed
+    22mm off truth while a credible IMU prediction was only ~3-5mm off, but
+    the flat base ceiling never noticed since it didn't depend on vision's
+    own quality at all -- see that method's own docstring for the full fit
+    derivation). Calibrated CONSERVATIVELY (user-directed): tight enough to
+    catch severe low-quality disagreements, deliberately NOT tight enough to
+    catch a single-frame case as mild as frame 251's own 18-22mm at
+    quality~0.53 -- see test_frame_251_scale_disagreement_at_moderate_
+    quality_still_accepted below for that explicit, intentional limitation,
+    not a bug."""
+
+    def _filter(self, **cfg_overrides):
+        cfg = {
+            "implausible_jump_pos_thresh_base_mm": 61.5,
+            "implausible_jump_pos_thresh_per_speed_mm_s": 0.0,
+            "implausible_jump_pos_quality_shrink_enabled": True,
+            "implausible_jump_pos_quality_full_trust_at": 0.7,
+            "implausible_jump_pos_quality_min_scale": 0.6,
+            **cfg_overrides,
+        }
+        f = _make_filter(cfg)
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.predict = _stub_predict(np.eye(3), np.zeros(3))  # p_pred == p -- no real motion predicted
+        f.frames_since_update = 1  # keeps frames_lost=0 -> imu_frame_scale=1.0 (warm, gate active)
+        f.last_update_ts_ns = 0
+        return f
+
+    def test_low_quality_severe_disagreement_rejected(self):
+        """quality=0 (n_inliers<=weak, error_px>=weak): ceiling shrinks to
+        min_scale (0.6) of the 61.5mm base = 36.9mm. A 50mm disagreement --
+        comfortably inside the flat 61.5mm ceiling, but past the shrunk
+        one -- must now be rejected."""
+        f = self._filter()
+        p_meas = np.array([0.0, 0.050, 0.0])  # 50mm from p_pred
+        sol = _solution(np.eye(3), p_meas, n_inliers=4, error_px=0.6)
+        ok = f.try_update(sol, 1_000_000)
+        self.assertFalse(ok)
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_frame_251_scale_disagreement_at_moderate_quality_still_accepted(self):
+        """Documents the deliberate, user-directed conservative calibration:
+        the real case this fix was found from (quality~0.53, n_inliers=7,
+        error_px=0.36, 18-22mm pos_innov_m) sits at that quality band's own
+        p90, not p99 -- catching it outright would also reject ~10% of
+        OTHER quality~0.5 candidates with no mocap check confirming those
+        are wrong too. This first cut deliberately does NOT catch it --
+        regression pin for that explicit choice."""
+        f = self._filter()
+        p_meas = np.array([0.0, 0.020, 0.0])  # 20mm, frame 251's own real scale
+        sol = _solution(np.eye(3), p_meas, n_inliers=7, error_px=0.36)
+        ok = f.try_update(sol, 1_000_000)
+        self.assertTrue(ok, "conservative calibration deliberately does not catch this milder case")
+
+    def test_strong_quality_unaffected_by_quality_shrink(self):
+        """quality>=full_trust_at (0.7): no shrink at all -- a strong
+        candidate keeps the exact flat ceiling, even with the SAME 50mm
+        disagreement the low-quality test above rejects."""
+        f = self._filter()
+        p_meas = np.array([0.0, 0.050, 0.0])
+        sol = _solution(np.eye(3), p_meas, n_inliers=20, error_px=0.1)
+        ok = f.try_update(sol, 1_000_000)
+        self.assertTrue(ok, "a strong candidate must not be newly rejected by the quality shrink")
+
+    def test_shrink_disabled_falls_back_to_flat_ceiling(self):
+        """implausible_jump_pos_quality_shrink_enabled=False reproduces
+        today's exact (quality-independent) ceiling -- the same low-quality/
+        50mm case that gets rejected above must now be ACCEPTED."""
+        f = self._filter(implausible_jump_pos_quality_shrink_enabled=False)
+        p_meas = np.array([0.0, 0.050, 0.0])
+        sol = _solution(np.eye(3), p_meas, n_inliers=4, error_px=0.6)
+        ok = f.try_update(sol, 1_000_000)
+        self.assertTrue(ok, "disabled shrink must reproduce the flat ceiling exactly")
+
+    def test_rotation_ceiling_unaffected_by_quality(self):
+        """Scope check: _implausible_jump_thresholds' ROTATION half must be
+        byte-identical regardless of the quality argument -- this fix is
+        POSITION-only by design."""
+        f = self._filter()
+        pos_a, rot_a = f._implausible_jump_thresholds(0, quality=0.0)
+        pos_b, rot_b = f._implausible_jump_thresholds(0, quality=1.0)
+        self.assertEqual(rot_a, rot_b)
+        self.assertNotEqual(pos_a, pos_b, "sanity check: position SHOULD differ across quality")
+
+
 class WeakBootstrapBufferTests(unittest.TestCase):
     """Regression for the user-reported "frames 2-5, huge jumps" real case
     (2026-09-13): a controller barely visible at true session start produced
@@ -1551,6 +1639,240 @@ class WarmGateSpeedAwareHardRejectTests(unittest.TestCase):
         ok = f.try_update(self._wild_solution(), 300_000_000)
         self.assertTrue(ok, "past its own credibility window, an otherwise-strong candidate must not be blocked")
         self.assertEqual(f.consecutive_rejects, 0)
+
+
+class BootstrapConfirmVetoTests(unittest.TestCase):
+    """Bootstrap-only vetoes on confirming two agreeing weak candidates:
+    coverage_fallback, and (2026-09-19) an accelerometer-gravity check --
+    accel rotated through the candidate's R must land near world -y (down).
+    Real cases: static_easy left frames 2803/3651, right 2134 (coverage_
+    fallback) and static_medium left frame_idx 2988 (rotation-flipped,
+    coverage_fallback=False)."""
+
+    UP_ACCEL = np.array([0.0, -9.81, 0.0])  # body frame == world frame under R=eye: gravity reads -y
+
+    def _weak(self, R, p, accel, coverage_fallback=False):
+        sol = _solution(R, p, n_inliers=4)
+        sol["accel_now"] = accel
+        if coverage_fallback:
+            sol["coverage_fallback"] = True
+        return sol
+
+    def _confirm_pair(self, R2, accel2, coverage_fallback2=False):
+        f = _make_filter()
+        f.try_update(self._weak(np.eye(3), np.array([1.0, 0.0, 0.0]), self.UP_ACCEL), 1 * _NS)
+        return f, f.try_update(self._weak(R2, np.array([1.01, 0.0, 0.0]), accel2, coverage_fallback2), 2 * _NS)
+
+    def test_agreeing_pair_with_gravity_along_minus_y_confirms(self):
+        f, ok = self._confirm_pair(np.eye(3), self.UP_ACCEL)
+        self.assertTrue(ok)
+        self.assertEqual(f._last.get("outcome"), "bootstrap")
+
+    def test_orientation_flipped_about_horizontal_axis_is_refused(self):
+        """Same position, rotation within confirm budget of the buffered one
+        (small drot) but accel now reads +y through R: gravity ~180deg off."""
+        f, ok = self._confirm_pair(np.eye(3), -self.UP_ACCEL)
+        self.assertFalse(ok)
+        self.assertIsNone(f.R)
+        self.assertIsNotNone(f._cold_pending, "the refused candidate must be re-buffered, not dropped")
+
+    def test_moderate_tilt_within_threshold_still_confirms(self):
+        a = 9.81 * np.array([np.sin(np.radians(40.0)), -np.cos(np.radians(40.0)), 0.0])  # 40deg from -y
+        f, ok = self._confirm_pair(np.eye(3), a)
+        self.assertTrue(ok)
+
+    def test_no_accel_sample_means_veto_does_not_apply(self):
+        f, ok = self._confirm_pair(np.eye(3), None)
+        self.assertTrue(ok)
+
+    def test_threshold_zero_disables_the_gravity_veto(self):
+        f = _make_filter({"bootstrap_gravity_veto_thresh_deg": 0.0})
+        f.try_update(self._weak(np.eye(3), np.array([1.0, 0.0, 0.0]), self.UP_ACCEL), 1 * _NS)
+        self.assertTrue(f.try_update(self._weak(np.eye(3), np.array([1.01, 0.0, 0.0]), -self.UP_ACCEL), 2 * _NS))
+
+    def test_coverage_fallback_pair_is_refused_at_bootstrap(self):
+        f = _make_filter()
+        f.try_update(self._weak(np.eye(3), np.array([1.0, 0.0, 0.0]), self.UP_ACCEL, True), 1 * _NS)
+        ok = f.try_update(self._weak(np.eye(3), np.array([1.01, 0.0, 0.0]), self.UP_ACCEL, True), 2 * _NS)
+        self.assertFalse(ok)
+        self.assertIsNone(f.R)
+
+    def test_gravity_veto_does_not_apply_to_cold_reacquire(self):
+        f = _make_filter()
+        f.try_update(_solution(np.eye(3), np.array([0.0, 0.0, 0.0]), n_inliers=20), 1 * _NS)  # bootstrap
+        self.assertIsNotNone(f.R)
+        f._cold_pending = None
+        ok = f._try_cold_reacquire(np.eye(3), np.array([1.0, 0.0, 0.0]), 2 * _NS, 0.5, n_inliers=20,
+                                   accel_now=-self.UP_ACCEL)
+        self.assertTrue(ok, "strong cold-reacquire candidates are not subject to the bootstrap-only gravity check")
+
+
+class RejectStreakOverrideTests(unittest.TestCase):
+    """Two consecutive STRONG candidates rejected against the prediction but
+    agreeing with each other re-anchor on vision (real case: static_medium,
+    right_controller, frames 4720-4727 -- a flipped cold reacquire left the
+    IMU state wrong, so three correct 11-inlier candidates were each rejected
+    with rot_innov=155deg)."""
+
+    NS = 1_000_000
+
+    def _filter(self, cfg_overrides=None):
+        f = _make_filter(cfg_overrides or {})
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.predict = _stub_predict(np.eye(3), np.zeros(3))
+        f.frames_since_update = 1
+        f.last_update_ts_ns = 0
+        return f
+
+    @staticmethod
+    def _rz(deg):
+        return Rotation.from_euler("z", deg, degrees=True).as_matrix()
+
+    def _sol(self, deg, pos, n_inliers=20, error_px=0.1):
+        return _solution(self._rz(deg), np.array(pos), n_inliers=n_inliers, error_px=error_px)
+
+    def test_first_strong_disagreeing_candidate_is_still_rejected(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._sol(120.0, [0.02, 0.0, 0.0]), 10 * self.NS))
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_second_agreeing_strong_candidate_reanchors_on_vision(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._sol(120.0, [0.020, 0.0, 0.0]), 10 * self.NS))
+        ok = f.try_update(self._sol(121.0, [0.024, 0.0, 0.0]), 21 * self.NS)
+        self.assertTrue(ok)
+        self.assertEqual(f._last.get("outcome"), "reject_streak_override")
+        np.testing.assert_allclose(f.p, [0.024, 0.0, 0.0], atol=1e-9)
+        self.assertLess(np.degrees(np.linalg.norm(Rotation.from_matrix(f.R.T @ self._rz(121.0)).as_rotvec())), 1e-6)
+
+    def test_two_strong_candidates_that_disagree_with_each_other_stay_rejected(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._sol(120.0, [0.02, 0.0, 0.0]), 10 * self.NS))
+        self.assertFalse(f.try_update(self._sol(-120.0, [0.02, 0.0, 0.0]), 21 * self.NS))
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_weak_candidates_never_override(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._sol(120.0, [0.02, 0.0, 0.0], n_inliers=4, error_px=0.6), 10 * self.NS))
+        self.assertFalse(f.try_update(self._sol(121.0, [0.024, 0.0, 0.0], n_inliers=4, error_px=0.6), 21 * self.NS))
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_pair_too_far_apart_in_time_does_not_count(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._sol(120.0, [0.02, 0.0, 0.0]), 10 * self.NS))
+        self.assertFalse(f.try_update(self._sol(121.0, [0.024, 0.0, 0.0]), 900 * self.NS))  # 0.89s later > 0.25s
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_disabled_flag_restores_old_behaviour(self):
+        f = self._filter({"reject_streak_override_enabled": False})
+        self.assertFalse(f.try_update(self._sol(120.0, [0.020, 0.0, 0.0]), 10 * self.NS))
+        self.assertFalse(f.try_update(self._sol(121.0, [0.024, 0.0, 0.0]), 21 * self.NS))
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_a_normal_accept_in_between_resets_the_streak(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._sol(120.0, [0.02, 0.0, 0.0]), 10 * self.NS))
+        self.assertTrue(f.try_update(self._sol(0.0, [0.001, 0.0, 0.0]), 15 * self.NS))  # agrees with prediction
+        self.assertNotEqual(f._last.get("outcome"), "reject_streak_override")
+        self.assertFalse(f.try_update(self._sol(121.0, [0.024, 0.0, 0.0]), 21 * self.NS))
+
+
+class ThinCandidateAndSolidMemberTests(unittest.TestCase):
+    """Real case (static_medium, left_controller, relative frames 42 -> 47): a
+    2-inlier prior-constrained P1P candidate (rotation copied from the
+    prediction) was buffered, then a poor 5-inlier/0.69px P3P candidate
+    "agreed" with it and became a 65mm/58deg-wrong anchor."""
+
+    def _weak(self, p, n_inliers=4, error_px=0.1, method=None):
+        sol = _solution(np.eye(3), np.array(p), n_inliers=n_inliers, error_px=error_px)
+        if method:
+            sol["camera_method"] = {0: method}
+        return sol
+
+    def test_candidate_below_min_inliers_is_ignored_not_buffered(self):
+        f = _make_filter()
+        self.assertFalse(f.try_update(self._weak([1.0, 0.0, 0.0], n_inliers=2), 1 * _NS))
+        self.assertIsNone(f._cold_pending)
+        self.assertIsNone(f.R)
+
+    def test_prior_constrained_candidate_is_ignored_not_buffered(self):
+        f = _make_filter()
+        self.assertFalse(f.try_update(self._weak([1.0, 0.0, 0.0], method="prior_constrained_p2p"), 1 * _NS))
+        self.assertIsNone(f._cold_pending)
+
+    def test_prior_constrained_candidate_cannot_confirm_a_buffered_one(self):
+        f = _make_filter()
+        f.try_update(self._weak([1.0, 0.0, 0.0]), 1 * _NS)
+        self.assertIsNotNone(f._cold_pending)
+        ok = f.try_update(self._weak([1.01, 0.0, 0.0], method="prior_constrained_p1p"), 2 * _NS)
+        self.assertFalse(ok)
+        self.assertIsNone(f.R)
+
+    def test_two_agreeing_poor_fits_do_not_confirm(self):
+        f = _make_filter()
+        f.try_update(self._weak([1.0, 0.0, 0.0], error_px=0.7), 1 * _NS)
+        ok = f.try_update(self._weak([1.01, 0.0, 0.0], error_px=0.69), 2 * _NS)
+        self.assertFalse(ok)
+        self.assertIsNone(f.R)
+        self.assertIsNotNone(f._cold_pending, "the newer poor candidate is re-buffered")
+
+    def test_one_clean_member_is_enough_to_confirm(self):
+        f = _make_filter()
+        f.try_update(self._weak([1.0, 0.0, 0.0], error_px=0.7), 1 * _NS)
+        self.assertTrue(f.try_update(self._weak([1.01, 0.0, 0.0], error_px=0.2), 2 * _NS))
+        f2 = _make_filter()
+        f2.try_update(self._weak([1.0, 0.0, 0.0], error_px=0.2), 1 * _NS)
+        self.assertTrue(f2.try_update(self._weak([1.01, 0.0, 0.0], error_px=0.7), 2 * _NS))
+
+    def test_switches_restore_old_behaviour(self):
+        f = _make_filter({"cold_confirm_ignore_prior_constrained": False, "cold_confirm_min_inliers": 0,
+                          "cold_confirm_require_solid_member": False})
+        f.try_update(self._weak([1.0, 0.0, 0.0], n_inliers=2, error_px=0.7), 1 * _NS)
+        self.assertIsNotNone(f._cold_pending)
+        self.assertTrue(f.try_update(self._weak([1.01, 0.0, 0.0], error_px=0.69), 2 * _NS))
+
+
+class RejectReportBudgetTests(unittest.TestCase):
+    """A hard-rejected vision candidate re-displays the coasted IMU prediction
+    only while the loss is within the display budget (real case: static_medium,
+    left_controller, frame_idx 4085 -- a 243mm-off stale coast shown 189ms after
+    the last accept)."""
+
+    NS = 1_000_000
+
+    def _filter(self, overrides=None):
+        f = _make_filter({"cold_pending_report_max_gap_s": 0.06, **(overrides or {})})
+        f.R, f.p, f.v = np.eye(3), np.zeros(3), np.zeros(3)
+        f.velocity_established = True
+        f.predict = _stub_predict(np.eye(3), np.array([0.0, 0.0, 0.0]))
+        f.frames_since_update = 1
+        f.last_update_ts_ns = 0
+        return f
+
+    def _wild(self):
+        # weak (never overrides) and rotated far from the identity prediction -> hard reject
+        return _solution(Rotation.from_euler("z", 120.0, degrees=True).as_matrix(),
+                         np.array([0.02, 0.0, 0.0]), n_inliers=4, error_px=0.6)
+
+    def test_reject_within_budget_still_shows_the_coast(self):
+        f = self._filter()
+        self.assertFalse(f.try_update(self._wild(), 20 * self.NS))   # dt = 0.02s <= 0.06s
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+        self.assertIsNotNone(f.reported_p)
+
+    def test_reject_past_budget_clears_the_reported_pose(self):
+        f = self._filter()
+        f.reported_R, f.reported_p = np.eye(3), np.array([9.0, 9.0, 9.0])   # stale value from earlier
+        self.assertFalse(f.try_update(self._wild(), 189 * self.NS))  # dt = 0.189s > 0.06s
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+        self.assertIsNone(f.reported_p)
+        self.assertIsNone(f.reported_R)
+
+    def test_switch_off_restores_old_behaviour(self):
+        f = self._filter({"reject_report_respect_display_budget": False})
+        self.assertFalse(f.try_update(self._wild(), 189 * self.NS))
+        self.assertIsNotNone(f.reported_p)
 
 
 class ConfirmStepRotPredVetoTests(unittest.TestCase):

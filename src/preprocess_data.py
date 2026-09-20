@@ -61,10 +61,16 @@ def _per_camera_image_lists(cfg) -> dict:
              for cam_idx in cfg["selected_cameras"]}
     counts = {cam_idx: len(paths) for cam_idx, paths in lists.items()}
     if len(set(counts.values())) > 1:
-        raise ValueError(
-            f"data.layout='per_camera_folders' requires the same image count in every "
-            f"camera folder, got {counts}"
-        )
+        # A folder short by a frame or two (dropped/incomplete last write, e.g. a
+        # capture stopped mid-frame) shouldn't hard-fail the whole run -- frames
+        # are paired by sorted POSITION across folders (this function's own
+        # docstring), so truncating every folder to the shortest one keeps that
+        # pairing correct for all frames that DO have a full set; only the
+        # trailing frames beyond the shortest folder's count are dropped.
+        min_count = min(counts.values())
+        print(f"WARNING: data.layout='per_camera_folders' camera folders have mismatched "
+              f"image counts {counts} -- truncating all to the shortest ({min_count})")
+        lists = {cam_idx: paths[:min_count] for cam_idx, paths in lists.items()}
     return lists
 
 

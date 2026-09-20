@@ -270,6 +270,9 @@ class HeuristicPoseFusionFilter:
         # that bad anchor and eats a rejection/grace-window cost that a
         # cleaner anchor would never have needed.
         self._cold_pending: dict | None = None
+        self._reject_streak_prev: dict | None = None   # see _check_reject_streak_override
+        self._cand_rotation_from_prior = False   # set per try_update call, read by _try_cold_reacquire
+        self._reject_streak_n = 0
 
         self.reported_R = None
         self.reported_p = None
@@ -515,7 +518,7 @@ class HeuristicPoseFusionFilter:
             gyro_shrink = per_gyro * max(0.0, peak_gyro_dps - gyro_calm_floor)
             return max(min_budget_s, base_budget_s - accel_shrink - gyro_shrink)
 
-    def _implausible_jump_thresholds(self, frame_ts_ns: int) -> tuple:
+    def _implausible_jump_thresholds(self, frame_ts_ns: int, quality: float = None) -> tuple:
         """(pos_thresh_m, rot_thresh_deg) for the hard implausibility gate --
         speed-scaled 2026-09-13, replacing a flat implausible_jump_pos_m
         (0.3m)/implausible_jump_rot_deg (60deg) that was "first-cut
@@ -569,7 +572,35 @@ class HeuristicPoseFusionFilter:
         consolidation this session already did once). stale_s is 0 right
         after a real accept (last_update_ts_ns == frame_ts_ns's own prior),
         growing only across consecutive rejects -- inert in the common
-        (tracking normally) case."""
+        (tracking normally) case.
+
+        Quality-aware POSITION shrink (2026-09-17, real case: right_
+        controller, walk_dark, frame 251 -- mocap-confirmed: a moderate-
+        quality (n_inliers=7, error_px=0.36, quality~0.53) vision candidate
+        landed 22mm off mocap ground truth while this filter's OWN p_pred
+        was only ~3-5mm off, but cost_weight_imu=0.0 means the ordinary
+        blend can't lean toward p_pred no matter how much better it is --
+        the HARD gate above is the only remaining protection, and its flat
+        base (61.5mm) has never scaled with how much vision's own quality
+        signal (n_inliers/error_px, the SAME ramp _vision_weight already
+        computes -- see _vision_quality) should be trusted. Fit (2026-09-17)
+        against this session's own fresh sweep of real pos_innov_m (vision
+        vs p_pred, the EXACT quantity this gate checks) binned by quality,
+        warm-tracking-only frames from a full 5400-frame walk_dark run:
+        p99 pos_innov_m falls from ~50-80mm at quality<0.6 down to ~20mm at
+        quality>=0.7 (both controllers). Calibrated CONSERVATIVELY
+        (user-directed): the shrink floor sits near each band's own p99,
+        not p90 -- this reduces false-reject risk on legitimate candidates
+        at the cost of NOT catching a single-frame case as mild as frame
+        251's own 17.8mm pos_innov_m at quality~0.53 (that would need a
+        p90-level cutoff, a materially higher false-reject risk this
+        first cut deliberately avoids). Applied multiplicatively to the
+        FULL pos_thresh_m computed above (including the speed/accel/stale
+        widening) -- a genuinely fast-moving OR long-stale candidate still
+        gets its full deserved allowance at high quality; only low-to-
+        moderate quality narrows it. quality=None (callers that don't have
+        a vision candidate to judge, e.g. none currently) skips this
+        entirely -- byte-identical to before this fix."""
         speed_m_s = float(np.linalg.norm(self.v)) if self.velocity_established else 0.0
         pos_base_mm = float(self._hc_get("implausible_jump_pos_thresh_base_mm", 61.5))
         pos_per_speed_mm_s = float(self._hc_get("implausible_jump_pos_thresh_per_speed_mm_s", 33.0))
@@ -594,6 +625,14 @@ class HeuristicPoseFusionFilter:
         max_ang_speed_deg_s = float(_matching_cfg.get("max_plausible_hand_ang_speed_deg_s", 2200.0))
         pos_thresh_m += max_speed_m_s * stale_s
         rot_thresh_deg += max_ang_speed_deg_s * stale_s
+
+        if quality is not None and bool(self._hc_get("implausible_jump_pos_quality_shrink_enabled", True)):
+            full_trust_at = float(self._hc_get("implausible_jump_pos_quality_full_trust_at", 0.7))
+            min_scale = float(self._hc_get("implausible_jump_pos_quality_min_scale", 0.6))
+            if full_trust_at > 0.0:
+                ramp = float(np.clip(quality / full_trust_at, 0.0, 1.0))
+                pos_thresh_m *= min_scale + (1.0 - min_scale) * ramp
+
         return pos_thresh_m, rot_thresh_deg
 
     def _report(self, frame_ts_ns: int, R_out: np.ndarray, p_out: np.ndarray) -> None:
@@ -903,7 +942,8 @@ class HeuristicPoseFusionFilter:
         site for the full account. Rotation-only stays because rotation
         specifically (not position) is what's structurally unstable for a
         low/degenerate point count."""
-        _pos_ceil_m, _rot_ceil_deg = self._implausible_jump_thresholds(frame_ts_ns)
+        quality, inlier_factor, error_factor = self._vision_quality(n_inliers, error_px)
+        _pos_ceil_m, _rot_ceil_deg = self._implausible_jump_thresholds(frame_ts_ns, quality=quality)
         if (gate_active and self.velocity_established
                 and pos_innov_m > _pos_ceil_m):
             return 0.0, 0.0, 0.0
@@ -912,6 +952,16 @@ class HeuristicPoseFusionFilter:
             return 0.0, 0.0, 0.0
 
         base = float(self._hc.get("cost_weight_vision", 2.0))
+        return base * 0.5 * (inlier_factor + error_factor), inlier_factor, error_factor
+
+    def _vision_quality(self, n_inliers: int, error_px: float) -> tuple:
+        """(quality, inlier_factor, error_factor) -- the SAME inlier/error
+        ramps _vision_weight blends into its own w_vision, factored out here
+        (2026-09-17) so `_implausible_jump_thresholds`' quality-aware ceiling
+        shrink (see that method's own docstring) can use the identical
+        signal instead of a second, driftable copy. quality is their simple
+        average, same as try_update's own `quality = (inlier_factor +
+        error_factor) / 2.0`."""
         inlier_factor = _ramp_up(
             float(n_inliers),
             float(self._hc_get("vision_weight_weak_inliers", 6)),
@@ -922,7 +972,7 @@ class HeuristicPoseFusionFilter:
             float(self._hc_get("vision_weight_weak_error_px", 0.5)),
             float(self._hc_get("vision_weight_strong_error_px", 0.15)),
         )
-        return base * 0.5 * (inlier_factor + error_factor), inlier_factor, error_factor
+        return (inlier_factor + error_factor) / 2.0, inlier_factor, error_factor
 
     def _gap_vision_scale(self, dt_s: float, quality: float) -> float:
         """Multiplier applied to w_vision when this update follows an
@@ -1156,6 +1206,21 @@ class HeuristicPoseFusionFilter:
         # _vision_weight does -- inliers alone isn't enough to rule out a
         # clean-but-wrong low-point fit.
         error_px = float(solution.get("error", 0.0))
+        # True when EVERY camera solution behind this candidate came from the
+        # prior-constrained (P2P/P1P) solver, which copies its rotation from the
+        # prediction and only solves translation -- see _try_cold_reacquire's
+        # thin-candidate check for why that is not independent evidence.
+        _cam_methods = [m for m in (solution.get("camera_method") or {}).values() if m]
+        self._cand_rotation_from_prior = bool(_cam_methods) and all(
+            str(m).startswith("prior_constrained") for m in _cam_methods)
+        # Hoisted early for the same reason as n_inliers/error_px above --
+        # the along-track/cross-track diagnostic further down needs it (the
+        # gravity_implausible veto that originally motivated threading this
+        # through was reverted 2026-09-18, see _try_cold_reacquire's own
+        # comment; this plumbing was left in place for the diagnostic).
+        # None when no accel stream is available (matches controller.py's
+        # own accel_now contract).
+        accel_now = solution.get("accel_now")
 
         # ── Bootstrap (no prior state) ──────────────────────────────────
         # Reuses _try_cold_reacquire's own weak/strong buffering wholesale
@@ -1177,6 +1242,7 @@ class HeuristicPoseFusionFilter:
                 error_px=error_px,
                 winner_was_contested=bool(solution.get("winner_was_contested", False)),
                 swap_suspected=bool(solution.get("swap_suspected", False)),
+                accel_now=accel_now,
                 log_prefix="BOOTSTRAP", pending_outcome="bootstrap_pending", accept_outcome="bootstrap",
             )
 
@@ -1310,8 +1376,12 @@ class HeuristicPoseFusionFilter:
             # budget, rot_pred_implausible naturally goes False and control
             # falls through to ordinary cold routing -- no new cliff.
             if rot_pred_implausible:
+                if self._check_reject_streak_override(R_meas, p_meas, frame_ts_ns, confidence, solution, n_inliers,
+                                                      error_px, R_pred, p_pred, dt_s, rot_innov_deg, pos_innov_m,
+                                                      accel_now):
+                    return True
                 self.consecutive_rejects += 1
-                self._report(frame_ts_ns, R_pred, p_pred)
+                self._report_coast_if_usable(frame_ts_ns, R_pred, p_pred, dt_s)
                 self._set_last(outcome="implausible_reject", pos_innov_m=pos_innov_m, rot_innov_deg=rot_innov_deg,
                                 confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
                 _log.info(
@@ -1326,7 +1396,8 @@ class HeuristicPoseFusionFilter:
                                              dt_s=dt_s,
                                              winner_was_contested=bool(solution.get("winner_was_contested", False)),
                                              swap_suspected=bool(solution.get("swap_suspected", False)),
-                                             rot_pred_implausible=rot_pred_implausible)
+                                             rot_pred_implausible=rot_pred_implausible,
+                                             accel_now=accel_now)
 
         # Manual-debug override: fusion_heuristic.vision_only_debug: true forces
         # imu_frame_scale to 0 on EVERY frame, regardless of frames_since_update --
@@ -1410,15 +1481,28 @@ class HeuristicPoseFusionFilter:
         # frames' own __init__ comment for the two real bugs this exact
         # sequencing was built to close.
         _rot_seed_untrustworthy = self._rotation_seed_grace_frames > 0
+        # _pos_ceil_m/_rot_ceil_deg: the UNSHRUNK (quality-independent)
+        # ceiling -- kept exactly as before so Case A's own reuse of these
+        # two values below (~line 1614) stays untouched, per this fix's own
+        # scope (quality-aware shrink applies to the hard implausibility
+        # gate only, see _implausible_jump_thresholds' docstring). The hard
+        # gate itself checks a SEPARATE, quality-shrunk POSITION ceiling
+        # (_pos_ceil_m_quality) computed alongside it.
         _pos_ceil_m, _rot_ceil_deg = self._implausible_jump_thresholds(frame_ts_ns)
+        _candidate_quality, _, _ = self._vision_quality(n_inliers, error_px)
+        _pos_ceil_m_quality, _ = self._implausible_jump_thresholds(frame_ts_ns, quality=_candidate_quality)
         _pos_implausible = (imu_frame_scale > 0.0 and self.velocity_established
-                             and pos_innov_m > _pos_ceil_m)
+                             and pos_innov_m > _pos_ceil_m_quality)
         _rot_implausible = (imu_frame_scale > 0.0 and not _rot_seed_untrustworthy
                              and rot_innov_deg > _rot_ceil_deg)
         _implausible = _pos_implausible or _rot_implausible
         if _implausible:
+            if self._check_reject_streak_override(R_meas, p_meas, frame_ts_ns, confidence, solution, n_inliers,
+                                                  error_px, R_pred, p_pred, dt_s, rot_innov_deg, pos_innov_m,
+                                                  accel_now):
+                return True
             self.consecutive_rejects += 1
-            self._report(frame_ts_ns, R_pred, p_pred)
+            self._report_coast_if_usable(frame_ts_ns, R_pred, p_pred, dt_s)
             self._set_last(outcome="implausible_reject", pos_innov_m=pos_innov_m, rot_innov_deg=rot_innov_deg,
                             confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
             _log.info(
@@ -1475,7 +1559,33 @@ class HeuristicPoseFusionFilter:
             w_vision *= vision_gap_scale
 
         w_sum = w_imu + w_vision
-        if w_sum <= 0.0:
+        # EXPERIMENTAL (2026-09-18, testing a user-proposed idea, not yet
+        # validated): route a candidate with a bottomed-out inlier_factor
+        # (n_inliers<=weak_inliers -- the same "clean-but-wrong" shape the
+        # degenerate branch below already guards against) into the SAME
+        # weak-candidate buffer EARLIER than w_sum<=0.0 requires -- that
+        # condition needs error_factor ALSO at floor, which a deceptively
+        # low reprojection error on a near-degenerate point count can dodge
+        # (real case: frame 82/static_easy, right_controller, n_inliers=5
+        # exactly at weak_inliers, error_px=0.495 well under its own
+        # weak_error_px=1.1 override -- inlier_factor=0.0 but
+        # error_factor=0.672 keeps w_sum=0.60, nowhere near 0). Gated on
+        # imu_frame_scale already having decayed below a threshold well
+        # short of full trust (NOT "any imu_frame_scale," which an earlier,
+        # reverted attempt tried at the wrong call site -- vision_only's own
+        # gate flag -- and which broke 3 tests by firing on fresh/warm
+        # single-frame weak matches too); only a candidate arriving after
+        # real coasting, where p_pred itself already carries much less
+        # weight, gets the earlier hold.
+        # 0.75 was tried (2026-09-19, static_medium frame_idx 2870) and
+        # REVERTED to 0.5: it fixed that case (65mm->18mm) but regressed the
+        # right controller on static_easy (the earlier frame-82 fix came back
+        # as 174mm: an earlier weak candidate got buffered and then "agreed"
+        # with the wrong one) and walk_easy (bad frames 5->7, from pure-IMU
+        # holds during slow drift).
+        _weak_imu_scale_thresh = float(self._hc_get("degenerate_fallback_weak_inlier_imu_scale_thresh", 0.5))
+        _weak_inlier_partial_decay = inlier_factor <= 0.0 and imu_frame_scale <= _weak_imu_scale_thresh
+        if w_sum <= 0.0 or _weak_inlier_partial_decay:
             # Degenerate: vision's own quality ramps both bottomed out (rare --
             # needs both n_inliers AND error_px at/below their weak floors at
             # once, since gate_active above already stops the distance check
@@ -1537,8 +1647,28 @@ class HeuristicPoseFusionFilter:
                     n_inliers=n_inliers, error_px=error_px, R_pred=R_pred, p_pred=p_pred, dt_s=dt_s,
                     winner_was_contested=bool(solution.get("winner_was_contested", False)),
                     swap_suspected=bool(solution.get("swap_suspected", False)),
-                    rot_pred_implausible=rot_pred_implausible)
-            w_imu, w_sum = 1.0, 1.0
+                    rot_pred_implausible=rot_pred_implausible,
+                    accel_now=accel_now)
+            # BUG FIX (2026-09-18, real case: right_controller, static_easy,
+            # frame_idx 1340): w_vision was never zeroed here -- only w_imu/
+            # w_sum got overridden to (1.0, 1.0), meaning p_new below silently
+            # became an UNNORMALIZED SUM (p_pred + w_vision*p_meas) instead of
+            # a weighted average, whenever w_vision was nonzero on entry.
+            # Dormant since this branch's original 2026-09-15 introduction:
+            # the only way in used to be w_sum<=0.0, which (cost_weight_imu=0
+            # in this project's real config) already forced w_vision<=0 too,
+            # so w_vision was always ~0 here and the bug never showed.
+            # _weak_inlier_partial_decay (2026-09-18, see its own comment
+            # above) is the first path that can reach this branch with
+            # w_vision still meaningfully nonzero (inlier_factor=0 but
+            # error_factor high) -- confirmed on the real case: imu=(-0.067,
+            # 0.340, 0.241) vision=(-0.074, 0.358, 0.254) (the two agree to
+            # within ~15mm) produced tracking=(-0.137, 0.678, 0.481) -- almost
+            # exactly imu+vision added together, not blended. This whole
+            # branch's own intent is "p_pred alone is still trustworthy
+            # enough within budget, use it" (see the dt_s-budget check just
+            # above), so vision must be fully excluded, not just outweighed.
+            w_imu, w_sum, w_vision = 1.0, 1.0, 0.0
 
         p_new = (w_imu * p_pred + w_vision * p_meas) / w_sum
 
@@ -1748,6 +1878,105 @@ class HeuristicPoseFusionFilter:
     # ------------------------------------------------------------------
     # Cold-state (vision_only) reacquisition
     # ------------------------------------------------------------------
+    def _report_coast_if_usable(self, frame_ts_ns: int, R_pred: np.ndarray, p_pred: np.ndarray,
+                                 dt_s: float) -> None:
+        """Display the coasted IMU prediction after a hard-rejected vision
+        candidate, but only while the loss so far is short enough to trust for
+        display -- otherwise clear the reported pose, exactly like
+        _try_cold_reacquire's _report_if_still_usable does for a buffered
+        candidate.
+
+        2026-09-20, real case: static_medium, left_controller, relative frame 85
+        (frame_idx 4085): frames 75-84 correctly showed no pose (loss past
+        cold_pending_report_max_gap_s), then a hard-rejected vision candidate at
+        189ms since the last accept re-displayed the stale IMU prediction --
+        243mm off mocap -- because both reject branches called _report()
+        unconditionally. Their veto (cold_reacquire_rot_veto_max_s, 0.25s base)
+        is deliberately more generous than the DISPLAY budget, so a candidate
+        can be legitimately rejected while the coast is already too old to show.
+        reject_report_respect_display_budget: false restores the old behaviour."""
+        if not bool(self._hc_get("reject_report_respect_display_budget", True)):
+            self._report(frame_ts_ns, R_pred, p_pred)
+            return
+        base = float(self._hc_get("cold_pending_report_max_gap_s", 0.25))
+        budget = self._effective_coast_budget_s(base, frame_ts_ns, rate_prefix="cold_pending")
+        if dt_s <= budget:
+            self._report(frame_ts_ns, R_pred, p_pred)
+        else:
+            self.reported_R = self.reported_p = None
+
+    def _check_reject_streak_override(self, R_meas, p_meas, frame_ts_ns, confidence, solution,
+                                       n_inliers, error_px, R_pred, p_pred, dt_s, rot_innov_deg,
+                                       pos_innov_m, accel_now) -> bool:
+        """Called at each hard-reject site (candidate disagrees with the IMU/gyro
+        prediction). Returns True if it re-anchored on this candidate instead.
+
+        reject_streak_override (2026-09-19, real case: static_medium, right_
+        controller, frames 4720-4727): a cold reacquire accepted at frame 4720
+        was a mirror flip (17mm, 157.7deg off mocap). The IMU/gyro state then
+        coasted from that wrong anchor, and three consecutive STRONG vision
+        solutions (11 inliers, 0.10px, correct orientation) were each rejected
+        as "implausible vs still-credible gyro prediction" (rot_innov=155deg) --
+        the disagreement WAS the flip, i.e. the prediction was wrong, not
+        vision. Two strong candidates in a row that are rejected against the
+        prediction but AGREE WITH EACH OTHER are much better evidence than one
+        wrong prediction, so the second one re-anchors (through
+        _try_cold_reacquire's strong path, which still runs its sibling-
+        collision check first). Deliberately requires STRONG candidates
+        (n_inliers >= vision_weight_strong_inliers, error below the weak floor,
+        not coverage_fallback/contested/swap_suspected): weak solves sharing one
+        systematic error also "agree" with each other, see _try_cold_reacquire.
+        State resets on any accept in between (last_update_ts_ns changes)."""
+        if not bool(self._hc_get("reject_streak_override_enabled", True)):
+            return False
+        strong_inliers = float(self._hc_get("vision_weight_strong_inliers", 18))
+        weak_error_px = float(self._hc_get("vision_weight_weak_error_px", 0.5))
+        strong = (n_inliers >= strong_inliers and error_px < weak_error_px
+                  and not solution.get("coverage_fallback", False)
+                  and not solution.get("winner_was_contested", False)
+                  and not solution.get("swap_suspected", False))
+        prev = self._reject_streak_prev
+        if prev is not None and prev["last_update_ts_ns"] != self.last_update_ts_ns:
+            prev = None
+            self._reject_streak_n = 0
+        if not strong:
+            self._reject_streak_prev = None
+            self._reject_streak_n = 0
+            return False
+        this = {"R": R_meas, "p": p_meas, "frame_ts_ns": frame_ts_ns, "last_update_ts_ns": self.last_update_ts_ns}
+        self._reject_streak_prev = this
+        if prev is None:
+            self._reject_streak_n = 1
+            return False
+        gap_s = (frame_ts_ns - prev["frame_ts_ns"]) / 1e9
+        if gap_s <= 0.0 or gap_s > float(self._hc_get("reject_streak_override_max_gap_s", 0.25)):
+            self._reject_streak_n = 1
+            return False
+        dpos_m = float(np.linalg.norm(p_meas - prev["p"]))
+        drot_deg = float(np.degrees(np.linalg.norm(Rotation.from_matrix(prev["R"].T @ R_meas).as_rotvec())))
+        jump_pos_m = (float(self._hc_get("weak_confirm_pos_thresh_base_m", 0.135))
+                      + float(self._hc_get("weak_confirm_max_speed_m_s", 3.0)) * gap_s)
+        jump_rot_deg = (float(self._hc_get("weak_confirm_rot_thresh_base_deg", 15.6))
+                        + float(self._hc_get("weak_confirm_max_ang_speed_deg_s", 2000.0)) * gap_s)
+        if dpos_m > jump_pos_m or drot_deg > jump_rot_deg:
+            self._reject_streak_n = 1
+            return False
+        self._reject_streak_n += 1
+        if self._reject_streak_n < int(self._hc_get("reject_streak_override_min_agreeing", 2)):
+            return False
+        _log.info(
+            f"[{self._ctrl_name}] REJECT-STREAK OVERRIDE ts={frame_ts_ns} — {self._reject_streak_n} consecutive strong "
+            f"candidates (n_inliers={n_inliers}, err={error_px:.2f}px) disagree with the IMU prediction "
+            f"(pos_innov={pos_innov_m * 1000:.0f}mm rot_innov={rot_innov_deg:.0f}deg) but agree with each other "
+            f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg) -- treating the prediction/anchor as wrong, re-anchoring on vision"
+        )
+        self._reject_streak_prev = None
+        self._reject_streak_n = 0
+        return self._try_cold_reacquire(
+            R_meas, p_meas, frame_ts_ns, confidence, coverage_fallback=False, n_inliers=n_inliers,
+            error_px=error_px, R_pred=R_pred, p_pred=p_pred, dt_s=dt_s, rot_pred_implausible=False,
+            accel_now=accel_now, accept_outcome="reject_streak_override")
+
     def _try_cold_reacquire(self, R_meas: np.ndarray, p_meas: np.ndarray,
                              frame_ts_ns: int, confidence: float,
                              coverage_fallback: bool = False, n_inliers: int = 0,
@@ -1755,6 +1984,7 @@ class HeuristicPoseFusionFilter:
                              winner_was_contested: bool = False,
                              swap_suspected: bool = False,
                              rot_pred_implausible: bool = False,
+                             accel_now: np.ndarray | None = None,
                              R_pred: np.ndarray | None = None, p_pred: np.ndarray | None = None,
                              dt_s: float | None = None, log_prefix: str = "COLD REACQUIRE",
                              pending_outcome: str = "cold_pending",
@@ -1965,6 +2195,26 @@ class HeuristicPoseFusionFilter:
                 self.reported_R = self.reported_p = None
 
         weak_inliers = float(self._hc_get("vision_weight_weak_inliers", 6))
+        # weak_error_px (2026-09-18, real case: right_controller, static_easy,
+        # frame_idx 6469, ts=100852465980200): this weak/strong split used to
+        # check n_inliers ONLY -- a single-camera p3p_systematic solve with
+        # n_inliers=6 (just above weak_inliers=5) and error_px=1.12
+        # (WORSE than this same controller's own vision_weight_weak_error_px
+        # override of 1.1 -- i.e. already at the error ramp's floor by
+        # _vision_weight's own standard) counted as "strong enough," skipped
+        # the weak buffer/confirm step entirely, and got trusted immediately
+        # as the new anchor. Mocap-confirmed: that reacquisition was 44.2mm/
+        # 141.2deg off truth, and every frame it anchored while coasting
+        # (implausible_reject keeps the reported pose pinned to the bad
+        # p_pred) drifted further (up to 210mm/142deg) before a forced
+        # cold-start finally recovered ~10 frames later. Symmetric with the
+        # n_inliers check above (error_px >= weak_error_px is exactly
+        # _ramp_down's own "at/above weak" floor, see that function's own
+        # docstring) -- a candidate this bad on EITHER axis alone gets
+        # buffered, matching _vision_weight's "clean-but-wrong" reasoning
+        # for why the normal warm path never trusts either axis in
+        # isolation either.
+        weak_error_px = float(self._hc_get("vision_weight_weak_error_px", 0.5))
         # winner_was_contested (2026-09-13): a THIRD trigger for "weak,"
         # alongside coverage_fallback/low-inlier-count -- see
         # TrackingSystem._resolve_cold_conflicts' own contested_winners
@@ -2022,9 +2272,46 @@ class HeuristicPoseFusionFilter:
         # further down, which is the part that actually matters (two
         # candidates sharing the SAME systematic error still "agree" with
         # each other regardless of each one's own weak/strong status).
-        weak = (coverage_fallback or n_inliers <= weak_inliers
+        weak = (coverage_fallback or n_inliers <= weak_inliers or error_px >= weak_error_px
                 or (winner_was_contested and not _contested_but_strong)
                 or swap_suspected or rot_pred_implausible)
+
+        # bootstrap_gravity_veto (2026-09-19): the accelerometer reading rotated
+        # through this candidate's R should point along world -y (down) -- see
+        # the veto below for the real cases and numbers. None when there is no
+        # accel sample to check against (veto then simply doesn't apply).
+        _bootstrap_gravity_angle_deg = None
+        if log_prefix == "BOOTSTRAP" and accel_now is not None:
+            _a = np.asarray(accel_now, dtype=float)
+            _a_norm = float(np.linalg.norm(_a))
+            if _a_norm > 1e-6:
+                _g_world = R_meas @ (_a / _a_norm)
+                _bootstrap_gravity_angle_deg = float(np.degrees(np.arccos(np.clip(-_g_world[1], -1.0, 1.0))))
+        # Thin-candidate check (2026-09-20, real case: static_medium, left_
+        # controller, relative frame 42 -> 47): a 2-inlier prior-constrained
+        # P1P solve (rotation COPIED from the prediction, only translation
+        # solved) was buffered as the "weak candidate", and a poor 5-inlier/
+        # 0.69px P3P candidate five frames later "agreed" with it within a
+        # 476mm/~190deg confirm budget (dt=89ms) -- 65mm/58deg off mocap, and
+        # it became the anchor. A candidate with fewer than
+        # cold_confirm_min_inliers inliers, or whose rotation came from the
+        # prediction, carries no independent orientation evidence, so it is
+        # neither buffered nor allowed to confirm/supersede anything; the
+        # frame is treated as a wait (no reject counted), like any other
+        # pending frame.
+        _min_evidence = int(self._hc_get("cold_confirm_min_inliers", 3))
+        _thin = ((bool(self._hc_get("cold_confirm_ignore_prior_constrained", True))
+                  and self._cand_rotation_from_prior)
+                 or n_inliers < _min_evidence)
+        if _thin:
+            _log.info(
+                f"[{self._ctrl_name}] {log_prefix} ts={frame_ts_ns} pos={_fmt_v(p_meas)} n_inliers={n_inliers} "
+                f"rotation_from_prior={self._cand_rotation_from_prior} — too thin to count as evidence "
+                f"(min {_min_evidence} inliers, no prior-copied rotation), ignored"
+            )
+            _report_if_still_usable()
+            self._set_last(outcome=pending_outcome, confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
+            return False
 
         if not weak:
             if pending is not None:
@@ -2042,7 +2329,7 @@ class HeuristicPoseFusionFilter:
             self._cold_pending = {
                 "R": R_meas, "p": p_meas, "confidence": confidence,
                 "coverage_fallback": coverage_fallback, "frame_ts_ns": frame_ts_ns,
-                "n_inliers": n_inliers,
+                "n_inliers": n_inliers, "accel": accel_now, "error_px": error_px,
             }
             _report_if_still_usable()
             self._set_last(outcome=pending_outcome, confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
@@ -2085,7 +2372,78 @@ class HeuristicPoseFusionFilter:
         jump_pos_m = _weak_confirm_pos_base_m + _weak_confirm_speed_m_s * confirm_dt_s
         jump_rot_deg = _weak_confirm_rot_base_deg + _weak_confirm_ang_speed_deg_s * confirm_dt_s
         _agrees_with_pending = dpos_m <= jump_pos_m and drot_deg <= jump_rot_deg
-        if _agrees_with_pending and not rot_pred_implausible:
+
+        # REVERTED 2026-09-18 (gravity_implausible veto, shipped same day):
+        # its justification -- "0% false-positive rate over 36 real firings"
+        # of controller.py's gravity-direction diagnostic -- was itself
+        # measured with a broken (bridge-uncomposed) mocap comparison. Every
+        # frame, good or bad, shows ~178deg/~80mm "error" against mocap
+        # without composing the controller's own mocap_bridge_path transform
+        # first (T_est.compose(bridge).inverse().compose(T_gt), see
+        # evaluate_mocap.py's own verified formula) -- that's the bridge's
+        # own fixed LED-frame-to-mocap-marker-frame rotation/lever-arm
+        # showing up as a false "error", not genuine candidate correctness.
+        # Redone properly: only 11/36 (31%) of those firings were actually
+        # bad poses; 25/36 (69%) were false positives, including several at
+        # HIGH disagreement (76-153deg) sitting right next to genuine true
+        # positives at similar magnitudes -- gravity disagreement magnitude
+        # alone does not reliably separate good from bad here at any
+        # threshold (likely needs an additional low-ANGULAR-VELOCITY gate,
+        # not just the existing low-LINEAR-acceleration one, since a
+        # genuinely fast rotation can pass the |accel|~9.81 gate while still
+        # producing a large, legitimate gravity-direction swing). Left
+        # accel_now/pending["accel"] threading in place (still used by the
+        # separate along-track/cross-track diagnostic below try_update)
+        # rather than ripping out the whole plumbing -- only the veto
+        # decision itself is removed pending a properly re-validated design.
+        # bootstrap_coverage_fallback_veto (2026-09-19, real case: static_easy,
+        # left_controller frame_idx 2803/3651, right_controller frame_idx
+        # 2134): coverage_fallback means too few of the geometrically-expected
+        # LEDs matched -- a degenerate, near-planar point set that P3P can fit
+        # to its own mirror-branch alternate just as "cleanly" as the true
+        # pose. Two such candidates sharing that SAME systematic bias agree
+        # with each other (this is exactly rot_pred_implausible's own real
+        # case above, just with no gyro reference yet to catch it -- at
+        # BOOTSTRAP there is no prior R to integrate gyro from, so that veto
+        # structurally cannot run here). Empirically checked across this
+        # recording's full 42 bootstraps (21 per controller): EVERY
+        # coverage_fallback=True bootstrap that turned out bad (3 of 4, 75%)
+        # was this exact shape; EVERY coverage_fallback=False bootstrap (38
+        # of 38, 100%) was good. Scoped to BOOTSTRAP only (not mid-recording
+        # COLD REACQUIRE) -- a fresh bootstrap has no other context (no
+        # recent last-known-good pose, no IMU coast) to lean on if this
+        # candidate is refused, unlike a cold-reacquire, so it is worth
+        # being pickier specifically here; refusing costs only the 1 good
+        # coverage_fallback bootstrap found (delayed until a non-fallback
+        # candidate arrives), against eliminating all 3 real failures.
+        # cold_confirm_require_solid_member (2026-09-20, same real case as the
+        # thin-candidate check above): two weak candidates that BOTH fit poorly
+        # (error_px >= vision_weight_weak_error_px) agree with each other about
+        # as easily as two random guesses under the time-scaled budget, so a
+        # confirmed pair needs at least one member with a clean fit.
+        _pending_err = float(pending.get("error_px", 0.0))
+        _no_solid_member = (bool(self._hc_get("cold_confirm_require_solid_member", True))
+                            and error_px >= weak_error_px and _pending_err >= weak_error_px)
+        _bootstrap_coverage_fallback_veto = log_prefix == "BOOTSTRAP" and coverage_fallback
+        # bootstrap_gravity_veto (2026-09-19, real case: static_medium, left_
+        # controller, frame_idx 2988: a rotation-flipped bootstrap, 7.5mm/155.9deg
+        # off mocap, confirmed because two weak candidates agreed with each other
+        # -- coverage_fallback was False, so the veto above didn't apply). Two
+        # weak solves sharing one mirror-branch error agree with each other, but
+        # a flipped orientation also flips where "down" points: at rest the
+        # accelerometer reading, rotated through a correct R, lands on world -y
+        # (static_easy/walk_easy first frames: (0.09,-0.97,-0.22) / (0.03,-1.00,
+        # -0.03) for both controllers). Checked on every bootstrap candidate of a
+        # full static_easy run (80 candidates, labelled vs mocap): good ones sit
+        # 0-51deg from -y (median 15), 19 of 22 flipped ones sit >=65deg;
+        # thresh 65 blocks 0/58 good. Bootstrap-only: no gyro prediction exists
+        # there for rot_pred_implausible to use. Cannot see a flip about the
+        # vertical axis (gravity unchanged by it).
+        _grav_veto_thresh_deg = float(self._hc_get("bootstrap_gravity_veto_thresh_deg", 65.0))
+        _bootstrap_gravity_veto = (_grav_veto_thresh_deg > 0.0 and _bootstrap_gravity_angle_deg is not None
+                                   and _bootstrap_gravity_angle_deg > _grav_veto_thresh_deg)
+        if _agrees_with_pending and not rot_pred_implausible and not _bootstrap_coverage_fallback_veto \
+                and not _bootstrap_gravity_veto and not _no_solid_member:
             self._cold_pending = None
             _log.info(
                 f"[{self._ctrl_name}] {log_prefix} CONFIRMED ts={frame_ts_ns} pos={_fmt_v(p_meas)} — "
@@ -2114,6 +2472,30 @@ class HeuristicPoseFusionFilter:
                 f"gyro prediction (rot_innov > {float(self._hc_get('cold_reacquire_rot_veto_thresh_deg', 100.0)):.0f}deg) "
                 f"— refusing to confirm, buffering this one instead"
             )
+        elif _agrees_with_pending and _no_solid_member:
+            _log.info(
+                f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — "
+                f"agrees with buffered weak candidate from ts={pending['frame_ts_ns']} "
+                f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg) BUT neither has a clean fit "
+                f"(err {error_px:.2f}px / {_pending_err:.2f}px, both >= {weak_error_px:.2f}px) — "
+                f"refusing to confirm, buffering this one instead"
+            )
+        elif _agrees_with_pending and _bootstrap_gravity_veto:
+            _log.info(
+                f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — "
+                f"agrees with buffered weak candidate from ts={pending['frame_ts_ns']} on position/rotation "
+                f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg) BUT its orientation puts gravity "
+                f"{_bootstrap_gravity_angle_deg:.0f}deg away from world down (> {_grav_veto_thresh_deg:.0f}deg) "
+                f"— refusing to establish a fresh bootstrap on a flipped-looking orientation, buffering this one instead"
+            )
+        elif _agrees_with_pending and _bootstrap_coverage_fallback_veto:
+            _log.info(
+                f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — "
+                f"agrees with buffered weak candidate from ts={pending['frame_ts_ns']} on position/rotation "
+                f"(dpos={dpos_m * 1000:.1f}mm drot={drot_deg:.2f}deg) BUT both are coverage_fallback (too few "
+                f"geometrically-expected LEDs matched) — refusing to establish a fresh bootstrap on "
+                f"fallback-only evidence, buffering this one instead"
+            )
         else:
             _log.info(
                 f"[{self._ctrl_name}] {log_prefix} PENDING ts={frame_ts_ns} pos={_fmt_v(p_meas)} — disagrees "
@@ -2124,7 +2506,7 @@ class HeuristicPoseFusionFilter:
         self._cold_pending = {
             "R": R_meas, "p": p_meas, "confidence": confidence,
             "coverage_fallback": coverage_fallback, "frame_ts_ns": frame_ts_ns,
-            "n_inliers": n_inliers,
+            "n_inliers": n_inliers, "accel": accel_now, "error_px": error_px,
         }
         _report_if_still_usable()
         self._set_last(outcome=pending_outcome, confidence=confidence, pos_pred=p_pred, R_pred=R_pred)

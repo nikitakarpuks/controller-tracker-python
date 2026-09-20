@@ -550,6 +550,7 @@ class BruteSearchState:
     fallback_tvec_err: float = float('inf')
     fallback_tier: Optional[int] = None
     strong_found: bool = False
+    strong_pending: bool = False   # strong candidate seen; finishing the current tier before stopping
     solution_tier: Optional[int] = None
     seen_bijections: set = field(default_factory=set)
     bijection_counts: Optional[Dict] = None
@@ -636,6 +637,7 @@ class PoseSearcher:
         self._c_brute_strong_in     = int(  _cfg.get('strong_match_inliers',             7))
         self._c_brute_strong_err    = float(_cfg.get('strong_match_error_px',            1.5))
         self._c_brute_min_vis_cov   = float(_cfg.get('min_vis_coverage',                 0.75))
+        self._c_brute_finish_tier   = bool(_cfg.get('brute_finish_tier_after_strong',     True))
         self._c_brute_rng_seed      = _cfg.get('rng_seed',                              42)
         self._c_brute_aux_reproj_px = float(_cfg.get('brute_aux_reprojection_threshold_px', 2.0))
         # See camera.radial_taper_weight's own docstring for the full "why" --
@@ -2886,10 +2888,25 @@ class PoseSearcher:
                                 # finalize_brute_state returns state.best_solution unconditionally,
                                 # so a thin candidate that's never "strong" is still returned if nothing
                                 # better ever turns up after the full search completes.
+                                #
+                                # brute_finish_tier_after_strong (2026-09-19, real case: static_
+                                # medium, right_controller, frame_idx 4720): the FIRST candidate to
+                                # clear this test -- 6 inliers, 0.109px, coverage 0.72, matched 6 of
+                                # 10 visible LEDs -- was a 157.7deg mirror flip, and stopping right
+                                # there skipped the true solution (8 inliers, 0.115px, coverage
+                                # 0.96, matched 8/10) that the SAME tier found 33ms later. Error is
+                                # a weak discriminator: the flipped fit's 6 pairs were nearly as
+                                # tight as the correct 8. So a strong candidate now only marks the
+                                # tier "pending" and the rest of THIS tier is still scanned (best-so-
+                                # far keeps updating as usual); the search stops at the tier's end
+                                # instead of at the first hit. Later tiers are still skipped.
                                 if (state.best_error <= self._c_brute_strong_err
                                         and balanced_coverage >= self._c_brute_min_vis_cov
                                         and n_inlier_blobs >= state.strong_inliers_eff):
-                                    state.strong_found = True
+                                    if self._c_brute_finish_tier:
+                                        state.strong_pending = True
+                                    else:
+                                        state.strong_found = True
                             t_coverage_tail += time.perf_counter() - _t0
 
             cur_prev_blob[triple_i] = blob_max
@@ -2897,6 +2914,9 @@ class PoseSearcher:
                 tier_lq_tried[tier_idx] += 1
             if state.strong_found:
                 break
+
+        if state.strong_pending:
+            state.strong_found = True   # tier fully scanned -- now skip the remaining tiers as before
 
         logger.bind(cat="timings").debug(
             f"[{self._ctrl} | cam {self._cam}] Brute tier_{tier_idx} bench: "
