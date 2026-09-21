@@ -52,10 +52,8 @@ from src.imu_data import load_imu_csv, load_and_calibrate_controller_imu, integr
 # Confirmed mapping + measured clock-offset (Stage 1 cross-correlation, this
 # recording only — see src/imu_data.py's module docstring for how these were
 # resolved; re-measure if this ever runs against different data).
-CTRL_IMU_FILES = {
-    "left_controller":  ("imu1/data.csv", -5_000_000),
-    "right_controller": ("imu2/data.csv", -7_000_000),
-}
+from src.mocap_data import controller_imu_files
+CTRL_IMU_FILES = controller_imu_files()  # lag_ns = -mocap_vision_offset_ns from config.yml (shared with main.py)
 AXIS_NAMES = ("x", "y", "z")
 
 

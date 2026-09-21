@@ -90,8 +90,8 @@ _MATEOSSS_EXTRINSICS_PATH = "./data/cameras/backup/mateosss.reverbg2v1.kleineinz
 # whether/where it's visible. It does NOT identify which detected blob is
 # which controller's LED -- there's no per-blob identity here, only a
 # per-frame-pair "was any controller moving" covariate.
-_CTRL_IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
-                    "right_controller": ("imu2/data.csv", -7_000_000)}
+from src.mocap_data import controller_imu_files
+_CTRL_IMU_FILES = controller_imu_files()  # lag_ns = -mocap_vision_offset_ns from config.yml (shared with main.py)
 
 _COLOR_STATIC    = (0, 200, 0)     # BGR green
 _COLOR_MOVED     = (0, 140, 255)   # BGR orange

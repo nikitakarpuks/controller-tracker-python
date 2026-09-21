@@ -105,8 +105,8 @@ from src.imu_data import (accel_preint_residual, create_imu_calib_from_config, g
                            slice_imu_to_window)
 from src.load_config import load_json_config, load_yaml_config
 
-_IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
-              "right_controller": ("imu2/data.csv", -7_000_000)}
+from src.mocap_data import controller_imu_files
+_IMU_FILES = controller_imu_files()  # lag_ns = -mocap_vision_offset_ns from config.yml (shared with main.py)
 _AXIS_NAMES = ("x", "y", "z")
 _DEFAULT_WINDOW = 300  # "a few hundred consecutive accepted frames" per the Step 4 plan
 _ANCHOR_SIGMA_SCALE = 1.0  # anchor sigma = bias_uncertainty * this -- see module docstring

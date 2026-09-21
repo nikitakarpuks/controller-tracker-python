@@ -14,7 +14,8 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from src.mocap_data import DeviceMocap, headset_angular_velocity, headset_linear_velocity
+from src.mocap_data import DeviceMocap, headset_angular_velocity, headset_linear_velocity, \
+    load_vision_offset_ns, relative_pose, controller_imu_lag_ns, controller_imu_files
 from src.transformations import Transform
 
 _NS = 1_000_000_000
@@ -156,6 +157,96 @@ class CoverageGapTests(unittest.TestCase):
         query_ts = int(before[-1] + gap_ns / 2)
         self.assertIsNone(headset_angular_velocity(device, query_ts))
         self.assertIsNone(headset_linear_velocity(device, query_ts))
+
+class VisionOffsetTests(unittest.TestCase):
+    """DeviceMocap.vision_offset_ns: lookup is frame_ts + vision_offset_ns + fine_offset_ns.
+    Analytic constant-velocity / constant-rate curves are reproduced exactly by linear/SLERP
+    interpolation, so expected values are exact (not approximate) up to float precision."""
+
+    V = np.array([0.8, -0.3, 0.5])          # m/s
+    W = np.array([0.4, 1.2, -0.9])          # rad/s
+    T0 = 50 * _NS
+
+    def _device(self, fine_ns, vision_ns):
+        t_ns = _sample_times(self.T0, duration_s=2.0)
+        R = lambda t: Rotation.from_rotvec(self.W * (t - self.T0) / 1e9).as_matrix()
+        p = lambda t: self.V * (t - self.T0) / 1e9
+        positions = np.array([p(t) for t in t_ns])
+        quats = np.array([Rotation.from_matrix(R(t)).as_quat() for t in t_ns])
+        return DeviceMocap(t_ns, positions, quats, fine_offset_ns=fine_ns,
+                           T_imu_marker=Transform(np.eye(3), np.zeros(3)), vision_offset_ns=vision_ns), R, p
+
+    def test_lookup_is_frame_plus_vision_plus_fine(self):
+        fine, vis = 100_000_000, 7_600_000
+        dev, R, p = self._device(fine, vis)
+        q = self.T0 + 300_000_000
+        R_got, p_got = dev.pose_at(q)
+        t_true = q + fine + vis
+        np.testing.assert_allclose(p_got, p(t_true), atol=1e-9)
+        np.testing.assert_allclose(R_got, R(t_true), atol=1e-9)
+
+    def test_default_is_zero_offset_old_behavior(self):
+        dev, R, p = self._device(100_000_000, 0.0)
+        q = self.T0 + 300_000_000
+        np.testing.assert_allclose(dev.pose_at(q)[1], p(q + 100_000_000), atol=1e-9)
+        self.assertEqual(DeviceMocap(np.array([0, 1]), np.zeros((2, 3)), np.array([[0, 0, 0, 1.0]] * 2),
+                                     0.0, Transform(np.eye(3), np.zeros(3))).vision_offset_ns, 0.0)
+
+    def test_lag_removed_relative_pose_residual(self):
+        """Controller moving at V, headset static: vision (stamped at true time) vs mocap looked up
+        WITHOUT the offset is off by exactly |V| * 7.6ms; WITH it the position error is ~0."""
+        fine, vis = 0, 7_600_000
+        t_ns = _sample_times(self.T0, duration_s=2.0)
+        I = Transform(np.eye(3), np.zeros(3))
+        head = DeviceMocap(t_ns, np.zeros((len(t_ns), 3)), np.tile([0, 0, 0, 1.0], (len(t_ns), 1)), 0.0, I)
+        ctrl_pos = np.array([self.V * (t - self.T0) / 1e9 for t in t_ns])
+        quats = np.tile([0, 0, 0, 1.0], (len(t_ns), 1))
+        # vision stamp t_cam sees the controller at ITS true mocap time t_cam + vis
+        q = self.T0 + 500_000_000
+        truth_at_vision = self.V * (q + vis - self.T0) / 1e9
+        with_off = DeviceMocap(t_ns, ctrl_pos, quats, fine, I, vision_offset_ns=vis)
+        without = DeviceMocap(t_ns, ctrl_pos, quats, fine, I)
+        err_with = np.linalg.norm(relative_pose(head, with_off, q).t - truth_at_vision)
+        err_without = np.linalg.norm(relative_pose(head, without, q).t - truth_at_vision)
+        self.assertLess(err_with, 1e-9)
+        self.assertAlmostEqual(err_without, np.linalg.norm(self.V) * 7.6e-3, places=9)
+
+    def test_load_vision_offset_ns(self):
+        self.assertEqual(load_vision_offset_ns(None), 0.0)
+        self.assertEqual(load_vision_offset_ns({}), 0.0)
+        self.assertEqual(load_vision_offset_ns({"mocap_vision_offset_ns": None}), 0.0)
+        self.assertEqual(load_vision_offset_ns({"mocap_vision_offset_ns": 7600000}), 7_600_000.0)
+
+
+class ControllerImuLagTests(unittest.TestCase):
+    """lag_ns (IMU stream) is the negation of mocap_vision_offset_ns (mocap lookup): one physical link,
+    one source of truth. Legacy -5ms/-7ms only when the key is unset."""
+
+    def test_lag_is_negated_vision_offset(self):
+        cfg = {"controllers": {"left_controller": {"mocap_vision_offset_ns": 7_650_000},
+                               "right_controller": {"mocap_vision_offset_ns": 7_600_000.0}}}
+        self.assertEqual(controller_imu_lag_ns("left_controller", cfg), -7_650_000)
+        self.assertEqual(controller_imu_lag_ns("right_controller", cfg), -7_600_000)
+        self.assertIsInstance(controller_imu_lag_ns("right_controller", cfg), int)
+
+    def test_legacy_fallback_when_unset(self):
+        cfg = {"controllers": {"left_controller": {}, "right_controller": {"mocap_vision_offset_ns": None}}}
+        self.assertEqual(controller_imu_lag_ns("left_controller", cfg), -5_000_000)
+        self.assertEqual(controller_imu_lag_ns("right_controller", cfg), -7_000_000)
+
+    def test_files_table_matches_lag_and_paths(self):
+        cfg = {"controllers": {"left_controller": {"mocap_vision_offset_ns": 7_650_000},
+                               "right_controller": {"mocap_vision_offset_ns": 7_600_000}}}
+        self.assertEqual(controller_imu_files(cfg),
+                         {"left_controller": ("imu1/data.csv", -7_650_000),
+                          "right_controller": ("imu2/data.csv", -7_600_000)})
+
+    def test_shipped_config_agrees_with_vision_offset(self):
+        """The real config.yml: lag_ns must be exactly -mocap_vision_offset_ns for both controllers."""
+        from src.load_config import load_yaml_config
+        cfg = load_yaml_config("config/config.yml")
+        for k in ("left_controller", "right_controller"):
+            self.assertEqual(controller_imu_lag_ns(k), -int(load_vision_offset_ns(cfg["controllers"][k])))
 
 
 if __name__ == "__main__":

@@ -33,6 +33,22 @@ Time offset -- confirmed empirically against real recordings, NOT assumed:
     coarse+fine TOTAL -- useful only as a sanity-check log line ("did I
     roughly start Motive N seconds before this device"), never as a
     correction applied to the data.
+
+Vision-clock offset (DeviceMocap.vision_offset_ns) -- the SECOND time link, easy to
+    confuse with the fine offset above:
+    the fine offset maps a device's OWN IMU clock -> mocap clock (basalt_mocap_time_sync,
+    gyro vs mocap angular velocity). Vision poses, though, are stamped with the CAMERA
+    frame time, and the controller's IMU stamps are NOT on that clock: measured against
+    the vision poses of all 8 recordings-aug26 recordings (vision-vs-controller-gyro and
+    vision-vs-mocap angular-velocity cross-correlation, both agree), controller raw IMU
+    stamp = camera stamp + ~7.6ms for both controllers, std 0.24ms across 16
+    recording/controller cases, uncorrelated with the per-device fine offsets. main.py's
+    lag_ns (imu_data.load_and_calibrate_controller_imu) already applies this link to the
+    IMU stream; without vision_offset_ns the mocap lookup silently skipped it, leaving a
+    constant ~7.6ms vision<->mocap lag that showed up as a speed-proportional residual
+    (~speed * 7ms) in every vision-vs-mocap comparison. Lookup is therefore
+    frame_ts + vision_offset_ns + fine_offset_ns. Defaults to 0 (old behavior); set per
+    controller via config.yml's mocap_vision_offset_ns (see load_vision_offset_ns).
 """
 import json
 
@@ -53,6 +69,39 @@ def load_mocap_csv(path):
     """mocap_filtered/<device>/data.csv -- identical EuRoC-ish schema to
     src/imu_data.py's vio/data.csv, so reuse that parser directly."""
     return load_vio_csv(path)
+
+
+def load_vision_offset_ns(device_cfg) -> float:
+    """config.yml's <device>.mocap_vision_offset_ns (vision-frame-stamp -> this device's
+    IMU clock, see module docstring), or 0.0 if unset/None -- old behavior."""
+    v = (device_cfg or {}).get("mocap_vision_offset_ns")
+    return 0.0 if v is None else float(v)
+
+
+# Legacy per-controller lag (t_imu + lag_ns), measured on one older clip -- ONLY used when config.yml's
+# mocap_vision_offset_ns is unset for that controller.
+_LEGACY_CONTROLLER_LAG_NS = {"left_controller": -5_000_000, "right_controller": -7_000_000}
+_CONTROLLER_IMU_REL_PATH  = {"left_controller": "imu1/data.csv", "right_controller": "imu2/data.csv"}
+
+
+def controller_imu_lag_ns(ctrl_key: str, config: dict = None) -> int:
+    """lag_ns for load_and_calibrate_controller_imu (t_imu + lag_ns puts the raw controller IMU stamps
+    on the camera clock) = -mocap_vision_offset_ns from config.yml -- the SAME physical link the mocap
+    lookup applies via DeviceMocap.vision_offset_ns (see module docstring), so the IMU stream and the
+    mocap lookup can't drift apart. config=None loads config/config.yml. Falls back to the legacy
+    -5ms/-7ms constants only if the key is unset for that controller."""
+    if config is None:
+        from pathlib import Path
+        from src.load_config import load_yaml_config
+        config = load_yaml_config(str(Path(__file__).resolve().parent.parent / "config" / "config.yml"))
+    offset_ns = load_vision_offset_ns(config["controllers"].get(ctrl_key))
+    return -int(round(offset_ns)) if offset_ns else _LEGACY_CONTROLLER_LAG_NS[ctrl_key]
+
+
+def controller_imu_files(config: dict = None) -> dict:
+    """{ctrl_key: (imu csv path relative to mav0/, lag_ns)} -- the (path, lag) table every script that
+    loads the controller IMUs used to hardcode. See controller_imu_lag_ns."""
+    return {k: (rel, controller_imu_lag_ns(k, config)) for k, rel in _CONTROLLER_IMU_REL_PATH.items()}
 
 
 def load_mocap_fine_offset_ns(drift_check_json_path) -> float:
@@ -126,13 +175,15 @@ class DeviceMocap:
 
     def __init__(self, t_ns: np.ndarray, position: np.ndarray, quat_xyzw: np.ndarray,
                  fine_offset_ns: float, T_imu_marker: Transform,
-                 max_interp_gap_ns: float = DEFAULT_MAX_INTERP_GAP_NS):
+                 max_interp_gap_ns: float = DEFAULT_MAX_INTERP_GAP_NS,
+                 vision_offset_ns: float = 0.0):
         self.t_ns              = t_ns
         self.position           = position
         self.quat_xyzw          = quat_xyzw
         self.fine_offset_ns     = fine_offset_ns
         self.T_imu_marker       = T_imu_marker
         self.max_interp_gap_ns  = max_interp_gap_ns
+        self.vision_offset_ns   = vision_offset_ns
 
     def pose_at(self, query_ts_ns: int):
         """Interpolated (R (3,3), t (3,)) marker pose in the shared mocap-world
@@ -140,7 +191,7 @@ class DeviceMocap:
         outside the trajectory's covered range once the fine offset (see
         module docstring) is applied, OR if the two real samples bracketing it
         are more than max_interp_gap_ns apart (see class docstring)."""
-        t_lookup = int(query_ts_ns) + int(round(self.fine_offset_ns))
+        t_lookup = int(query_ts_ns) + int(round(self.vision_offset_ns + self.fine_offset_ns))
         if t_lookup < self.t_ns[0] or t_lookup > self.t_ns[-1]:
             return None
         idx0 = min(int(np.searchsorted(self.t_ns, t_lookup, side="right")) - 1, len(self.t_ns) - 2)

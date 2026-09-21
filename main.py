@@ -19,7 +19,7 @@ from src.controller import ControllerModel, TrackingSystem, create_leds_from_con
 from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP, \
     LiveGravityEstimator
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
-                            relative_pose, DRIFT_CHECK_VARIANT
+                            load_vision_offset_ns, controller_imu_files, relative_pose, DRIFT_CHECK_VARIANT
 from src.headset_pose_source import MocapHeadsetPoseSource
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
@@ -172,8 +172,13 @@ def main():
                                    # recording's mocap room leveling needs re-checking.
     if imu_cfg.get("enabled", False):
         _mav0_root = Path(config["data"]["root"])
-        _IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
-                      "right_controller": ("imu2/data.csv", -7_000_000)}
+        # lag_ns = -mocap_vision_offset_ns (config.yml), via the shared src.mocap_data.controller_imu_files:
+        # the SAME physical link (controller IMU stamp = camera stamp + ~7.6ms) the mocap lookup applies via
+        # DeviceMocap.vision_offset_ns -- one source of truth. Re-tuned 2026-09-21 from the legacy -5ms (left)/
+        # -7ms (right) (one older clip) to the value measured over all 8 recordings-aug26: vision-vs-gyro
+        # optimum -7.66/-7.67ms, gyro-vs-mocap optimum -7.59ms; left high-rate (>1000deg/s) rotation
+        # prediction error 2.21 -> 1.77deg median, right/position unchanged.
+        _IMU_FILES = controller_imu_files(config)
         for ctrl_key, (imu_rel_path, lag_ns) in _IMU_FILES.items():
             if ctrl_key not in enabled_ctrls:
                 continue
@@ -245,11 +250,13 @@ def main():
                 _offset_source = f"{DRIFT_CHECK_VARIANT}/drift_check.json"
             T_imu_marker = load_T_imu_marker(calib_path)
             _max_gap_ns  = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
+            vision_offset_ns = load_vision_offset_ns(_dev_cfg)
             device_mocap[device_key] = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
-                                                    max_interp_gap_ns=_max_gap_ns)
+                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns)
             logger.bind(cat="startup").info(
                 f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
-                f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source})")
+                f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source}; "
+                f"vision offset {vision_offset_ns / 1e6:.2f} ms)")
 
     # For src/lamp_region_memory.py (blob_detection.lamp_blob_filter.static_lamp_mask)
     # -- None (complete no-op there) whenever headset mocap isn't loaded.
