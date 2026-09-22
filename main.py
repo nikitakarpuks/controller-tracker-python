@@ -19,7 +19,8 @@ from src.controller import ControllerModel, TrackingSystem, create_leds_from_con
 from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP, \
     LiveGravityEstimator
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
-                            load_vision_offset_ns, controller_imu_files, relative_pose, DRIFT_CHECK_VARIANT
+                            load_vision_offset_ns, load_vision_drift_params, controller_imu_files, \
+                            relative_pose, DRIFT_CHECK_VARIANT
 from src.headset_pose_source import MocapHeadsetPoseSource
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
@@ -251,12 +252,16 @@ def main():
             T_imu_marker = load_T_imu_marker(calib_path)
             _max_gap_ns  = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
             vision_offset_ns = load_vision_offset_ns(_dev_cfg)
+            drift_offset_ns, drift_rate_ns_per_ns = load_vision_drift_params(_dev_cfg)
             device_mocap[device_key] = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
-                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns)
+                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns,
+                                                    drift_offset_ns=drift_offset_ns,
+                                                    drift_rate_ns_per_ns=drift_rate_ns_per_ns)
             logger.bind(cat="startup").info(
                 f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
                 f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source}; "
-                f"vision offset {vision_offset_ns / 1e6:.2f} ms)")
+                f"vision offset {vision_offset_ns / 1e6:.2f} ms; "
+                f"drift {drift_offset_ns / 1e6:+.2f} ms + {drift_rate_ns_per_ns * 60e9 / 1e6:+.2f} ms/min)")
 
     # For src/lamp_region_memory.py (blob_detection.lamp_blob_filter.static_lamp_mask)
     # -- None (complete no-op there) whenever headset mocap isn't loaded.

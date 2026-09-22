@@ -1,0 +1,9 @@
+controller,recording,n,fitted_a_ms,fitted_slope_ms_per_min,zero_trans_mean_mm,zero_rot_mean_deg,fitted_trans_mean_mm,fitted_rot_mean_deg
+left_controller,static_dark,535,-3.5,2.5,3.812,1.249,3.791,1.158
+left_controller,static_medium,487,-3.5,3.0,9.78,2.611,9.152,2.387
+left_controller,static_hard,564,-2.5,3.0,7.537,2.014,6.725,1.692
+left_controller,POOLED,1586,-2.0,2.5,,,,
+right_controller,static_dark,2072,-4.0,3.0,5.108,0.868,4.91,0.786
+right_controller,static_medium,1940,-3.5,3.0,9.726,2.053,9.293,1.783
+right_controller,static_hard,1288,-2.5,3.0,7.648,2.069,7.099,1.573
+right_controller,POOLED,5300,-2.5,2.5,,,,

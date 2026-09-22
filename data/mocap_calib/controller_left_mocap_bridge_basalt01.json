@@ -1,24 +1,26 @@
 {
   "value0": {
-    "comment": "Empirically-fit LED-reference-frame -> mocap accelerometer-IMU-frame bridge (T_ledRef_mocapAccelImu), fit against real vision + mocap. Refit 2026-09-21 AFTER applying the vision->IMU-clock offset (mocap_vision_offset_ns=7.65ms) to the mocap lookup, on STRONG poses only (n_inliers/error_px thresholds from fusion_heuristic), pooled over all 8 recordings-aug26 (static_dark from the fresh full run), 1/err^2-weighted chordal mean with iterative 3-MAD outlier trimming. Not derived from factory Rt. Trimmed pooled residual: rot 1.297+/-0.695 deg, trans 4.527+/-2.231 mm (median 1.24 deg / 4.34 mm over all 4020 strong frames).",
+    "comment": "Empirically-fit LED-reference-frame -> mocap accelerometer-IMU-frame bridge (T_ledRef_mocapAccelImu), fit against real vision + mocap. Refit 2026-09-22 after adding the vision-clock DRIFT correction (mocap_vision_drift_offset_ns=-2.00ms, mocap_vision_drift_rate_ms_per_min=+2.50, on top of the existing mocap_vision_offset_ns=7.65ms) to the mocap lookup, on STRONG poses only (n_inliers/error_px thresholds from fusion_heuristic), pooled over all 8 recordings-aug26 (static_dark/static_medium/static_hard from fresh full runs), 1/err^2-weighted chordal mean with iterative 3-MAD outlier trimming. Numerically almost identical to the pre-drift-correction bridge (backed up under data/mocap_calib/backup_pre_drift_correction/) -- the drift term's benefit is in asymmetric/partial time coverage (a held-out time-block test, or any frame_range subset/live run), not in this full, symmetric-coverage aggregate fit, where a plain constant already centers itself. Not derived from factory Rt. Trimmed pooled residual: rot 1.153+/-0.602 deg, trans 4.260+/-2.076 mm (median 1.10 deg / 4.19 mm over all 4052 strong frames).",
     "T_ledRef_mocapAccelImu": {
-      "qx": 0.999953347286505,
-      "qy": 0.0010104103906949874,
-      "qz": 0.0021355916920308138,
-      "qw": -0.00936597936585965,
-      "px": 0.005547322352853687,
-      "py": 0.007260900269578371,
-      "pz": -0.08372281903433892
+      "qx": 0.999952575053627,
+      "qy": 0.001181622345956674,
+      "qz": 0.0019339960155095872,
+      "qw": -0.009471592878913885,
+      "px": 0.005605402590585787,
+      "py": 0.007382514440552018,
+      "pz": -0.08387858177747223
     },
-    "fitted_from_recording": "pooled_all_8_recordings_aug26",
-    "n_frames": 4020,
-    "n_frames_after_trim": 3779,
+    "fitted_from_recording": "pooled_all_8_recordings_aug26_drift_corrected",
+    "n_frames": 4052,
+    "n_frames_after_trim": 3844,
     "vision_offset_ns_applied": 7650000.0,
-    "residual_rotation_deg_mean": 1.2972434073067267,
-    "residual_rotation_deg_std": 0.6947957352296866,
-    "residual_translation_mm_mean": 4.527198077438009,
-    "residual_translation_mm_std": 2.2310281027915884,
-    "residual_rotation_deg_median_all": 1.2412944820065395,
-    "residual_translation_mm_median_all": 4.3379301920063735
+    "vision_drift_offset_ns_applied": -2000000.0,
+    "vision_drift_rate_ms_per_min_applied": 2.5,
+    "residual_rotation_deg_mean": 1.1526276038547874,
+    "residual_rotation_deg_std": 0.6019097133841488,
+    "residual_translation_mm_mean": 4.260309697666989,
+    "residual_translation_mm_std": 2.0763757419089517,
+    "residual_rotation_deg_median_all": 1.0960308472659643,
+    "residual_translation_mm_median_all": 4.193630129447066
   }
 }

@@ -955,7 +955,19 @@ controllers:
                           # the IMU-stream lag_ns (= -this, via src.mocap_data.controller_imu_files, used by main.py and
                           # the offline scripts) -- one physical link, one value. null/0 = legacy: no mocap offset,
                           # lag_ns falls back to the old -5ms (left)/-7ms (right).
-    mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
+    mocap_vision_drift_offset_ns: -2500000 # ADDITIONAL constant on top of mocap_vision_offset_ns above, plus
+                          # mocap_vision_drift_rate_ms_per_min below -- see src/mocap_data.py's "Vision-clock
+                          # DRIFT" docstring. The vision<->mocap lag isn't perfectly constant: a held-out
+                          # linear-drift fit (train/test time-block split, bridge refit per fold) found a
+                          # consistent +2.5 to +3.5 ms/min residual drift in nearly every recording-aug26
+                          # recording; this pair is the (offset, rate) jointly fit and pooled (n-weighted) over
+                          # the 3 recordings with fresh vision (static_dark/static_medium/static_hard) -- see
+                          # analysis/drift_test/fit_deploy_drift.py. Deliberately NOT folded into
+                          # mocap_vision_offset_ns (that key also drives the IMU stream's lag_ns, which this
+                          # must not silently perturb) -- affects only mocap ground-truth comparison and (when
+                          # mocap.enabled) the headset ego-motion correction, never live IMU integration.
+                          # null/0 = old behavior (no drift term).
+    mocap_vision_drift_rate_ms_per_min: 2.5 # see mocap_vision_drift_offset_ns above
     mocap_bridge_path: "./data/mocap_calib/controller_right_mocap_bridge_basalt01.json" # compare_vision_mocap.py's
                           # empirically-fit LED-reference-frame -> mocap accelerometer-IMU-frame bridge
                           # (see src/mocap_data.load_mocap_bridge). Deliberately NOT derived from this
@@ -1004,8 +1016,10 @@ controllers:
                    # inter-controller relative-pose check -- see that script's module docstring)
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     mocap_calib_path: "/home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_left_calib.json" # see cameras.mocap_calib_path above
-    mocap_vision_offset_ns: 7650000 # see right_controller.mocap_vision_offset_ns above
     mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
+    mocap_vision_offset_ns: 7650000 # see right_controller.mocap_vision_offset_ns above
+    mocap_vision_drift_offset_ns: -2000000 # see right_controller.mocap_vision_drift_offset_ns above
+    mocap_vision_drift_rate_ms_per_min: 2.5 # see right_controller.mocap_vision_drift_offset_ns above
     mocap_bridge_path: "./data/mocap_calib/controller_left_mocap_bridge_basalt01.json" # see right_controller.mocap_bridge_path above
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
