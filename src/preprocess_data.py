@@ -32,9 +32,21 @@ def _apply_frame_range(paths: list, cfg) -> list:
     return paths[frame_range.get("lower"):frame_range.get("upper")]
 
 
+def camera_folder_index(cfg, cam_idx: int) -> int:
+    """Maps an internal camera index (0-based; what selected_cameras, calibration
+    lookups etc. use everywhere else in the pipeline) to the on-disk folder index.
+
+    Needed for recordings that pack SLAM cameras in cam0..cam{N-1} and
+    controller-tracking cameras in cam{N}..cam{2N-1} on disk: this pipeline only
+    ever tracks controllers, so it keeps 0-based internal indexing throughout and
+    shifts just the folder lookup via data.controller_cam_start_index (0 = no
+    offset, i.e. controller folders already start at cam0)."""
+    return cam_idx + cfg.get("controller_cam_start_index", 0)
+
+
 def _camera_dir(cfg, cam_idx) -> Path:
     root_dir = Path(cfg["root"])
-    folder = cfg.get("camera_folder_pattern", "cam{idx}").format(idx=cam_idx)
+    folder = cfg.get("camera_folder_pattern", "cam{idx}").format(idx=camera_folder_index(cfg, cam_idx))
     images_subdir = cfg.get("images_subdir", "")
     return root_dir / folder / images_subdir if images_subdir else root_dir / folder
 
@@ -49,10 +61,16 @@ def _per_camera_image_lists(cfg) -> dict:
              for cam_idx in cfg["selected_cameras"]}
     counts = {cam_idx: len(paths) for cam_idx, paths in lists.items()}
     if len(set(counts.values())) > 1:
-        raise ValueError(
-            f"data.layout='per_camera_folders' requires the same image count in every "
-            f"camera folder, got {counts}"
-        )
+        # A folder short by a frame or two (dropped/incomplete last write, e.g. a
+        # capture stopped mid-frame) shouldn't hard-fail the whole run -- frames
+        # are paired by sorted POSITION across folders (this function's own
+        # docstring), so truncating every folder to the shortest one keeps that
+        # pairing correct for all frames that DO have a full set; only the
+        # trailing frames beyond the shortest folder's count are dropped.
+        min_count = min(counts.values())
+        print(f"WARNING: data.layout='per_camera_folders' camera folders have mismatched "
+              f"image counts {counts} -- truncating all to the shortest ({min_count})")
+        lists = {cam_idx: paths[:min_count] for cam_idx, paths in lists.items()}
     return lists
 
 

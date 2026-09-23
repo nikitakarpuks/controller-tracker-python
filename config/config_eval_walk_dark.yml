@@ -1,0 +1,322 @@
+# AUTO-GENERATED eval config for recording tag 'walk_dark' -- see make_eval_config.py.
+# Regenerate whenever config.yml's tuned pipeline settings change.
+# data.root -> /home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173350_walk_dark/mav0
+data:
+  root: /home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173350_walk_dark/mav0
+  layout: per_camera_folders
+  camera_folder_pattern: cam{idx}
+  controller_cam_start_index: 4
+  images_subdir: data
+  img_width: 2560
+  img_height: 481
+  has_technical_row: true
+  total_cameras_number: 4
+  selected_cameras:
+  - 0
+  - 1
+  - 2
+  - 3
+  frame_range:
+    lower: null
+    upper: null
+fusion_heuristic:
+  cost_weight_imu: 1.0
+  cost_weight_smooth: 0.5
+  trust_window_len: 5
+  cost_weight_vision: 2.0
+  vision_weight_weak_inliers: 5
+  vision_weight_strong_inliers: 8
+  vision_weight_weak_error_px: 0.5
+  vision_weight_strong_error_px: 0.15
+  implausible_jump_pos_m: 0.3
+  implausible_jump_rot_deg: 60.0
+  gap_dt_normal_s: 0.04
+  gap_dt_full_s: 0.15
+  gap_vision_weight_floor: 0.3
+  gap_smooth_weight_boost: 2.5
+  per_controller:
+    right_controller:
+      vision_weight_weak_error_px: 1.1
+      vision_weight_strong_error_px: 0.2
+imu:
+  enabled: true
+fusion:
+  enabled: true
+  filter_type: heuristic
+  max_coast_s: 0.3
+  max_consecutive_rejects: 5
+  imu_vision_collision_dist_m: 0.05
+  process_noise_pos_m_per_s: 0.6
+  process_noise_rot_deg_per_s: 250.0
+  gate_chi2_threshold: 7.8
+  absolute_reject_pos_m: 0.08
+  bootstrap_cross_ctrl_gate_chi2_threshold: 7.8
+  trust_window_len: 5
+  trust_gap_tau_s: 0.45
+  sibling_trust_min: 0.4
+  initial_pos_sigma_m: 0.02
+  initial_rot_sigma_deg: 2.0
+  initial_vel_sigma_m_per_s: 0.1
+  meas_base_pos_sigma_m: 0.015
+  meas_error_px_to_m: 0.003
+  meas_base_rot_sigma_deg: 2.0
+  long_gap_reacquire_s: 0.08
+  long_gap_min_vision_trust: 0.9
+  g_world_min_samples: 20
+  g_world_low_omega_thresh_rad_s: 2.0
+mocap:
+  enabled: true
+  max_interp_gap_ms: 30.0
+cameras:
+  intrinsics_path: ./data/cameras/calibration_basalt.json
+  mocap_calib_path: /home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/mocap_calibration_headset.json
+  mocap_fine_offset_override_ns: null
+  extrinsics_convention: T_imu_cam
+controllers:
+  right_controller:
+    enabled: true
+    config_path: ./data/controllers/right_controller_A85K6081930636R.json
+    mocap_calib_path: /home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_right_calib.json
+    mocap_fine_offset_override_ns: null
+    mocap_bridge_path: ./data/mocap_calib/controller_right_mocap_bridge_basalt01.json
+    mesh_alignment:
+      translation:
+        x: 0.19610239
+        y: 0.01522315
+        z: -0.09380996
+      rotation:
+        rx: -0.0052316
+        ry: 0.22553752
+        rz: 3.15
+    handle_primitives:
+      boxes:
+      - name: box_vertical
+        center:
+        - -0.009
+        - -0.012
+        - -0.015
+        half_dims:
+        - 0.022
+        - 0.0028
+        - 0.013
+        color:
+        - 220
+        - 130
+        - 60
+      - name: box_horizontal
+        center:
+        - -0.009
+        - -0.029
+        - -0.0048
+        half_dims:
+        - 0.021
+        - 0.0032
+        - 0.015
+        axes:
+        - - 1
+          - 0
+          - 0
+        - - 0
+          - 0
+          - 1
+        - - 0
+          - -1
+          - 0
+        color:
+        - 130
+        - 60
+        - 220
+      cylinders:
+      - name: control_panel
+        center:
+        - -0.008
+        - 0.0
+        - -0.05
+        axis:
+        - 0.0
+        - 1.0
+        - 0.0
+        radius: 0.031
+        radius_v: 0.033
+        half_length: 0.017
+        angle: 0.31416
+        color:
+        - 100
+        - 180
+        - 255
+      - name: handle
+        center:
+        - 0.001
+        - 0.022
+        - -0.098
+        axis:
+        - 0.0
+        - 1.0
+        - -1.5
+        radius: 0.021
+        half_length: 0.037
+        color:
+        - 255
+        - 55
+        - 55
+  left_controller:
+    enabled: true
+    config_path: ./data/controllers/left_controller_A85K5091630091L.json
+    mocap_calib_path: /home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_left_calib.json
+    mocap_fine_offset_override_ns: null
+    mocap_bridge_path: ./data/mocap_calib/controller_left_mocap_bridge_basalt01.json
+geometry:
+  z_frustum_top_padding: 0.0045
+  z_frustum_bot_padding: 0.0055
+  wall_thickness: 0.007
+blob_detection:
+  min_threshold: 7
+  min_area: 2
+  max_area: 500
+  min_split_dist: 4.0
+  split_valley_ratio: 0.6
+  min_circularity: 0.5
+  min_circularity_angle_factor: 0.2
+  min_circularity_floor: 0.1
+  required_threshold_factor: 2.0
+  velocity_threshold_k: 0.013
+  velocity_threshold_min_factor: 0.75
+  warm_strategy: hybrid
+  pose_guided_thresholds:
+    max_area:
+      use_facing_cos: false
+      a: 1.2
+      b: 40
+      c: 0.5
+  local_search_depth_k: 0.0
+  blob_cross_mask_margin_px: 3
+  cross_controller_blackout: true
+  outlier_factor: 2.5
+  interior_edge_margin_px: 10.0
+  pass2_threshold_factor: 0.7
+  pass2_required_factor: 1.2
+  pass2_brightness_percentile: 25
+  pass2_min_area: 2
+  pass2_threshold_ema_alpha: 0.25
+  pass2_count_gate_max_factor: 1.7
+matching:
+  parallel_search_enabled: true
+  parallel_search_workers: 6
+  led_facing_angle_deg: 90.0
+  max_warm_search_cameras: 2
+  warm_cam_cap_min_facing_deg: 80.0
+  depth_tiers:
+  - - 2
+    - 3
+  p4_threshold_px: 2.5
+  hungarian_threshold_px: 5.0
+  reprojection_threshold: 2.5
+  min_inliers: 4
+  cold_brute_force_confirm_frames: 3
+  strong_match_error_px: 0.5
+  score_error_floor_px: 0.5
+  min_vis_coverage: 0.6
+  brute_aux_reprojection_threshold_px: 2.0
+  brute_redundancy_ref: 6
+  rng_seed: 42
+  use_proximity_match: true
+  proximity_min_inliers: 4
+  proximity_redundancy_ref: 6
+  proximity_reprojection_threshold: 2.5
+  proximity_expansion_px: 5.0
+  proximity_max_hypotheses: 32
+  proximity_none_penalty_px: 0.4
+  proximity_none_penalty_factor: 1.5
+  proximity_strong_match_px: 0.5
+  proximity_branch_k: 2
+  proximity_none_branch_width: 4
+  proximity_level0_max_hyp: 8
+  proximity_topk_max_pop: 8000
+  proximity_max_estimated_combos: 5000000
+  proximity_score_metric: mean
+  proximity_top_k_ransac: 3
+  proximity_stage2_max_err_factor: 4.0
+  visibility_occlusion_margin_m: 0.01
+  proximity_vis_score_threshold: 0.95
+  proximity_expansion_velocity_k: 0.3
+  proximity_expansion_uncertainty_k: 1.0
+  proximity_expansion_depth_k: 2.0
+  pose_history_window: 3
+  pose_prediction_weight_decay: 0.7
+  pose_prediction_vel_ema_beta: 0.7
+  pose_gap_velocity_warmstart_frames: 2
+  tracking_lost_grace_frames: 1
+  imu_only_propagation_max_s: 0.066
+  accept_error_px: 1.5
+  pose_jump_pos_thresh_m:
+  - 0.25
+  - 0.25
+  - 0.3
+  pose_jump_rot_thresh_deg:
+  - 30.0
+  - 30.0
+  - 30.0
+  joint_huber_scale: 1.5
+  joint_aux_prefilter_px: 2.0
+  joint_lm_max_nfev: 50
+  joint_lm_ftol: 0.001
+  joint_lm_xtol: 0.001
+  joint_lm_gtol: 0.001
+  cross_controller_occlusion: true
+  cross_occlusion_bounding_radius_m: 0.18
+  cross_occlusion_gate_margin_px: 20.0
+  min_controller_center_distance_m: 0.05
+self_calibration:
+  enabled: false
+  primary_camera: 1
+  aux_cameras:
+  - 3
+  optimize_params:
+  - fx
+  - fy
+  - cx
+  - cy
+  - k1
+  - k2
+  - k3
+  - k4
+  min_primary_error_px: 0.5
+  min_primary_inliers: 4
+  plots_dir: ./data/cameras/
+debug:
+  calibration_csv: null
+  pose_csv: ./data/eval/walk_dark/pose_log_full.csv
+  vision_pose_csv: ./data/eval/walk_dark/vision_pose_log_full.csv
+  led_detections_csv: null
+  algorithm_log_dir: null
+  mocap_log_dir: ./data/eval/walk_dark/mocap_gt
+  assume_continuous_frames: true
+  split_to_folders: false
+  log_startup: true
+  log_frame_summary: false
+  log_timings: false
+  log_blob_detection: false
+  log_blob_diag: false
+  log_matching_decisions: false
+  log_batch_orchestration: false
+  log_pose_fusion: false
+  log_occlusion: false
+  log_proximity_match: false
+  log_hypothesis_testing: false
+  log_ransac: false
+  log_self_calibration: false
+  log_all_triples: false
+  log_all_proximity_hyps: false
+  log_best: false
+  debug_led_ids: null
+  debug_blob_ids: null
+visualization:
+  enabled: false
+  visualize_save: false
+  visualize_rerun: false
+  3d_model_path: ./data/controllers/reverb_g2_controller_3d_model.stp
+  save_recording: ./visualization/recording.rrd
+  fine_tune_alignment: false
+  pose_fusion_debug:
+    enabled: true
+    path_stride: 4

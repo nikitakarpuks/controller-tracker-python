@@ -1,4 +1,5 @@
 import csv
+import sys
 from pathlib import Path
 from shutil import copy
 from time import time
@@ -12,10 +13,14 @@ from tqdm import tqdm
 
 from src import debug_config
 from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods,
-                               _compute_led_search_radii)
+                               _compute_led_search_radii, predicted_leds_protect_rects)
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
-from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config
+from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP, \
+    LiveGravityEstimator
+from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
+                            load_vision_offset_ns, controller_imu_files, relative_pose, DRIFT_CHECK_VARIANT
+from src.headset_pose_source import MocapHeadsetPoseSource
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
 from src.transformations import Transform
@@ -25,13 +30,44 @@ from src.visualization import (ControllerAnimatorRerun, prepare_model_geometry,
 SLOW_MATCH_THRESHOLD_S = 1.5
 
 
+def _is_recent_memory_usable(last_good_pose, last_good_pose_ts_ns, last_good_pose_quality,
+                              frame_ts_ns, max_stale_s, min_inliers, max_error_px) -> bool:
+    """Pure boolean logic behind main()'s own _has_recent_memory closure --
+    see that closure's own (long) docstring for the full safety reasoning
+    behind each condition below. Factored out to a plain, dependency-free,
+    module-level function specifically so it has DIRECT unit tests
+    (tests/test_has_recent_memory_logic.py), not just incidental exercise
+    through the full pipeline -- this exact logic was found unsafe once
+    already (an under-specified first version passed a 3-agent critique's
+    scrutiny straight to a real, describable failure mode), so it earns its
+    own isolated test coverage rather than trusting a closure buried inside
+    main()'s own multi-hundred-line per-frame loop.
+
+    True only if last_good_pose is BOTH fresh (within max_stale_s of
+    frame_ts_ns, never negative-stale) AND strong (quality clears
+    min_inliers/max_error_px) -- either missing/failing condition returns
+    False, the conservative default."""
+    if last_good_pose is None:
+        return False
+    if last_good_pose_ts_ns is None:
+        return False
+    stale_s = (frame_ts_ns - last_good_pose_ts_ns) / 1e9
+    if not (0.0 <= stale_s <= max_stale_s):
+        return False
+    if last_good_pose_quality is None:
+        return False
+    lg_inliers, lg_error = last_good_pose_quality
+    return lg_inliers >= min_inliers and lg_error <= max_error_px
+
+
 def main():
     # Initialise rerun before any other native libraries (numpy BLAS/LAPACK,
     # cv2, scipy) are loaded to prevent a Windows DLL heap-state conflict that
     # causes rrb.EyeControls3D() to crash with 0xC0000005 ACCESS_VIOLATION.
     rr.init("controller_animator", spawn=False)
 
-    config = load_yaml_config('./config/config.yml')
+    config_path = sys.argv[1] if len(sys.argv) > 1 else './config/config.yml'
+    config = load_yaml_config(config_path)
 
     data_root = Path(config["data"]["root"])
 
@@ -113,22 +149,36 @@ def main():
                 geo["handle_primitives"] = mirror_primitives(right_prim)
         geo_cfg_per_ctrl[ctrl_key] = geo
 
-    # ── IMU (Stage 3): load + calibrate controller gyro/accel for pose prediction
-    # and the gravity-alignment diagnostic ───────────────────────────────────────
+    # ── IMU (Stage 3): load + calibrate controller gyro/accel for pose prediction,
+    # the gravity-alignment diagnostic, and (when fusion.enabled) the pose-fusion
+    # filter's dead-reckoning ────────────────────────────────────────────────────
     # Confirmed mapping (mentor + Stage 1 cross-correlation validation, this
     # recording only): imu1.csv = left controller, imu2.csv = right controller.
-    # flip_y @ T_rt.R.T is the axis transform Stage 1 empirically resolved (see
-    # src/imu_data.py's module docstring — T_rt's own direction is undocumented
-    # in the calibration file). Per-controller lag is Stage 1's measured
-    # controller<->camera clock offset on THIS recording (imu_vision_sync_check.py)
-    # — a single-clip estimate, re-measure if this ever runs against different data.
+    # _DIAG_FLIP is the confirmed sensor->body axis transform (see
+    # src/imu_data.py's module docstring for the full story). Per-controller lag
+    # is Stage 1's measured controller<->camera clock offset on THIS recording
+    # (imu_vision_sync_check.py) — a single-clip estimate, re-measure if this ever
+    # runs against different data.
     imu_cfg = config.get("imu", {})
     gyro_data:  dict = {}
     accel_data: dict = {}
+    lever_arm:  dict = {}   # {ctrl_key: (3,) accel<->gyro lever arm}, see PoseFusionFilter
+    g_world_estimator = None
+    g_world_estimator_abs = None  # second, absolute (mocap-world)-frame accumulator --
+                                   # REPLACED by the empirically-validated MOCAP_ROOM_G_WORLD
+                                   # constant (see src/imu_data.py's own comment there for the
+                                   # validation numbers); left wired as None/commented-out below
+                                   # rather than deleted, for future re-validation if a future
+                                   # recording's mocap room leveling needs re-checking.
     if imu_cfg.get("enabled", False):
         _mav0_root = Path(config["data"]["root"])
-        _IMU_FILES = {"left_controller":  ("imu1/data.csv", -5_000_000),
-                      "right_controller": ("imu2/data.csv", -7_000_000)}
+        # lag_ns = -mocap_vision_offset_ns (config.yml), via the shared src.mocap_data.controller_imu_files:
+        # the SAME physical link (controller IMU stamp = camera stamp + ~7.6ms) the mocap lookup applies via
+        # DeviceMocap.vision_offset_ns -- one source of truth. Re-tuned 2026-09-21 from the legacy -5ms (left)/
+        # -7ms (right) (one older clip) to the value measured over all 8 recordings-aug26: vision-vs-gyro
+        # optimum -7.66/-7.67ms, gyro-vs-mocap optimum -7.59ms; left high-rate (>1000deg/s) rotation
+        # prediction error 2.21 -> 1.77deg median, right/position unchanged.
+        _IMU_FILES = controller_imu_files(config)
         for ctrl_key, (imu_rel_path, lag_ns) in _IMU_FILES.items():
             if ctrl_key not in enabled_ctrls:
                 continue
@@ -144,7 +194,74 @@ def main():
             gyro_data[ctrl_key]  = (t_imu, gyro_body)
             accel_data[ctrl_key] = (t_imu, accel_body)
 
+            _imu_calib = create_imu_calib_from_config(ctrl_json_cfg[ctrl_key])
+            lever_arm[ctrl_key] = _imu_calib.accel.T_rt.compose(_imu_calib.gyro.T_rt.inverse()).t
+
             logger.bind(cat="startup").info(f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name}")
+
+        fusion_cfg = config.get("fusion", {})
+        g_world_estimator = LiveGravityEstimator(
+            omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
+            min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
+        )
+        # g_world_estimator_abs = LiveGravityEstimator(
+        #     omega_thresh=float(fusion_cfg.get("g_world_low_omega_thresh_rad_s", 0.5)),
+        #     min_samples=int(fusion_cfg.get("g_world_min_samples", 20)),
+        # )
+        # -- commented out, not deleted: direct total replacement by MOCAP_ROOM_G_WORLD
+        # (src/imu_data.py), for future research if this ever needs re-estimating live
+        # again (e.g. a recording where the mocap room wasn't leveled against gravity).
+
+    # ── Mocap ground truth (see src/mocap_data.py + the imu/mocap organization
+    # discussion): per-device filtered/aligned trajectories live under
+    # mocap_filtered/, a SIBLING of mav0/ (not inside it) at the recording root.
+    # headset is loaded unconditionally when enabled -- every controller's
+    # ground truth is expressed relative to it (see relative_pose), independent
+    # of which controllers happen to be enabled this run.
+    mocap_cfg = config.get("mocap", {})
+    device_mocap: dict = {}   # {"headset": DeviceMocap, ctrl_key: DeviceMocap, ...}
+    if mocap_cfg.get("enabled", False):
+        _recording_root    = Path(config["data"]["root"]).parent
+        _MOCAP_DISK_NAMES  = {"headset": "headset", "left_controller": "ctrlleft", "right_controller": "ctrlright"}
+        _mocap_device_cfg  = {"headset": config["cameras"],
+                               "left_controller":  config["controllers"]["left_controller"],
+                               "right_controller": config["controllers"]["right_controller"]}
+        for device_key in ["headset", *enabled_ctrls]:
+            _dev_cfg    = _mocap_device_cfg[device_key]
+            calib_path  = _dev_cfg.get("mocap_calib_path")
+            offset_override_ns = _dev_cfg.get("mocap_fine_offset_override_ns")
+            device_dir  = _recording_root / "mocap_filtered" / _MOCAP_DISK_NAMES[device_key]
+            data_path   = device_dir / "data.csv"
+            drift_path  = device_dir / "drift_check" / DRIFT_CHECK_VARIANT / "drift_check.json"
+            # drift_path is only required when no manual override is configured --
+            # an override lets a device be used before its drift_check has even
+            # been run (see config.yml's mocap_fine_offset_override_ns comment).
+            if not calib_path or not data_path.exists() or (offset_override_ns is None and not drift_path.exists()):
+                logger.bind(cat="startup").warning(
+                    f"[{device_key}] mocap data/calibration incomplete ({device_dir}) — "
+                    f"mocap ground truth disabled for this device")
+                continue
+            t_mocap, position, quat_xyzw = load_mocap_csv(data_path)
+            if offset_override_ns is not None:
+                fine_offset_ns = float(offset_override_ns)
+                _offset_source = "config override"
+            else:
+                fine_offset_ns = load_mocap_fine_offset_ns(drift_path)
+                _offset_source = f"{DRIFT_CHECK_VARIANT}/drift_check.json"
+            T_imu_marker = load_T_imu_marker(calib_path)
+            _max_gap_ns  = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
+            vision_offset_ns = load_vision_offset_ns(_dev_cfg)
+            device_mocap[device_key] = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
+                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns)
+            logger.bind(cat="startup").info(
+                f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
+                f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source}; "
+                f"vision offset {vision_offset_ns / 1e6:.2f} ms)")
+
+    # For src/lamp_region_memory.py (blob_detection.lamp_blob_filter.static_lamp_mask)
+    # -- None (complete no-op there) whenever headset mocap isn't loaded.
+    _headset_pose_source = (MocapHeadsetPoseSource(device_mocap["headset"])
+                             if device_mocap.get("headset") is not None else None)
 
     tracking_system = TrackingSystem(
         list(enabled_ctrls.values()), list(cameras.values()),
@@ -155,6 +272,30 @@ def main():
         blob_detection_cfg=config["blob_detection"],
         gyro_data=gyro_data,
         accel_data=accel_data,
+        lever_arm=lever_arm,
+        g_world_estimator=g_world_estimator,
+        headset_mocap=device_mocap.get("headset"),
+        g_world_estimator_abs=g_world_estimator_abs,
+        # HeuristicPoseFusionFilter reads its OWN knobs from a nested
+        # "fusion_heuristic" key inside this dict (self._hc = cfg.get(
+        # "fusion_heuristic", {})) -- but config.yml's fusion_heuristic: block
+        # is a SIBLING top-level key, not nested under fusion:. config.get(
+        # "fusion", {}) alone therefore never contained it, so self._hc was
+        # always {} and every _hc.get(...)/_hc_get(...) call in that filter
+        # silently fell back to its hardcoded Python default -- NONE of
+        # config.yml's fusion_heuristic: tuning (cost_weight_vision, the
+        # inlier/error ramps, per_controller overrides, imu_decay_frames,
+        # gap_dt_*, vision_only_debug, ...) was ever actually read live. Went
+        # unnoticed because most of those defaults were set to match whatever
+        # was in config.yml at the time each knob was added, so behavior
+        # looked config-driven by coincidence -- found only once a config
+        # value was changed to something that actually differs from the
+        # code's own default (vision_only_debug: true had no effect at all).
+        # PoseFusionFilter (kalman) doesn't have this problem -- all of ITS
+        # knobs live directly under fusion: with no second-tier block.
+        fusion_cfg={**config.get("fusion", {}), "fusion_heuristic": config.get("fusion_heuristic", {}),
+                    "matching": config.get("matching", {})},
+        debug_pose_fusion_cfg=config["visualization"].get("pose_fusion_debug", {}),
     )
     pool          = tracking_system.get_pool()
     blob_parallel = tracking_system.blob_parallel_enabled
@@ -183,22 +324,64 @@ def main():
             config["visualization"]["3d_model_path"],
             controllers_vis,
             matching_cfg=config.get("matching", {}),
+            pose_fusion_debug_enabled=bool(
+                config["visualization"].get("pose_fusion_debug", {}).get("enabled", False)),
+            pose_fusion_debug_show_tabs=bool(
+                config["visualization"].get("pose_fusion_debug", {}).get("show_tabs", True)),
         )
         animator.begin(cameras, save_path=config["visualization"].get("save_recording"))
 
     # ── Tracking loop ──────────────────────────────────────────────────────
     any_valid_pose    = {n: False for n in enabled_ctrls}
     last_good_T_world = {n: None for n in enabled_ctrls}
-    # Consecutive lost frames per controller, for capping how long the ghost
-    # (frozen last-known pose) stays visible in the visualizer — see the
-    # tracking_lost_grace_frames use below.
+    # Consecutive lost frames per controller (any_valid_pose sanity check below).
     lost_streak       = {n: 0 for n in enabled_ctrls}
     # Cold-path BlobDetector EMA-threshold memory, round-tripped explicitly through
     # run_blob_detect() rather than left as worker-resident state (a pool task isn't
-    # pinned to the same worker every call) — keyed per (cam_idx, ctrl_name) so two
-    # controllers cold-starting on the same camera in the same frame no longer
-    # clobber each other's memory (see run_blob_detect's docstring).
+    # pinned to the same worker every call) — keyed per cam_idx ALONE (one real
+    # camera, one real adaptive-threshold history), NOT per (cam_idx, ctrl_name).
+    #
+    # Was keyed per (cam_idx, ctrl_name) until 2026-09-11: that avoided an earlier
+    # same-frame clobbering bug (two controllers cold-starting on the same camera
+    # in the same frame stepping on a single shared BlobDetector instance's
+    # memory) but traded it for a worse one — confirmed on a real recording
+    # (frame_range 1700-1735, cam3, both controllers cold): [blob-dedup] never
+    # fired for cam3 across dozens of consecutive frames (it did for cam2, same
+    # frames) because left_controller's and right_controller's per-controller
+    # memory for cam3 had already diverged from earlier in the run and never
+    # reconverged, so they silently ran as two independent, ever-diverging
+    # detection pipelines against the SAME physical camera indefinitely — not
+    # randomness, a real architectural gap. Fixed by going back to one shared
+    # per-camera history (the dedup grouping below, which already merges same-
+    # frame same-camera "cold" requests into one task+one memory read/write
+    # instead of one per controller, is what actually prevents the ORIGINAL
+    # clobbering bug now -- see the "cold" grouping key just below, which no
+    # longer needs a memory-value comparison to decide who can share a call).
     _cold_memory: dict = {}
+    # Same round-trip idea, for src/lamp_region_memory.py's LampRegionMemory
+    # (the parallel-pool path's workers aren't pinned to a camera across
+    # calls, same as _cold_memory above) -- keyed by cam_idx alone.
+    _cold_region_memory: dict = {}
+
+    # Cross-camera lamp-region sharing (static_lamp_mask.share_across_cameras): each
+    # camera keeps its own LampRegionMemory, but regions live in the ROOM frame, so a
+    # lamp another camera has already CONFIRMED can mask the same lamp here even when
+    # this camera never recognised it (see BlobDetector.detect's foreign_lamp_quads).
+    _share_lamp_regions = bool(((config["blob_detection"].get("lamp_blob_filter") or {})
+                                .get("static_lamp_mask") or {}).get("share_across_cameras", False))
+
+    def _foreign_lamp_quads(cam_idx: int):
+        if not _share_lamp_regions:
+            return None
+        quads = []
+        for other_idx in blob_detectors:
+            if other_idx == cam_idx:
+                continue
+            mem = (_cold_region_memory.get(other_idx) if (pool is not None and blob_parallel)
+                   else getattr(blob_detectors[other_idx], "_lamp_region_memory", None))
+            if mem is not None:
+                quads.extend(mem.confirmed_quads())
+        return quads or None
 
     _csv_path = debug_cfg.get("calibration_csv")
     _csv_file = _csv_writer = None
@@ -217,8 +400,33 @@ def main():
         Path(_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
         _pose_csv_file = open(_pose_csv_path, "w", newline="")
         _pose_csv_writer = csv.writer(_pose_csv_file)
-        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz"])
+        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz", "reproj_err_px", "inlier_count"])
         logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
+
+    _vision_pose_csv_path = debug_cfg.get("vision_pose_csv")
+    _vision_pose_csv_file = _vision_pose_csv_writer = None
+    if _vision_pose_csv_path:
+        Path(_vision_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        _vision_pose_csv_file = open(_vision_pose_csv_path, "w", newline="")
+        _vision_pose_csv_writer = csv.writer(_vision_pose_csv_file)
+        _vision_pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz",
+                                           "confidence", "error_px", "n_inliers"])
+        logger.bind(cat="startup").info(f"Vision pose CSV → {_vision_pose_csv_path}")
+
+    # ── Raw per-LED 2D observations (pre-PnP-solve point data) -- unlike pose_csv
+    # above (already-solved 6-DOF pose) or calibration_csv (primary-camera-only),
+    # this is every LED actually matched THIS frame across ALL cameras that
+    # contributed to the accepted solve -- what a bundle-adjustment-style external
+    # tool needs and can't recover by working backward from a solved pose.
+    _led_csv_path = debug_cfg.get("led_detections_csv")
+    _led_csv_file = _led_csv_writer = None
+    if _led_csv_path:
+        Path(_led_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        _led_csv_file = open(_led_csv_path, "w", newline="")
+        _led_csv_writer = csv.writer(_led_csv_file)
+        _led_csv_writer.writerow(["timestamp_ns", "camera_id", "ctrl_name", "led_id", "pixel_x", "pixel_y",
+                                   "blob_radius_px", "brightness"])
+        logger.bind(cat="startup").info(f"LED-detections CSV → {_led_csv_path}")
 
     # ── basalt_controller_mocap_calib input: one T_Ih_Ic(t) log per controller ──
     # T_world_ctrl is already T_Ih_ref (headset-IMU <- LED reference frame): LED
@@ -226,22 +434,26 @@ def main():
     # Rt entries' near-zero translation, are all given relative to that same
     # reference frame, whose origin is defined to sit exactly at the (Id=Undefined)
     # gyro's physical location -- so T_world_ctrl.t is already the IMU's position,
-    # no correction needed. Rt's rotation, however, is NOT near-identity: it
-    # reorients the reference frame's axes onto the gyro chip's own native sensor
-    # axes (the frame real onboard accel/gyro samples are actually reported in).
-    # Composing that in gives the true T_Ih_Ic this file is meant to hold.
+    # no correction needed. What's needed for T_Ih_Ic's ROTATION is R_ref_ic: the
+    # rotation taking a vector expressed in the controller-IMU's own native sensor
+    # axes into reference-frame axes (T_Ih_Ic = T_world_ctrl.compose(Transform(
+    # R_ref_ic, 0))).
     #
-    # Rt.R is documented (src/imu_data.py module docstring) as converting a raw
-    # vector from reference axes into gyro axes: v_gyro = Rt.R @ v_ref. Under this
-    # project's T_A_B = "pose of B in A" convention, that makes T_ref_gyro.R =
-    # Rt.R.T, so T_Ih_Ic = T_world_ctrl.compose(Transform(Rt.R.T, 0)).
-    # UNVERIFIED: Rt's stored direction was never pinned down empirically (see
-    # imu_data.py docstring) -- this transpose is the derived hypothesis, not a
-    # confirmed fact. Flip algorithm_log_rt_transpose to false and re-check if
-    # basalt_mocap_time_sync against the raw (untouched) imu*.csv doesn't
-    # converge cleanly once real data is available.
+    # RESOLVED 2026-09-02 (previously computed from the controller config's
+    # InertialSensors Rt, with an UNVERIFIED transpose direction -- see git
+    # history for that version): R_ref_ic is exactly _DIAG_FLIP, the same
+    # sensor-frame->body-frame transform load_and_calibrate_controller_imu now
+    # applies to raw gyro/accel samples to land them in this same reference
+    # frame (see src/imu_data.py's module docstring) -- gyro_body IS gyro data
+    # expressed in reference-frame axes, by construction, so the same transform
+    # is what T_Ih_Ic's rotation needs too. Confirmed Rt's rotation is NOT the
+    # right quantity for this either direction: both Rt.R and Rt.R.T are
+    # ~137-139° away from _DIAG_FLIP (both controllers) -- the same ~140°
+    # mismatch found independently twice elsewhere in this investigation (see
+    # visualization/controller_calibration_for_basalt/README.md findings 5/7).
+    # Rt's rotation just isn't the sensor<->reference-frame axis relationship
+    # for this hardware; only its TRANSLATION (used for the lever arm) is.
     _algo_log_dir = debug_cfg.get("algorithm_log_dir")
-    _algo_log_rt_transpose = bool(debug_cfg.get("algorithm_log_rt_transpose", True))
     _algo_log_writers = {}   # {ctrl_name: csv.writer}
     _algo_log_files   = {}   # {ctrl_name: file handle}
     _algo_log_T_ref_ic = {}  # {ctrl_name: Transform}  ref-frame -> controller-IMU
@@ -249,10 +461,7 @@ def main():
         _algo_log_path = Path(_algo_log_dir)
         _algo_log_path.mkdir(parents=True, exist_ok=True)
         for ctrl_name in enabled_ctrls:
-            imu_calib = create_imu_calib_from_config(ctrl_json_cfg[ctrl_name])
-            R_rt = imu_calib.gyro.T_rt.R
-            R_ref_ic = R_rt.T if _algo_log_rt_transpose else R_rt
-            _algo_log_T_ref_ic[ctrl_name] = Transform(R_ref_ic, np.zeros(3))
+            _algo_log_T_ref_ic[ctrl_name] = Transform(_DIAG_FLIP, np.zeros(3))
 
             f = open(_algo_log_path / f"{ctrl_name}_algorithm_log.csv", "w", newline="")
             w = csv.writer(f)
@@ -260,8 +469,30 @@ def main():
             _algo_log_files[ctrl_name]   = f
             _algo_log_writers[ctrl_name] = w
         logger.bind(cat="startup").info(
-            f"Algorithm-log CSVs → {_algo_log_path}/<ctrl_name>_algorithm_log.csv "
-            f"(Rt transpose={_algo_log_rt_transpose}, unverified — see comment above)")
+            f"Algorithm-log CSVs → {_algo_log_path}/<ctrl_name>_algorithm_log.csv")
+
+    # ── Mocap ground-truth export: one T_headsetImu_ctrlImu(t) log per
+    # controller with both its own and the headset's mocap loaded (see
+    # src/mocap_data.py.relative_pose) -- written every processed frame,
+    # independent of whether vision tracking accepted a pose that frame, since
+    # it's derived purely from mocap.
+    _mocap_log_dir     = debug_cfg.get("mocap_log_dir")
+    _mocap_log_writers = {}   # {ctrl_name: csv.writer}
+    _mocap_log_files   = {}   # {ctrl_name: file handle}
+    if _mocap_log_dir and "headset" in device_mocap:
+        _mocap_log_path = Path(_mocap_log_dir)
+        _mocap_log_path.mkdir(parents=True, exist_ok=True)
+        for ctrl_name in enabled_ctrls:
+            if ctrl_name not in device_mocap:
+                continue
+            f = open(_mocap_log_path / f"{ctrl_name}_mocap_gt.csv", "w", newline="")
+            w = csv.writer(f)
+            w.writerow(["#timestamp_ns", "p_x", "p_y", "p_z", "q_w", "q_x", "q_y", "q_z"])
+            _mocap_log_files[ctrl_name]   = f
+            _mocap_log_writers[ctrl_name] = w
+        if _mocap_log_writers:
+            logger.bind(cat="startup").info(
+                f"Mocap ground-truth CSVs → {_mocap_log_path}/<ctrl_name>_mocap_gt.csv")
 
     _n_frames = count_images(config["data"])
     for frame_idx, batch in enumerate(tqdm(get_data(config["data"]), total=_n_frames)):
@@ -275,6 +506,17 @@ def main():
         # substantially different gaps), so pose extrapolation uses this exact
         # elapsed time rather than assuming one frame = one uniform step.
         frame_ts_ns = int(img_path.stem)
+
+        for ctrl_name, _mocap_writer in _mocap_log_writers.items():
+            T_gt = relative_pose(device_mocap["headset"], device_mocap[ctrl_name], frame_ts_ns)
+            if T_gt is None:
+                continue
+            _gqx, _gqy, _gqz, _gqw = Rotation.from_matrix(T_gt.R).as_quat()
+            _mocap_writer.writerow([
+                frame_ts_ns,
+                f"{T_gt.t[0]:.6f}", f"{T_gt.t[1]:.6f}", f"{T_gt.t[2]:.6f}",
+                f"{_gqw:.8f}", f"{_gqx:.8f}", f"{_gqy:.8f}", f"{_gqz:.8f}",
+            ])
 
         proj_hints, vel_hints, radius_hints, search_eligible = tracking_system.get_predicted_led_projections_per_camera(frame_ts_ns)
         primary_cams       = tracking_system.get_designated_primary_cameras()
@@ -303,6 +545,15 @@ def main():
         _visualize_save    = bool(config["visualization"].get("visualize_save", False))
         _visualize_rerun   = bool(config["visualization"].get("visualize_rerun", False))
         _visualize_compute = _visualize_save or _visualize_rerun
+        # Independent of the blob-canvas toggles above: vision-vs-fused-vs-IMU-predicted
+        # trajectories plus PoseFusionFilter's internal state, logged into the same
+        # Rerun recording (see ControllerAnimatorRerun's "Pose Fusion" tab). Needs
+        # fusion.enabled: true to have anything meaningful to show; TrackingSystem was
+        # already constructed with this same flag (debug_pose_fusion_cfg above), which
+        # is what actually gates PoseFusionFilter.debug_snapshot()/predict_dense()'s
+        # extra per-frame cost -- this local copy only gates what main.py forwards to
+        # the animator.
+        _pose_fusion_debug = bool(config["visualization"].get("pose_fusion_debug", {}).get("enabled", False))
 
         def _run_blob_detect_batch_multi(cam_kwargs_per_ctrl: dict, images_override: dict = None):
             """Detect blobs for every controller across their cameras in a
@@ -338,9 +589,13 @@ def main():
             computation, not independent work.
 
             cam_kwargs_per_ctrl: {ctrl_name: {cam_idx: {predicted_leds,
-            local_search_radius_px, threshold_scale, velocity_px}}} — only
-            predicted_leds is required per camera, the rest default to the
-            cold-path values.
+            local_search_radius_px, threshold_scale, velocity_px,
+            has_recent_memory, lamp_protect_rects}}} — only predicted_leds is required per
+            camera, the rest default to the cold-path values.
+            has_recent_memory participates in the dedup grouping key below
+            (not just forwarded) since it changes detect()'s own exclusion
+            behavior -- see that key's own comment. lamp_protect_rects
+            likewise (it changes what detect() removes).
 
             images_override: optional {ctrl_name: {cam_idx: image}} — used by
             the cross-controller blackout (_build_blackout_images) to hand a
@@ -359,39 +614,22 @@ def main():
                 return (images_override or {}).get(ctrl_name, {}).get(cam_idx, cam_images[cam_idx])
 
             # ── Dedup: two-or-more controllers sharing a camera whose detect()
-            # inputs are provably identical — no image override, the same
-            # predicted_leds/radius/threshold/velocity kwargs, and equal
-            # cold-path EMA memory (both empty/never-established, or both
-            # holding the same pixel_threshold/required_threshold/max_area/
-            # blob_count — which is what two controllers that have been
-            # deduped together since they went cold end up with, since
-            # BlobDetector.detect is a pure function of (image,
-            # predicted_leds, radius, threshold_scale, velocity_px, memory)
-            # and identical inputs produce identical memory going forward)
-            # — get ONE detect() call instead of one per controller, with
-            # that single result copied to every member below. ctrl_label
-            # only affects a debug-canvas filename.
+            # inputs are identical this frame — no image override, same
+            # predicted_leds/radius/threshold/velocity kwargs — get ONE
+            # detect() call instead of one per controller, with that single
+            # result (and the one resulting _cold_memory[cam_idx] update)
+            # shared by every member below. ctrl_label only affects a debug-
+            # canvas filename.
             #
-            # Comparing memory *by value* (not just "has any memory been
-            # established") matters: an earlier version treated any
-            # established memory as disqualifying, which meant two
-            # controllers that started cold-cold and got deduped on their
-            # first frame would permanently fall back to solo (duplicated)
-            # detection from their second cold frame onward, even though
-            # their fanned-out memory was still identical — silently
-            # doubling blob-detection cost for the rest of a cold-cold run.
-            # Only large_blobs is left out of the comparison below — it's
-            # write-only in BlobDetector (never read back via _mem), so it
-            # can't affect detect()'s output and including it would just
-            # risk an unnecessary split (or an elementwise-comparison error
-            # on the numpy contour arrays it holds).
-            def _mem_key(cam_idx, ctrl_name):
-                mem = _cold_memory.get((cam_idx, ctrl_name))
-                if not mem:
-                    return None
-                return (mem.get("pixel_threshold"), mem.get("required_threshold"),
-                        mem.get("max_area"), mem.get("blob_count"))
-
+            # No memory-value comparison needed in the grouping key (unlike an
+            # earlier version, which compared _cold_memory by value to decide
+            # whether two controllers could share a call): _cold_memory is now
+            # keyed by cam_idx alone, so any two controllers hitting the same
+            # camera with the same params in this same call are, by
+            # construction, reading the exact same dict entry already — there
+            # is no "memory might differ" case left to guard against. See
+            # _cold_memory's own comment (this file, above) for why per-camera
+            # (not per (camera, controller)) is the correct invariant here.
             groups: dict = {}   # dedup_key -> [(ctrl_name, cam_idx, kwargs), ...]
             for ctrl_name, cam_kwargs in cam_kwargs_per_ctrl.items():
                 for cam_idx, kwargs in cam_kwargs.items():
@@ -400,12 +638,23 @@ def main():
                     if _has_override or _has_prior:
                         key = ("solo", ctrl_name, cam_idx)
                     else:
+                        # has_recent_memory included: two controllers cold on
+                        # the same camera this frame can differ on it (one
+                        # just lost track, one never tracked at all) -- since
+                        # it changes detect()'s own exclusion behavior (see
+                        # BlobDetector.detect()'s own docstring), they are
+                        # NOT the same computation and must not be merged
+                        # into one shared detect() call the way identical
+                        # cold kwargs otherwise would be.
                         key = (
                             "cold", cam_idx,
                             kwargs.get("local_search_radius_px", 0.0),
                             kwargs.get("threshold_scale", 1.0),
                             kwargs.get("velocity_px", 0.0),
-                            _mem_key(cam_idx, ctrl_name),
+                            bool(kwargs.get("has_recent_memory", False)),
+                            # Two controllers with different protect zones on the
+                            # same camera are different computations too.
+                            tuple(tuple(r) for r in (kwargs.get("lamp_protect_rects") or ())),
                         )
                     groups.setdefault(key, []).append((ctrl_name, cam_idx, kwargs))
 
@@ -424,12 +673,15 @@ def main():
                     )
                 )
 
-            def _fan_out(ctrl_name, cam_idx, det_result, memory_out=None):
+            def _fan_out(ctrl_name, cam_idx, det_result):
+                # No memory write here: _cold_memory is keyed by cam_idx alone
+                # now, and every fanned-out member shares that SAME cam_idx
+                # (dedup only ever merges same-camera entries) — the
+                # representative's own _cold_memory[cam_idx] write, made by
+                # the caller before/after this, already covers every member.
                 for _mc, _mcam, _ in _group_by_rep[(ctrl_name, cam_idx)][1:]:
                     results_by_ctrl[_mc][_mcam] = det_result
                     ms_by_ctrl[_mc][_mcam] = 0.0
-                    if memory_out is not None:
-                        _cold_memory[(_mcam, _mc)] = memory_out
 
             if pool is not None and blob_parallel:
                 from src.parallel_search import run_blob_detect
@@ -445,12 +697,18 @@ def main():
                         kwargs.get("threshold_scale", 1.0),
                         kwargs.get("velocity_px", 0.0),
                         _visualize_compute, img_path_arg, img_path.name,
-                        _cold_memory.get((cam_idx, ctrl_name)),
+                        _cold_memory.get(cam_idx),
+                        frame_ts_ns,
+                        _cold_region_memory.get(cam_idx),
+                        kwargs.get("has_recent_memory", False),
+                        kwargs.get("lamp_protect_rects"),
+                        _foreign_lamp_quads(cam_idx),
                     )
                 for (ctrl_name, cam_idx), fut in futures.items():
-                    result, canvases, memory_out, diag = fut.result()
+                    result, canvases, memory_out, region_memory_out, diag = fut.result()
                     t_result = time()
-                    _cold_memory[(cam_idx, ctrl_name)] = memory_out
+                    _cold_memory[cam_idx] = memory_out
+                    _cold_region_memory[cam_idx] = region_memory_out
                     results_by_ctrl[ctrl_name][cam_idx] = (result, canvases)
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - t0_by_key[(ctrl_name, cam_idx)]) * 1000
                     if debug_config.log_enabled("blob_diag"):
@@ -465,7 +723,7 @@ def main():
                             f"dispatch={dispatch_ms:.2f}ms  compute={compute_ms:.2f}ms  "
                             f"return={return_ms:.2f}ms  total={total_ms:.2f}ms"
                         )
-                    _fan_out(ctrl_name, cam_idx, (result, canvases), memory_out=memory_out)
+                    _fan_out(ctrl_name, cam_idx, (result, canvases))
             else:
                 for ctrl_name, cam_idx, kwargs in flat:
                     ctrl_label = ctrl_name.replace("_controller", "")
@@ -480,6 +738,12 @@ def main():
                         visualize=_visualize_compute,
                         img_path=img_path_arg,
                         frame_name=img_path.name,
+                        camera=cameras[cam_idx],
+                        pose_source=_headset_pose_source,
+                        frame_ts_ns=frame_ts_ns,
+                        has_recent_memory=kwargs.get("has_recent_memory", False),
+                        lamp_protect_rects=kwargs.get("lamp_protect_rects"),
+                        foreign_lamp_quads=_foreign_lamp_quads(cam_idx),
                     )
                     results_by_ctrl[ctrl_name][cam_idx] = det_result
                     ms_by_ctrl[ctrl_name][cam_idx] = (time() - _t0) * 1000
@@ -567,6 +831,124 @@ def main():
         # covered Phase 2 and was easy to mistake for the whole per-frame cost.
         blob_ms_per_ctrl: dict = {}
 
+        # See _has_recent_memory's own docstring for the full story. Both
+        # values below are read once, outside the per-call helper, from the
+        # SAME config namespace ControllerTracker's own jump-gate reads
+        # (matching.*) plus a new, dedicated static_lamp_mask.* budget --
+        # deliberately NOT reusing an existing "coast"/"budget" constant,
+        # since none of them represent "how long before the vs-last_good_pose
+        # jump-gate is still meaningfully tight," which is the one thing
+        # this specific decision needs.
+        _recent_memory_max_s = float(
+            (config["blob_detection"].get("lamp_blob_filter") or {})
+            .get("static_lamp_mask", {}).get("recent_memory_max_s", 0.05))
+        _recent_memory_min_inliers = float(config["matching"].get("strong_match_inliers", 6))
+        _recent_memory_max_error_px = float(config["matching"].get("strong_match_error_px", 0.5))
+
+        def _has_recent_memory(ctrl_name: str, cam_idx: int) -> bool:
+            """True if this (controller, camera) pair has a FRESH, STRONG
+            last_good_pose -- i.e. this is genuinely a "just lost this
+            frame or the last few, re-acquiring" cold call, not merely
+            "has ever been tracked, however long ago." Forwarded to
+            BlobDetector.detect() as has_recent_memory, which gates
+            static_lamp_mask's EXCLUSION only (never its tracking) -- see
+            that parameter's own docstring for the full reasoning.
+
+            FIXED 2026-09-15 (3-agent critique of the first version, which
+            checked ONLY `last_good_pose is not None`): two independent
+            reviewers found that check alone doesn't hold up.
+              1. last_good_pose is retained INDEFINITELY across loss events
+                 by design (CameraTracker's own comment: "Retained across
+                 loss events") -- it's cleared only on a PROVABLY WRONG
+                 reset (identity-swap/contested-winner), never for
+                 staleness. Meanwhile ControllerTracker._check_vs_last_good
+                 (src/controller.py) widens its own accept threshold
+                 UNBOUNDED with real elapsed time since last_good_pose_ts_ns
+                 (no cap anywhere -- confirmed by grep), by explicit design
+                 ("degrades toward no meaningful check" -- that function's
+                 own comment). Checked against this project's REAL shipped
+                 matching.* config (not just the code's own fallback
+                 defaults): the rotation half of that check reaches its
+                 absolute ceiling (180 degrees -- i.e. a total no-op) after
+                 roughly 70ms of staleness. Without a recency requirement
+                 here, has_recent_memory could stay True indefinitely after
+                 a controller is merely SET DOWN or walks out of view for
+                 an extended period, disabling lamp exclusion at exactly the
+                 moment (both this feature's own check AND the jump-gate it
+                 leans on are gone) protection matters most -- the opposite
+                 of "true cold start still gets full protection."
+              2. Even within a fresh window, ControllerTracker's own
+                 _quality_rescue can bypass the position/rotation check
+                 OUTRIGHT (not just widen it) whenever the REFERENCE
+                 (last_good_pose_quality) was weak -- and matching.min_inliers
+                 (the floor for ANY accepted solve at all) sits BELOW
+                 strong_match_inliers, so an entirely ordinary recent accept
+                 (not a coverage_fallback, just a modest edge-of-frame/
+                 partial-occlusion one) already counts as "weak" by this
+                 definition, making the bypass reachable far more often than
+                 "rare edge case." Requiring the reference to already be
+                 STRONG here closes that path: if last_good_pose_quality
+                 itself clears the same strong_match_inliers/error_px bar,
+                 _quality_rescue's own _reference_weak condition can never
+                 be true, so the real position/rotation distance check is
+                 the one actually protecting this frame, not a corroboration-
+                 free bypass.
+
+            KNOWN RESIDUAL RISK, not fully closed by either fix above (flagged
+            by review, not hidden): the safety argument assumes a lamp-
+            mistaken solve's position differs greatly in 3D from
+            last_good_pose because "a lamp is room-fixed near the ceiling,
+            a recently-tracked controller was near the camera." If the
+            controller's own last real position was ALSO close to the
+            lamp (e.g. genuinely held up near ceiling height, not typical
+            but not impossible), that premise weakens for exactly this
+            frame. Accepted, not solved here -- deliberately narrowed via
+            the fresh+strong requirements above rather than left wide open,
+            and revisit if real usage ever shows this scenario matters in
+            practice.
+
+            Missing/unknown state (a controller or camera pairing this
+            function doesn't recognize, or a reference with no recorded
+            quality/timestamp to check freshness/strength against) defaults
+            to False -- the conservative, NON-regressive direction: today's
+            shipped behavior before this whole feature existed is "always
+            apply lamp exclusion on every cold call," so an uncertain case
+            falls back to exactly that.
+
+            The actual fresh/strong boolean logic lives in the pure,
+            independently-unit-tested module-level function
+            _is_recent_memory_usable (top of this file) -- this closure only
+            does the tracker lookups it can't do outside main()'s own scope."""
+            ctrl_tracker = tracking_system.ctrl_trackers.get(ctrl_name)
+            if ctrl_tracker is None:
+                return False
+            cam_tracker = ctrl_tracker.trackers.get(cam_idx)
+            if cam_tracker is None:
+                return False
+            return _is_recent_memory_usable(
+                cam_tracker.last_good_pose, cam_tracker.last_good_pose_ts_ns,
+                cam_tracker.last_good_pose_quality, frame_ts_ns,
+                _recent_memory_max_s, _recent_memory_min_inliers, _recent_memory_max_error_px)
+
+        # Lamp-protect zones for a cold RE-detect after a failed warm attempt
+        # (blob_detection.lamp_blob_filter.predicted_pose_protect): one small
+        # square around EACH LED the failed warm attempt predicted for this
+        # camera (the union hugs the LED ring, not the whole controller), so
+        # the lamp filters can't remove the real LED blobs standing there.
+        # The prediction just failed, so each square gets the base padding
+        # PLUS warm_failed_extra_px. Only cameras that had predicted LEDs get
+        # one; a true cold start (no prior) has nothing to protect.
+        _pp_cfg = (_blob_cfg.get("lamp_blob_filter") or {}).get("predicted_pose_protect") or {}
+        _pp_enabled = bool(_pp_cfg.get("enabled", False))
+        _pp_pad_px = float(_pp_cfg.get("pad_px", 20.0)) + float(_pp_cfg.get("warm_failed_extra_px", 20.0))
+
+        def _lamp_protect_rects(ctrl_name: str, cam_idx: int):
+            if not _pp_enabled:
+                return None
+            _pred_leds = _cam_kwargs_per_ctrl.get(ctrl_name, {}).get(cam_idx, {}).get("predicted_leds")
+            _h, _w = cam_images[cam_idx].shape[:2]
+            return predicted_leds_protect_rects(_pred_leds, _pp_pad_px, _w, _h) or None
+
         # Pass A: figure out each controller's per-camera detection kwargs
         # (and out-of-scope skips) independently — no cross-controller
         # dependency here, so this loop stays per-controller; only the actual
@@ -610,6 +992,10 @@ def main():
                     local_search_radius_px=radius_hints.get(cam_idx, {}).get(ctrl_name, _base_r),
                     threshold_scale=(max(1.0 / (1.0 + _thr_k * _v_px), _thr_min) if _thr_k > 0 else 1.0),
                     velocity_px=_v_px,
+                    # has_recent_memory DISABLED 2026-09-20 (superseded by the lamp-protect zone,
+                    # see _lamp_protect_rects; user will re-check on more recordings). To restore,
+                    # uncomment this line and the matching one in the mid-Phase-2 redetect below.
+                    # has_recent_memory=_has_recent_memory(ctrl_name, cam_idx),
                 )
 
             skipped_cams_per_ctrl[ctrl_name] = list(_skipped_cams)
@@ -806,19 +1192,25 @@ def main():
                 # that just proved untrustworthy, so brute-force against those SAME
                 # blobs has no better chance: a blob outside a wrong ROI was never
                 # detected at all. Re-detect this controller's blobs cold (full-image,
-                # no prior — same as frame 1) before falling back to brute, and add the
-                # cold-path (pass1/pass2) canvases to this frame's debug view alongside
-                # the failed warm-path ("local") one, instead of replacing it — seeing
-                # what the failed proximity attempt looked at is exactly what's needed
-                # to understand why it missed.
+                # no prior — same as frame 1) before falling back to brute.
+                #
+                # The debug view shows ONLY this fresh cold-path (pass1/pass2) canvas,
+                # not the failed warm-path ("local") one alongside it -- an earlier
+                # version merged both (to show what the failed proximity attempt
+                # looked at), but the warm/local path never applies the static-lamp
+                # mask at all (lamp_region_active requires not has_prior, by design --
+                # see src/blob_detector.py's own comment), so it always shows a real
+                # static lamp as an unfiltered "detection" regardless of whether
+                # anything is actually wrong. Next to the correctly-filtered cold
+                # panel, that reads as "the redetect lost the lamp" when nothing of
+                # the sort happened -- confusing, not informative.
                 _cold_cams = [c for c in cameras if c in cam_images]
-                _warm_canvases = {
-                    cam_idx: frame_blob_vis.get(ctrl_name, {}).get(cam_idx)
-                    for cam_idx in _cold_cams
-                }
                 _t_redetect0 = time()
                 _cold_results, _cold_ms_per_cam = _run_blob_detect_batch(
-                    ctrl_name, {c: {"predicted_leds": None} for c in _cold_cams},
+                    ctrl_name, {c: {"predicted_leds": None,
+                                     # "has_recent_memory": _has_recent_memory(ctrl_name, c),  # disabled, see Pass A
+                                     "lamp_protect_rects": _lamp_protect_rects(ctrl_name, c)}
+                                for c in _cold_cams},
                     images_override=_build_blackout_images(ctrl_name, _cold_cams),
                 )
                 # Extra blob-detection work triggered mid-Phase-2 — counts
@@ -829,10 +1221,8 @@ def main():
                 _redetect_ms_total += _redetect_s * 1000
                 for cam_idx, (det_result_0, det_result_1) in _cold_results.items():
                     per_ctrl_blobs[ctrl_name][cam_idx] = det_result_0
-                    _merged_canvases = dict(_warm_canvases.get(cam_idx) or {})
-                    _merged_canvases.update(det_result_1 or {})
-                    if _merged_canvases:
-                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = _merged_canvases
+                    if det_result_1:
+                        frame_blob_vis.setdefault(ctrl_name, {})[cam_idx] = dict(det_result_1)
                     else:
                         frame_blob_vis.get(ctrl_name, {}).pop(cam_idx, None)
                 _cold_str = "  ".join(f"cam{c}={ms:.1f}ms" for c, ms in _cold_ms_per_cam.items())
@@ -921,7 +1311,22 @@ def main():
         primary_cams_frame_out    = {}
         aux_assignments_frame_out = {}
         camera_importance_frame_out = {}
+        camera_method_frame_out = {}
         frozen_T_world_ctrl_frame = {}
+        # Pose-fusion debug tool (visualization.pose_fusion_debug) -- populated only
+        # when a controller's sol actually carries these (fusion enabled + the debug
+        # flag on, see ControllerTracker._commit_fused_solution); left empty per
+        # controller otherwise, same convention as the dicts above.
+        vision_T_world_ctrl_frame   = {}
+        fusion_debug_frame          = {}
+        fusion_imu_path_frame       = {}
+        fusion_forced_cold_start_frame = {}
+        # {ctrl_name: bool} -- True iff THIS frame's T_world_ctrl_frame entry (when
+        # present) is the fusion filter's own IMU-only prediction rather than a
+        # real accepted vision update this frame (full occlusion, or a fusion-
+        # rejected candidate -- see the two population sites below). Feeds the
+        # cross-controller collision check right after this loop.
+        pose_is_imu_only_frame: dict = {}
 
         for ctrl_name in enabled_ctrls:
             sol = results.get(ctrl_name)
@@ -931,23 +1336,104 @@ def main():
             if sol:
                 T_world_ctrl    = sol["T_world_ctrl"]
                 primary_cam_idx = sol.get("primary_cam", 0)
-                T_world_ctrl_frame[ctrl_name]        = T_world_ctrl
+                # This controller's OWN escape hatch just fired this frame (see
+                # ControllerTracker._commit_fused_solution's abs_reject-triggered
+                # persistent-reject escape hatch): T_world_ctrl here is still just the
+                # coasted IMU-only prediction from a rejected candidate, not a real
+                # accepted pose -- showing it would be exactly the confident-looking-
+                # but-wrong display the user flagged (frame 354: "this should be right
+                # away marked as unreliable ... tracking should be lost already").
+                # Skip populating the three pose-tracking dicts that drive the 3D mesh
+                # display so this controller is hidden THIS SAME FRAME, same as a real
+                # tracking-loss frame (T_world_ctrl_frame/frozen_T_world_ctrl_frame
+                # absent -- see src/visualization.py's _log_frame). Everything else in
+                # this block (CSV writers, frame-summary logging, etc.) is left as-is.
+                #
+                # ALSO hidden when T_world_ctrl is None -- a brand new fusion filter's
+                # very first candidate rejected before any state ever existed (e.g. the
+                # bootstrap-branch sibling-collision check) has genuinely no pose to
+                # report at all, unlike a warm reject (which always falls back to a
+                # meaningful IMU-coasted prediction) -- crashed every consumer below
+                # before this None-check existed (found on a real run: TypeError
+                # dereferencing T_world_ctrl.t on a rejected bootstrap).
+                _forced_cold_start_this_frame = bool(sol.get("fusion_forced_cold_start"))
+                _no_pose_this_frame = _forced_cold_start_this_frame or T_world_ctrl is None
+                if not _no_pose_this_frame:
+                    T_world_ctrl_frame[ctrl_name]        = T_world_ctrl
+                    pose_is_imu_only_frame[ctrl_name]    = not sol.get("fusion_accepted", True)
+                # Always populated (cheap -- same Transform object, no copy), not just
+                # under _pose_fusion_debug: the rerun 3D view's own LED-projection/
+                # error overlay needs vision's own pose too (see _log_frame), any time
+                # fusion.enabled is on, independent of the separate debug-tool toggle.
+                vision_T_world_ctrl_frame[ctrl_name] = sol.get("vision_T_world_ctrl", T_world_ctrl)
+                if _vision_pose_csv_writer:
+                    _v_T = vision_T_world_ctrl_frame[ctrl_name]
+                    _vqx, _vqy, _vqz, _vqw = Rotation.from_matrix(_v_T.R).as_quat()
+                    # n_inliers: total matched LED-blob pairs across every camera that
+                    # contributed to this solve -- same definition HeuristicPoseFusionFilter's
+                    # vision-weight cost term uses (see src/pose_fusion_heuristic.py).
+                    _n_inliers = (len(sol.get("assignment") or [])
+                                  + sum(len(v) for v in (sol.get("aux_assignments") or {}).values()))
+                    _vision_pose_csv_writer.writerow([
+                        frame_ts_ns, ctrl_name,
+                        f"{_vqx:.8f}", f"{_vqy:.8f}", f"{_vqz:.8f}", f"{_vqw:.8f}",
+                        f"{_v_T.t[0]:.6f}", f"{_v_T.t[1]:.6f}", f"{_v_T.t[2]:.6f}",
+                        f"{float(sol.get('confidence', 1.0)):.4f}", f"{float(sol.get('error', 0.0)):.4f}",
+                        _n_inliers,
+                    ])
+                if _pose_fusion_debug:
+                    if "fusion_debug" in sol:
+                        fusion_debug_frame[ctrl_name] = sol["fusion_debug"]
+                    if sol.get("fusion_imu_path") is not None:
+                        fusion_imu_path_frame[ctrl_name] = sol["fusion_imu_path"]
+                    if sol.get("fusion_forced_cold_start"):
+                        fusion_forced_cold_start_frame[ctrl_name] = True
                 assignments_frame_out[ctrl_name]     = sol["assignment"].copy()
                 primary_cams_frame_out[ctrl_name]    = primary_cam_idx
                 aux_assignments_frame_out[ctrl_name] = sol.get("aux_assignments")
                 camera_importance_frame_out[ctrl_name] = sol.get("camera_importance")
-                last_good_T_world[ctrl_name] = T_world_ctrl
-                frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
-                any_valid_pose[ctrl_name] = True
-                lost_streak[ctrl_name] = 0
+                camera_method_frame_out[ctrl_name] = sol.get("camera_method")
+                if not _no_pose_this_frame:
+                    last_good_T_world[ctrl_name] = T_world_ctrl
+                    frozen_T_world_ctrl_frame[ctrl_name] = T_world_ctrl
+                # Gated on fusion_accepted (found in review): a fusion-rejected frame still
+                # has a non-None sol (T_world_ctrl is then the filter's own IMU-only
+                # prediction), so counting it as "a real valid pose"/"not lost" here would
+                # let a controller stuck in a persistent-reject loop (vision keeps finding
+                # candidates, the filter keeps failing them) never register as lost --
+                # any_valid_pose's end-of-run sanity check and lost_streak's tracking_lost
+                # grace-period bookkeeping would both silently treat it as healthy.
+                if sol.get("fusion_accepted", True):
+                    any_valid_pose[ctrl_name] = True
+                    lost_streak[ctrl_name] = 0
                 if _pose_csv_writer:
-                    _qx, _qy, _qz, _qw = Rotation.from_matrix(T_world_ctrl.R).as_quat()
+                    # sol['error']/assignment describe the ORIGINAL vision candidate, not
+                    # necessarily this row's pose -- on a fusion-rejected frame T_world_ctrl
+                    # is the filter's own IMU-only prediction (see _commit_fused_solution),
+                    # so pairing it with the discarded candidate's error/inlier-count would
+                    # misrepresent this row as a real vision fit (found in review).
+                    _fusion_accepted = sol.get("fusion_accepted", True)
+                    if T_world_ctrl is not None:
+                        _qx, _qy, _qz, _qw = Rotation.from_matrix(T_world_ctrl.R).as_quat()
+                        _px, _py, _pz = T_world_ctrl.t
+                    else:
+                        # No pose at all this frame (see _no_pose_this_frame above) --
+                        # "nan", not "" -- downstream readers (compare_vision_mocap.py,
+                        # pnp_certainty_check.py) unconditionally float() every column;
+                        # an empty string crashes them the first time they load a
+                        # fusion-enabled pose_csv (found in review). float("nan")
+                        # parses cleanly and is still an honest "no fit at all" row,
+                        # keeping this frame's row present for downstream alignment
+                        # instead of silently skipping it.
+                        _qx = _qy = _qz = _qw = _px = _py = _pz = float("nan")
                     _pose_csv_writer.writerow([
                         int(img_path.stem), ctrl_name,
                         f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
-                        f"{T_world_ctrl.t[0]:.6f}", f"{T_world_ctrl.t[1]:.6f}", f"{T_world_ctrl.t[2]:.6f}",
+                        f"{_px:.6f}", f"{_py:.6f}", f"{_pz:.6f}",
+                        (f"{sol['error']:.4f}" if _fusion_accepted else "nan"),
+                        (len(sol["assignment"]) if _fusion_accepted else 0),
                     ])
-                if ctrl_name in _algo_log_writers:
+                if ctrl_name in _algo_log_writers and T_world_ctrl is not None:
                     T_Ih_Ic = T_world_ctrl.compose(_algo_log_T_ref_ic[ctrl_name])
                     _aqx, _aqy, _aqz, _aqw = Rotation.from_matrix(T_Ih_Ic.R).as_quat()
                     _algo_log_writers[ctrl_name].writerow([
@@ -955,6 +1441,26 @@ def main():
                         f"{T_Ih_Ic.t[0]:.6f}", f"{T_Ih_Ic.t[1]:.6f}", f"{T_Ih_Ic.t[2]:.6f}",
                         f"{_aqw:.8f}", f"{_aqx:.8f}", f"{_aqy:.8f}", f"{_aqz:.8f}",
                     ])
+                if _led_csv_writer:
+                    # (cam_idx, matched_pairs) for every camera that actually contributed
+                    # to this frame's accepted solve -- primary plus every aux camera,
+                    # not just primary (unlike calibration_csv above).
+                    _cams_matched = [(primary_cam_idx, sol["assignment"])]
+                    for _aux_cam_idx, _aux_pairs in (sol.get("aux_assignments") or {}).items():
+                        if _aux_pairs:
+                            _cams_matched.append((_aux_cam_idx, _aux_pairs))
+                    for _cam_idx, _pairs in _cams_matched:
+                        _cam_result = per_ctrl_blobs[ctrl_name].get(_cam_idx)
+                        if _cam_result is None:
+                            continue
+                        for _blob_idx, _led_id in _pairs:
+                            _px, _py = _cam_result.centroids[_blob_idx]
+                            _led_csv_writer.writerow([
+                                frame_ts_ns, _cam_idx, ctrl_name, _led_id,
+                                f"{_px:.3f}", f"{_py:.3f}",
+                                f"{float(_cam_result.radii[_blob_idx]):.3f}",
+                                f"{float(_cam_result.brightnesses[_blob_idx]):.1f}",
+                            ])
                 primary_cam = sol.get("primary_cam", "?")
                 aux_cameras = sol.get("aux_cameras")
                 if aux_cameras:
@@ -964,12 +1470,23 @@ def main():
                     aux_str = f"  +{sol['aux_inliers']}aux"
                 else:
                     aux_str = ""
+                # err/matches gated on fusion_accepted (found in review, same reason as
+                # pose_csv above): on a fusion-rejected frame these still describe the
+                # DISCARDED vision candidate, not the IMU-predicted pose actually reported.
+                _fs_accepted = sol.get("fusion_accepted", True)
+                _fs_err_str = f"{sol['error']:.2f}px" if _fs_accepted else "n/a (fusion-rejected)"
+                _fs_matches = len(sol["assignment"]) if _fs_accepted else 0
                 logger.bind(cat="frame_summary").info(
                             f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  "
-                            f"cam={primary_cam}  err={sol['error']:.2f}px  "
-                            f"matches={len(sol['assignment'])}{aux_str}  "
+                            f"cam={primary_cam}  err={_fs_err_str}  "
+                            f"matches={_fs_matches}{aux_str}  "
                             f"method={sol.get('method', '?')}")
-                if _csv_writer:
+                if _csv_writer and sol.get("fusion_accepted", True):
+                    # Skipped on a fusion-rejected frame: T_world_ctrl would then be the
+                    # filter's own IMU-only prediction while sol["assignment"] still lists
+                    # LEDs matched under the DISCARDED vision candidate -- computing
+                    # depth/facing_cos from that mismatched pairing would corrupt
+                    # calibration-threshold data (found in review).
                     _proj = proj_hints.get(primary_cam_idx, {}).get(ctrl_name)
                     if _proj is not None:  # warm path was active for this camera
                         _cam_result = per_ctrl_blobs[ctrl_name].get(primary_cam_idx)
@@ -998,20 +1515,72 @@ def main():
                                     f"{float(np.pi * _radii[blob_idx] ** 2):.2f}",
                                 ])
             else:
-                # Case 3: had a prior good pose and cameras still see blobs →
-                # controller is between cameras or ambiguous; freeze last pose,
-                # but only for up to tracking_lost_grace_frames consecutive
-                # lost frames — beyond that the track is really gone and the
-                # ghost must disappear rather than hang around indefinitely.
-                # Cases 1/2: never tracked or truly out of view → None (hidden).
+                # No sol this frame -- report the IMU-only dead-reckoned pose
+                # instead of hiding the controller outright, so a short vision
+                # gap (occlusion, a missed detection) still shows where the
+                # controller actually is. Fails open to the old hide-immediately
+                # behavior whenever IMU coverage/g_world/prior state aren't
+                # there yet (imu_only_predicted_pose returns None).
                 lost_streak[ctrl_name] += 1
-                _grace = int(_match_cfg.get('tracking_lost_grace_frames', 1))
-                last_good = last_good_T_world[ctrl_name]
-                frozen_T_world_ctrl_frame[ctrl_name] = (
-                    last_good if last_good is not None and total_blobs > 0
-                    and lost_streak[ctrl_name] <= _grace else None
-                )
+                _imu_T = tracking_system.ctrl_trackers[ctrl_name].imu_only_predicted_pose(frame_ts_ns)
+                if _imu_T is not None:
+                    T_world_ctrl_frame[ctrl_name] = _imu_T
+                    pose_is_imu_only_frame[ctrl_name] = True
+                frozen_T_world_ctrl_frame[ctrl_name] = None
                 logger.bind(cat="frame_summary").info(f"[{img_path.name}]  [{ctrl_name}]  {_time_str}  TRACKING LOST")
+                # No sol at all this frame -- _commit_fused_solution never ran, so it
+                # never got a chance to capture fusion_debug/fusion_imu_path itself.
+                # Captured here instead so the debug tool's IMU-predicted-path curve
+                # keeps growing across a real full-occlusion gap too, not just a
+                # reject streak where vision keeps finding (rejected) candidates
+                # (found in review).
+                if _pose_fusion_debug:
+                    _dbg, _path = tracking_system.ctrl_trackers[ctrl_name].debug_fusion_state(frame_ts_ns)
+                    if _dbg is not None:
+                        fusion_debug_frame[ctrl_name] = _dbg
+                    if _path is not None:
+                        fusion_imu_path_frame[ctrl_name] = _path
+
+        # ── Cross-controller collision check ────────────────────────────────────
+        # Two controllers are separate rigid bodies and cannot physically share a
+        # tracked origin. A controller with NO real vision this frame (full
+        # occlusion, or a fusion-rejected candidate -- pose_is_imu_only_frame
+        # covers both) is just coasting on the fusion filter's own dead-reckoned
+        # belief; if that belief has drifted onto a DIFFERENT controller's actual
+        # vision-confirmed position this frame, showing both is exactly the
+        # interpenetrating-rigid-bodies display the user flagged. Only fires when
+        # exactly one side is vision-backed this frame -- two simultaneously-
+        # coasting controllers overlapping isn't resolved here (neither side is
+        # more trustworthy than the other, see config.yml's own comment on this
+        # key). The disproven IMU-only side is hidden this frame (same as
+        # tracking-lost) and force-reset so it doesn't just coast right back into
+        # the same collision next frame.
+        _collision_dist_m = float(config.get("fusion", {}).get("imu_vision_collision_dist_m", 0.05))
+        _ctrl_list = list(T_world_ctrl_frame.keys())
+        for _i, _name_a in enumerate(_ctrl_list):
+            for _name_b in _ctrl_list[_i + 1:]:
+                if _name_a not in T_world_ctrl_frame or _name_b not in T_world_ctrl_frame:
+                    continue  # one of the pair was already dropped by an earlier pair this frame
+                _a_imu = pose_is_imu_only_frame.get(_name_a, False)
+                _b_imu = pose_is_imu_only_frame.get(_name_b, False)
+                if _a_imu == _b_imu:
+                    continue  # both vision-backed (fine) or both coasting (no trustworthy side)
+                _imu_name, _vision_name = (_name_a, _name_b) if _a_imu else (_name_b, _name_a)
+                _dist_m = float(np.linalg.norm(
+                    T_world_ctrl_frame[_imu_name].t - T_world_ctrl_frame[_vision_name].t))
+                if _dist_m < _collision_dist_m:
+                    logger.bind(cat="matching_decisions").info(
+                        f"[{img_path.name}] COLLISION: [{_imu_name}]'s IMU-only prediction "
+                        f"({_dist_m * 1000:.1f}mm from [{_vision_name}]'s vision-confirmed pose, "
+                        f"threshold={_collision_dist_m * 1000:.0f}mm) -- dropping [{_imu_name}] this frame"
+                    )
+                    T_world_ctrl_frame.pop(_imu_name, None)
+                    frozen_T_world_ctrl_frame[_imu_name] = None
+                    vision_T_world_ctrl_frame.pop(_imu_name, None)
+                    tracking_system.ctrl_trackers[_imu_name].force_cold_start(
+                        reason=f"collided with [{_vision_name}]'s vision-confirmed pose "
+                               f"({_dist_m * 1000:.1f}mm apart)"
+                    )
 
         if animator is not None:
             _t_rerun0 = time()
@@ -1024,9 +1593,14 @@ def main():
                 primary_cam_per_ctrl=primary_cams_frame_out,
                 aux_assignments_per_ctrl=aux_assignments_frame_out,
                 camera_importance_per_ctrl=camera_importance_frame_out,
+                camera_method_per_ctrl=camera_method_frame_out,
                 frozen_T_world_ctrl_per_ctrl=frozen_T_world_ctrl_frame,
                 blob_vis_frame=(frame_blob_vis if _visualize_rerun else {}),
                 blob_vis_skipped=(skipped_cams_per_ctrl if _visualize_rerun else {}),
+                vision_T_world_ctrl_per_ctrl=vision_T_world_ctrl_frame,
+                fusion_debug_per_ctrl=fusion_debug_frame,
+                fusion_imu_path_per_ctrl=fusion_imu_path_frame,
+                fusion_forced_cold_start_per_ctrl=fusion_forced_cold_start_frame,
             )
             logger.bind(cat="timings").info(f"[{img_path.name}]  rerun log_frame: {(time() - _t_rerun0) * 1000:.1f}ms")
 
@@ -1052,10 +1626,23 @@ def main():
         _pose_csv_file.close()
         logger.bind(cat="startup").info(f"Pose CSV saved → {_pose_csv_path}")
 
+    if _vision_pose_csv_file:
+        _vision_pose_csv_file.close()
+        logger.bind(cat="startup").info(f"Vision pose CSV saved → {_vision_pose_csv_path}")
+
+    if _led_csv_file:
+        _led_csv_file.close()
+        logger.bind(cat="startup").info(f"LED-detections CSV saved → {_led_csv_path}")
+
     for f in _algo_log_files.values():
         f.close()
     if _algo_log_files:
         logger.bind(cat="startup").info(f"Algorithm-log CSVs saved → {_algo_log_dir}")
+
+    for f in _mocap_log_files.values():
+        f.close()
+    if _mocap_log_files:
+        logger.bind(cat="startup").info(f"Mocap ground-truth CSVs saved → {_mocap_log_dir}")
 
     if tracking_system._self_cal is not None:
         tracking_system._self_cal.run()

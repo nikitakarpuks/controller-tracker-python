@@ -97,6 +97,16 @@ def _project_points(rvec, tvec, points: np.ndarray, K, dc, is_fisheye: bool = Fa
     return pts.reshape(-1, 2)
 
 
-def _check_z_range(tvec_h: np.ndarray, z_min: float = 0.05, z_max: float = 15.0) -> bool:
-    """Return True if the hypothesis depth is within plausible range (OpenHMD: 0.05–15 m)."""
-    return z_min < tvec_h[2] < z_max
+def _check_z_range(tvec_h: np.ndarray, z_min: float = 0.05, max_dist_m: float = 2.0) -> bool:
+    """Return True if the hypothesis is within plausible range: in front of the
+    camera (z > z_min, rules out behind-camera solutions) AND within max_dist_m
+    Euclidean distance of the camera. max_dist_m default lowered from OpenHMD's
+    original 15 m z-only bound -- 15 m never made sense for a WMR-style
+    headset-mounted controller-tracking camera (controllers only ever operate
+    within arm's reach); z_max also let a solution arbitrarily far off-axis
+    (large x/y, small z) pass depth-only checking. 2 m covers a full-motion
+    play area with generous margin over normal arm's-reach distances."""
+    z = float(tvec_h[2])
+    if z <= z_min:
+        return False
+    return float(np.linalg.norm(tvec_h)) < max_dist_m
