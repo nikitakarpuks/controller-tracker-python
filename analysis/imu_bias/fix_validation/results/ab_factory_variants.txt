@@ -1,0 +1,6 @@
+left_controller
+  T=0.3s (n=2865): zero:   67.5  t (today):   90.5  -R^T t  [proposed]:   32.9  R^T t:  111.0  -R t:   83.8  R t:   74.4  D(-R^T t):  110.0  D t:   73.2
+  T=1.0s (n=1706): zero:  227.9  t (today):  336.7  -R^T t  [proposed]:  134.9  R^T t:  395.4  -R t:  304.8  R t:  268.7  D(-R^T t):  388.0  D t:  259.6
+right_controller
+  T=0.3s (n=2038): zero:   95.4  t (today):  119.7  -R^T t  [proposed]:   47.7  R^T t:  150.1  -R t:  106.6  R t:   97.3  D(-R^T t):  148.7  D t:   92.6
+  T=1.0s (n=994): zero:  378.1  t (today):  464.1  -R^T t  [proposed]:  228.0  R^T t:  594.8  -R t:  449.3  R t:  383.5  D(-R^T t):  586.9  D t:  393.2

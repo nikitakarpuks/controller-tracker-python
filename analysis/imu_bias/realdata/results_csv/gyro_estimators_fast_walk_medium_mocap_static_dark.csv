@@ -1,0 +1,193 @@
+recording,ctrl,gyro_variant,ego,K_source,family,chosen,gap,n_test,median_deg,p90_deg,mean_deg
+walk_medium,left_controller,rawgyro,mocap,static_dark,zero,zero,0.05,675,0.6726,1.4605,0.8458
+walk_medium,left_controller,rawgyro,mocap,static_dark,zero,zero,0.25,596,1.4076,2.5661,1.5402
+walk_medium,left_controller,rawgyro,mocap,static_dark,zero,zero,0.5,668,1.7491,3.3982,1.8889
+walk_medium,left_controller,rawgyro,mocap,static_dark,zero,zero,1.0,720,2.0747,3.7041,2.2463
+walk_medium,left_controller,rawgyro,mocap,static_dark,zero,zero,2.0,709,2.8797,5.4134,3.0532
+walk_medium,left_controller,rawgyro,mocap,static_dark,zero,zero,real,76,1.6721,3.3974,1.9295
+walk_medium,left_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,0.05,675,0.6685,1.4609,0.8455
+walk_medium,left_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,0.25,596,1.4075,2.522,1.5337
+walk_medium,left_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,0.5,668,1.741,3.4268,1.8964
+walk_medium,left_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,1.0,720,2.141,3.8057,2.3008
+walk_medium,left_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,2.0,709,2.9287,5.6275,3.1625
+walk_medium,left_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,real,76,1.6368,3.3748,1.9402
+walk_medium,left_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.05,675,0.6879,1.4682,0.848
+walk_medium,left_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.25,596,1.364,2.5893,1.5494
+walk_medium,left_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.5,668,1.8179,3.4533,2.0144
+walk_medium,left_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=160,1.0,720,2.4897,4.2888,2.6343
+walk_medium,left_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=160,2.0,709,3.6888,6.2628,3.9038
+walk_medium,left_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=160,real,76,1.664,3.4428,2.0236
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=2,0.05,675,0.7175,1.4926,0.8664
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=2,0.25,596,1.6179,2.9771,1.7841
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=2,0.5,668,2.3217,4.408,2.536
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=2,1.0,720,3.3588,5.2796,3.3873
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=2,2.0,709,4.5906,7.385,4.7318
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=2,real,76,2.0758,3.7707,2.3423
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.05,675,0.6741,1.4652,0.8483
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.25,596,1.4355,2.5925,1.557
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.5,668,1.7392,3.4961,1.9289
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,1.0,720,2.1923,3.7875,2.3154
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,2.0,709,2.8538,5.3899,3.1471
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,real,76,1.6457,3.3087,1.9482
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.05,675,0.6755,1.4578,0.8457
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.25,596,1.413,2.5757,1.5415
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.5,668,1.7404,3.4452,1.8934
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,1.0,720,2.0976,3.7101,2.2501
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,2.0,709,2.8581,5.4258,3.0483
+walk_medium,left_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,real,76,1.6785,3.4049,1.9329
+walk_medium,left_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,0.05,675,0.6788,1.466,0.847
+walk_medium,left_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,0.25,596,1.3676,2.555,1.5371
+walk_medium,left_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,0.5,668,1.7804,3.4036,1.9655
+walk_medium,left_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,1.0,720,2.4097,4.1641,2.5408
+walk_medium,left_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,2.0,709,3.54,6.0409,3.765
+walk_medium,left_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,real,76,1.6442,3.4244,1.9977
+walk_medium,left_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),0.05,675,0.6938,1.4921,0.8602
+walk_medium,left_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),0.25,596,1.5714,2.8697,1.7289
+walk_medium,left_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),0.5,668,1.9756,3.6529,2.2127
+walk_medium,left_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),1.0,720,2.5956,4.0809,2.6791
+walk_medium,left_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),2.0,709,3.8009,5.7468,3.834
+walk_medium,left_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),real,76,1.7595,3.6204,2.0479
+walk_medium,left_controller,gyro+K,mocap,static_dark,zero,zero,0.05,675,0.6423,1.4493,0.8024
+walk_medium,left_controller,gyro+K,mocap,static_dark,zero,zero,0.25,596,1.2241,2.2735,1.3347
+walk_medium,left_controller,gyro+K,mocap,static_dark,zero,zero,0.5,668,1.2602,2.4591,1.4737
+walk_medium,left_controller,gyro+K,mocap,static_dark,zero,zero,1.0,720,1.5148,2.512,1.5722
+walk_medium,left_controller,gyro+K,mocap,static_dark,zero,zero,2.0,709,1.84,3.1327,1.9171
+walk_medium,left_controller,gyro+K,mocap,static_dark,zero,zero,real,76,1.3318,3.0157,1.6653
+walk_medium,left_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=80,0.05,675,0.6424,1.4327,0.8007
+walk_medium,left_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=80,0.25,596,1.2099,2.2922,1.3251
+walk_medium,left_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=80,0.5,668,1.2637,2.4569,1.4611
+walk_medium,left_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=80,1.0,720,1.4983,2.5328,1.5866
+walk_medium,left_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=80,2.0,709,1.8901,3.2966,1.9885
+walk_medium,left_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=80,real,76,1.3604,2.9849,1.6702
+walk_medium,left_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.05,675,0.6423,1.4365,0.8
+walk_medium,left_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.25,596,1.1933,2.3012,1.332
+walk_medium,left_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.5,668,1.2775,2.4582,1.5007
+walk_medium,left_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,1.0,720,1.6417,2.8131,1.7244
+walk_medium,left_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,2.0,709,2.2483,3.8498,2.356
+walk_medium,left_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,real,76,1.4586,2.8894,1.7092
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,0.05,675,0.6687,1.4587,0.819
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,0.25,596,1.455,2.5014,1.5357
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,0.5,668,1.8081,3.3668,2.0228
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,1.0,720,2.4106,4.2833,2.6804
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,2.0,709,3.717,6.838,4.0244
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,real,76,1.8841,3.3723,2.0839
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.05,675,0.64,1.4567,0.8035
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.25,596,1.2145,2.3057,1.3483
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.5,668,1.302,2.6901,1.5275
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,1.0,720,1.5487,2.6707,1.6608
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,2.0,709,1.9349,3.4133,2.0856
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,real,76,1.3235,2.9852,1.674
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.05,675,0.6433,1.4467,0.8024
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.25,596,1.2242,2.2786,1.3355
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.5,668,1.2632,2.4791,1.476
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,1.0,720,1.5125,2.5492,1.5735
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,2.0,709,1.8194,3.1164,1.9156
+walk_medium,left_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,real,76,1.3189,3.0062,1.6683
+walk_medium,left_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,0.05,675,0.6483,1.4306,0.7994
+walk_medium,left_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,0.25,596,1.1961,2.3029,1.3266
+walk_medium,left_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,0.5,668,1.2576,2.4755,1.4742
+walk_medium,left_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,1.0,720,1.5368,2.6652,1.6279
+walk_medium,left_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,2.0,709,1.9981,3.5095,2.1405
+walk_medium,left_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,real,76,1.3641,2.8878,1.6908
+walk_medium,left_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),0.05,675,0.7255,1.5245,0.8843
+walk_medium,left_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),0.25,596,2.0243,3.2817,2.1591
+walk_medium,left_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),0.5,668,3.2515,4.6283,3.2568
+walk_medium,left_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),1.0,720,4.8286,7.4104,4.9396
+walk_medium,left_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),2.0,709,8.0582,12.696,8.366
+walk_medium,left_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),real,76,2.5141,4.8154,2.8741
+walk_medium,right_controller,rawgyro,mocap,static_dark,zero,zero,0.05,532,0.7832,1.789,0.9973
+walk_medium,right_controller,rawgyro,mocap,static_dark,zero,zero,0.25,463,1.8734,3.2073,1.9923
+walk_medium,right_controller,rawgyro,mocap,static_dark,zero,zero,0.5,521,1.9735,4.0193,2.2705
+walk_medium,right_controller,rawgyro,mocap,static_dark,zero,zero,1.0,603,2.6006,4.8968,2.9412
+walk_medium,right_controller,rawgyro,mocap,static_dark,zero,zero,2.0,607,3.8426,6.9205,4.154
+walk_medium,right_controller,rawgyro,mocap,static_dark,zero,zero,real,81,2.2697,3.9382,2.4898
+walk_medium,right_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,0.05,532,0.7789,1.8018,0.9938
+walk_medium,right_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,0.25,463,1.8447,3.1689,1.9766
+walk_medium,right_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,0.5,521,1.9254,3.8733,2.2455
+walk_medium,right_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,1.0,603,2.6544,4.8364,2.9402
+walk_medium,right_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,2.0,607,3.7877,6.8108,4.1407
+walk_medium,right_controller,rawgyro,mocap,static_dark,feedbackEMA,feedbackEMA tau=160,real,81,2.1988,3.719,2.447
+walk_medium,right_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=5,0.05,532,0.7882,1.8521,0.9971
+walk_medium,right_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=5,0.25,463,1.8894,3.2371,2.0448
+walk_medium,right_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=5,0.5,521,2.1719,3.9536,2.4354
+walk_medium,right_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=5,1.0,603,3.2049,5.2217,3.3834
+walk_medium,right_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=5,2.0,607,4.8752,7.7542,5.0773
+walk_medium,right_controller,rawgyro,mocap,static_dark,ratioEMA,ratioEMA tau=5,real,81,2.2614,3.7291,2.5448
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=160,0.05,532,0.8008,1.8462,1.0437
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=160,0.25,463,2.1352,3.4932,2.2927
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=160,0.5,521,2.7985,4.564,2.9554
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=160,1.0,603,4.1095,6.2477,4.2367
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=160,2.0,607,6.7455,10.0771,6.8757
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS,worldRLS tau=160,real,81,2.8955,5.3633,3.1752
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.05,532,0.7872,1.7685,0.9999
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.25,463,1.8859,3.2258,2.0124
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.5,521,2.0437,4.0388,2.3248
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,1.0,603,2.6825,4.9391,3.0255
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,2.0,607,3.9147,7.0791,4.2684
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,real,81,2.3442,3.9709,2.5197
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.05,532,0.7847,1.7914,0.9978
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.25,463,1.885,3.2126,1.9953
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.5,521,1.986,4.0039,2.2773
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,1.0,603,2.6211,4.8999,2.9558
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,2.0,607,3.868,6.878,4.1754
+walk_medium,right_controller,rawgyro,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,real,81,2.3024,3.9096,2.4918
+walk_medium,right_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,0.05,532,0.7801,1.8101,0.9956
+walk_medium,right_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,0.25,463,1.8066,3.1974,2.0301
+walk_medium,right_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,0.5,521,2.2364,3.6448,2.4688
+walk_medium,right_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,1.0,603,3.3021,5.1354,3.4989
+walk_medium,right_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,2.0,607,5.1556,7.6513,5.2383
+walk_medium,right_controller,rawgyro,mocap,static_dark,windowMedian,windowMedian W=40,real,81,2.2882,4.0435,2.5495
+walk_medium,right_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),0.05,532,0.7903,1.7884,1.0169
+walk_medium,right_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),0.25,463,1.914,3.3121,2.1096
+walk_medium,right_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),0.5,521,2.3901,4.0845,2.5559
+walk_medium,right_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),1.0,603,3.2824,5.098,3.4945
+walk_medium,right_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),2.0,607,5.3827,7.8978,5.5009
+walk_medium,right_controller,rawgyro,mocap,static_dark,const(train vision fit),const(train vision fit),real,81,2.3546,4.8217,2.7313
+walk_medium,right_controller,gyro+K,mocap,static_dark,zero,zero,0.05,532,0.6175,1.7198,0.881
+walk_medium,right_controller,gyro+K,mocap,static_dark,zero,zero,0.25,463,1.1087,2.3871,1.3973
+walk_medium,right_controller,gyro+K,mocap,static_dark,zero,zero,0.5,521,1.19,2.511,1.5158
+walk_medium,right_controller,gyro+K,mocap,static_dark,zero,zero,1.0,603,1.2466,2.5034,1.6151
+walk_medium,right_controller,gyro+K,mocap,static_dark,zero,zero,2.0,607,1.5602,2.8789,1.8496
+walk_medium,right_controller,gyro+K,mocap,static_dark,zero,zero,real,81,1.4721,3.8443,1.9846
+walk_medium,right_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=40,0.05,532,0.6273,1.725,0.8818
+walk_medium,right_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=40,0.25,463,1.1333,2.3449,1.4091
+walk_medium,right_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=40,0.5,521,1.2296,2.4624,1.5407
+walk_medium,right_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=40,1.0,603,1.3965,2.6126,1.7188
+walk_medium,right_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=40,2.0,607,1.7955,3.3833,2.1255
+walk_medium,right_controller,gyro+K,mocap,static_dark,feedbackEMA,feedbackEMA tau=40,real,81,1.5599,3.6778,2.0149
+walk_medium,right_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.05,532,0.6297,1.7129,0.8831
+walk_medium,right_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.25,463,1.1498,2.3888,1.4262
+walk_medium,right_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,0.5,521,1.2784,2.4944,1.577
+walk_medium,right_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,1.0,603,1.5211,2.7221,1.8263
+walk_medium,right_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,2.0,607,2.0269,3.7361,2.3357
+walk_medium,right_controller,gyro+K,mocap,static_dark,ratioEMA,ratioEMA tau=160,real,81,1.6402,3.649,2.0465
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,0.05,532,0.6577,1.7973,0.9063
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,0.25,463,1.308,2.6547,1.6026
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,0.5,521,1.7937,3.6155,2.1304
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,1.0,603,2.3863,5.3124,2.9123
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,2.0,607,3.7643,8.1742,4.5065
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS,worldRLS tau=2,real,81,1.9895,3.9531,2.4542
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.05,532,0.6144,1.7214,0.8828
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.25,463,1.0909,2.363,1.4079
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,0.5,521,1.2111,2.5822,1.5732
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,1.0,603,1.3403,2.6096,1.6913
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,2.0,607,1.772,3.108,2.0216
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS+rateGate,worldRLS+rateGate tau=2,real,81,1.5414,3.6685,2.006
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.05,532,0.6175,1.7192,0.8814
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.25,463,1.1158,2.3895,1.3984
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,0.5,521,1.1933,2.5139,1.5185
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,1.0,603,1.2579,2.4966,1.6236
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,2.0,607,1.5839,2.932,1.8749
+walk_medium,right_controller,gyro+K,mocap,static_dark,worldRLS(strongPrior),worldRLS(strongPrior) tau=2,real,81,1.4793,3.8052,1.9845
+walk_medium,right_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,0.05,532,0.6169,1.7257,0.8806
+walk_medium,right_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,0.25,463,1.1012,2.3283,1.3989
+walk_medium,right_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,0.5,521,1.1915,2.4698,1.524
+walk_medium,right_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,1.0,603,1.3067,2.656,1.6541
+walk_medium,right_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,2.0,607,1.5604,2.9153,1.9056
+walk_medium,right_controller,gyro+K,mocap,static_dark,windowMedian,windowMedian W=40,real,81,1.5443,3.5326,1.994
+walk_medium,right_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),0.05,532,0.675,1.685,0.922
+walk_medium,right_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),0.25,463,1.4712,2.6045,1.7206
+walk_medium,right_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),0.5,521,2.0008,3.3003,2.2178
+walk_medium,right_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),1.0,603,2.667,4.3881,2.9476
+walk_medium,right_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),2.0,607,4.264,7.0411,4.5169
+walk_medium,right_controller,gyro+K,mocap,static_dark,const(train vision fit),const(train vision fit),real,81,2.0481,3.8793,2.3833

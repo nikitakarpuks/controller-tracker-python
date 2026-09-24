@@ -1,0 +1,47 @@
+[
+ {
+  "name": "T1a dR/dt = R[omega]x (max abs err, relative to |omega|max)",
+  "ok": true,
+  "detail": "1.43e-02 abs, 1.8e-03 rel (|omega| max 8.14 rad/s; slerp between 1 kHz nodes)"
+ },
+ {
+  "name": "T1b spline v = dp/dt",
+  "ok": true,
+  "detail": "1.2e-07"
+ },
+ {
+  "name": "T1c spline a = dv/dt",
+  "ok": true,
+  "detail": "2.6e-04"
+ },
+ {
+  "name": "T2 project gyro integration vs sim truth rotation over 0.5 s (max deg)",
+  "ok": true,
+  "detail": "max 0.0085 deg, median 0.0021"
+ },
+ {
+  "name": "T3 project accel dead-reckoning (lever arm, gravity) vs sim truth over 0.04 s = one vision gap, the integrator's documented horizon (max mm)",
+  "ok": true,
+  "detail": "max 0.043 mm, median 0.014"
+ },
+ {
+  "name": "T3b test is sensitive: ignoring the lever arm gives larger error",
+  "ok": true,
+  "detail": "median with lever 0.014 mm vs without 0.702 mm"
+ },
+ {
+  "name": "T4 vectorised marker->IMU pose chain == src.mocap_data.world_pose",
+  "ok": true,
+  "detail": "max diff 6.7e-16"
+ },
+ {
+  "name": "T5 subtracting the true bias recovers truth; not subtracting leaves ~|b|*T",
+  "ok": true,
+  "detail": "corrected max 0.006 deg; uncorrected median 1.031 deg (expected ~1.07)"
+ },
+ {
+  "name": "T6 IMU noise sigma reproduced",
+  "ok": true,
+  "detail": "gyro 7.06e-04 accel 6.47e-03"
+ }
+]

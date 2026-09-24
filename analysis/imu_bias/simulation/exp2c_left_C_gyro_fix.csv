@@ -1,0 +1,13 @@
+estimator,rms,rms_zero,ratio_vs_zero,mean_err,t_conv_30pct,kind,scenario,seed,rec,dev,note
+C_gyro_W30,0.0002161161394553613,0.00011465778796864737,1.8848797215105635,0.00023634621840955248,,gyro,factory,0,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W60,0.00011655703147277166,0.00011465778796864737,1.0165644526880602,0.00013845951284479206,,gyro,factory,0,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W90,5.558385575338012e-05,0.00011465778796864737,0.4847804648784892,3.866556977507105e-05,,gyro,factory,0,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W30,0.00020794687217968026,0.00011896348528568523,1.747989071439069,0.00023678179692431667,,gyro,factory,1,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W60,0.0012707509631734767,0.00011896348528568523,10.681857211242827,0.0002655791803879094,,gyro,factory,1,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W90,0.0014352158476540213,0.00011896348528568523,12.064339273579769,0.000725420080687982,,gyro,factory,1,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W30,0.0002276986040998128,0.011280567083005925,0.02018503169426994,0.00025232364282232016,0.0,gyro,large,0,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W60,0.00013357727906110323,0.011280567083005925,0.0118413620590348,0.00015636451458280246,0.0,gyro,large,0,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W90,6.683598514978521e-05,0.011280567083005925,0.0059248781251851285,4.447620496994173e-05,0.0,gyro,large,0,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W30,0.00021672336941924074,0.011200715241119033,0.019349065193946354,0.0002599411528592923,18.974872716,gyro,large,1,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W60,0.0013103268130037773,0.011200715241119033,0.11698599462589909,0.0002836889691502994,44.241558133,gyro,large,1,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)
+C_gyro_W90,0.0014653477651383976,0.011200715241119033,0.1308262672154139,0.0007225456160510409,44.241558133,gyro,large,1,static_dark,left,max_gap=12s (chain no longer broken by 3-8 s vision gaps)

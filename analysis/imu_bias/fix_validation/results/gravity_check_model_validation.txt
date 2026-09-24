@@ -1,0 +1,12 @@
+            ctrl           rec  n_win  meas_absC  model_absC  model_nobias_absC  ideal_absC  err_model  err_model_nobias  err_ideal_driver_only  absC_L3
+ left_controller   static_dark      4     10.100      10.106             10.044      10.000      0.068             0.128                  0.194    9.905
+ left_controller     walk_dark      3     10.125      10.106             10.043      10.000      0.085             0.121                  0.176    9.929
+ left_controller   static_easy      1     10.091      10.114             10.046      10.000      0.324             0.327                  0.326    9.896
+ left_controller     walk_easy      7     10.115      10.119             10.047      10.000      0.111             0.159                  0.218    9.920
+ left_controller   walk_medium      1     10.042      10.146             10.051      10.000      0.201             0.141                  0.207    9.848
+right_controller   static_dark      1      9.877      10.017             10.064      10.000      0.140             0.242                  0.147    9.686
+right_controller     walk_dark      3     10.004       9.985             10.055      10.000      0.171             0.258                  0.196    9.811
+right_controller   static_easy      1      9.963       9.966             10.051      10.000      0.049             0.187                  0.102    9.771
+right_controller static_medium      5     10.004       9.916             10.047      10.000      0.167             0.161                  0.109    9.810
+
+mean vector error vs measured quiet-window mean (m/s^2): full audit model 0.130 | model with b=0 0.172 | driver-constant only 0.183  (n windows 26)

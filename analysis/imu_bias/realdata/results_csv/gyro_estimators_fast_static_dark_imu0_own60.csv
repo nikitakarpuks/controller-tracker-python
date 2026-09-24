@@ -1,0 +1,217 @@
+recording,ctrl,gyro_variant,ego,K_source,family,chosen,gap,n_test,median_deg,p90_deg,mean_deg
+static_dark,left_controller,rawgyro,imu0,own60,zero,zero,0.05,1430,0.3834,0.9632,0.5157
+static_dark,left_controller,rawgyro,imu0,own60,zero,zero,0.25,1430,0.9608,1.8547,1.0514
+static_dark,left_controller,rawgyro,imu0,own60,zero,zero,0.5,1446,1.3466,2.5426,1.4737
+static_dark,left_controller,rawgyro,imu0,own60,zero,zero,1.0,1453,1.7394,3.0907,1.8203
+static_dark,left_controller,rawgyro,imu0,own60,zero,zero,2.0,1445,2.0088,3.4191,2.0997
+static_dark,left_controller,rawgyro,imu0,own60,zero,zero,real,29,1.1574,2.8432,1.3543
+static_dark,left_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=160,0.05,1430,0.3838,0.9667,0.5152
+static_dark,left_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=160,0.25,1430,0.9541,1.8533,1.0483
+static_dark,left_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=160,0.5,1446,1.3471,2.5413,1.4679
+static_dark,left_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=160,1.0,1453,1.7368,3.0969,1.8158
+static_dark,left_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=160,2.0,1445,2.0273,3.3965,2.0998
+static_dark,left_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=160,real,29,1.1402,2.8466,1.3625
+static_dark,left_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=80,0.05,1430,0.3813,0.967,0.5147
+static_dark,left_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=80,0.25,1430,0.9556,1.8536,1.0468
+static_dark,left_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=80,0.5,1446,1.3527,2.5437,1.4686
+static_dark,left_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=80,1.0,1453,1.7252,3.1558,1.8367
+static_dark,left_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=80,2.0,1445,2.0714,3.4499,2.1683
+static_dark,left_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=80,real,29,1.0976,2.8541,1.3802
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,0.05,1430,0.3836,0.9724,0.5167
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,0.25,1430,0.9738,1.8521,1.064
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,0.5,1446,1.3907,2.5717,1.5072
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,1.0,1453,1.781,3.2056,1.894
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,2.0,1445,2.1143,3.5164,2.2327
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,real,29,1.1077,3.0092,1.4042
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.05,1430,0.3811,0.9722,0.5168
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.25,1430,0.9761,1.848,1.0617
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.5,1446,1.399,2.5672,1.4937
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,1.0,1453,1.7402,3.1865,1.8642
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,2.0,1445,2.0812,3.5321,2.2286
+static_dark,left_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,real,29,1.1182,2.9748,1.4029
+static_dark,left_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,0.05,1430,0.3805,0.9688,0.5145
+static_dark,left_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,0.25,1430,0.9582,1.8584,1.0551
+static_dark,left_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,0.5,1446,1.355,2.5787,1.4895
+static_dark,left_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,1.0,1453,1.779,3.2025,1.901
+static_dark,left_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,2.0,1445,2.2953,3.6504,2.3919
+static_dark,left_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,real,29,1.2057,2.8351,1.4281
+static_dark,left_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),0.05,1430,0.3831,0.9747,0.5165
+static_dark,left_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),0.25,1430,0.9737,1.8529,1.0635
+static_dark,left_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),0.5,1446,1.3777,2.5586,1.507
+static_dark,left_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),1.0,1453,1.7732,3.2025,1.8959
+static_dark,left_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),2.0,1445,2.1329,3.5319,2.2326
+static_dark,left_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),real,29,1.0834,2.9837,1.4084
+static_dark,left_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.05,1430,0.3855,0.9721,0.517
+static_dark,left_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.25,1430,0.9776,1.8578,1.0689
+static_dark,left_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.5,1446,1.3795,2.5695,1.5223
+static_dark,left_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],1.0,1453,1.7953,3.245,1.9297
+static_dark,left_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],2.0,1445,2.1648,3.5979,2.2763
+static_dark,left_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],real,29,1.0847,2.9633,1.412
+static_dark,left_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.05,1430,0.3911,0.9759,0.5251
+static_dark,left_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.25,1430,1.0411,1.9433,1.1292
+static_dark,left_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.5,1446,1.5099,2.671,1.6451
+static_dark,left_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",1.0,1453,1.9645,3.4852,2.1298
+static_dark,left_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",2.0,1445,2.3018,3.7869,2.4256
+static_dark,left_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",real,29,1.4648,2.455,1.4571
+static_dark,left_controller,gyro+K,imu0,own60,zero,zero,0.05,1430,0.3328,0.973,0.4699
+static_dark,left_controller,gyro+K,imu0,own60,zero,zero,0.25,1430,0.4946,1.3124,0.6633
+static_dark,left_controller,gyro+K,imu0,own60,zero,zero,0.5,1446,0.6399,1.652,0.8483
+static_dark,left_controller,gyro+K,imu0,own60,zero,zero,1.0,1453,0.779,1.9443,0.9953
+static_dark,left_controller,gyro+K,imu0,own60,zero,zero,2.0,1445,0.9833,1.9459,1.1645
+static_dark,left_controller,gyro+K,imu0,own60,zero,zero,real,29,0.874,3.3106,1.3911
+static_dark,left_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=20,0.05,1430,0.3308,0.9672,0.4693
+static_dark,left_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=20,0.25,1430,0.4831,1.2833,0.6561
+static_dark,left_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=20,0.5,1446,0.6078,1.652,0.8333
+static_dark,left_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=20,1.0,1453,0.7644,1.914,0.9655
+static_dark,left_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=20,2.0,1445,0.9273,1.872,1.0849
+static_dark,left_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=20,real,29,0.9109,3.2787,1.3945
+static_dark,left_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=160,0.05,1430,0.331,0.9661,0.4692
+static_dark,left_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=160,0.25,1430,0.4783,1.2852,0.6526
+static_dark,left_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=160,0.5,1446,0.599,1.6448,0.822
+static_dark,left_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=160,1.0,1453,0.7245,1.8639,0.931
+static_dark,left_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=160,2.0,1445,0.8256,1.8126,1.0073
+static_dark,left_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=160,real,29,0.8789,3.2803,1.3825
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=160,0.05,1430,0.3313,0.9653,0.4695
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=160,0.25,1430,0.4795,1.2953,0.6554
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=160,0.5,1446,0.6025,1.6505,0.8288
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=160,1.0,1453,0.7278,1.878,0.9433
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=160,2.0,1445,0.866,1.8396,1.039
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=160,real,29,0.8525,3.2719,1.3858
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.05,1430,0.3316,0.9636,0.4699
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.25,1430,0.4872,1.3024,0.6591
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.5,1446,0.6085,1.6641,0.8376
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,1.0,1453,0.747,1.9292,0.962
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,2.0,1445,0.9022,1.9192,1.0695
+static_dark,left_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,real,29,0.8099,3.2511,1.3895
+static_dark,left_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,0.05,1430,0.3299,0.9595,0.4695
+static_dark,left_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,0.25,1430,0.4828,1.2927,0.6576
+static_dark,left_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,0.5,1446,0.6066,1.6559,0.8372
+static_dark,left_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,1.0,1453,0.7728,1.8628,0.9642
+static_dark,left_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,2.0,1445,0.9408,1.8702,1.1195
+static_dark,left_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,real,29,0.913,3.2337,1.3919
+static_dark,left_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),0.05,1430,0.3317,0.9673,0.4692
+static_dark,left_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),0.25,1430,0.4816,1.2882,0.653
+static_dark,left_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),0.5,1446,0.6004,1.642,0.8227
+static_dark,left_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),1.0,1453,0.7227,1.8638,0.934
+static_dark,left_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),2.0,1445,0.8479,1.8114,1.0216
+static_dark,left_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),real,29,0.8533,3.3033,1.3814
+static_dark,left_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.05,1430,0.33,0.9599,0.4692
+static_dark,left_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.25,1430,0.4774,1.2915,0.6552
+static_dark,left_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.5,1446,0.6068,1.6631,0.8296
+static_dark,left_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],1.0,1453,0.7525,1.9019,0.9444
+static_dark,left_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],2.0,1445,0.8724,1.8388,1.0605
+static_dark,left_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],real,29,0.9342,3.2632,1.3828
+static_dark,left_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.05,1430,0.331,0.9594,0.473
+static_dark,left_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.25,1430,0.523,1.3177,0.6918
+static_dark,left_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.5,1446,0.6666,1.7392,0.9018
+static_dark,left_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",1.0,1453,0.8468,2.057,1.0775
+static_dark,left_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",2.0,1445,1.1132,2.5103,1.3532
+static_dark,left_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",real,29,1.0137,3.2155,1.3773
+static_dark,right_controller,rawgyro,imu0,own60,zero,zero,0.05,1116,0.425,1.1417,0.5781
+static_dark,right_controller,rawgyro,imu0,own60,zero,zero,0.25,1166,1.1567,2.1994,1.2676
+static_dark,right_controller,rawgyro,imu0,own60,zero,zero,0.5,1188,1.6709,2.9332,1.7859
+static_dark,right_controller,rawgyro,imu0,own60,zero,zero,1.0,1203,2.0314,3.5246,2.1481
+static_dark,right_controller,rawgyro,imu0,own60,zero,zero,2.0,1192,2.3081,4.156,2.5167
+static_dark,right_controller,rawgyro,imu0,own60,zero,zero,real,44,0.9569,2.6885,1.3314
+static_dark,right_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=5,0.05,1116,0.4232,1.1394,0.5696
+static_dark,right_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=5,0.25,1166,1.0843,2.1254,1.2108
+static_dark,right_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=5,0.5,1188,1.5968,2.7863,1.6992
+static_dark,right_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=5,1.0,1203,2.1676,3.5141,2.2668
+static_dark,right_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=5,2.0,1192,2.9373,4.908,3.1486
+static_dark,right_controller,rawgyro,imu0,own60,feedbackEMA,feedbackEMA tau=5,real,44,0.9998,2.5555,1.3
+static_dark,right_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=10,0.05,1116,0.4251,1.1383,0.569
+static_dark,right_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=10,0.25,1166,1.0746,2.1138,1.2037
+static_dark,right_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=10,0.5,1188,1.5721,2.7138,1.6759
+static_dark,right_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=10,1.0,1203,2.0634,3.3849,2.178
+static_dark,right_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=10,2.0,1192,2.784,4.5938,2.9771
+static_dark,right_controller,rawgyro,imu0,own60,ratioEMA,ratioEMA tau=10,real,44,1.0051,2.5831,1.298
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,0.05,1116,0.4295,1.1454,0.5803
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,0.25,1166,1.1717,2.2174,1.2702
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,0.5,1188,1.6889,2.9123,1.7799
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,1.0,1203,2.0361,3.4076,2.14
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,2.0,1192,2.168,4.0939,2.4069
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS,worldRLS tau=160,real,44,0.9928,2.5997,1.3045
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.05,1116,0.4492,1.1613,0.5909
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.25,1166,1.2433,2.2762,1.3293
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,0.5,1188,1.8006,3.0616,1.8881
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,1.0,1203,2.254,3.5774,2.3615
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,2.0,1192,2.564,4.3131,2.7404
+static_dark,right_controller,rawgyro,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=160,real,44,0.9733,2.4385,1.2954
+static_dark,right_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,0.05,1116,0.4189,1.1533,0.5695
+static_dark,right_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,0.25,1166,1.0676,2.1046,1.212
+static_dark,right_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,0.5,1188,1.5857,2.7295,1.6975
+static_dark,right_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,1.0,1203,2.0563,3.4233,2.1705
+static_dark,right_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,2.0,1192,2.6916,4.5689,2.9277
+static_dark,right_controller,rawgyro,imu0,own60,windowMedian,windowMedian W=40,real,44,1.0019,2.4538,1.3069
+static_dark,right_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),0.05,1116,0.4266,1.1441,0.5787
+static_dark,right_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),0.25,1166,1.1546,2.2214,1.2616
+static_dark,right_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),0.5,1188,1.6768,2.876,1.7622
+static_dark,right_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),1.0,1203,2.0039,3.3839,2.0947
+static_dark,right_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),2.0,1192,2.1577,4.0488,2.3801
+static_dark,right_controller,rawgyro,imu0,own60,const(train vision fit),const(train vision fit),real,44,0.9755,2.6424,1.3165
+static_dark,right_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.05,1116,0.4443,1.1527,0.5891
+static_dark,right_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.25,1166,1.2265,2.2683,1.3281
+static_dark,right_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.5,1188,1.8176,3.0066,1.8892
+static_dark,right_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],1.0,1203,2.2281,3.6436,2.3272
+static_dark,right_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],2.0,1192,2.4717,4.2249,2.628
+static_dark,right_controller,rawgyro,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],real,44,1.0142,2.5468,1.2995
+static_dark,right_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.05,1116,0.4672,1.1507,0.6028
+static_dark,right_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.25,1166,1.2873,2.4603,1.4126
+static_dark,right_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.5,1188,1.8407,3.5886,2.0503
+static_dark,right_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",1.0,1203,2.3344,4.2228,2.5717
+static_dark,right_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",2.0,1192,2.3333,5.0954,2.8155
+static_dark,right_controller,rawgyro,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",real,44,0.9337,2.667,1.3887
+static_dark,right_controller,gyro+K,imu0,own60,zero,zero,0.05,1116,0.3445,1.089,0.5154
+static_dark,right_controller,gyro+K,imu0,own60,zero,zero,0.25,1166,0.5971,1.4117,0.7405
+static_dark,right_controller,gyro+K,imu0,own60,zero,zero,0.5,1188,0.8035,1.5305,0.922
+static_dark,right_controller,gyro+K,imu0,own60,zero,zero,1.0,1203,0.9948,1.7695,1.1056
+static_dark,right_controller,gyro+K,imu0,own60,zero,zero,2.0,1192,1.3932,2.3271,1.5031
+static_dark,right_controller,gyro+K,imu0,own60,zero,zero,real,44,0.8231,1.6857,1.0111
+static_dark,right_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=10,0.05,1116,0.349,1.0806,0.516
+static_dark,right_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=10,0.25,1166,0.5678,1.4073,0.7319
+static_dark,right_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=10,0.5,1188,0.7396,1.506,0.8722
+static_dark,right_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=10,1.0,1203,0.9101,1.6415,1.0004
+static_dark,right_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=10,2.0,1192,1.0987,2.0838,1.2515
+static_dark,right_controller,gyro+K,imu0,own60,feedbackEMA,feedbackEMA tau=10,real,44,0.734,1.5635,0.981
+static_dark,right_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=80,0.05,1116,0.3496,1.0846,0.5144
+static_dark,right_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=80,0.25,1166,0.5677,1.4015,0.721
+static_dark,right_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=80,0.5,1188,0.7329,1.4758,0.8546
+static_dark,right_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=80,1.0,1203,0.8737,1.5766,0.9688
+static_dark,right_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=80,2.0,1192,1.0661,1.9623,1.1814
+static_dark,right_controller,gyro+K,imu0,own60,ratioEMA,ratioEMA tau=80,real,44,0.7738,1.5576,0.9754
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=80,0.05,1116,0.3491,1.0774,0.5152
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=80,0.25,1166,0.5637,1.3829,0.731
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=80,0.5,1188,0.7354,1.4744,0.8539
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=80,1.0,1203,0.868,1.6257,0.9685
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=80,2.0,1192,1.0443,1.9571,1.1563
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS,worldRLS tau=80,real,44,0.81,1.5201,0.9556
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=2,0.05,1116,0.3558,1.084,0.524
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=2,0.25,1166,0.6647,1.4726,0.8144
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=2,0.5,1188,0.9487,1.718,1.0641
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=2,1.0,1203,1.3147,2.2263,1.4113
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=2,2.0,1192,1.8896,3.2631,2.0071
+static_dark,right_controller,gyro+K,imu0,own60,worldRLS+rateGate,worldRLS+rateGate tau=2,real,44,0.8836,1.7272,1.0379
+static_dark,right_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,0.05,1116,0.349,1.0789,0.5141
+static_dark,right_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,0.25,1166,0.5728,1.3909,0.7238
+static_dark,right_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,0.5,1188,0.7387,1.4802,0.8658
+static_dark,right_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,1.0,1203,0.8972,1.6292,0.9982
+static_dark,right_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,2.0,1192,1.1242,1.9685,1.2224
+static_dark,right_controller,gyro+K,imu0,own60,windowMedian,windowMedian W=40,real,44,0.7718,1.5987,0.9723
+static_dark,right_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),0.05,1116,0.3478,1.0793,0.5146
+static_dark,right_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),0.25,1166,0.5598,1.3827,0.7225
+static_dark,right_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),0.5,1188,0.7234,1.4615,0.8442
+static_dark,right_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),1.0,1203,0.8482,1.5642,0.9419
+static_dark,right_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),2.0,1192,1.0138,1.9556,1.1348
+static_dark,right_controller,gyro+K,imu0,own60,const(train vision fit),const(train vision fit),real,44,0.7777,1.5204,0.9674
+static_dark,right_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.05,1116,0.344,1.0734,0.5147
+static_dark,right_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.25,1166,0.5738,1.3776,0.7334
+static_dark,right_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],0.5,1188,0.7516,1.4739,0.8685
+static_dark,right_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],1.0,1203,0.8855,1.6372,0.984
+static_dark,right_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],2.0,1192,1.0707,1.9032,1.1649
+static_dark,right_controller,gyro+K,imu0,own60,const(all-time mocap) [UB],const(all-time mocap) [UB],real,44,0.8224,1.5827,0.9668
+static_dark,right_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.05,1116,0.3497,1.0851,0.5171
+static_dark,right_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.25,1166,0.6117,1.4085,0.767
+static_dark,right_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",0.5,1188,0.7969,1.5957,0.927
+static_dark,right_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",1.0,1203,0.9713,1.845,1.0891
+static_dark,right_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",2.0,1192,1.0886,2.2539,1.287
+static_dark,right_controller,gyro+K,imu0,own60,"windowed oracle (mocap 20s, NON-causal) [UB]","windowed oracle (mocap 20s, NON-causal) [UB]",real,44,0.8288,1.6667,0.9779
