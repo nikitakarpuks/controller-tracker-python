@@ -2752,6 +2752,14 @@ class BlobDetector:
         pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
         ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
         count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
+        # Pass-2 thresholds are never stricter than THIS frame's own statistics-derived
+        # ones (raw p25 * factor), whatever the remembered/EMA-blended values say -- the
+        # memory is per CAMERA (shared by both controllers) and can describe a different
+        # blob population (see tests/test_blob_detector_pass2_stale_memory.py).
+        cap_at_frame_stats          = bool(cfg.get("pass2_cap_at_frame_stats", True))
+        # 0 = off. Else: pass 1 found >= 3 blobs and pass 2 kept fewer than this fraction
+        # of them -> discard pass 2 (return pass 1's result) and clear the memory.
+        min_survival_fraction       = float(cfg.get("pass2_min_survival_fraction", 0.0))
         _mem = self._memory
 
         _neighborhoods = (predicted_leds, search_radii) if has_prior else None
@@ -2814,6 +2822,18 @@ class BlobDetector:
                         pixel_threshold_2    = _mem["pixel_threshold"]
                         required_threshold_2 = _mem.get("required_threshold", required_threshold)
                         update_memory        = False
+                        # Frame-to-frame count gate: remember THIS frame's count even though the
+                        # thresholds are not updated. Comparing against the count of the last
+                        # memory WRITE deadlocked forever once the population changed
+                        # persistently (remembered count 2, real population 8).
+                        _mem["blob_count"]   = cur_count
+
+                    _blended_pix, _blended_req = pixel_threshold_2, required_threshold_2
+                    if cap_at_frame_stats:
+                        # Applied to the values USED this frame; the memory keeps the blended
+                        # value (EMA continuity), so upward lag is preserved when raw is higher.
+                        pixel_threshold_2    = min(pixel_threshold_2, raw_pixel_thr)
+                        required_threshold_2 = min(required_threshold_2, raw_required_thr)
 
                     # Area ceiling: the biggest blob pass 1 actually found this
                     # frame — real data, not a modeled/scaled estimate. Pass 1's
@@ -2857,7 +2877,14 @@ class BlobDetector:
                     )
                     if result2[7] is not None:
                         canvases["pass2"] = result2[7]
-                    if len(result2[0]) >= 1:
+                    _n1, _n2 = len(result[0]), len(result2[0])
+                    _pass2_lost_too_many = (min_survival_fraction > 0.0 and _n1 >= 3
+                                            and _n2 < min_survival_fraction * _n1)
+                    if _pass2_lost_too_many:
+                        # Fall through to the pass-1 result below (same path as pass 2 finding
+                        # 0 blobs) and forget the memory that produced such a threshold.
+                        _mem.clear()
+                    elif len(result2[0]) >= 1:
                         # Always a deterministic, physics-derived value (no
                         # population stats involved) — always safe to remember
                         # for the memory-reuse branch below, unlike the old
@@ -2865,8 +2892,8 @@ class BlobDetector:
                         # measurement that shouldn't have been remembered.
                         _mem["max_area"] = max_area_pass2
                         if update_memory:
-                            _mem["pixel_threshold"]    = pixel_threshold_2
-                            _mem["required_threshold"] = required_threshold_2
+                            _mem["pixel_threshold"]    = _blended_pix
+                            _mem["required_threshold"] = _blended_req
                             _mem["large_blobs"]        = large_blobs_pass1
                             _mem["blob_count"]         = cur_count
                         corrected_radii = _correct_radii_for_threshold(

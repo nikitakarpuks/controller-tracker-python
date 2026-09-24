@@ -1781,6 +1781,14 @@ blob_detection:
   pass2_min_area: 2                 # null = use min_area; blobs shrink under higher threshold so can be smaller
   pass2_threshold_ema_alpha: 0.25   # EMA weight on the new threshold (0=frozen, 1=no smoothing)
   pass2_count_gate_max_factor: 1.7  # skip EMA update if blob count changes by more than this factor
+  pass2_cap_at_frame_stats: true    # pass-2 thresholds never exceed THIS frame's own p25*factor values, whatever the
+                                    # (per-camera, shared by both controllers) memory/EMA holds. The memory could
+                                    # freeze at another controller's high thresholds and, via the count gate, never
+                                    # refresh -> real dim LEDs thresholded away (walk_dark frame 1328: 7 blobs -> 1).
+                                    # false = old behaviour (A/B only).
+  pass2_min_survival_fraction: 0.0  # 0 = OFF (shipped off). Else, if pass 1 found >= 3 blobs and pass 2 kept fewer
+                                    # than this fraction, discard pass 2 (use pass 1's result) and clear the memory.
+                                    # Off because noise-heavy cold frames can legitimately lose many pass-1 blobs.
                                     # max_area_pass2 = the biggest blob pass 1 actually found this frame
                                     # (already bounded by pass 1's own physics-based ceiling below) —
                                     # no separate config needed; see BlobDetector.detect for details
