@@ -772,6 +772,15 @@ imu:
                   # diagnostic (log-only). Requires
                   # <data.root>/imu1/data.csv (left) and imu2/data.csv (right) in
                   # EuRoC format; falls back to pure vision-history prediction
+  recorded_stream_factory_corrected: true  # the recorded imu1/imu2 CSVs were written by Monado AFTER its own
+                  # mix + bias + axis-rotation step (wmr_controller_hp.c:258-276), so the loader must NOT
+                  # apply the factory mix+bias again (it used to: doubled the bias, re-applied the mixing
+                  # matrix; worse accel/gyro prediction in 12/12 recording-controller pairs). false = the
+                  # CSV is genuinely raw -> apply factory correction as before. See src/imu_data.py's
+                  # module docstring and analysis/imu_bias/REPORT.md.
+  accel_driver_scale: 0.980665  # multiplies the accelerometer: Monado reports counts/(98000/2) = 10.000 for one g
+                  # ("1g ~ 490,000 counts" is the driver author's own unconfirmed observation), so true m/s^2 =
+                  # reported * 9.80665/10. Removes a measured ~1.9-2.5 % accel gain error. 1.0 = no scaling.
                   # (with a startup warning) if a file is missing.
 
 fusion:

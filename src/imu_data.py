@@ -61,6 +61,23 @@ project's own joint bias+rotation solve in bias_estimation_check.py).
 Do not assume diag(1,-1,-1) generalizes to other controller hardware/
 calibration files or recordings without re-running this check.
 
+RECORDED CONTROLLER IMU STREAMS ARE ALREADY FACTORY-CORRECTED (2026-09-23, IMU-bias research,
+analysis/imu_bias/REPORT.md + fix_design.md): Monado's WMR controller driver
+(wmr_controller_hp.c:258-276) converts raw counts to floats, applies the mixing matrix, ADDS the
+bias, then rotates by P_oxr -- and that finished sample is what the recorder wrote to
+mav0/imu1|imu2/data.csv. Applying ControllerImuAxisCalib.correct() (mix + bias) to those CSVs a
+SECOND time was therefore a bug: it doubled the factory bias (up to ~0.21 m/s^2 accel, ~0.009
+rad/s gyro), re-applied the mixing matrix, and worsened accel/gyro prediction against mocap in 12
+of 12 recording/controller pairs. load_and_calibrate_controller_imu now skips it by default
+(factory_corrected_input=True); factory_corrected_input=False reproduces the old chain exactly,
+for any stream that really is raw.
+The same driver divides accel counts by 98000/2 with the comment "1g is approximately 490,000.
+@todo: Confirm the scale", i.e. it reports 10.000 for what should be 9.80665 m/s^2 -- a 1.97 %
+gain error that shows up as a fitted accel gain of ~1.9-2.5 %; ACCEL_DRIVER_SCALE (9.80665/10)
+removes it. Neither change touches the small per-session bias left on top (~0.01 rad/s gyro,
+~0.1-0.16 m/s^2 accel) or the ~1 % gyro gain/misalignment (see the research report); gyro units
+(counts * 0.00001, also "@todo confirm") are NOT rescaled -- unverified against vision.
+
 imu0 (the HMD's own IMU) needs NO axis transform at all -- it IS the reference
 frame T_imu_cam/VIO are already expressed against, unlike the controllers
 (unknown wireless-chip mounting orientation). Confirmed via the same
@@ -695,7 +712,11 @@ class ControllerImuAxisCalib:
     def correct(self, raw: np.ndarray) -> np.ndarray:
         """raw: (N,3) raw samples in sensor frame -> T=0 mixing+bias corrected (N,3).
         mix then ADD bias -- matches Monado's wmr_controller_hp_packet_parse (see
-        module docstring), not the more common "subtract bias" convention."""
+        module docstring), not the more common "subtract bias" convention.
+
+        Do NOT apply this to the recorded mav0/imu1|imu2 CSVs: the driver already did
+        exactly this before recording (see module docstring, "RECORDED CONTROLLER IMU
+        STREAMS ARE ALREADY FACTORY-CORRECTED"). Only for a genuinely raw stream."""
         return (self.mix0 @ raw.T).T + self.bias0
 
 
@@ -721,6 +742,23 @@ def create_imu_calib_from_config(cfg, entry_index: int = 1) -> ControllerImuCali
     )
 
 
+def accel_lever_arm_body(calib: "ControllerImuCalib") -> np.ndarray:
+    """Accelerometer position relative to the gyro, expressed in the controller BODY (LED-reference) frame
+    (3,) metres -- the `r` that _lever_arm_correction / integrate_accel_* / predict_world_pose expect.
+
+    Each sensor's factory Rt maps BODY coordinates -> SENSOR coordinates (p_sensor = R p_body + t), so the
+    sensor's own origin sits at p_body = -R^T t = T_rt.inverse().t. The lever arm used to be built as
+    accel.T_rt.compose(gyro.T_rt.inverse()).t, which for this hardware (gyro Rt translation exactly 0) is just
+    the raw factory translation t_acc, read in the SENSOR frame: right length (~85 mm) but ~95-97 deg off in
+    direction from the true body-frame accelerometer position (bridge/mocap-fit and factory-derived agree to
+    ~3-4 mm, analysis/imu_bias/REPORT.md, fix_design.md, independent review 2026-09-23). Measured payoff:
+    accel dead-reckoning position error at a 1 s gap roughly halves.
+
+    The two sensors' positions are both taken in the body frame and differenced, so a nonzero gyro Rt
+    translation (zero for every controller file we have) would still be handled."""
+    return calib.accel.T_rt.inverse().t - calib.gyro.T_rt.inverse().t
+
+
 # Sensor-frame -> body-frame transform, SAME for gyro and accel (both live on the
 # same physical chip package, same mounting) -- a precise 180deg flip about X (X
 # unchanged, Y/Z reversed). Superseded the old per-sensor-distinct _Y_FLIP @
@@ -729,13 +767,30 @@ def create_imu_calib_from_config(cfg, entry_index: int = 1) -> ControllerImuCali
 _DIAG_FLIP = np.diag([1.0, -1.0, -1.0])
 
 
+# Monado's WMR controller driver reports accel = counts / (98000/2), i.e. 10.000 (not 9.80665)
+# for one g if 1 g = 490,000 counts (its own comment: "Reverb G1 observation ... @todo: Confirm the
+# scale is correct"). Multiplying by 9.80665/10 removes that ~1.97 % gain error (measured fitted
+# accel gain 1.9-2.5 % on the loader's output, collapsing to ~0 after this scale). See module
+# docstring. Kept as a named constant (and a config override, imu.accel_driver_scale) because the
+# 1 g = 490,000 counts figure is the driver author's own approximate observation.
+ACCEL_DRIVER_SCALE = 9.80665 / 10.0
+
+
 def load_and_calibrate_controller_imu(imu_path, controller_cfg: dict, lag_ns: int = 0,
-                                       entry_index: int = 1):
-    """Load one controller's raw imu*.csv and apply the full correction chain:
-    mix+bias calibration, the confirmed sensor->body axis transform (_DIAG_FLIP
-    -- see module docstring), and an optional clock-offset correction (lag_ns,
-    added to the raw timestamps -- e.g. Stage 1's measured controller<->camera
-    offset).
+                                       entry_index: int = 1, factory_corrected_input: bool = True,
+                                       accel_scale: float = ACCEL_DRIVER_SCALE):
+    """Load one controller's imu*.csv and apply the correction chain: (optionally) factory
+    mix+bias calibration, the confirmed sensor->body axis transform (_DIAG_FLIP -- see module
+    docstring), the accel driver-scale fix, and an optional clock-offset correction (lag_ns,
+    added to the raw timestamps -- e.g. the measured controller<->camera offset).
+
+    factory_corrected_input=True (default): the CSV is what the Monado driver already wrote
+    AFTER its own mix + bias + axis-rotation step (true of every recording this project has --
+    see module docstring), so mix+bias is NOT applied again. False: the CSV is genuinely raw,
+    apply calib.correct() as before (entry_index selects the factory entry then).
+    accel_scale multiplies the accelerometer AFTER the axis transform (default: the driver
+    unit fix ACCEL_DRIVER_SCALE; pass 1.0 for no scaling). factory_corrected_input=False with
+    accel_scale=1.0 reproduces this function's pre-2026-09-23 output exactly.
 
     Single source for this chain -- main.py and visualize_imu.py both call this
     rather than each keeping their own copy of the transform logic.
@@ -743,15 +798,29 @@ def load_and_calibrate_controller_imu(imu_path, controller_cfg: dict, lag_ns: in
     Returns (t_ns int64[N], gyro_body float64[N,3], accel_body float64[N,3]).
     """
     t_imu, gyro_raw, accel_raw = load_imu_csv(imu_path)
-    calib = create_imu_calib_from_config(controller_cfg, entry_index=entry_index)
+    gyro_in = gyro_raw.astype(np.float64)
+    accel_in = accel_raw.astype(np.float64)
 
-    gyro_corr = calib.gyro.correct(gyro_raw.astype(np.float64))
-    gyro_body = (_DIAG_FLIP @ gyro_corr.T).T
+    if not factory_corrected_input:
+        calib = create_imu_calib_from_config(controller_cfg, entry_index=entry_index)
+        gyro_in = calib.gyro.correct(gyro_in)
+        accel_in = calib.accel.correct(accel_in)
 
-    accel_corr = calib.accel.correct(accel_raw.astype(np.float64))
-    accel_body = (_DIAG_FLIP @ accel_corr.T).T
+    gyro_body = (_DIAG_FLIP @ gyro_in.T).T
+    accel_body = accel_scale * (_DIAG_FLIP @ accel_in.T).T
 
     return t_imu + lag_ns, gyro_body, accel_body
+
+
+def imu_loader_kwargs(imu_cfg: dict) -> dict:
+    """config.yml's imu.recorded_stream_factory_corrected / imu.accel_driver_scale as keyword
+    arguments for load_and_calibrate_controller_imu (defaults = the fix: True / ACCEL_DRIVER_SCALE).
+    Set recorded_stream_factory_corrected: false and accel_driver_scale: 1.0 for the legacy chain."""
+    cfg = imu_cfg or {}
+    fc = cfg.get("recorded_stream_factory_corrected")
+    sc = cfg.get("accel_driver_scale")
+    return {"factory_corrected_input": True if fc is None else bool(fc),
+            "accel_scale": ACCEL_DRIVER_SCALE if sc is None else float(sc)}
 
 
 # "Near-stationary" gate for a low-motion-frame gravity bootstrap -- shared canonical
@@ -759,6 +828,26 @@ def load_and_calibrate_controller_imu(imu_path, controller_cfg: dict, lag_ns: in
 # accel_short_horizon_check.py's own module-level copy, which now imports this instead,
 # and this same file's LiveGravityEstimator, below).
 LOW_OMEGA_THRESH_RAD_S = 0.5
+
+
+# Acceptance band for the median |accelerometer| over low-rotation samples (|gyro| < 0.5 rad/s) of a
+# controller stream AFTER the loader (analysis/imu_bias/fix_validation, 16 recording-controller pairs):
+# correct stream 9.75..9.96 m/s^2; the old double-corrected stream 10.13..10.29; a genuinely raw stream (no
+# mix/bias/scale at all) lands elsewhere again. A value outside this band means the loader's
+# factory_corrected_input / accel_scale assumption does not match the data (e.g. a recording made with a
+# different driver build) -- main.py logs a startup warning instead of silently mis-integrating.
+ACCEL_QUIET_MAGNITUDE_BAND = (9.70, 10.02)
+
+
+def median_quiet_accel_magnitude(gyro_body: np.ndarray, accel_body: np.ndarray,
+                                  omega_thresh: float = LOW_OMEGA_THRESH_RAD_S, min_samples: int = 100):
+    """Median |accel| (m/s^2) over samples whose |gyro| < omega_thresh (rad/s), or None if fewer than
+    min_samples such samples exist (too little quiet data to judge). A rest sample reads ~|g|; see
+    ACCEL_QUIET_MAGNITUDE_BAND. gyro_body/accel_body: (N,3), same sample times (one IMU stream)."""
+    quiet = np.linalg.norm(gyro_body, axis=1) < omega_thresh
+    if int(quiet.sum()) < min_samples:
+        return None
+    return float(np.median(np.linalg.norm(accel_body[quiet], axis=1)))
 
 
 class LiveGravityEstimator:

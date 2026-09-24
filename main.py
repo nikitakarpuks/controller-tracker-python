@@ -17,7 +17,8 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP, \
-    LiveGravityEstimator
+    LiveGravityEstimator, imu_loader_kwargs, accel_lever_arm_body, median_quiet_accel_magnitude, \
+    ACCEL_QUIET_MAGNITUDE_BAND
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
                             load_vision_offset_ns, load_vision_drift_params, controller_imu_files, \
                             relative_pose, DRIFT_CHECK_VARIANT
@@ -189,16 +190,33 @@ def main():
                     f"[{ctrl_key}] IMU file not found ({imu_path}) — gyro prediction "
                     f"and gravity-check diagnostic disabled for this controller")
                 continue
+            _imu_kwargs = imu_loader_kwargs(imu_cfg)   # imu.recorded_stream_factory_corrected / accel_driver_scale
             t_imu, gyro_body, accel_body = load_and_calibrate_controller_imu(
                 imu_path, load_json_config(config["controllers"][ctrl_key]["config_path"]), lag_ns=lag_ns,
+                **_imu_kwargs,
             )
             gyro_data[ctrl_key]  = (t_imu, gyro_body)
             accel_data[ctrl_key] = (t_imu, accel_body)
 
             _imu_calib = create_imu_calib_from_config(ctrl_json_cfg[ctrl_key])
-            lever_arm[ctrl_key] = _imu_calib.accel.T_rt.compose(_imu_calib.gyro.T_rt.inverse()).t
+            lever_arm[ctrl_key] = accel_lever_arm_body(_imu_calib)   # body-frame accel position, NOT the raw factory t
 
-            logger.bind(cat="startup").info(f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name}")
+            # Guard against a stream that does not match the loader's assumption (factory-corrected + driver
+            # accel scale), e.g. a recording from a different driver build: rest samples must read ~|g|.
+            _quiet_g = median_quiet_accel_magnitude(gyro_body, accel_body)
+            if _quiet_g is not None and not (ACCEL_QUIET_MAGNITUDE_BAND[0] <= _quiet_g <= ACCEL_QUIET_MAGNITUDE_BAND[1]):
+                logger.bind(cat="startup").warning(
+                    f"[{ctrl_key}] median |accel| over low-rotation samples is {_quiet_g:.3f} m/s^2, outside the expected "
+                    f"{ACCEL_QUIET_MAGNITUDE_BAND[0]}..{ACCEL_QUIET_MAGNITUDE_BAND[1]} band for the current IMU loader "
+                    f"settings (factory_corrected_input={_imu_kwargs['factory_corrected_input']}, "
+                    f"accel_scale={_imu_kwargs['accel_scale']:.6f}) -- this recording's IMU stream may not match them "
+                    f"(raw stream, different driver build, or double correction); accel dead-reckoning will be biased")
+
+            logger.bind(cat="startup").info(
+                f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name} "
+                f"(lag {lag_ns / 1e6:+.2f} ms, factory_corrected_input={_imu_kwargs['factory_corrected_input']}, "
+                f"accel_scale={_imu_kwargs['accel_scale']:.6f}, "
+                f"accel lever arm (body frame, mm)={np.round(lever_arm[ctrl_key] * 1000, 1).tolist()})")
 
         fusion_cfg = config.get("fusion", {})
         g_world_estimator = LiveGravityEstimator(
