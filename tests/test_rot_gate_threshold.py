@@ -28,8 +28,15 @@ class RotGateThresholdTests(unittest.TestCase):
         self.assertAlmostEqual(rot_gate_threshold_deg(0.35, False, True), 150.0)
 
     def test_expired_state_returns_179(self):
-        self.assertEqual(rot_gate_threshold_deg(0.351, True, False), _ROT_GATE_EXPIRED_DEG)
+        self.assertEqual(rot_gate_threshold_deg(3.01, True, False), _ROT_GATE_EXPIRED_DEG)
         self.assertEqual(rot_gate_threshold_deg(5.0, False, True), _ROT_GATE_EXPIRED_DEG)
+
+    def test_finite_limit_past_0p35s(self):
+        # a wrong 135 deg pair was confirmed at 0.455 s (walk_medium right, 93.70 s): still gated now
+        self.assertAlmostEqual(rot_gate_threshold_deg(0.455, True, False), 40.0)
+        self.assertGreater(135.0, rot_gate_threshold_deg(0.455, True, False))
+        self.assertAlmostEqual(rot_gate_threshold_deg(1.5, False, False), 150.0)   # no headset: capped
+        self.assertAlmostEqual(rot_gate_threshold_deg(3.0, True, True), 65.0)
 
     def test_negative_dt_clamped(self):
         self.assertAlmostEqual(rot_gate_threshold_deg(-1.0, False, False), 40.0)

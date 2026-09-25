@@ -88,7 +88,8 @@ class ContinuousGateTests(unittest.TestCase):
     def test_expired_state_never_vetoes_via_gate(self):
         f = _filter(np.radians(100.0), frames_since_update=5)
         f.last_update_ts_ns = 0
-        self.assertEqual(f._rot_gate_info(400 * MS)["T"], 179.0)
+        self.assertEqual(f._rot_gate_info(3500 * MS)["T"], 179.0)
+        self.assertLess(f._rot_gate_info(400 * MS)["T"], 179.0)
 
     def test_ceiling_uses_gate_in_continuous_only(self):
         fc = _filter(np.radians(100.0), 2)

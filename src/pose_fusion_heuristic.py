@@ -113,7 +113,7 @@ _ROT_GATE_EXPIRED_DEG = 179.0
 def rot_gate_threshold_deg(dt_s: float, headset_active: bool, saturated: bool, base_deg: float = 40.0,
                             sat_allow_deg: float = 25.0, nohs_allow_dps: float = 500.0,
                             cap_hs_deg: float = 75.0, cap_nohs_deg: float = 150.0,
-                            max_state_age_s: float = 0.35) -> float:
+                            max_state_age_s: float = 3.0) -> float:
     """Continuous rotation-innovation threshold (deg) between a vision candidate and the gyro-
     propagated prediction, valid at EVERY elapsed time dt_s since the last accepted state -- there is
     no "dt <= budget" on/off switch (that fail-open switch let a 171 deg mirror lock through 0.244 s
@@ -130,9 +130,11 @@ def rot_gate_threshold_deg(dt_s: float, headset_active: bool, saturated: bool, b
     30-45 deg. The old fitted 0.05*peak_gyro*dt term is deliberately NOT used: it was fitted to ~3
     saturation events, is not physical, and is unbounded.
 
-    Beyond max_state_age_s the state is too stale to gate against (the live filter resets at
-    max_coast_s = 0.3 s anyway): returns _ROT_GATE_EXPIRED_DEG, which no real innovation exceeds
-    meaningfully. Negative dt_s is clamped to 0."""
+    Beyond max_state_age_s (3 s) the state is too stale to gate against: returns _ROT_GATE_EXPIRED_DEG,
+    which no real innovation exceeds meaningfully. Between ~0.35 s and 3 s the gate stays at its finite
+    value (measured on 588 good and 81 bad candidates with dt > 0.35 s: good headset-corrected innovation
+    max 30 deg, bad >= 108 deg; T=40 had 0 false positives when the state was itself good). Negative dt_s
+    is clamped to 0."""
     dt = max(0.0, float(dt_s))
     if dt > float(max_state_age_s):
         return _ROT_GATE_EXPIRED_DEG
@@ -895,7 +897,7 @@ class HeuristicPoseFusionFilter:
                     nohs_allow_dps=float(self._hc_get("rot_gate_nohs_allow_dps", 500.0)),
                     cap_hs_deg=float(self._hc_get("rot_gate_cap_hs_deg", 75.0)),
                     cap_nohs_deg=float(self._hc_get("rot_gate_cap_nohs_deg", 150.0)),
-                    max_state_age_s=float(self._hc_get("rot_gate_max_state_age_s", 0.35)))
+                    max_state_age_s=float(self._hc_get("rot_gate_max_state_age_s", 3.0)))
 
     def _rot_gate_saturated(self, ts0, ts1):
         """(saturated, peak_dps): gyro clip within the padded window, OR peak gyro >= rot_gate_sat_peak_dps

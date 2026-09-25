@@ -661,14 +661,14 @@ fusion_heuristic:
   # dt-budgeted cold veto + speed/gyro/stale-widening warm ceiling above (unchanged). continuous =
   # T = min(cap_hs, base + sat_allow*saturated) with headset ego-motion correction, or
   # min(cap_nohs, base + sat_allow*saturated + nohs_allow_dps*dt) without; state older than
-  # max_state_age_s -> 179 deg (expired). Also vetoes on gyro alone when predict() is None.
+  # max_state_age_s (3 s; was 0.35 s -- the data shows the finite limit holds out to 3 s) -> 179 deg (expired). Also vetoes on gyro alone when predict() is None.
   rot_gate_mode: auto   # legacy | continuous | auto (continuous iff headset ego-motion data is available, else legacy)
   rot_gate_base_deg: 40.0
   rot_gate_sat_allow_deg: 25.0
   rot_gate_nohs_allow_dps: 500.0
   rot_gate_cap_hs_deg: 75.0
   rot_gate_cap_nohs_deg: 150.0
-  rot_gate_max_state_age_s: 0.35
+  rot_gate_max_state_age_s: 3.0
   rot_gate_sat_peak_dps: 1800.0
   rot_gate_clip_frac: 0.95
   rot_gate_pad_s: 0.010
