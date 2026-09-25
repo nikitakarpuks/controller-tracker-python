@@ -213,6 +213,12 @@ class HeuristicPoseFusionFilter:
         # surviving reference for the swap-check to compare against).
         self._last_known_p: np.ndarray | None = None
         self._last_known_p_ts_ns: int | None = None
+        # Last SOLID accepted rotation (+ its time), kept across reset() like _last_known_p: the
+        # reference the bootstrap rotation gate (bootstrap_rot_gate_mode) propagates by the gyro when a
+        # fresh bootstrap follows a reset, where self.R is gone. Only recorded from accepts that are not
+        # coverage-fallback / rotation-untrustworthy / bootstrap / fail-open.
+        self._last_known_R: np.ndarray | None = None
+        self._last_known_R_ts_ns: int | None = None
         self.v = np.zeros(3)
         # True once self.v has been set from an ACTUAL measured displacement
         # -- a real two-point finite difference over a SHORT, known gap, in
@@ -929,6 +935,40 @@ class HeuristicPoseFusionFilter:
                     headset=hs, saturated=sat, peak_dps=peak_dps)
         self._rot_gate_cache = (key, info)
         return info
+
+    def _note_last_known_R(self, frame_ts_ns: int, coverage_fallback: bool) -> None:
+        """Remember self.R as the bootstrap gate's reference -- only from a solid accept."""
+        if coverage_fallback or self._rotation_seed_grace_frames > 0 or self.R is None:
+            return
+        self._last_known_R, self._last_known_R_ts_ns = self.R.copy(), frame_ts_ns
+
+    def _bootstrap_rot_check(self, R_meas, frame_ts_ns: int):
+        """Bootstrap rotation gate (fusion_heuristic.bootstrap_rot_gate_mode legacy|shadow|enforce): after a
+        reset self.R is gone, so a fresh bootstrap pair had no gyro reference at all and two wrong candidates
+        that agree with each other (walk_medium 93.70 s: 135 deg, 5 inliers) were confirmed. Propagates the
+        last solid accepted rotation by the headset-corrected gyro to the candidate's time and compares.
+        Returns None when not evaluable (mode legacy, no reference, reference older than
+        bootstrap_rot_gate_max_age_s, no headset ego-motion data for the window, no gyro coverage), else
+        dict(innov, T, age_s, saturated, would_veto)."""
+        mode = str(self._hc_get("bootstrap_rot_gate_mode", "legacy")).lower()
+        if mode not in ("shadow", "enforce") or self._last_known_R is None or self._gyro_data is None:
+            return None
+        ts0 = self._last_known_R_ts_ns
+        age_s = (frame_ts_ns - ts0) / 1e9
+        if age_s <= 0.0 or age_s > float(self._hc_get("bootstrap_rot_gate_max_age_s", 1.5)):
+            return None
+        hs = self._headset_inputs(ts0, frame_ts_ns)
+        if hs is None:
+            return None
+        t_gyro, gyro_body = slice_imu_to_window(*self._gyro_data, ts0, frame_ts_ns)
+        R_rel = integrate_gyro_segment(t_gyro, gyro_body, ts0, frame_ts_ns)
+        if R_rel is None:
+            return None
+        R_pred = hs[1].R.T @ hs[0].R @ self._last_known_R @ R_rel
+        innov = float(np.degrees(np.linalg.norm(Rotation.from_matrix(R_pred.T @ R_meas).as_rotvec())))
+        sat, _ = self._rot_gate_saturated(ts0, frame_ts_ns)
+        T = rot_gate_threshold_deg(age_s, True, sat, **self._rot_gate_params())
+        return dict(innov=innov, T=T, age_s=age_s, saturated=bool(sat), would_veto=innov > T)
 
     def _gyro_only_rot_veto(self, R_meas, frame_ts_ns: int):
         """Continuous-gate check for the frames where predict() returned None (rig-frame g_world not
@@ -2039,6 +2079,7 @@ class HeuristicPoseFusionFilter:
             self._rotation_seed_grace_frames -= 1
         self.last_update_ts_ns = frame_ts_ns
         self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
+        self._note_last_known_R(frame_ts_ns, bool(solution.get("coverage_fallback", False)))
         self._report(frame_ts_ns, self.R, self.p)
         self.frames_since_update = 0
 
@@ -2480,6 +2521,16 @@ class HeuristicPoseFusionFilter:
         # through this candidate's R should point along world -y (down) -- see
         # the veto below for the real cases and numbers. None when there is no
         # accel sample to check against (veto then simply doesn't apply).
+        if log_prefix == "BOOTSTRAP":
+            _bg = self._bootstrap_rot_check(R_meas, frame_ts_ns)
+            if _bg is not None:
+                _bg_mode = str(self._hc_get("bootstrap_rot_gate_mode", "legacy")).lower()
+                _log.info(f"[{self._ctrl_name}] BOOTSTRAP-GATE {_bg_mode.upper()} ts={frame_ts_ns} "
+                          f"innov={_bg['innov']:.2f}deg T={_bg['T']:.1f}deg age={_bg['age_s']:.3f}s "
+                          f"sat={_bg['saturated']} n_inliers={n_inliers} would_veto={_bg['would_veto']}")
+                if _bg_mode == "enforce" and _bg["would_veto"]:
+                    rot_pred_implausible = True
+                    weak = True   # `weak` was already computed above from the original rot_pred_implausible
         _bootstrap_gravity_angle_deg = None
         if log_prefix == "BOOTSTRAP" and accel_now is not None:
             _a = np.asarray(accel_now, dtype=float)
@@ -2770,6 +2821,8 @@ class HeuristicPoseFusionFilter:
         self._seed_rotation_grace(coverage_fallback, high_risk=high_risk)
         self.last_update_ts_ns = frame_ts_ns
         self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
+        if log_prefix != "BOOTSTRAP":
+            self._note_last_known_R(frame_ts_ns, coverage_fallback)
         self.frames_since_update = 0
         self.consecutive_rejects = 0
         self._report(frame_ts_ns, self.R, self.p)

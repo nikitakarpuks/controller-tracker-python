@@ -194,3 +194,63 @@ class AutoModeTests(unittest.TestCase):
     def test_auto_with_headset_disabled_is_legacy(self):
         f = _filter(1.0, 0, mode="auto", headset_mocap=object(), extra_hc={"disable_headset_ego_motion": True})
         self.assertFalse(f._rot_gate_continuous())
+
+
+class BootstrapRotGateTests(unittest.TestCase):
+    def _f(self, mode="shadow", gyro_dps=100.0, age_ns=200 * MS):
+        f = _filter(np.radians(gyro_dps), 0, extra_hc={"bootstrap_rot_gate_mode": mode}, headset_mocap=object())
+        f._last_known_R, f._last_known_R_ts_ns = np.eye(3), 0
+        Tid = Mock(R=np.eye(3))
+        self._hs = patch.object(f, "_headset_inputs", return_value=(Tid, Tid, np.zeros(3), np.zeros(3)))
+        self._hs.start(); self.addCleanup(self._hs.stop)
+        return f, age_ns
+
+    def _cand(self, f, age_ns, innov_deg):
+        from src.imu_data import slice_imu_to_window, integrate_gyro_segment
+        tg, wg = slice_imu_to_window(*f._gyro_data, 0, age_ns)
+        R_pred = integrate_gyro_segment(tg, wg, 0, age_ns)
+        return R_pred @ Rotation.from_rotvec(np.radians(innov_deg) * np.array([1.0, 0.0, 0.0])).as_matrix()
+
+    def test_legacy_mode_none(self):
+        f, age = self._f("legacy")
+        self.assertIsNone(f._bootstrap_rot_check(np.eye(3), age))
+
+    def test_no_reference_none(self):
+        f, age = self._f()
+        f._last_known_R = None
+        self.assertIsNone(f._bootstrap_rot_check(np.eye(3), age))
+
+    def test_veto_when_far(self):
+        f, age = self._f()
+        r = f._bootstrap_rot_check(self._cand(f, age, 135.0), age)
+        self.assertTrue(r["would_veto"]); self.assertAlmostEqual(r["innov"], 135.0, places=1)
+        self.assertAlmostEqual(r["T"], 40.0)
+
+    def test_no_veto_when_close(self):
+        f, age = self._f()
+        self.assertFalse(f._bootstrap_rot_check(self._cand(f, age, 25.0), age)["would_veto"])
+
+    def test_too_old_reference_ignored(self):
+        f, _ = self._f()
+        self.assertIsNone(f._bootstrap_rot_check(np.eye(3), 1600 * MS))
+
+    def test_without_headset_ignored(self):
+        f, age = self._f()
+        self._hs.stop()
+        with patch.object(f, "_headset_inputs", return_value=None):
+            self.assertIsNone(f._bootstrap_rot_check(np.eye(3), age))
+
+    def test_reference_survives_reset(self):
+        f, _ = self._f()
+        f.reset()
+        self.assertIsNotNone(f._last_known_R)
+
+    def test_note_skips_coverage_fallback_and_grace(self):
+        f, _ = self._f()
+        f._last_known_R = None
+        f.R = np.eye(3)
+        f._note_last_known_R(100, True); self.assertIsNone(f._last_known_R)
+        f._rotation_seed_grace_frames = 2
+        f._note_last_known_R(100, False); self.assertIsNone(f._last_known_R)
+        f._rotation_seed_grace_frames = 0
+        f._note_last_known_R(100, False); self.assertIsNotNone(f._last_known_R)
