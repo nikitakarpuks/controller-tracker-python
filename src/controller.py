@@ -2427,6 +2427,11 @@ class ControllerTracker:
                                                        _anchor_per_gyro_rot, _anchor_rot_min_budget_s,
                                                        _anchor_rot_calm_extend_ceiling_s,
                                                        _anchor_rot_calm_extend_max_dps)
+            # headset-ego-motion-active rotation budget (fusion_heuristic.coast_rot_budget_mode; the
+            # getattr guard covers the Kalman filter, which has no such method) -- rotation only
+            _rot_budget_fn = getattr(self._fusion_filter, "rot_coast_budget_s", None)
+            if _rot_budget_fn is not None:
+                _rot_budget_s = _rot_budget_fn(frame_ts_ns, _rot_budget_s)
             _imu_only_max_s = min(_pos_budget_s, _rot_budget_s)
 
         _imu_pose = None

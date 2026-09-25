@@ -433,6 +433,47 @@ def peak_gyro_accel_over_window(gyro_data, accel_data, ts_lo: int, ts_hi: int,
     return peak_gyro_dps, peak_accel_mps2
 
 
+# Empirical per-axis gyro ceilings of the recorded controller IMU streams, rad/s, in the BODY
+# (D-flipped) frame the loader delivers: x hard-clips at +-2000 dps (ICM-20602 FS_SEL=3 full
+# scale), z at ~2722 dps, y unresolved (raw y reaches ~2025 in a couple of samples -- 2000 is the
+# conservative choice). Found 2026-09-25 (analysis/imu_thresholds_2026-09-25/saturation/): only
+# static_hard and walk_hard reach them (0.15-1.04 % of samples), where a burst then under-
+# integrates by 30-45 deg and the recorded peak |gyro| itself under-reads the true rate.
+GYRO_CLIP_CEILING_RAD_S = np.radians(np.array([2000.0, 2000.0, 2722.0]))
+
+
+def gyro_window_clip_flags(gyro_data, ts_lo, ts_hi, ceil_rad_s=None, frac: float = 0.95,
+                            pad_ns: int = 10_000_000) -> tuple:
+    """(clipped: bool, peak_dps: float) over [ts_lo - pad_ns, ts_hi + pad_ns] of a (t_ns, gyro_body)
+    tuple (same convention as slice_imu_to_window / peak_gyro_accel_over_window).
+
+    clipped is True when ANY sample has |axis_i| >= frac * ceil_rad_s[i] -- the gyro is (nearly) pinned
+    at its measurable range, so the integrated rotation can UNDER-read the true rotation (a burst
+    lasting several samples at the ceiling loses everything above it) and the windowed peak_dps is
+    only a lower bound. peak_dps is the plain peak |gyro| norm in the same padded window, computed
+    here (independent of any accel stream, unlike peak_gyro_accel_over_window which returns (0, 0)
+    when accel is missing).
+
+    The pad (default 10 ms = two 200 Hz samples) matters: with pad 0 an 11 ms window holds only 2-3
+    samples, a burst between samples is invisible, and the recorded IMU stream has gaps of up to 90 ms
+    (static_hard) that are linearly interpolated. Returns (False, 0.0) -- inert -- when gyro_data or
+    ts_lo is missing or the window holds no samples."""
+    if gyro_data is None or ts_lo is None or ts_hi is None:
+        return False, 0.0
+    t, g = gyro_data
+    if len(t) == 0:
+        return False, 0.0
+    ceil = GYRO_CLIP_CEILING_RAD_S if ceil_rad_s is None else np.asarray(ceil_rad_s, dtype=np.float64)
+    i0 = int(np.searchsorted(t, ts_lo - pad_ns, side="left"))
+    i1 = int(np.searchsorted(t, ts_hi + pad_ns, side="right"))
+    if i1 <= i0:
+        return False, 0.0
+    w = np.asarray(g[i0:i1], dtype=np.float64)
+    clipped = bool(np.any(np.abs(w) >= float(frac) * ceil))
+    peak_dps = float(np.degrees(np.linalg.norm(w, axis=1)).max())
+    return clipped, peak_dps
+
+
 def effective_coast_budget_s(base_budget_s: float, peak_dps: float, calm_floor_dps: float,
                               shrink_per_dps: float, min_budget_s: float,
                               calm_extend_ceiling_s: float = 0.0,
@@ -479,6 +520,22 @@ def effective_coast_budget_s(base_budget_s: float, peak_dps: float, calm_floor_d
     ramp = max(0.0, 1.0 - peak_dps / calm_extend_max_dps) if calm_extend_max_dps > 0.0 else 0.0
     extend = headroom_s * ramp
     return max(min_budget_s, base_budget_s + extend - shrink)
+
+
+def headset_rot_coast_budget_s(peak_dps: float, full_budget_s: float = 0.30, full_until_dps: float = 1000.0,
+                                floor_s: float = 0.035, floor_at_dps: float = 1500.0) -> float:
+    """How long a gyro-only ROTATION prediction stays credible when the headset's own motion is
+    compensated (headset ego-motion active): full_budget_s up to full_until_dps, then linear down to
+    floor_s at floor_at_dps (flat floor beyond). Replaces the steep no-headset shrink (which sat at its
+    3 ms floor from ~400 dps up) because, with the headset rotation removed, the gyro-integrated rotation
+    error stays p99 14-33 deg out to 1.5 s (analysis/imu_thresholds_2026-09-25, A2). Rotation ONLY --
+    position budgets are deliberately untouched. Callers take max(legacy_budget, this)."""
+    if peak_dps <= full_until_dps:
+        return float(full_budget_s)
+    if peak_dps >= floor_at_dps:
+        return float(floor_s)
+    f = (peak_dps - full_until_dps) / (floor_at_dps - full_until_dps)
+    return float(full_budget_s + f * (floor_s - full_budget_s))
 
 
 def predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world, lever_arm,

@@ -657,6 +657,40 @@ fusion_heuristic:
   cold_reacquire_rot_veto_max_s: 0.25
   cold_reacquire_rot_veto_thresh_deg: 100.0
 
+  # Continuous rotation gate (analysis/imu_thresholds_2026-09-25/FINAL_PLAN.md). legacy = the
+  # dt-budgeted cold veto + speed/gyro/stale-widening warm ceiling above (unchanged). continuous =
+  # T = min(cap_hs, base + sat_allow*saturated) with headset ego-motion correction, or
+  # min(cap_nohs, base + sat_allow*saturated + nohs_allow_dps*dt) without; state older than
+  # max_state_age_s -> 179 deg (expired). Also vetoes on gyro alone when predict() is None.
+  rot_gate_mode: auto   # legacy | continuous | auto (continuous iff headset ego-motion data is available, else legacy)
+  rot_gate_base_deg: 40.0
+  rot_gate_sat_allow_deg: 25.0
+  rot_gate_nohs_allow_dps: 500.0
+  rot_gate_cap_hs_deg: 75.0
+  rot_gate_cap_nohs_deg: 150.0
+  rot_gate_max_state_age_s: 0.35
+  rot_gate_sat_peak_dps: 1800.0
+  rot_gate_clip_frac: 0.95
+  rot_gate_pad_s: 0.010
+  # Dev switch: force the no-headset prediction path even when headset mocap is loaded.
+  disable_headset_ego_motion: false
+
+  # Rotation-only coast/anchor budget while headset ego-motion is active (degenerate w_sum<=0 gate and
+  # ControllerTracker._mark_all_lost's search anchor; both still min() with the UNCHANGED position
+  # budget). legacy = unchanged. headset = max(legacy, full_s up to full_until_dps, linear to floor_s at
+  # floor_at_dps). Without headset data the legacy shrink is kept.
+  coast_rot_budget_mode: legacy
+  coast_rot_budget_hs_full_s: 0.30
+  coast_rot_budget_hs_full_until_dps: 1000.0
+  coast_rot_budget_hs_floor_s: 0.035
+  coast_rot_budget_hs_floor_at_dps: 1500.0
+  # FUTURE WORK (deferred by decision 2026-09-25): everything above (rot_gate_*, coast_rot_budget_*)
+  # is validated for headset ego-motion from the dev-only mocap headset track with the fixed mocap
+  # room g_world. The no-headset case (real deployments without mocap: needs the headset imu0 gyro fed
+  # into predict(), or SLAM/VIO headset pose, and a converged g_world_estimator so predict() stops
+  # returning None / failing open) is NOT handled yet. See
+  # analysis/imu_thresholds_2026-09-25/FINAL_PLAN.md (C8).
+
   # bootstrap_gravity_veto_thresh_deg: at BOOTSTRAP only, refuse to confirm two
   # agreeing weak candidates when the accelerometer reading rotated through the
   # candidate's R points more than this many degrees away from world down (-y).
