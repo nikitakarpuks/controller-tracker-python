@@ -679,7 +679,7 @@ fusion_heuristic:
   # contradicts the headset-corrected gyro propagation of the last solid accepted rotation as
   # rot_pred_implausible (forced weak, cannot confirm). Needs headset ego-motion data; reference
   # older than max_age_s -> no gate. Limit T = rot_gate_threshold_deg (40 / 65 deg if gyro clipped).
-  bootstrap_rot_gate_mode: legacy
+  bootstrap_rot_gate_mode: enforce   # legacy | shadow | enforce (no effect without headset ego-motion data)
   bootstrap_rot_gate_max_age_s: 1.5
 
   # Rotation-only coast/anchor budget while headset ego-motion is active (degenerate w_sum<=0 gate and
