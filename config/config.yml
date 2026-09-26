@@ -1137,6 +1137,15 @@ blob_detection:
   min_streak_elongation: 2.0
   max_streak_elongation: 4.5
   min_streak_fill_ratio: 0.30
+  # Streak tail trim (src/blob_detector.py _trim_streak_tail): replace an elongated, single-peaked head+tail motion streak by its
+  # bright head at the connected-component level, before any area/circularity decision in either pass (centroid = head). false = off (legacy behaviour).
+  streak_tail_trim: true
+  streak_tail_trim_peak_fraction: 0.5      # keep the bins along the streak that stay >= this fraction of the head peak
+  streak_tail_trim_min_elongation: 2.0     # untouched below this (round / slightly oval LEDs)
+  streak_tail_trim_max_elongation: 8.0
+  streak_tail_trim_min_length_px: 8.0
+  streak_tail_trim_max_area_factor: 6.0    # components above this multiple of max_area (lamp merges) are never examined
+  streak_tail_trim_max_head_offset: 0.35   # head peak must lie within this fraction of the length from one end
   min_circularity_angle_factor: 0.2
   min_circularity_floor: 0.1
   required_threshold_factor: 2.0   # required_threshold = clip(pixel_threshold * factor, 255)
