@@ -2076,7 +2076,18 @@ class HeuristicPoseFusionFilter:
         elif solution.get("coverage_fallback", False):
             self._seed_rotation_grace(True)
         elif self._rotation_seed_grace_frames > 0:
-            self._rotation_seed_grace_frames -= 1
+            # rotation_seed_grace_vetted_deg (default 20; <= 0 disables): this accept was exempt from the
+            # rotation gate, but if its rotation nevertheless AGREED with the gyro prediction, the reference
+            # is gyro-consistent -- the seed evidently was right -- so the exemption ends now instead of
+            # counting down. An exempt accept that disagrees with the gyro (the 2026-09-13 frame 66->67 case:
+            # a wrong reference) keeps the old countdown. Real case: static_hard frames 5868-5871 accepted
+            # with 0.5/1.8/1.0/0.4 deg gyro innovation, yet grace was still 1 at 5872, where a wrong 133 deg
+            # candidate (17 inliers, 0.06 px) slipped through.
+            _vetted_deg = float(self._hc_get("rotation_seed_grace_vetted_deg", 20.0))
+            if _vetted_deg > 0.0 and rot_innov_deg <= _vetted_deg:
+                self._rotation_seed_grace_frames = 0
+            else:
+                self._rotation_seed_grace_frames -= 1
         self.last_update_ts_ns = frame_ts_ns
         self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
         self._note_last_known_R(frame_ts_ns, bool(solution.get("coverage_fallback", False)))

@@ -356,6 +356,8 @@ fusion_heuristic:
   # (vision was confirmed correct via mocap the whole time). 2 gives that
   # frame one full real accept to settle before it's trusted as a reference.
   rotation_seed_grace_frames: 2
+  # An exempt accept whose rotation agreed with the gyro to within this many deg ends the grace at once (<= 0 disables).
+  rotation_seed_grace_vetted_deg: 20.0
 
   # _try_cold_reacquire's weak-candidate buffer (see its own docstring): a
   # buffered weak cold-reacquire candidate older than this is dropped as
