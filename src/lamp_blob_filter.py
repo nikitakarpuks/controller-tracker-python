@@ -428,6 +428,8 @@ def detect_lamp_blobs(blobs: BlobResult, cfg: dict) -> LampFilterResult:
     max_lines = int(cfg.get("max_lines", 20))
     max_brightness = float(cfg.get("max_brightness", 60.0))
     max_line_residual_px = float(cfg.get("max_line_residual_px", 2.0))
+    noise_brightness_max = float(cfg.get("noise_brightness_max", 8.5))
+    noise_zone_min_points = int(cfg.get("noise_zone_min_points", 0))   # 0 = guard off (module default)
 
     areas = np.array(
         [float(np.pi * r * r) for r in blobs.radii],
@@ -508,6 +510,19 @@ def detect_lamp_blobs(blobs: BlobResult, cfg: dict) -> LampFilterResult:
             continue
         cluster_mask = np.zeros(n, dtype=bool)
         cluster_mask[cluster_local] = True
+        # Noise-zone guard (noise_zone_min_points > 0 enables): a cluster holding many noise-LEVEL points
+        # (peak brightness <= noise_brightness_max, i.e. right at the detection floor) is a noise cloud, not a
+        # lamp fixture. Single-pixel noise blobs have integer centroids, so runs of them line up exactly along
+        # rows/diagonals and the (2 px) line tolerance happily builds "lamp lines" through them -- lines that
+        # also swallowed real LED blobs sitting in the same cloud (static_hard frames 5861/5876/5878: the LED
+        # ring on cam3/cam1 removed together with 3-4 noise points). In such a cluster the noise-level points
+        # may not be line members; brighter points (real lamp rows are r~0.8, brightness 12-115) still can.
+        if noise_zone_min_points > 0:
+            _noise = cluster_local[blobs.brightnesses[cluster_local] <= noise_brightness_max]
+            if len(_noise) >= noise_zone_min_points:
+                cluster_mask[_noise] = False
+                if int(cluster_mask.sum()) < min_points:
+                    continue
         found_lines.extend(_find_dominant_lines(
             centroids64, cluster_mask,
             spacing_min_px, spacing_max_px, max_line_residual_px, min_points, max_lines,

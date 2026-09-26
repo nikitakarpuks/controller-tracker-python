@@ -1410,6 +1410,14 @@ blob_detection:
                                  # -- every blob reaching this filter already clears that; real LEDs
                                  # typically saturate far brighter.
     max_line_residual_px: 2.0   # every line in a candidate must have max perpendicular PCA-fit
+    # Noise-zone guard (src/lamp_blob_filter.py): in a spatially-connected cluster holding at least
+    # noise_zone_min_points noise-LEVEL points (peak brightness <= noise_brightness_max, i.e. at the detection
+    # floor), those noise points may not be members of a lamp line. Single-pixel noise blobs have integer
+    # centroids and line up exactly, so a noise cloud otherwise yields spurious "lamp lines" that also swallow real
+    # LED blobs in the same cloud (static_hard frames 5861 cam3 / 5876 cam1: LED ring blobs removed together with
+    # noise). Real lamp rows (r~0.8, brightness 12-115) are unaffected. 0 disables.
+    noise_brightness_max: 8.5
+    noise_zone_min_points: 20
                                  # residual <= this or the whole candidate is spared. Generous by
                                  # design: min_points+spacing above is the real guard (no
                                  # controller pose in the simulation ever achieved lamp-like
