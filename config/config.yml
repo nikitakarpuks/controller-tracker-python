@@ -2577,6 +2577,10 @@ matching:
   # LM only reached 4.05px (~3.5x worse than either input alone).
   joint_fusion_max_error_ratio: 2.0
   joint_fusion_fallback_min_abs_px: 1.0
+  # A camera whose own blob->LED pairs reproject under the RETURNED fused pose with RMS above this (px) is not
+  # evidence for it (e.g. fuse_camera_poses fell back to one camera's solve): its pairs are dropped from the
+  # candidate's inliers / aux evidence / drawn projections / claimed blobs / per-camera priors.
+  fused_aux_max_reproj_px: 8.0
 
   # --------------------------------------------------------------------------
   # Cross-controller occlusion

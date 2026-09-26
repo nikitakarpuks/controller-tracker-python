@@ -503,6 +503,38 @@ def fuse_camera_poses(
     return T_joint, err_joint
 
 
+
+def fused_pose_consistent_cameras(cam_solutions: List[dict], T_world_ctrl: Transform,
+                                   model_positions: np.ndarray,
+                                   max_reproj_px: float = 8.0) -> Tuple[set, Dict[int, float]]:
+    """Which cameras' own blob->LED pairs are actually explained by the pose fuse_camera_poses returned.
+
+    Returns ({camera_idx, ...} whose pairs reproject under T_world_ctrl with RMS <= max_reproj_px,
+    {camera_idx: that RMS in px}). fuse_camera_poses can return ONE camera's own solve (its single-camera
+    fallback, or a joint fit that stayed at the seed) while the other cameras' solves disagree with it by
+    hundreds of px; such a camera's pairs are not evidence for the returned pose and must not be reported as
+    its inliers, drawn as its projections, or registered as this controller's claimed blobs (which would block
+    the OTHER controller from blobs it may really own -- static_hard frame 5872: cam0/cam1 pairs 336-464 px off).
+    A camera with no pairs is treated as consistent (nothing to contradict)."""
+    kept: set = set()
+    rms: Dict[int, float] = {}
+    for cs in cam_solutions:
+        cam = cs['camera']; pairs = cs['pairs']; cid = cam.camera_idx
+        if not pairs:
+            kept.add(cid); rms[cid] = 0.0
+            continue
+        T_cc = cam.T_world_cam.inverse().compose(T_world_ctrl)
+        rvec, _ = cv2.Rodrigues(T_cc.R.astype(np.float64))
+        led_ids = np.array([l for _, l in pairs], dtype=np.int32)
+        blob_ids = np.array([b for b, _ in pairs], dtype=np.int32)
+        proj, _ = cam.project_points(model_positions[led_ids].astype(np.float32), rvec, T_cc.t)
+        err = np.linalg.norm(np.asarray(proj).reshape(-1, 2) - np.asarray(cs['blobs'])[blob_ids][:, :2], axis=1)
+        rms[cid] = float(np.sqrt(np.mean(np.square(err))))
+        if rms[cid] <= max_reproj_px:
+            kept.add(cid)
+    return kept, rms
+
+
 @dataclass
 class BruteSearchState:
     """
