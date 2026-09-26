@@ -676,6 +676,11 @@ fusion_heuristic:
   rot_gate_pad_s: 0.010
   # Dev switch: force the no-headset prediction path even when headset mocap is loaded.
   disable_headset_ego_motion: false
+  # Quality-aware shrink of the warm hard gate's rotation ceiling (continuous mode): ceiling * (s + (1-s)*min(1, quality/full)).
+  # 1.0 disables. 0.75 catches weak candidates whose rotation is 30-40 deg off the gyro prediction (static_hard frame 2593:
+  # quality 0.0, 37.9 deg innovation vs a flat 40); offline over 8 recordings it cost 0 correct frames on the current-code runs.
+  rot_gate_quality_min_scale: 0.75
+  rot_gate_quality_full_trust_at: 0.7
   # Bootstrap rotation gate: a fresh bootstrap after a reset had no rotation reference. legacy = off |
   # shadow = compute + log "BOOTSTRAP-GATE" only | enforce = also treat a candidate whose rotation
   # contradicts the headset-corrected gyro propagation of the last solid accepted rotation as

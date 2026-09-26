@@ -888,6 +888,21 @@ class HeuristicPoseFusionFilter:
             float(self._hc_get("coast_rot_budget_hs_floor_s", 0.035)),
             float(self._hc_get("coast_rot_budget_hs_floor_at_dps", 1500.0))))
 
+    def _rot_quality_scale(self, quality: float) -> float:
+        """Quality-aware shrink of the warm hard gate's ROTATION ceiling (continuous mode only):
+        s + (1-s)*min(1, quality/full) with s = rot_gate_quality_min_scale (1.0 = off) and full =
+        rot_gate_quality_full_trust_at. Mirrors the quality shrink the position ceiling already has. Real case:
+        static_hard frame 2593 (left, 3 lost frames): a 5-inlier / 1.32 px candidate (quality 0.0), 143 mm / 38 deg
+        off mocap, passed a flat 40 deg ceiling with 37.9 deg innovation. Offline over all 8 recordings the correct
+        weak accepts after a short loss have <= 22.5 deg innovation while the wrong ones sit at 35-130 deg."""
+        if not self._rot_gate_continuous():
+            return 1.0
+        s_min = float(self._hc_get("rot_gate_quality_min_scale", 1.0))
+        full = float(self._hc_get("rot_gate_quality_full_trust_at", 0.7))
+        if s_min >= 1.0 or full <= 0.0:
+            return 1.0
+        return s_min + (1.0 - s_min) * float(np.clip(quality / full, 0.0, 1.0))
+
     def _rot_gate_continuous(self) -> bool:
         """rot_gate_mode: legacy | continuous | auto. auto = continuous whenever headset ego-motion data
         is available to this filter (headset mocap loaded and not disabled), else legacy -- the
@@ -1732,8 +1747,9 @@ class HeuristicPoseFusionFilter:
         _pos_ceil_m_quality, _ = self._implausible_jump_thresholds(frame_ts_ns, quality=_candidate_quality)
         _pos_implausible = (imu_frame_scale > 0.0 and self.velocity_established
                              and pos_innov_m > _pos_ceil_m_quality)
+        _rot_ceil_deg_q = _rot_ceil_deg * self._rot_quality_scale(_candidate_quality)
         _rot_implausible = (imu_frame_scale > 0.0 and not _rot_seed_untrustworthy
-                             and rot_innov_deg > _rot_ceil_deg)
+                             and rot_innov_deg > _rot_ceil_deg_q)
         _implausible = _pos_implausible or _rot_implausible
         if _implausible:
             if self._check_reject_streak_override(R_meas, p_meas, frame_ts_ns, confidence, solution, n_inliers,
@@ -1746,7 +1762,8 @@ class HeuristicPoseFusionFilter:
                             confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
             _log.info(
                 f"[{self._ctrl_name}] IMPLAUSIBLE vision jump ts={frame_ts_ns} — "
-                f"pos_innov={pos_innov_m * 1000:.1f}mm rot_innov={rot_innov_deg:.2f}deg -- "
+                f"pos_innov={pos_innov_m * 1000:.1f}mm rot_innov={rot_innov_deg:.2f}deg "
+                f"(rot ceiling {_rot_ceil_deg_q:.1f}deg, quality {_candidate_quality:.2f}) -- "
                 f"likely identity swap or a degenerate low-point fit; REJECTED "
                 f"(state left at IMU prediction), vision candidate was {_fmt_v(p_meas)}"
             )

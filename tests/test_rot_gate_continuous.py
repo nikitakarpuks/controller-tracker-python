@@ -254,3 +254,44 @@ class BootstrapRotGateTests(unittest.TestCase):
         f._note_last_known_R(100, False); self.assertIsNone(f._last_known_R)
         f._rotation_seed_grace_frames = 0
         f._note_last_known_R(100, False); self.assertIsNotNone(f._last_known_R)
+
+
+class QualityAwareRotCeilingTests(unittest.TestCase):
+    """rot_gate_quality_min_scale: warm hard gate's rotation ceiling shrinks with candidate quality (continuous mode).
+    No headset in these fixtures -> ceiling = 40 + 500*dt = 45.5 deg at dt 11 ms; s=0.75 -> 34.1 deg at quality 0."""
+
+    def _try(self, innov, n_inliers, error_px, extra=None, mode="continuous"):
+        hc = {"rot_gate_quality_min_scale": 0.75, "rot_gate_quality_full_trust_at": 0.7}
+        hc.update(extra or {})
+        f = _filter(np.radians(100.0), 2, mode=mode, extra_hc=hc)
+        sol, ts = _cand(f, 0.011, innov, n_inliers=n_inliers, error_px=error_px)
+        return f.try_update(sol, ts), f
+
+    def test_scale_function(self):
+        f = _filter(1.0, 0, extra_hc={"rot_gate_quality_min_scale": 0.75})
+        self.assertAlmostEqual(f._rot_quality_scale(0.0), 0.75)
+        self.assertAlmostEqual(f._rot_quality_scale(0.35), 0.875)
+        self.assertAlmostEqual(f._rot_quality_scale(0.7), 1.0)
+        self.assertAlmostEqual(f._rot_quality_scale(1.0), 1.0)
+
+    def test_scale_off_by_default_and_in_legacy_mode(self):
+        self.assertEqual(_filter(1.0, 0)._rot_quality_scale(0.0), 1.0)
+        f = _filter(1.0, 0, mode="legacy", extra_hc={"rot_gate_quality_min_scale": 0.75})
+        self.assertEqual(f._rot_quality_scale(0.0), 1.0)
+
+    def test_weak_candidate_between_shrunk_and_full_ceiling_is_vetoed(self):
+        ok, f = self._try(40.0, n_inliers=5, error_px=1.3)          # quality 0.0 -> ceiling 34.1 < 40
+        self.assertFalse(ok)
+        self.assertEqual(f._last.get("outcome"), "implausible_reject")
+
+    def test_strong_candidate_same_innovation_is_accepted(self):
+        ok, _ = self._try(40.0, n_inliers=12, error_px=0.1)          # quality 1.0 -> ceiling 45.5
+        self.assertTrue(ok)
+
+    def test_weak_candidate_below_shrunk_ceiling_is_accepted(self):
+        ok, _ = self._try(30.0, n_inliers=5, error_px=1.3)
+        self.assertTrue(ok)
+
+    def test_disabled_key_keeps_flat_ceiling(self):
+        ok, _ = self._try(40.0, n_inliers=5, error_px=1.3, extra={"rot_gate_quality_min_scale": 1.0})
+        self.assertTrue(ok)
