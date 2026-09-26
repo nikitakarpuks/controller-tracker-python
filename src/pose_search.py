@@ -491,7 +491,14 @@ def fuse_camera_poses(
     _max_ratio = float(_cfg.get('joint_fusion_max_error_ratio', 2.0))
     _min_abs_px = float(_cfg.get('joint_fusion_fallback_min_abs_px', 1.0))
     if err_joint > _min_abs_px and err_joint > _max_ratio * best_solo['error']:
-        return best_solo['T_world_ctrl'], best_solo['error']
+        # The fallback trigger compares against the lowest solo error, but WHICH single camera to return is
+        # the seed's own question (highest confidence, lowest error breaks ties) -- see the seed comment
+        # above: a low reprojection error alone is deceptive (a small, low-confidence fit can reproject
+        # tighter than a larger, confident one). Returning min-error here instead of the seed picked cam0
+        # (5 pairs, conf 0.118, 0.059 px, 737 mm / 132 deg off mocap) over cam2 (7 pairs, conf 0.299,
+        # 0.091 px, 248 mm / 32 deg off) at static_hard frame 5872. With equal confidences (e.g. all 0.0)
+        # seed == best_solo, so behaviour there is unchanged.
+        return seed['T_world_ctrl'], seed['error']
 
     return T_joint, err_joint
 
