@@ -3283,6 +3283,20 @@ class ControllerTracker:
         # prediction (found in review -- pairing a rejected pose with the discarded
         # candidate's error/assignment silently corrupts calibration-threshold data).
         solution["fusion_accepted"] = accepted
+        # Read-only exports for offline analysis (detectability/one-euro tables), no behavior depends on
+        # these. fusion_outcome: the filter's own outcome label for this frame (fused/bootstrap/fail_open/
+        # implausible_reject/... -- see HeuristicPoseFusionFilter._set_last), already computed on every
+        # try_update() call at no extra cost (unlike debug_snapshot(), which needs pose_fusion_debug.enabled).
+        # raw_R/raw_p: the pre-One-Euro tracking state (see last_raw_R/_p's own comment) -- when there is no
+        # fusion filter at all (fusion.enabled: false), there is no smoothing to strip, so raw == reported.
+        if self._fusion_filter is not None:
+            solution["fusion_outcome"] = self._fusion_filter._last.get("outcome")
+            solution["raw_R"] = self._fusion_filter.last_raw_R
+            solution["raw_p"] = self._fusion_filter.last_raw_p
+        else:
+            solution["fusion_outcome"] = "no_filter"
+            solution["raw_R"] = T_world_ctrl.R if T_world_ctrl is not None else None
+            solution["raw_p"] = T_world_ctrl.t if T_world_ctrl is not None else None
 
         # Reporting/self-cal anchor tracking (per-camera importance above is now the
         # reported signal; kept only for get_designated_primary_cameras()).

@@ -423,7 +423,9 @@ def main():
         Path(_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
         _pose_csv_file = open(_pose_csv_path, "w", newline="")
         _pose_csv_writer = csv.writer(_pose_csv_file)
-        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz", "reproj_err_px", "inlier_count"])
+        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz", "reproj_err_px", "inlier_count",
+                                    "fusion_outcome", "primary_method", "n_cams",
+                                    "raw_qx", "raw_qy", "raw_qz", "raw_qw", "raw_px", "raw_py", "raw_pz"])
         logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
 
     _vision_pose_csv_path = debug_cfg.get("vision_pose_csv")
@@ -1449,12 +1451,28 @@ def main():
                         # keeping this frame's row present for downstream alignment
                         # instead of silently skipping it.
                         _qx = _qy = _qz = _qw = _px = _py = _pz = float("nan")
+                    # Read-only exports (see solution["fusion_outcome"]/["raw_R"/"raw_p"]'s own comment in
+                    # _commit_fused_solution) -- primary_method/n_cams describe THIS row's actual pose the
+                    # same way T_world_ctrl does (not the original candidate), unlike error/inlier_count above
+                    # which intentionally still describe the discarded candidate on a rejected frame.
+                    _raw_R, _raw_p = sol.get("raw_R"), sol.get("raw_p")
+                    if _raw_R is not None and _raw_p is not None:
+                        _rqx, _rqy, _rqz, _rqw = Rotation.from_matrix(_raw_R).as_quat()
+                        _rpx, _rpy, _rpz = _raw_p
+                    else:
+                        _rqx = _rqy = _rqz = _rqw = _rpx = _rpy = _rpz = float("nan")
+                    _cam_method = sol.get("camera_method") or {}
                     _pose_csv_writer.writerow([
                         int(img_path.stem), ctrl_name,
                         f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
                         f"{_px:.6f}", f"{_py:.6f}", f"{_pz:.6f}",
                         (f"{sol['error']:.4f}" if _fusion_accepted else "nan"),
                         (len(sol["assignment"]) if _fusion_accepted else 0),
+                        sol.get("fusion_outcome", ""),
+                        _cam_method.get(primary_cam_idx, ""),
+                        len(_cam_method),
+                        f"{_rqx:.8f}", f"{_rqy:.8f}", f"{_rqz:.8f}", f"{_rqw:.8f}",
+                        f"{_rpx:.6f}", f"{_rpy:.6f}", f"{_rpz:.6f}",
                     ])
                 if ctrl_name in _algo_log_writers and T_world_ctrl is not None:
                     T_Ih_Ic = T_world_ctrl.compose(_algo_log_T_ref_ic[ctrl_name])

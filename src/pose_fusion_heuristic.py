@@ -329,6 +329,14 @@ class HeuristicPoseFusionFilter:
 
         self.reported_R = None
         self.reported_p = None
+        # Pre-One-Euro tracking state at the moment of the last _report() call -- i.e. exactly what
+        # reported_R/reported_p would be if fusion_heuristic.one_euro_enabled were false (see _report's own
+        # docstring: that flag only bypasses the smoothing step inside _report, nothing upstream). Exported
+        # read-only for an offline "does the One Euro filter help" comparison against mocap, without needing
+        # a separate one_euro_enabled:false rerun -- this value is mathematically identical to what that rerun
+        # would report.
+        self.last_raw_R = None
+        self.last_raw_p = None
 
         # One Euro filters for the REPORTED pose only -- see module docstring
         # for why this replaces the old w_smooth cost term. Position/rotation
@@ -715,6 +723,7 @@ class HeuristicPoseFusionFilter:
         expect one glitched dt on the very first frame after re-enabling if
         real time elapsed while it was off, exactly like re-enabling after
         any other pause would."""
+        self.last_raw_R, self.last_raw_p = R_out, p_out
         if not bool(self._hc_get("one_euro_enabled", True)):
             self.reported_p, self.reported_R = p_out, R_out
             return
