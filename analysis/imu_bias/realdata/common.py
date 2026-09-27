@@ -27,7 +27,9 @@ from src.transformations import Transform
 LEVER_MODE = os.environ.get("LEVER", "factory")      # "factory" (what main.py uses today) | "bridge" (accelerometer position from the mocap bridge)
 LEVER_TAG = "_leverBridge" if LEVER_MODE == "bridge" else ""
 REC_ROOT = Path("/home/nikitakarpuks/Downloads/recordings-aug26")
-EVAL_DIR = REPO / "visualization" / "evaluate_2026-09-22"
+EVAL_DIR = REPO / "visualization" / "evaluate_2026-09-27_full"  # was evaluate_2026-09-22, no longer on disk;
+# repointed 2026-09-27 at the final run (same flat config.yml/vision_pose.csv symlinks as compute_per_frame_errors.py
+# expects) -- only vision_pose.csv (raw, unaffected by fusion) and config.yml are read from here, so any batch works
 OUT_DIR = REPO / "analysis" / "imu_bias" / "realdata"
 CTRLS = ("left_controller", "right_controller")
 _DISK = {"headset": "headset", "left_controller": "ctrlleft", "right_controller": "ctrlright"}
