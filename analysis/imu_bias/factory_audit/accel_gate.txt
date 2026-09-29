@@ -1,0 +1,18 @@
+gate: baseline-stream per-recording accel fit (b,S,dg free) vs oracle accel_bias_per_recording.csv
+static_dark   left_: nwin=45 mine b=[ 0.097  0.189 -0.038] oracle b=[ 0.097  0.189 -0.038]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_dark     left_: nwin=49 mine b=[ 0.081  0.178 -0.058] oracle b=[ 0.081  0.178 -0.058]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_easy   left_: nwin=49 mine b=[ 0.067  0.184 -0.049] oracle b=[ 0.067  0.184 -0.049]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_medium left_: nwin=46 mine b=[ 0.076  0.182 -0.036] oracle b=[ 0.076  0.182 -0.036]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_hard   left_: nwin=40 mine b=[-0.069 -0.051 -0.23 ] oracle b=[-0.069 -0.051 -0.23 ]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_easy     left_: nwin=41 mine b=[ 0.041  0.184 -0.042] oracle b=[ 0.041  0.184 -0.042]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_medium   left_: nwin=48 mine b=[ 0.034  0.193 -0.107] oracle b=[ 0.034  0.193 -0.107]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_hard     left_: nwin=37 mine b=[-0.001  0.147 -0.17 ] oracle b=[-0.001  0.147 -0.17 ]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_dark   right: nwin=54 mine b=[-0.06   0.149 -0.284] oracle b=[-0.06   0.149 -0.284]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_dark     right: nwin=39 mine b=[-0.053  0.134 -0.276] oracle b=[-0.053  0.134 -0.276]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_easy   right: nwin=44 mine b=[-0.081  0.127 -0.3  ] oracle b=[-0.081  0.127 -0.3  ]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_medium right: nwin=52 mine b=[-0.026  0.051 -0.322] oracle b=[-0.026  0.051 -0.322]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+static_hard   right: nwin=35 mine b=[ 0.143  0.075 -0.5  ] oracle b=[ 0.143  0.075 -0.5  ]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_easy     right: nwin=35 mine b=[-0.052  0.14  -0.273] oracle b=[-0.052  0.14  -0.273]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_medium   right: nwin=41 mine b=[-0.001  0.067 -0.325] oracle b=[-0.001  0.067 -0.325]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+walk_hard     right: nwin=23 mine b=[-0.046  0.032 -0.444] oracle b=[-0.046  0.032 -0.444]  max|db|=0.0e+00 max|dSdiag|=0.0e+00
+worst deviation 0

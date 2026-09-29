@@ -49,6 +49,39 @@ Vision-clock offset (DeviceMocap.vision_offset_ns) -- the SECOND time link, easy
     (~speed * 7ms) in every vision-vs-mocap comparison. Lookup is therefore
     frame_ts + vision_offset_ns + fine_offset_ns. Defaults to 0 (old behavior); set per
     controller via config.yml's mocap_vision_offset_ns (see load_vision_offset_ns).
+
+Vision-clock DRIFT (DeviceMocap.drift_offset_ns / drift_rate_ns_per_ns) -- a THIRD, independent
+    correction, on top of vision_offset_ns above, not a replacement for it:
+    the vision<->mocap lag is not perfectly constant -- a per-recording sweep of the best extra
+    lookup shift in time quarters, and a held-out linear-drift fit (train on time blocks, score on
+    held-out blocks, bridge refit under each model), both found a consistent residual drift of
+    roughly +2.5 to +3.5 ms/min between the mocap clock and the camera/controller-IMU clock,
+    the SAME SIGN in essentially every recording-aug26 recording. A held-out linear correction
+    measurably reduces the STATIC_MEDIUM/STATIC_HARD residual (roughly 5-25%, largest on rotation)
+    with no held-out case made worse; on the calmer static_dark it helps the right controller and
+    is close to neutral for the left. Fit as one shared (offset, rate) pair per controller, pooled
+    (n-weighted) over the 3 recordings with fresh, current-pipeline vision (static_dark,
+    static_medium, static_hard) -- see analysis/drift_test/fit_deploy_drift.py.
+
+    Deliberately kept SEPARATE from vision_offset_ns/mocap_vision_offset_ns (not folded into that
+    same number) even though both are additive constants at the pivot: mocap_vision_offset_ns also
+    drives controller_imu_lag_ns (the constant used for the LIVE controller IMU stream, gyro/accel
+    integration, via -mocap_vision_offset_ns) -- an unrelated, separately-validated constant this
+    drift correction must NOT silently perturb. This drift correction only ever touches
+    DeviceMocap.pose_at, i.e. mocap ground truth comparison and (when mocap.enabled) the headset
+    ego-motion correction in predict_headset_relative_pose -- never the IMU stream's own lag.
+
+    Pivot: each device's OWN mocap-track start (t_ns[0], set at construction) -- not the mean time
+    of whichever frames a given run happens to track, which would make the fitted intercept
+    dependent on run-to-run coverage. This needs no extra file or config lookup (t_ns is always
+    already loaded) and makes the correction a pure function of (query_ts_ns - t_ns[0]), so it
+    behaves identically regardless of which frame_range subset of the recording is processed.
+    Lookup is now frame_ts + vision_offset_ns + drift_offset_ns +
+    drift_rate_ns_per_ns*(frame_ts - t_ns[0]) + fine_offset_ns. Defaults to (0, 0) -- old behavior.
+    Set per controller via config.yml's mocap_vision_drift_offset_ns /
+    mocap_vision_drift_rate_ms_per_min (see load_vision_drift_params). Headset is deliberately left
+    at (0, 0): the drift fit above is controller-mocap-specific (pivoted on the CONTROLLER's own
+    track), and no comparably-validated headset-side drift fit exists.
 """
 import json
 
@@ -76,6 +109,21 @@ def load_vision_offset_ns(device_cfg) -> float:
     IMU clock, see module docstring), or 0.0 if unset/None -- old behavior."""
     v = (device_cfg or {}).get("mocap_vision_offset_ns")
     return 0.0 if v is None else float(v)
+
+
+def load_vision_drift_params(device_cfg) -> tuple:
+    """config.yml's <device>.mocap_vision_drift_offset_ns / mocap_vision_drift_rate_ms_per_min
+    (see module docstring's "Vision-clock DRIFT" section) as (drift_offset_ns, drift_rate_ns_per_ns)
+    -- the rate is converted from human-readable ms/min to a dimensionless ns-correction-per-ns-
+    elapsed ratio (ms_per_min * 1e6 / 60e9 = ms_per_min / 60_000). (0.0, 0.0) if either is unset --
+    old behavior, no drift term. Deliberately independent of load_vision_offset_ns/
+    controller_imu_lag_ns -- see module docstring."""
+    cfg = device_cfg or {}
+    offset_ns = cfg.get("mocap_vision_drift_offset_ns")
+    rate_ms_per_min = cfg.get("mocap_vision_drift_rate_ms_per_min")
+    offset_ns = 0.0 if offset_ns is None else float(offset_ns)
+    rate_ns_per_ns = 0.0 if rate_ms_per_min is None else float(rate_ms_per_min) / 60_000.0
+    return offset_ns, rate_ns_per_ns
 
 
 # Legacy per-controller lag (t_imu + lag_ns), measured on one older clip -- ONLY used when config.yml's
@@ -176,7 +224,8 @@ class DeviceMocap:
     def __init__(self, t_ns: np.ndarray, position: np.ndarray, quat_xyzw: np.ndarray,
                  fine_offset_ns: float, T_imu_marker: Transform,
                  max_interp_gap_ns: float = DEFAULT_MAX_INTERP_GAP_NS,
-                 vision_offset_ns: float = 0.0):
+                 vision_offset_ns: float = 0.0,
+                 drift_offset_ns: float = 0.0, drift_rate_ns_per_ns: float = 0.0):
         self.t_ns              = t_ns
         self.position           = position
         self.quat_xyzw          = quat_xyzw
@@ -184,6 +233,13 @@ class DeviceMocap:
         self.T_imu_marker       = T_imu_marker
         self.max_interp_gap_ns  = max_interp_gap_ns
         self.vision_offset_ns   = vision_offset_ns
+        self.drift_offset_ns       = drift_offset_ns
+        self.drift_rate_ns_per_ns  = drift_rate_ns_per_ns
+        # Pivot for the drift term: THIS device's own mocap-track start (see module docstring's
+        # "Vision-clock DRIFT" section for why -- a fixed, always-available, run-coverage-
+        # independent anchor). int() up front since t_ns entries are queried against int query
+        # timestamps below; harmless (and pivot is unused) when drift_rate_ns_per_ns == 0.
+        self._drift_pivot_ns = int(t_ns[0]) if len(t_ns) else 0
 
     def pose_at(self, query_ts_ns: int):
         """Interpolated (R (3,3), t (3,)) marker pose in the shared mocap-world
@@ -191,7 +247,9 @@ class DeviceMocap:
         outside the trajectory's covered range once the fine offset (see
         module docstring) is applied, OR if the two real samples bracketing it
         are more than max_interp_gap_ns apart (see class docstring)."""
-        t_lookup = int(query_ts_ns) + int(round(self.vision_offset_ns + self.fine_offset_ns))
+        query_ts_ns = int(query_ts_ns)
+        drift_ns = self.drift_offset_ns + self.drift_rate_ns_per_ns * (query_ts_ns - self._drift_pivot_ns)
+        t_lookup = query_ts_ns + int(round(self.vision_offset_ns + drift_ns + self.fine_offset_ns))
         if t_lookup < self.t_ns[0] or t_lookup > self.t_ns[-1]:
             return None
         idx0 = min(int(np.searchsorted(self.t_ns, t_lookup, side="right")) - 1, len(self.t_ns) - 2)

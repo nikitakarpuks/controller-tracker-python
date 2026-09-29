@@ -17,9 +17,11 @@ from src.blob_detector import (BlobDetector, BlobResult, _blackout_neighborhoods
 from src.camera import Camera
 from src.controller import ControllerModel, TrackingSystem, create_leds_from_config, mirror_primitives
 from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_from_config, _DIAG_FLIP, \
-    LiveGravityEstimator
+    LiveGravityEstimator, imu_loader_kwargs, accel_lever_arm_body, median_quiet_accel_magnitude, \
+    ACCEL_QUIET_MAGNITUDE_BAND
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
-                            load_vision_offset_ns, controller_imu_files, relative_pose, DRIFT_CHECK_VARIANT
+                            load_vision_offset_ns, load_vision_drift_params, controller_imu_files, \
+                            relative_pose, DRIFT_CHECK_VARIANT
 from src.headset_pose_source import MocapHeadsetPoseSource
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
@@ -188,16 +190,33 @@ def main():
                     f"[{ctrl_key}] IMU file not found ({imu_path}) — gyro prediction "
                     f"and gravity-check diagnostic disabled for this controller")
                 continue
+            _imu_kwargs = imu_loader_kwargs(imu_cfg)   # imu.recorded_stream_factory_corrected / accel_driver_scale
             t_imu, gyro_body, accel_body = load_and_calibrate_controller_imu(
                 imu_path, load_json_config(config["controllers"][ctrl_key]["config_path"]), lag_ns=lag_ns,
+                **_imu_kwargs,
             )
             gyro_data[ctrl_key]  = (t_imu, gyro_body)
             accel_data[ctrl_key] = (t_imu, accel_body)
 
             _imu_calib = create_imu_calib_from_config(ctrl_json_cfg[ctrl_key])
-            lever_arm[ctrl_key] = _imu_calib.accel.T_rt.compose(_imu_calib.gyro.T_rt.inverse()).t
+            lever_arm[ctrl_key] = accel_lever_arm_body(_imu_calib)   # body-frame accel position, NOT the raw factory t
 
-            logger.bind(cat="startup").info(f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name}")
+            # Guard against a stream that does not match the loader's assumption (factory-corrected + driver
+            # accel scale), e.g. a recording from a different driver build: rest samples must read ~|g|.
+            _quiet_g = median_quiet_accel_magnitude(gyro_body, accel_body)
+            if _quiet_g is not None and not (ACCEL_QUIET_MAGNITUDE_BAND[0] <= _quiet_g <= ACCEL_QUIET_MAGNITUDE_BAND[1]):
+                logger.bind(cat="startup").warning(
+                    f"[{ctrl_key}] median |accel| over low-rotation samples is {_quiet_g:.3f} m/s^2, outside the expected "
+                    f"{ACCEL_QUIET_MAGNITUDE_BAND[0]}..{ACCEL_QUIET_MAGNITUDE_BAND[1]} band for the current IMU loader "
+                    f"settings (factory_corrected_input={_imu_kwargs['factory_corrected_input']}, "
+                    f"accel_scale={_imu_kwargs['accel_scale']:.6f}) -- this recording's IMU stream may not match them "
+                    f"(raw stream, different driver build, or double correction); accel dead-reckoning will be biased")
+
+            logger.bind(cat="startup").info(
+                f"[{ctrl_key}] IMU loaded: {len(t_imu)} samples from {imu_path.name} "
+                f"(lag {lag_ns / 1e6:+.2f} ms, factory_corrected_input={_imu_kwargs['factory_corrected_input']}, "
+                f"accel_scale={_imu_kwargs['accel_scale']:.6f}, "
+                f"accel lever arm (body frame, mm)={np.round(lever_arm[ctrl_key] * 1000, 1).tolist()})")
 
         fusion_cfg = config.get("fusion", {})
         g_world_estimator = LiveGravityEstimator(
@@ -251,12 +270,16 @@ def main():
             T_imu_marker = load_T_imu_marker(calib_path)
             _max_gap_ns  = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
             vision_offset_ns = load_vision_offset_ns(_dev_cfg)
+            drift_offset_ns, drift_rate_ns_per_ns = load_vision_drift_params(_dev_cfg)
             device_mocap[device_key] = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
-                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns)
+                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns,
+                                                    drift_offset_ns=drift_offset_ns,
+                                                    drift_rate_ns_per_ns=drift_rate_ns_per_ns)
             logger.bind(cat="startup").info(
                 f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
                 f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source}; "
-                f"vision offset {vision_offset_ns / 1e6:.2f} ms)")
+                f"vision offset {vision_offset_ns / 1e6:.2f} ms; "
+                f"drift {drift_offset_ns / 1e6:+.2f} ms + {drift_rate_ns_per_ns * 60e9 / 1e6:+.2f} ms/min)")
 
     # For src/lamp_region_memory.py (blob_detection.lamp_blob_filter.static_lamp_mask)
     # -- None (complete no-op there) whenever headset mocap isn't loaded.
@@ -400,7 +423,9 @@ def main():
         Path(_pose_csv_path).parent.mkdir(parents=True, exist_ok=True)
         _pose_csv_file = open(_pose_csv_path, "w", newline="")
         _pose_csv_writer = csv.writer(_pose_csv_file)
-        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz", "reproj_err_px", "inlier_count"])
+        _pose_csv_writer.writerow(["timestamp_ns", "ctrl_name", "qx", "qy", "qz", "qw", "px", "py", "pz", "reproj_err_px", "inlier_count",
+                                    "fusion_outcome", "primary_method", "n_cams",
+                                    "raw_qx", "raw_qy", "raw_qz", "raw_qw", "raw_px", "raw_py", "raw_pz"])
         logger.bind(cat="startup").info(f"Pose CSV → {_pose_csv_path}")
 
     _vision_pose_csv_path = debug_cfg.get("vision_pose_csv")
@@ -1426,12 +1451,28 @@ def main():
                         # keeping this frame's row present for downstream alignment
                         # instead of silently skipping it.
                         _qx = _qy = _qz = _qw = _px = _py = _pz = float("nan")
+                    # Read-only exports (see solution["fusion_outcome"]/["raw_R"/"raw_p"]'s own comment in
+                    # _commit_fused_solution) -- primary_method/n_cams describe THIS row's actual pose the
+                    # same way T_world_ctrl does (not the original candidate), unlike error/inlier_count above
+                    # which intentionally still describe the discarded candidate on a rejected frame.
+                    _raw_R, _raw_p = sol.get("raw_R"), sol.get("raw_p")
+                    if _raw_R is not None and _raw_p is not None:
+                        _rqx, _rqy, _rqz, _rqw = Rotation.from_matrix(_raw_R).as_quat()
+                        _rpx, _rpy, _rpz = _raw_p
+                    else:
+                        _rqx = _rqy = _rqz = _rqw = _rpx = _rpy = _rpz = float("nan")
+                    _cam_method = sol.get("camera_method") or {}
                     _pose_csv_writer.writerow([
                         int(img_path.stem), ctrl_name,
                         f"{_qx:.8f}", f"{_qy:.8f}", f"{_qz:.8f}", f"{_qw:.8f}",
                         f"{_px:.6f}", f"{_py:.6f}", f"{_pz:.6f}",
                         (f"{sol['error']:.4f}" if _fusion_accepted else "nan"),
                         (len(sol["assignment"]) if _fusion_accepted else 0),
+                        sol.get("fusion_outcome", ""),
+                        _cam_method.get(primary_cam_idx, ""),
+                        len(_cam_method),
+                        f"{_rqx:.8f}", f"{_rqy:.8f}", f"{_rqz:.8f}", f"{_rqw:.8f}",
+                        f"{_rpx:.6f}", f"{_rpy:.6f}", f"{_rpz:.6f}",
                     ])
                 if ctrl_name in _algo_log_writers and T_world_ctrl is not None:
                     T_Ih_Ic = T_world_ctrl.compose(_algo_log_T_ref_ic[ctrl_name])

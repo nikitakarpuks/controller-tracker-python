@@ -101,6 +101,7 @@ from scipy.spatial.transform import Rotation
 from accel_short_horizon_check import low_motion_bootstrap_g_world
 from accel_sign_check import _MAX_PAIR_DT_S, world_vision_poses
 from compare_vision_mocap import load_pose_csv, load_device_mocap
+from src.imu_data import accel_lever_arm_body
 from src.imu_data import (accel_preint_residual, create_imu_calib_from_config, gyro_preint_residual, load_imu_csv,
                            slice_imu_to_window)
 from src.load_config import load_json_config, load_yaml_config
@@ -338,6 +339,10 @@ def main():
         # rot_delta, as a correction on top of _DIAG_FLIP).
         t_raw, gyro_raw, accel_raw = load_imu_csv(imu_path)
         t_raw = t_raw + lag_ns
+        # NOTE (2026-09-23): the recorded controller CSVs are ALREADY factory-corrected by the Monado driver
+        # (see src/imu_data.py module docstring); this diagnostic applies mix+bias again (the legacy chain), so
+        # it no longer matches main.py's loader (load_and_calibrate_controller_imu). Kept for the joint-solve
+        # archaeology only -- do not compare its absolute bias numbers against the live pipeline.
         gyro_raw_corr = imu_calib.gyro.correct(gyro_raw.astype(np.float64))
         accel_raw_corr = imu_calib.accel.correct(accel_raw.astype(np.float64))
         t_gyro = t_accel = t_raw
@@ -349,7 +354,7 @@ def main():
         # gyro.T_rt.inverse()) is accel.Rt ∘ gyro.Rt^-1 -- rotation is near-identity
         # (sub-0.2°, noise), translation is the ~85mm lever arm that Step 4's original
         # lever-arm-free residuals couldn't explain no matter how far bias was allowed to move.
-        lever_arm = imu_calib.accel.T_rt.compose(imu_calib.gyro.T_rt.inverse()).t
+        lever_arm = accel_lever_arm_body(imu_calib)
         print(f"[{ctrl_name}] lever arm (m): {lever_arm}  |.|={np.linalg.norm(lever_arm) * 1000:.2f}mm")
 
         world_poses = world_vision_poses(poses[ctrl_name], headset_mocap)

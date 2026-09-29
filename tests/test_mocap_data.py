@@ -15,7 +15,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from src.mocap_data import DeviceMocap, headset_angular_velocity, headset_linear_velocity, \
-    load_vision_offset_ns, relative_pose, controller_imu_lag_ns, controller_imu_files
+    load_vision_offset_ns, load_vision_drift_params, relative_pose, controller_imu_lag_ns, controller_imu_files
 from src.transformations import Transform
 
 _NS = 1_000_000_000
@@ -247,6 +247,115 @@ class ControllerImuLagTests(unittest.TestCase):
         cfg = load_yaml_config("config/config.yml")
         for k in ("left_controller", "right_controller"):
             self.assertEqual(controller_imu_lag_ns(k), -int(load_vision_offset_ns(cfg["controllers"][k])))
+
+
+class VisionDriftTests(unittest.TestCase):
+    """DeviceMocap.drift_offset_ns / drift_rate_ns_per_ns: an ADDITIONAL correction on top of
+    vision_offset_ns, pivoted at t_ns[0] (this device's own mocap-track start). Isolates the drift
+    term by leaving fine_offset_ns=vision_offset_ns=0 in every test here."""
+
+    def test_load_vision_drift_params(self):
+        self.assertEqual(load_vision_drift_params(None), (0.0, 0.0))
+        self.assertEqual(load_vision_drift_params({}), (0.0, 0.0))
+        self.assertEqual(load_vision_drift_params(
+            {"mocap_vision_drift_offset_ns": None, "mocap_vision_drift_rate_ms_per_min": None}), (0.0, 0.0))
+        # only one of the two set -- the other stays 0, not coupled
+        self.assertEqual(load_vision_drift_params({"mocap_vision_drift_offset_ns": -2_000_000}), (-2_000_000.0, 0.0))
+        off, rate = load_vision_drift_params({"mocap_vision_drift_rate_ms_per_min": 2.5})
+        self.assertEqual(off, 0.0)
+        self.assertAlmostEqual(rate, 2.5 / 60_000.0, places=15)
+        # exact ms/min -> ns-per-ns conversion: 60 ms/min means "1ms of correction per second", i.e.
+        # ratio 1e6/1e9 = 1e-3 exactly
+        _, rate60 = load_vision_drift_params({"mocap_vision_drift_rate_ms_per_min": 60.0})
+        self.assertAlmostEqual(rate60, 1e-3, places=15)
+
+    def test_pivot_is_own_t_ns_first_sample(self):
+        t_ns = _sample_times(123_000_000_000, duration_s=1.0)
+        dev = DeviceMocap(t_ns, np.zeros((len(t_ns), 3)), np.tile([0, 0, 0, 1.0], (len(t_ns), 1)),
+                          fine_offset_ns=0.0, T_imu_marker=Transform(np.eye(3), np.zeros(3)))
+        self.assertEqual(dev._drift_pivot_ns, int(t_ns[0]))
+
+    def test_drift_lookup_formula_exact(self):
+        """t_lookup = query + vision_offset + drift_offset + drift_rate*(query - pivot) + fine_offset,
+        checked by construction against an analytic constant-rate curve (exact under SLERP/linear
+        interpolation)."""
+        t_ns = _sample_times(50 * _NS, duration_s=3.0)
+        pivot = int(t_ns[0])
+        W = np.array([0.4, 1.2, -0.9])
+        V = np.array([0.8, -0.3, 0.5])
+        R = lambda t: Rotation.from_rotvec(W * (t - pivot) / 1e9).as_matrix()
+        p = lambda t: V * (t - pivot) / 1e9
+        positions = np.array([p(t) for t in t_ns])
+        quats = np.array([Rotation.from_matrix(R(t)).as_quat() for t in t_ns])
+        drift_offset_ns, drift_rate_ns_per_ns = -2_000_000.0, 2.5 / 60_000.0  # -2ms, +2.5ms/min
+        dev = DeviceMocap(t_ns, positions, quats, fine_offset_ns=0.0,
+                          T_imu_marker=Transform(np.eye(3), np.zeros(3)),
+                          drift_offset_ns=drift_offset_ns, drift_rate_ns_per_ns=drift_rate_ns_per_ns)
+        query = pivot + 2_000_000_000  # 2s after pivot
+        t_true = query + drift_offset_ns + drift_rate_ns_per_ns * (query - pivot)
+        R_got, p_got = dev.pose_at(query)
+        np.testing.assert_allclose(p_got, p(t_true), atol=1e-9)
+        np.testing.assert_allclose(R_got, R(t_true), atol=1e-9)
+
+    def test_zero_rate_is_old_behavior(self):
+        t_ns = _sample_times(50 * _NS, duration_s=2.0)
+        p = lambda t: np.array([0.8, -0.3, 0.5]) * (t - t_ns[0]) / 1e9
+        positions = np.array([p(t) for t in t_ns])
+        quats = np.tile([0, 0, 0, 1.0], (len(t_ns), 1))
+        kwargs = dict(fine_offset_ns=5_000_000.0, T_imu_marker=Transform(np.eye(3), np.zeros(3)),
+                      vision_offset_ns=3_000_000.0)
+        dev_old = DeviceMocap(t_ns, positions, quats, **kwargs)
+        dev_new = DeviceMocap(t_ns, positions, quats, drift_offset_ns=0.0, drift_rate_ns_per_ns=0.0, **kwargs)
+        q = t_ns[0] + 700_000_000
+        np.testing.assert_allclose(dev_old.pose_at(q)[1], dev_new.pose_at(q)[1], atol=1e-12)
+
+    def test_rate_removes_growing_relative_pose_error(self):
+        """Headset static at origin; controller moving at constant velocity V. The controller's mocap
+        clock genuinely runs at a different rate relative to the vision/camera clock (drift_ratio):
+        with the MATCHING (offset, rate) configured, relative_pose recovers the true position (as
+        seen by the camera, i.e. queried at the vision timestamp) to near machine precision; with
+        rate=0 (offset only, today's behavior) the residual grows linearly with elapsed time, exactly
+        |V| * |drift_ratio| * elapsed -- the same speed-proportional signature the vision_offset_ns
+        fix targeted, but for the RATE component specifically."""
+        T0 = 50 * _NS
+        V = np.array([0.8, -0.3, 0.5])
+        drift_offset_ns, drift_ratio = -2_000_000.0, 2.5 / 60_000.0
+        t_ns = _sample_times(T0, duration_s=61.0)
+        I = Transform(np.eye(3), np.zeros(3))
+        head = DeviceMocap(t_ns, np.zeros((len(t_ns), 3)), np.tile([0, 0, 0, 1.0], (len(t_ns), 1)), 0.0, I)
+        quats = np.tile([0, 0, 0, 1.0], (len(t_ns), 1))
+        ctrl_pos = np.array([V * (t - T0) / 1e9 for t in t_ns])
+
+        q = T0 + 60_000_000_000  # 60s after pivot -- real-recording timescale, see module docstring
+        t_true = q + drift_offset_ns + drift_ratio * (q - T0)     # the mocap sample time this vision frame really matches
+        truth_at_vision = V * (t_true - T0) / 1e9
+
+        with_drift = DeviceMocap(t_ns, ctrl_pos, quats, 0.0, I,
+                                 drift_offset_ns=drift_offset_ns, drift_rate_ns_per_ns=drift_ratio)
+        offset_only = DeviceMocap(t_ns, ctrl_pos, quats, 0.0, I, drift_offset_ns=drift_offset_ns)  # rate=0
+
+        err_with = np.linalg.norm(relative_pose(head, with_drift, q).t - truth_at_vision)
+        err_offset_only = np.linalg.norm(relative_pose(head, offset_only, q).t - truth_at_vision)
+        self.assertLess(err_with, 1e-9)
+        expected_err = np.linalg.norm(V) * drift_ratio * (q - T0) / 1e9
+        self.assertAlmostEqual(err_offset_only, expected_err, places=9)
+        # not a no-op: ~2.5mm at this speed over 60s, the real timescale/magnitude this correction targets
+        # (2.5ms/min * 60s = 2.5ms of timing error * ~1m/s speed)
+        self.assertGreater(err_offset_only, 1e-3)
+
+    def test_shipped_config_has_nonzero_drift_for_both_controllers(self):
+        from src.load_config import load_yaml_config
+        cfg = load_yaml_config("config/config.yml")
+        for k in ("left_controller", "right_controller"):
+            off, rate = load_vision_drift_params(cfg["controllers"][k])
+            self.assertNotEqual(off, 0.0, f"{k} mocap_vision_drift_offset_ns unset")
+            self.assertNotEqual(rate, 0.0, f"{k} mocap_vision_drift_rate_ms_per_min unset")
+
+    def test_shipped_config_headset_has_no_drift(self):
+        """Headset is deliberately left at (0, 0) -- see module docstring."""
+        from src.load_config import load_yaml_config
+        cfg = load_yaml_config("config/config.yml")
+        self.assertEqual(load_vision_drift_params(cfg["cameras"]), (0.0, 0.0))
 
 
 if __name__ == "__main__":

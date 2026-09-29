@@ -1,0 +1,62 @@
+[
+ {
+  "name": "E1a dR0 identical to src.imu_data.integrate_gyro_segment",
+  "ok": true,
+  "detail": "max diff 3.2e-15"
+ },
+ {
+  "name": "E1b first-order bias Jacobian: error ~ b^2 (b=0.01: <1e-4 rad; b=1e-3 100x smaller)",
+  "ok": true,
+  "detail": "b=1e-3: 2.6e-07, b=1e-2: 2.6e-05 rad (worst interval, up to 1.4 s)"
+ },
+ {
+  "name": "E2 A_gyro[dt_weighted] recovers constant b_g",
+  "ok": true,
+  "detail": "err 4.6e-05 rad/s (|b|=0.027)"
+ },
+ {
+  "name": "E2 A_gyro[naive_ema] recovers constant b_g",
+  "ok": true,
+  "detail": "err 4.9e-05 rad/s (|b|=0.027)"
+ },
+ {
+  "name": "E2 A_gyro[median] recovers constant b_g",
+  "ok": true,
+  "detail": "err 5.9e-05 rad/s (|b|=0.027)"
+ },
+ {
+  "name": "E2 C_gyro recovers constant b_g",
+  "ok": true,
+  "detail": "err 1.1e-04"
+ },
+ {
+  "name": "E2 B(ESKF) recovers constant b_g and b_a",
+  "ok": true,
+  "detail": "err_g 5.6e-05  err_a 5.6e-04"
+ },
+ {
+  "name": "E2 C_accel recovers constant b_a",
+  "ok": true,
+  "detail": "err 2.6e-03 m/s^2 (|b|=0.137)"
+ },
+ {
+  "name": "E2x A_accel (frame-level, mentor) is BIASED even with perfect vision (documented negative result)",
+  "ok": true,
+  "detail": "err 0.107 vs signal |b_a|=0.137: velocity-from-position-difference truncation error swamps the bias signal"
+ },
+ {
+  "name": "E3 zero true bias -> estimates ~0 (no spurious bias)",
+  "ok": true,
+  "detail": "A/C gyro 8.7e-05, B gyro 3.5e-05, B accel 2.3e-04"
+ },
+ {
+  "name": "E4 sign convention: b -> -b flips estimates (A gyro, B gyro, B accel)",
+  "ok": true,
+  "detail": "A 4.5e-05, B_g 1.5e-05, B_a 1.6e-04"
+ },
+ {
+  "name": "E5 tracks an exponential warm-up drift after convergence (A tau=4 s; B with matching q)",
+  "ok": true,
+  "detail": "A max err 1.2e-03, B max err 9.9e-04 rad/s"
+ }
+]

@@ -1,0 +1,24 @@
+{
+  "value0": {
+    "comment": "Empirically-fit LED-reference-frame -> mocap accelerometer-IMU-frame bridge (T_ledRef_mocapAccelImu), fit against real vision + mocap. Refit 2026-09-21 AFTER applying the vision->IMU-clock offset (mocap_vision_offset_ns=7.65ms) to the mocap lookup, on STRONG poses only (n_inliers/error_px thresholds from fusion_heuristic), pooled over all 8 recordings-aug26 (static_dark from the fresh full run), 1/err^2-weighted chordal mean with iterative 3-MAD outlier trimming. Not derived from factory Rt. Trimmed pooled residual: rot 1.297+/-0.695 deg, trans 4.527+/-2.231 mm (median 1.24 deg / 4.34 mm over all 4020 strong frames).",
+    "T_ledRef_mocapAccelImu": {
+      "qx": 0.999953347286505,
+      "qy": 0.0010104103906949874,
+      "qz": 0.0021355916920308138,
+      "qw": -0.00936597936585965,
+      "px": 0.005547322352853687,
+      "py": 0.007260900269578371,
+      "pz": -0.08372281903433892
+    },
+    "fitted_from_recording": "pooled_all_8_recordings_aug26",
+    "n_frames": 4020,
+    "n_frames_after_trim": 3779,
+    "vision_offset_ns_applied": 7650000.0,
+    "residual_rotation_deg_mean": 1.2972434073067267,
+    "residual_rotation_deg_std": 0.6947957352296866,
+    "residual_translation_mm_mean": 4.527198077438009,
+    "residual_translation_mm_std": 2.2310281027915884,
+    "residual_rotation_deg_median_all": 1.2412944820065395,
+    "residual_translation_mm_median_all": 4.3379301920063735
+  }
+}

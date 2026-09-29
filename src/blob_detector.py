@@ -306,6 +306,133 @@ def _looks_like_motion_streak(cnt, area, cfg) -> bool:
     return (min_elong <= elongation <= max_elong) and (fill_ratio >= min_fill)
 
 
+def _trim_streak_tail(image, cnt, cfg):
+    """Cut the fading TAIL off a motion-blur streak and return just the bright head, or None if this blob is not a
+    single-peaked, elongated streak this can safely trim.
+
+    A streak is a bright head (exposure start, front-loaded LED emission) followed by a fading tail. Along the blob's
+    long axis the pixel-maximum profile has one peak at the head; keeping only the bins that stay >=
+    streak_tail_trim_peak_fraction of that peak leaves a compact head whose circularity passes the ordinary test, so no
+    relaxed circularity is needed and the centroid is the head's (not pulled toward the tail).
+
+    Returns (head_contour (N,2) float32, (cx, cy) intensity-weighted head centroid, head_area) or None.
+    Refuses (None) when: too few pixels, elongation outside [streak_tail_trim_min_elongation,
+    streak_tail_trim_max_elongation], shorter than streak_tail_trim_min_length_px, a second comparable peak on the
+    tail side (a merged multi-streak blob -- left to the existing split/rescue logic), or the head would be empty."""
+    frac = float(cfg.get("streak_tail_trim_peak_fraction", 0.5))
+    min_el = float(cfg.get("streak_tail_trim_min_elongation", 2.0))
+    max_head_offset = float(cfg.get("streak_tail_trim_max_head_offset", 0.35))
+    max_el = float(cfg.get("streak_tail_trim_max_elongation", 8.0))
+    min_len = float(cfg.get("streak_tail_trim_min_length_px", 8.0))
+    pts = np.asarray(cnt, dtype=np.float32).reshape(-1, 1, 2)
+    (_, _), (w1, h1), _ = cv2.minAreaRect(pts)
+    L, W = max(w1, h1), min(w1, h1)
+    if L < min_len or W <= 0.0 or not (min_el <= L / W <= max_el):
+        return None
+    x0, y0 = np.floor(pts.reshape(-1, 2).min(axis=0)).astype(int)
+    x1, y1 = np.ceil(pts.reshape(-1, 2).max(axis=0)).astype(int) + 1
+    x0, y0 = max(x0, 0), max(y0, 0)
+    x1, y1 = min(x1, image.shape[1]), min(y1, image.shape[0])
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillPoly(mask, [np.round(pts.reshape(-1, 2) - [x0, y0]).astype(np.int32)], 1)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 8:
+        return None
+    w = image[ys + y0, xs + x0].astype(np.float32)
+    P = np.stack([xs + x0, ys + y0], axis=1).astype(np.float64)
+    mu = P.mean(axis=0)
+    evals, evecs = np.linalg.eigh(np.cov((P - mu).T))
+    u = evecs[:, int(np.argmax(evals))]
+    t = (P - mu) @ u
+    b = np.floor(t - t.min()).astype(int)
+    nb = int(b.max()) + 1
+    if nb < 4:
+        return None
+    prof = np.zeros(nb, dtype=np.float64)
+    np.maximum.at(prof, b, w)
+    pk = int(np.argmax(prof)); peak = prof[pk]
+    if peak <= 0:
+        return None
+    tail_dir = 1 if (nb - 1 - pk) >= pk else -1          # the longer side of the peak is the tail
+    if min(pk, nb - 1 - pk) > max_head_offset * nb:
+        return None                                        # peak near the middle: symmetric blob, not a head+tail streak
+    # a second comparable peak on either side => merged multi-streak blob: do not touch
+    for step in (1, -1):
+        seen_dip = False
+        for k in range(pk + step, nb if step > 0 else -1, step):
+            if prof[k] < 0.6 * peak:
+                seen_dip = True
+            elif seen_dip and prof[k] >= 0.6 * peak:
+                return None
+    lo = hi = pk
+    k = pk
+    while 0 <= k + tail_dir < nb and prof[k + tail_dir] >= frac * peak:
+        k += tail_dir
+    hi_tail = k
+    k = pk
+    while 0 <= k - tail_dir < nb and prof[k - tail_dir] >= frac * peak:
+        k -= tail_dir
+    head_lo, head_hi = (min(hi_tail, k), max(hi_tail, k))
+    keep = (b >= head_lo) & (b <= head_hi)
+    if keep.sum() < 3 or keep.sum() >= len(xs):
+        return None                                        # nothing to trim (or nothing left)
+    head_mask = np.zeros_like(mask); head_mask[ys[keep], xs[keep]] = 1
+    cs, _ = cv2.findContours(head_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cs:
+        return None
+    hc = max(cs, key=cv2.contourArea)
+    ww = w[keep]; tw = float(ww.sum())
+    if tw <= 0:
+        return None
+    cx = float(np.sum((xs[keep] + x0 + 1) * ww)) / tw - 1.0
+    cy = float(np.sum((ys[keep] + y0 + 1) * ww)) / tw - 1.0
+    hc = (hc.reshape(-1, 2) + [x0, y0]).astype(np.float32)
+    return hc, (cx, cy), float(cv2.contourArea(hc.reshape(-1, 1, 2)))
+
+
+def _trim_streak_labels(image, mask, labels, stats, required_threshold, cfg):
+    """Streak tail trim at the connected-component level, in place: every elongated, single-peaked head+tail component
+    (see _trim_streak_tail) is cut down to its bright head -- its tail pixels are cleared from `labels`/`mask` and its
+    `stats` row (area, bbox) is updated -- BEFORE any area / brightness / contour / split / circularity decision. All
+    downstream logic (both passes, whatever their thresholds and area ceilings) then only ever sees the head, so a tail
+    that grows the component past the area ceiling, or fails circularity, at a given pixel threshold can't drop the LED.
+    Only components that are long enough, bright enough (a pixel >= required_threshold) and not absurdly large
+    (<= streak_tail_trim_max_area_factor * max area, so a lamp-fixture merge is never touched) are examined."""
+    min_len = float(cfg.get("streak_tail_trim_min_length_px", 8.0))
+    max_px = float(cfg.get("streak_tail_trim_max_area_factor", 6.0)) * float(cfg["max_area"])
+    ext = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+    cand = np.where((ext >= min_len * 0.7) & (stats[:, cv2.CC_STAT_AREA] >= 8) & (stats[:, cv2.CC_STAT_AREA] <= max_px))[0]
+    for label_id in cand:
+        label_id = int(label_id)
+        if label_id == 0:
+            continue
+        x_b = int(stats[label_id, cv2.CC_STAT_LEFT]); y_b = int(stats[label_id, cv2.CC_STAT_TOP])
+        w_b = int(stats[label_id, cv2.CC_STAT_WIDTH]); h_b = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+        roi = labels[y_b:y_b + h_b, x_b:x_b + w_b] == label_id
+        if int(image[y_b:y_b + h_b, x_b:x_b + w_b][roi].max()) < required_threshold:
+            continue
+        cnt = _bbox_scoped_contour(labels, label_id, x_b, y_b, w_b, h_b)
+        tr = _trim_streak_tail(image, cnt, cfg)
+        if tr is None:
+            continue
+        head_cnt = np.round(tr[0]).astype(np.int32) - np.array([x_b, y_b], dtype=np.int32)
+        head = np.zeros((h_b, w_b), dtype=np.uint8)
+        cv2.fillPoly(head, [head_cnt.reshape(-1, 1, 2)], 1)
+        keep = roi & (head > 0)
+        n_keep = int(keep.sum())
+        if n_keep < 3 or n_keep >= int(roi.sum()):
+            continue
+        drop = roi & ~keep
+        labels[y_b:y_b + h_b, x_b:x_b + w_b][drop] = 0
+        mask[y_b:y_b + h_b, x_b:x_b + w_b][drop] = 0
+        ys, xs = np.nonzero(keep)
+        stats[label_id, cv2.CC_STAT_LEFT] = x_b + int(xs.min()); stats[label_id, cv2.CC_STAT_TOP] = y_b + int(ys.min())
+        stats[label_id, cv2.CC_STAT_WIDTH] = int(xs.max() - xs.min()) + 1; stats[label_id, cv2.CC_STAT_HEIGHT] = int(ys.max() - ys.min()) + 1
+        stats[label_id, cv2.CC_STAT_AREA] = n_keep
+
+
 # Above this many labels, a single full-image lut[labels] gather + one
 # findContours call beats per-label bbox-scoped extraction — each small
 # extraction's fixed per-call dispatch overhead starts to add up past this
@@ -515,6 +642,8 @@ def _detect_blobs(image, pixel_threshold, required_threshold, cfg,
     # pixel in one pass — proportional to the number of bright pixels, not
     # image size.)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n_labels > 1 and cfg.get("streak_tail_trim", False):
+        _trim_streak_labels(image, mask, labels, stats, required_threshold, cfg)
 
     centroids        = []
     blob_contours    = []
@@ -2752,6 +2881,14 @@ class BlobDetector:
         pass2_brightness_percentile = float(cfg.get("pass2_brightness_percentile", 25.0))
         ema_alpha                   = float(cfg.get("pass2_threshold_ema_alpha", 1.0))
         count_gate_max_factor       = float(cfg.get("pass2_count_gate_max_factor", 1.7))
+        # Pass-2 thresholds are never stricter than THIS frame's own statistics-derived
+        # ones (raw p25 * factor), whatever the remembered/EMA-blended values say -- the
+        # memory is per CAMERA (shared by both controllers) and can describe a different
+        # blob population (see tests/test_blob_detector_pass2_stale_memory.py).
+        cap_at_frame_stats          = bool(cfg.get("pass2_cap_at_frame_stats", True))
+        # 0 = off. Else: pass 1 found >= 3 blobs and pass 2 kept fewer than this fraction
+        # of them -> discard pass 2 (return pass 1's result) and clear the memory.
+        min_survival_fraction       = float(cfg.get("pass2_min_survival_fraction", 0.0))
         _mem = self._memory
 
         _neighborhoods = (predicted_leds, search_radii) if has_prior else None
@@ -2814,6 +2951,18 @@ class BlobDetector:
                         pixel_threshold_2    = _mem["pixel_threshold"]
                         required_threshold_2 = _mem.get("required_threshold", required_threshold)
                         update_memory        = False
+                        # Frame-to-frame count gate: remember THIS frame's count even though the
+                        # thresholds are not updated. Comparing against the count of the last
+                        # memory WRITE deadlocked forever once the population changed
+                        # persistently (remembered count 2, real population 8).
+                        _mem["blob_count"]   = cur_count
+
+                    _blended_pix, _blended_req = pixel_threshold_2, required_threshold_2
+                    if cap_at_frame_stats:
+                        # Applied to the values USED this frame; the memory keeps the blended
+                        # value (EMA continuity), so upward lag is preserved when raw is higher.
+                        pixel_threshold_2    = min(pixel_threshold_2, raw_pixel_thr)
+                        required_threshold_2 = min(required_threshold_2, raw_required_thr)
 
                     # Area ceiling: the biggest blob pass 1 actually found this
                     # frame — real data, not a modeled/scaled estimate. Pass 1's
@@ -2857,7 +3006,14 @@ class BlobDetector:
                     )
                     if result2[7] is not None:
                         canvases["pass2"] = result2[7]
-                    if len(result2[0]) >= 1:
+                    _n1, _n2 = len(result[0]), len(result2[0])
+                    _pass2_lost_too_many = (min_survival_fraction > 0.0 and _n1 >= 3
+                                            and _n2 < min_survival_fraction * _n1)
+                    if _pass2_lost_too_many:
+                        # Fall through to the pass-1 result below (same path as pass 2 finding
+                        # 0 blobs) and forget the memory that produced such a threshold.
+                        _mem.clear()
+                    elif len(result2[0]) >= 1:
                         # Always a deterministic, physics-derived value (no
                         # population stats involved) — always safe to remember
                         # for the memory-reuse branch below, unlike the old
@@ -2865,8 +3021,8 @@ class BlobDetector:
                         # measurement that shouldn't have been remembered.
                         _mem["max_area"] = max_area_pass2
                         if update_memory:
-                            _mem["pixel_threshold"]    = pixel_threshold_2
-                            _mem["required_threshold"] = required_threshold_2
+                            _mem["pixel_threshold"]    = _blended_pix
+                            _mem["required_threshold"] = _blended_req
                             _mem["large_blobs"]        = large_blobs_pass1
                             _mem["blob_count"]         = cur_count
                         corrected_radii = _correct_radii_for_threshold(

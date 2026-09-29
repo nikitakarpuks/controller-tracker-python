@@ -356,6 +356,8 @@ fusion_heuristic:
   # (vision was confirmed correct via mocap the whole time). 2 gives that
   # frame one full real accept to settle before it's trusted as a reference.
   rotation_seed_grace_frames: 2
+  # An exempt accept whose rotation agreed with the gyro to within this many deg ends the grace at once (<= 0 disables).
+  rotation_seed_grace_vetted_deg: 20.0
 
   # _try_cold_reacquire's weak-candidate buffer (see its own docstring): a
   # buffered weak cold-reacquire candidate older than this is dropped as
@@ -657,6 +659,52 @@ fusion_heuristic:
   cold_reacquire_rot_veto_max_s: 0.25
   cold_reacquire_rot_veto_thresh_deg: 100.0
 
+  # Continuous rotation gate (analysis/imu_thresholds_2026-09-25/FINAL_PLAN.md). legacy = the
+  # dt-budgeted cold veto + speed/gyro/stale-widening warm ceiling above (unchanged). continuous =
+  # T = min(cap_hs, base + sat_allow*saturated) with headset ego-motion correction, or
+  # min(cap_nohs, base + sat_allow*saturated + nohs_allow_dps*dt) without; state older than
+  # max_state_age_s (3 s; was 0.35 s -- the data shows the finite limit holds out to 3 s) -> 179 deg (expired). Also vetoes on gyro alone when predict() is None.
+  rot_gate_mode: auto   # legacy | continuous | auto (continuous iff headset ego-motion data is available, else legacy)
+  rot_gate_base_deg: 40.0
+  rot_gate_sat_allow_deg: 25.0
+  rot_gate_nohs_allow_dps: 500.0
+  rot_gate_cap_hs_deg: 75.0
+  rot_gate_cap_nohs_deg: 150.0
+  rot_gate_max_state_age_s: 3.0
+  rot_gate_sat_peak_dps: 1800.0
+  rot_gate_clip_frac: 0.95
+  rot_gate_pad_s: 0.010
+  # Dev switch: force the no-headset prediction path even when headset mocap is loaded.
+  disable_headset_ego_motion: false
+  # Quality-aware shrink of the warm hard gate's rotation ceiling (continuous mode): ceiling * (s + (1-s)*min(1, quality/full)).
+  # 1.0 disables. 0.75 catches weak candidates whose rotation is 30-40 deg off the gyro prediction (static_hard frame 2593:
+  # quality 0.0, 37.9 deg innovation vs a flat 40); offline over 8 recordings it cost 0 correct frames on the current-code runs.
+  rot_gate_quality_min_scale: 0.75
+  rot_gate_quality_full_trust_at: 0.7
+  # Bootstrap rotation gate: a fresh bootstrap after a reset had no rotation reference. legacy = off |
+  # shadow = compute + log "BOOTSTRAP-GATE" only | enforce = also treat a candidate whose rotation
+  # contradicts the headset-corrected gyro propagation of the last solid accepted rotation as
+  # rot_pred_implausible (forced weak, cannot confirm). Needs headset ego-motion data; reference
+  # older than max_age_s -> no gate. Limit T = rot_gate_threshold_deg (40 / 65 deg if gyro clipped).
+  bootstrap_rot_gate_mode: enforce   # legacy | shadow | enforce (no effect without headset ego-motion data)
+  bootstrap_rot_gate_max_age_s: 1.5
+
+  # Rotation-only coast/anchor budget while headset ego-motion is active (degenerate w_sum<=0 gate and
+  # ControllerTracker._mark_all_lost's search anchor; both still min() with the UNCHANGED position
+  # budget). legacy = unchanged. headset = max(legacy, full_s up to full_until_dps, linear to floor_s at
+  # floor_at_dps). Without headset data the legacy shrink is kept.
+  coast_rot_budget_mode: legacy
+  coast_rot_budget_hs_full_s: 0.30
+  coast_rot_budget_hs_full_until_dps: 1000.0
+  coast_rot_budget_hs_floor_s: 0.035
+  coast_rot_budget_hs_floor_at_dps: 1500.0
+  # FUTURE WORK (deferred by decision 2026-09-25): everything above (rot_gate_*, coast_rot_budget_*)
+  # is validated for headset ego-motion from the dev-only mocap headset track with the fixed mocap
+  # room g_world. The no-headset case (real deployments without mocap: needs the headset imu0 gyro fed
+  # into predict(), or SLAM/VIO headset pose, and a converged g_world_estimator so predict() stops
+  # returning None / failing open) is NOT handled yet. See
+  # analysis/imu_thresholds_2026-09-25/FINAL_PLAN.md (C8).
+
   # bootstrap_gravity_veto_thresh_deg: at BOOTSTRAP only, refuse to confirm two
   # agreeing weak candidates when the accelerometer reading rotated through the
   # candidate's R points more than this many degrees away from world down (-y).
@@ -772,6 +820,15 @@ imu:
                   # diagnostic (log-only). Requires
                   # <data.root>/imu1/data.csv (left) and imu2/data.csv (right) in
                   # EuRoC format; falls back to pure vision-history prediction
+  recorded_stream_factory_corrected: true  # the recorded imu1/imu2 CSVs were written by Monado AFTER its own
+                  # mix + bias + axis-rotation step (wmr_controller_hp.c:258-276), so the loader must NOT
+                  # apply the factory mix+bias again (it used to: doubled the bias, re-applied the mixing
+                  # matrix; worse accel/gyro prediction in 12/12 recording-controller pairs). false = the
+                  # CSV is genuinely raw -> apply factory correction as before. See src/imu_data.py's
+                  # module docstring and analysis/imu_bias/REPORT.md.
+  accel_driver_scale: 0.980665  # multiplies the accelerometer: Monado reports counts/(98000/2) = 10.000 for one g
+                  # ("1g ~ 490,000 counts" is the driver author's own unconfirmed observation), so true m/s^2 =
+                  # reported * 9.80665/10. Removes a measured ~1.9-2.5 % accel gain error. 1.0 = no scaling.
                   # (with a startup warning) if a file is missing.
 
 fusion:
@@ -955,7 +1012,19 @@ controllers:
                           # the IMU-stream lag_ns (= -this, via src.mocap_data.controller_imu_files, used by main.py and
                           # the offline scripts) -- one physical link, one value. null/0 = legacy: no mocap offset,
                           # lag_ns falls back to the old -5ms (left)/-7ms (right).
-    mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
+    mocap_vision_drift_offset_ns: -2500000 # ADDITIONAL constant on top of mocap_vision_offset_ns above, plus
+                          # mocap_vision_drift_rate_ms_per_min below -- see src/mocap_data.py's "Vision-clock
+                          # DRIFT" docstring. The vision<->mocap lag isn't perfectly constant: a held-out
+                          # linear-drift fit (train/test time-block split, bridge refit per fold) found a
+                          # consistent +2.5 to +3.5 ms/min residual drift in nearly every recording-aug26
+                          # recording; this pair is the (offset, rate) jointly fit and pooled (n-weighted) over
+                          # the 3 recordings with fresh vision (static_dark/static_medium/static_hard) -- see
+                          # analysis/drift_test/fit_deploy_drift.py. Deliberately NOT folded into
+                          # mocap_vision_offset_ns (that key also drives the IMU stream's lag_ns, which this
+                          # must not silently perturb) -- affects only mocap ground-truth comparison and (when
+                          # mocap.enabled) the headset ego-motion correction, never live IMU integration.
+                          # null/0 = old behavior (no drift term).
+    mocap_vision_drift_rate_ms_per_min: 2.5 # see mocap_vision_drift_offset_ns above
     mocap_bridge_path: "./data/mocap_calib/controller_right_mocap_bridge_basalt01.json" # compare_vision_mocap.py's
                           # empirically-fit LED-reference-frame -> mocap accelerometer-IMU-frame bridge
                           # (see src/mocap_data.load_mocap_bridge). Deliberately NOT derived from this
@@ -1004,8 +1073,10 @@ controllers:
                    # inter-controller relative-pose check -- see that script's module docstring)
     config_path: "./data/controllers/left_controller_A85K5091630091L.json"
     mocap_calib_path: "/home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_left_calib.json" # see cameras.mocap_calib_path above
-    mocap_vision_offset_ns: 7650000 # see right_controller.mocap_vision_offset_ns above
     mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
+    mocap_vision_offset_ns: 7650000 # see right_controller.mocap_vision_offset_ns above
+    mocap_vision_drift_offset_ns: -2000000 # see right_controller.mocap_vision_drift_offset_ns above
+    mocap_vision_drift_rate_ms_per_min: 2.5 # see right_controller.mocap_vision_drift_offset_ns above
     mocap_bridge_path: "./data/mocap_calib/controller_left_mocap_bridge_basalt01.json" # see right_controller.mocap_bridge_path above
     # mesh_alignment is not stored here: left mesh = X-reflection of right mesh
     # handle_primitives are auto-derived by X-mirroring right_controller primitives in main.py
@@ -1066,6 +1137,15 @@ blob_detection:
   min_streak_elongation: 2.0
   max_streak_elongation: 4.5
   min_streak_fill_ratio: 0.30
+  # Streak tail trim (src/blob_detector.py _trim_streak_tail): replace an elongated, single-peaked head+tail motion streak by its
+  # bright head at the connected-component level, before any area/circularity decision in either pass (centroid = head). false = off (legacy behaviour).
+  streak_tail_trim: true
+  streak_tail_trim_peak_fraction: 0.5      # keep the bins along the streak that stay >= this fraction of the head peak
+  streak_tail_trim_min_elongation: 2.0     # untouched below this (round / slightly oval LEDs)
+  streak_tail_trim_max_elongation: 8.0
+  streak_tail_trim_min_length_px: 8.0
+  streak_tail_trim_max_area_factor: 6.0    # components above this multiple of max_area (lamp merges) are never examined
+  streak_tail_trim_max_head_offset: 0.35   # head peak must lie within this fraction of the length from one end
   min_circularity_angle_factor: 0.2
   min_circularity_floor: 0.1
   required_threshold_factor: 2.0   # required_threshold = clip(pixel_threshold * factor, 255)
@@ -1330,6 +1410,14 @@ blob_detection:
                                  # -- every blob reaching this filter already clears that; real LEDs
                                  # typically saturate far brighter.
     max_line_residual_px: 2.0   # every line in a candidate must have max perpendicular PCA-fit
+    # Noise-zone guard (src/lamp_blob_filter.py): in a spatially-connected cluster holding at least
+    # noise_zone_min_points noise-LEVEL points (peak brightness <= noise_brightness_max, i.e. at the detection
+    # floor), those noise points may not be members of a lamp line. Single-pixel noise blobs have integer
+    # centroids and line up exactly, so a noise cloud otherwise yields spurious "lamp lines" that also swallow real
+    # LED blobs in the same cloud (static_hard frames 5861 cam3 / 5876 cam1: LED ring blobs removed together with
+    # noise). Real lamp rows (r~0.8, brightness 12-115) are unaffected. 0 disables.
+    noise_brightness_max: 8.5
+    noise_zone_min_points: 20
                                  # residual <= this or the whole candidate is spared. Generous by
                                  # design: min_points+spacing above is the real guard (no
                                  # controller pose in the simulation ever achieved lamp-like
@@ -1758,6 +1846,14 @@ blob_detection:
   pass2_min_area: 2                 # null = use min_area; blobs shrink under higher threshold so can be smaller
   pass2_threshold_ema_alpha: 0.25   # EMA weight on the new threshold (0=frozen, 1=no smoothing)
   pass2_count_gate_max_factor: 1.7  # skip EMA update if blob count changes by more than this factor
+  pass2_cap_at_frame_stats: true    # pass-2 thresholds never exceed THIS frame's own p25*factor values, whatever the
+                                    # (per-camera, shared by both controllers) memory/EMA holds. The memory could
+                                    # freeze at another controller's high thresholds and, via the count gate, never
+                                    # refresh -> real dim LEDs thresholded away (walk_dark frame 1328: 7 blobs -> 1).
+                                    # false = old behaviour (A/B only).
+  pass2_min_survival_fraction: 0.0  # 0 = OFF (shipped off). Else, if pass 1 found >= 3 blobs and pass 2 kept fewer
+                                    # than this fraction, discard pass 2 (use pass 1's result) and clear the memory.
+                                    # Off because noise-heavy cold frames can legitimately lose many pass-1 blobs.
                                     # max_area_pass2 = the biggest blob pass 1 actually found this frame
                                     # (already bounded by pass 1's own physics-based ceiling below) —
                                     # no separate config needed; see BlobDetector.detect for details
@@ -2489,6 +2585,10 @@ matching:
   # LM only reached 4.05px (~3.5x worse than either input alone).
   joint_fusion_max_error_ratio: 2.0
   joint_fusion_fallback_min_abs_px: 1.0
+  # A camera whose own blob->LED pairs reproject under the RETURNED fused pose with RMS above this (px) is not
+  # evidence for it (e.g. fuse_camera_poses fell back to one camera's solve): its pairs are dropped from the
+  # candidate's inliers / aux evidence / drawn projections / claimed blobs / per-camera priors.
+  fused_aux_max_reproj_px: 8.0
 
   # --------------------------------------------------------------------------
   # Cross-controller occlusion

@@ -1,0 +1,85 @@
+recording,ctrl,v0_source,method,gap_s,n_test,median_m,p90_m,mean_m
+static_dark,left_controller,vision,naive,0.25,763,0.0901,0.1987,0.101
+static_dark,left_controller,vision,naive,0.5,676,0.2503,0.5106,0.2708
+static_dark,left_controller,vision,naive,1.0,518,0.5377,1.0197,0.5916
+static_dark,left_controller,vision,accel b=0,0.25,763,0.0273,0.0595,0.0329
+static_dark,left_controller,vision,accel b=0,0.5,676,0.0727,0.1331,0.081
+static_dark,left_controller,vision,accel b=0,1.0,518,0.2285,0.3374,0.229
+static_dark,left_controller,vision,const b (first 60 s),0.25,763,0.0257,0.0525,0.0295
+static_dark,left_controller,vision,const b (first 60 s),0.5,676,0.0635,0.1172,0.069
+static_dark,left_controller,vision,const b (first 60 s),1.0,518,0.181,0.3052,0.1915
+static_dark,left_controller,vision,const b+K_a (first 60 s),0.25,763,0.0262,0.0578,0.0309
+static_dark,left_controller,vision,const b+K_a (first 60 s),0.5,676,0.0578,0.1171,0.0664
+static_dark,left_controller,vision,const b+K_a (first 60 s),1.0,518,0.1307,0.2554,0.1461
+static_dark,left_controller,vision,RLS-vision tau=160s b,0.25,763,0.0252,0.0514,0.0289
+static_dark,left_controller,vision,RLS-vision tau=160s b,0.5,676,0.0604,0.1117,0.0661
+static_dark,left_controller,vision,RLS-vision tau=160s b,1.0,518,0.1651,0.2935,0.1795
+static_dark,left_controller,vision,RLS-vision tau=80s b+K_a,0.25,763,0.0255,0.0572,0.0306
+static_dark,left_controller,vision,RLS-vision tau=80s b+K_a,0.5,676,0.0551,0.1157,0.0651
+static_dark,left_controller,vision,RLS-vision tau=80s b+K_a,1.0,518,0.1216,0.2448,0.1404
+static_dark,left_controller,vision,b+K_a all-time [UB],0.25,763,0.0257,0.0571,0.0305
+static_dark,left_controller,vision,b+K_a all-time [UB],0.5,676,0.056,0.119,0.0646
+static_dark,left_controller,vision,b+K_a all-time [UB],1.0,518,0.1236,0.2463,0.1399
+static_dark,left_controller,mocap,naive,0.25,872,0.0742,0.1697,0.0843
+static_dark,left_controller,mocap,naive,0.5,766,0.2377,0.4827,0.2574
+static_dark,left_controller,mocap,naive,1.0,587,0.5347,1.1229,0.6037
+static_dark,left_controller,mocap,accel b=0,0.25,872,0.0141,0.0234,0.0147
+static_dark,left_controller,mocap,accel b=0,0.5,766,0.0526,0.0779,0.0518
+static_dark,left_controller,mocap,accel b=0,1.0,587,0.1968,0.2634,0.192
+static_dark,left_controller,mocap,const b (first 60 s),0.25,872,0.0127,0.0198,0.0129
+static_dark,left_controller,mocap,const b (first 60 s),0.5,766,0.0422,0.0683,0.0442
+static_dark,left_controller,mocap,const b (first 60 s),1.0,587,0.1533,0.2448,0.161
+static_dark,left_controller,mocap,const b+K_a (first 60 s),0.25,872,0.0093,0.0177,0.0101
+static_dark,left_controller,mocap,const b+K_a (first 60 s),0.5,766,0.0286,0.0499,0.0303
+static_dark,left_controller,mocap,const b+K_a (first 60 s),1.0,587,0.0831,0.1406,0.0884
+static_dark,left_controller,mocap,RLS-vision tau=160s b,0.25,872,0.0123,0.0199,0.0126
+static_dark,left_controller,mocap,RLS-vision tau=160s b,0.5,766,0.0399,0.0686,0.042
+static_dark,left_controller,mocap,RLS-vision tau=160s b,1.0,587,0.1445,0.2358,0.1488
+static_dark,left_controller,mocap,RLS-vision tau=20s b+K_a,0.25,872,0.009,0.0173,0.0099
+static_dark,left_controller,mocap,RLS-vision tau=20s b+K_a,0.5,766,0.0275,0.047,0.0293
+static_dark,left_controller,mocap,RLS-vision tau=20s b+K_a,1.0,587,0.0742,0.1282,0.0808
+static_dark,left_controller,mocap,b+K_a all-time [UB],0.25,872,0.0086,0.017,0.0096
+static_dark,left_controller,mocap,b+K_a all-time [UB],0.5,766,0.0265,0.046,0.0284
+static_dark,left_controller,mocap,b+K_a all-time [UB],1.0,587,0.0766,0.1304,0.0822
+static_dark,right_controller,vision,naive,0.25,450,0.1141,0.2927,0.1452
+static_dark,right_controller,vision,naive,0.5,316,0.3108,0.7105,0.3687
+static_dark,right_controller,vision,naive,1.0,151,0.7346,1.3086,0.8176
+static_dark,right_controller,vision,accel b=0,0.25,450,0.0377,0.0891,0.0486
+static_dark,right_controller,vision,accel b=0,0.5,316,0.0841,0.1997,0.1061
+static_dark,right_controller,vision,accel b=0,1.0,151,0.229,0.3943,0.2568
+static_dark,right_controller,vision,const b (first 60 s),0.25,450,0.0364,0.0812,0.0439
+static_dark,right_controller,vision,const b (first 60 s),0.5,316,0.0817,0.168,0.0949
+static_dark,right_controller,vision,const b (first 60 s),1.0,151,0.2207,0.35,0.2343
+static_dark,right_controller,vision,const b+K_a (first 60 s),0.25,450,0.0346,0.089,0.0447
+static_dark,right_controller,vision,const b+K_a (first 60 s),0.5,316,0.0639,0.1805,0.0862
+static_dark,right_controller,vision,const b+K_a (first 60 s),1.0,151,0.1245,0.3235,0.165
+static_dark,right_controller,vision,RLS-vision tau=20s b,0.25,450,0.0367,0.0824,0.0441
+static_dark,right_controller,vision,RLS-vision tau=20s b,0.5,316,0.0852,0.1656,0.0973
+static_dark,right_controller,vision,RLS-vision tau=20s b,1.0,151,0.2345,0.3536,0.2398
+static_dark,right_controller,vision,RLS-vision tau=40s b+K_a,0.25,450,0.0348,0.0896,0.0452
+static_dark,right_controller,vision,RLS-vision tau=40s b+K_a,0.5,316,0.0657,0.1805,0.0871
+static_dark,right_controller,vision,RLS-vision tau=40s b+K_a,1.0,151,0.1341,0.3319,0.1667
+static_dark,right_controller,vision,b+K_a all-time [UB],0.25,450,0.0347,0.0886,0.0449
+static_dark,right_controller,vision,b+K_a all-time [UB],0.5,316,0.0643,0.1825,0.0868
+static_dark,right_controller,vision,b+K_a all-time [UB],1.0,151,0.1267,0.3245,0.1649
+static_dark,right_controller,mocap,naive,0.25,629,0.092,0.2358,0.116
+static_dark,right_controller,mocap,naive,0.5,443,0.2974,0.635,0.3426
+static_dark,right_controller,mocap,naive,1.0,212,0.7383,1.2766,0.7936
+static_dark,right_controller,mocap,accel b=0,0.25,629,0.0161,0.0281,0.0175
+static_dark,right_controller,mocap,accel b=0,0.5,443,0.0546,0.0813,0.0557
+static_dark,right_controller,mocap,accel b=0,1.0,212,0.1921,0.27,0.1865
+static_dark,right_controller,mocap,const b (first 60 s),0.25,629,0.0137,0.0233,0.0145
+static_dark,right_controller,mocap,const b (first 60 s),0.5,443,0.0457,0.073,0.0464
+static_dark,right_controller,mocap,const b (first 60 s),1.0,212,0.1532,0.2502,0.1633
+static_dark,right_controller,mocap,const b+K_a (first 60 s),0.25,629,0.011,0.0201,0.0121
+static_dark,right_controller,mocap,const b+K_a (first 60 s),0.5,443,0.0308,0.0525,0.0331
+static_dark,right_controller,mocap,const b+K_a (first 60 s),1.0,212,0.0857,0.1336,0.09
+static_dark,right_controller,mocap,RLS-vision tau=20s b,0.25,629,0.015,0.0248,0.0157
+static_dark,right_controller,mocap,RLS-vision tau=20s b,0.5,443,0.0504,0.0797,0.0512
+static_dark,right_controller,mocap,RLS-vision tau=20s b,1.0,212,0.1597,0.2666,0.1715
+static_dark,right_controller,mocap,RLS-vision tau=40s b+K_a,0.25,629,0.0115,0.0208,0.0128
+static_dark,right_controller,mocap,RLS-vision tau=40s b+K_a,0.5,443,0.0333,0.0565,0.0356
+static_dark,right_controller,mocap,RLS-vision tau=40s b+K_a,1.0,212,0.0926,0.141,0.0949
+static_dark,right_controller,mocap,b+K_a all-time [UB],0.25,629,0.011,0.02,0.0122
+static_dark,right_controller,mocap,b+K_a all-time [UB],0.5,443,0.0309,0.0536,0.0332
+static_dark,right_controller,mocap,b+K_a all-time [UB],1.0,212,0.0831,0.1296,0.0871

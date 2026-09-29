@@ -86,6 +86,7 @@ from scipy.spatial.transform import Rotation
 
 from src.imu_data import predict_world_pose, slice_imu_to_window, dead_reckon_dense, \
     predict_headset_relative_pose, MOCAP_ROOM_G_WORLD, peak_gyro_accel_over_window, \
+    integrate_gyro_segment, gyro_window_clip_flags, headset_rot_coast_budget_s, \
     effective_coast_budget_s as _shared_effective_coast_budget_s
 from src.mocap_data import world_pose, headset_angular_velocity, headset_linear_velocity
 from src.one_euro_filter import OneEuroFilter, OneEuroRotationFilter
@@ -101,6 +102,46 @@ _log = logger.bind(cat="pose_fusion")
 # both sides. Kept as a separate literal (not imported from pose_fusion.py) since
 # the two filter implementations are deliberately independent.
 _GAP_DT_NORMAL_S = 0.04
+
+
+# Returned instead of "infinity" once the state is too old for the continuous rotation gate to mean
+# anything: just under the 180 deg maximum possible rotation, so every consumer that scales with the
+# ceiling (Case A's pushback ramp, _agreement_weak_bounds, _vision_weight) stays finite and monotone.
+_ROT_GATE_EXPIRED_DEG = 179.0
+
+
+def rot_gate_threshold_deg(dt_s: float, headset_active: bool, saturated: bool, base_deg: float = 40.0,
+                            sat_allow_deg: float = 25.0, nohs_allow_dps: float = 500.0,
+                            cap_hs_deg: float = 75.0, cap_nohs_deg: float = 150.0,
+                            max_state_age_s: float = 3.0) -> float:
+    """Continuous rotation-innovation threshold (deg) between a vision candidate and the gyro-
+    propagated prediction, valid at EVERY elapsed time dt_s since the last accepted state -- there is
+    no "dt <= budget" on/off switch (that fail-open switch let a 171 deg mirror lock through 0.244 s
+    after the last accept: walk_medium frame 348; see analysis/imu_thresholds_2026-09-25/FINAL_PLAN.md).
+
+        headset ego-motion correction ACTIVE :  T = min(cap_hs,   base + sat_allow*saturated)
+        NOT available for this prediction    :  T = min(cap_nohs, base + sat_allow*saturated + nohs_allow_dps*dt)
+
+    The gyro-integrated rotation prediction is accurate (p99 rotation error ~14-33 deg out to 1.5 s once
+    the headset's own rotation is compensated), so the headset-active gate is flat. Without the headset
+    correction the prediction ignores headset rotation, whose rate reaches ~390 deg/s in these
+    recordings, hence the additive nohs_allow_dps*dt term. sat_allow_deg covers gyro CLIPPING (see
+    src.imu_data.gyro_window_clip_flags): a burst pinned at the sensor ceiling under-integrates by
+    30-45 deg. The old fitted 0.05*peak_gyro*dt term is deliberately NOT used: it was fitted to ~3
+    saturation events, is not physical, and is unbounded.
+
+    Beyond max_state_age_s (3 s) the state is too stale to gate against: returns _ROT_GATE_EXPIRED_DEG,
+    which no real innovation exceeds meaningfully. Between ~0.35 s and 3 s the gate stays at its finite
+    value (measured on 588 good and 81 bad candidates with dt > 0.35 s: good headset-corrected innovation
+    max 30 deg, bad >= 108 deg; T=40 had 0 false positives when the state was itself good). Negative dt_s
+    is clamped to 0."""
+    dt = max(0.0, float(dt_s))
+    if dt > float(max_state_age_s):
+        return _ROT_GATE_EXPIRED_DEG
+    t = float(base_deg) + (float(sat_allow_deg) if saturated else 0.0)
+    if headset_active:
+        return min(float(cap_hs_deg), t)
+    return min(float(cap_nohs_deg), t + float(nohs_allow_dps) * dt)
 
 
 def _fmt_v(v) -> str:
@@ -172,6 +213,12 @@ class HeuristicPoseFusionFilter:
         # surviving reference for the swap-check to compare against).
         self._last_known_p: np.ndarray | None = None
         self._last_known_p_ts_ns: int | None = None
+        # Last SOLID accepted rotation (+ its time), kept across reset() like _last_known_p: the
+        # reference the bootstrap rotation gate (bootstrap_rot_gate_mode) propagates by the gyro when a
+        # fresh bootstrap follows a reset, where self.R is gone. Only recorded from accepts that are not
+        # coverage-fallback / rotation-untrustworthy / bootstrap / fail-open.
+        self._last_known_R: np.ndarray | None = None
+        self._last_known_R_ts_ns: int | None = None
         self.v = np.zeros(3)
         # True once self.v has been set from an ACTUAL measured displacement
         # -- a real two-point finite difference over a SHORT, known gap, in
@@ -253,6 +300,12 @@ class HeuristicPoseFusionFilter:
         # not time-based. Drives w_imu's decay in try_update -- see there.
         self.frames_since_update = 0
         self._last_predict_seen_ts_ns = None
+        # (last_update_ts_ns, target_ts_ns, headset_used) stamped by predict() -- lets the continuous
+        # rotation gate reuse predict()'s own headset/no-headset decision instead of repeating the
+        # (0.83 ms) mocap lookups. headset_used: True / False (plain path) / None (predict() returned None).
+        self._pred_stamp = None
+        # one-entry memo of _rot_gate_info, keyed (last_update_ts_ns, frame_ts_ns)
+        self._rot_gate_cache = None
 
         # A single buffered WEAK cold-reacquire candidate (dict with R/p/
         # confidence/coverage_fallback/frame_ts_ns/n_inliers), or None -- see
@@ -276,6 +329,14 @@ class HeuristicPoseFusionFilter:
 
         self.reported_R = None
         self.reported_p = None
+        # Pre-One-Euro tracking state at the moment of the last _report() call -- i.e. exactly what
+        # reported_R/reported_p would be if fusion_heuristic.one_euro_enabled were false (see _report's own
+        # docstring: that flag only bypasses the smoothing step inside _report, nothing upstream). Exported
+        # read-only for an offline "does the One Euro filter help" comparison against mocap, without needing
+        # a separate one_euro_enabled:false rerun -- this value is mathematically identical to what that rerun
+        # would report.
+        self.last_raw_R = None
+        self.last_raw_p = None
 
         # One Euro filters for the REPORTED pose only -- see module docstring
         # for why this replaces the old w_smooth cost term. Position/rotation
@@ -625,6 +686,11 @@ class HeuristicPoseFusionFilter:
         max_ang_speed_deg_s = float(_matching_cfg.get("max_plausible_hand_ang_speed_deg_s", 2200.0))
         pos_thresh_m += max_speed_m_s * stale_s
         rot_thresh_deg += max_ang_speed_deg_s * stale_s
+        if self._rot_gate_continuous():
+            # continuous mode: the rotation ceiling is the physically-grounded gate T (see
+            # rot_gate_threshold_deg) -- flat for headset-corrected prediction, NOT widening with
+            # 2200 deg/s * stale. Position part above is untouched.
+            rot_thresh_deg = self._rot_gate_info(frame_ts_ns)["T"]
 
         if quality is not None and bool(self._hc_get("implausible_jump_pos_quality_shrink_enabled", True)):
             full_trust_at = float(self._hc_get("implausible_jump_pos_quality_full_trust_at", 0.7))
@@ -657,6 +723,7 @@ class HeuristicPoseFusionFilter:
         expect one glitched dt on the very first frame after re-enabling if
         real time elapsed while it was off, exactly like re-enabling after
         any other pause would."""
+        self.last_raw_R, self.last_raw_p = R_out, p_out
         if not bool(self._hc_get("one_euro_enabled", True)):
             self.reported_p, self.reported_R = p_out, R_out
             return
@@ -734,26 +801,32 @@ class HeuristicPoseFusionFilter:
         # full headset mocap coverage but a not-yet-converged rig-frame
         # estimator (needs g_world_min_samples low-motion samples) would
         # fail-open even though a mocap-corrected prediction was available.
-        if self._headset_mocap is not None:
+        _ts0 = self.last_update_ts_ns
+        if self._headset_possible():
             corrected = self._predict_with_headset_correction(t_gyro, gyro_body, t_accel, accel_body,
                                                                 target_ts_ns)
             if corrected is not None:
+                self._pred_stamp = (_ts0, target_ts_ns, True)
                 return corrected
             # else: real mocap coverage gap -- fall through to the plain
             # (uncorrected) path below, same fail-open contract as every
             # other missing precondition in this class.
 
         if self._g_world_estimator is None:
+            self._pred_stamp = (_ts0, target_ts_ns, None)
             return None
         g_world = self._g_world_estimator.g_world
         if g_world is None:
+            self._pred_stamp = (_ts0, target_ts_ns, None)
             return None
 
         predicted = predict_world_pose(t_gyro, gyro_body, t_accel, accel_body, g_world,
                                         self._lever_arm, self.last_update_ts_ns, target_ts_ns,
                                         self.R, self.p, self.v)
         if predicted is None:
+            self._pred_stamp = (_ts0, target_ts_ns, None)
             return None
+        self._pred_stamp = (_ts0, target_ts_ns, False)
         return predicted  # (R_pred, p_pred)
 
     def _predict_with_headset_correction(self, t_gyro, gyro_body, t_accel, accel_body, target_ts_ns: int):
@@ -765,18 +838,184 @@ class HeuristicPoseFusionFilter:
         src/imu_data.py), not a live/converging estimate -- self._g_world_estimator_abs is no
         longer read here (see its own commented-out feed site in src/controller.py)."""
         ts0, ts1 = self.last_update_ts_ns, target_ts_ns
-        T_wh0 = world_pose(self._headset_mocap, ts0)
-        T_wh1 = world_pose(self._headset_mocap, ts1)
-        omega_h0 = headset_angular_velocity(self._headset_mocap, ts0)
-        v_wh0 = headset_linear_velocity(self._headset_mocap, ts0)
+        inputs = self._headset_inputs(ts0, ts1)
         g_world_abs = MOCAP_ROOM_G_WORLD
-        if T_wh0 is None or T_wh1 is None or omega_h0 is None or v_wh0 is None:
+        if inputs is None:
             return None
+        T_wh0, T_wh1, omega_h0, v_wh0 = inputs
         return predict_headset_relative_pose(
             t_gyro, gyro_body, t_accel, accel_body, g_world_abs, self._lever_arm,
             ts0, ts1, self.R, self.p, self.v,
             T_wh0.R, T_wh0.t, omega_h0, v_wh0, T_wh1.R, T_wh1.t,
         )
+
+    def _headset_possible(self) -> bool:
+        """Headset ego-motion correction can be attempted at all: a headset mocap trajectory is loaded and
+        fusion_heuristic.disable_headset_ego_motion (dev switch, default false: force the no-headset
+        prediction path while mocap stays loaded, e.g. to validate the no-headset gate constants on
+        recordings that do have headset mocap) is not set."""
+        return (self._headset_mocap is not None
+                and not bool(self._hc_get("disable_headset_ego_motion", False)))
+
+    def _headset_inputs(self, ts0, ts1):
+        """(T_wh0, T_wh1, omega_h0, v_wh0) headset-ego-motion inputs for the window [ts0, ts1], or None
+        when headset correction is not possible (no headset mocap / disabled / ts0 unknown) or ANY of the
+        four mocap lookups has a coverage gap (DeviceMocap.pose_at returns None when the two bracketing
+        samples are > max_interp_gap_ms apart -- it never interpolates across a gap).
+
+        All four lookups are always evaluated, in this fixed order, before the None check (tests patch
+        world_pose with an ordered side_effect list and count calls) -- this is the single source of the
+        lookup set predict() and every rule that needs to know "headset active?" share."""
+        if not self._headset_possible() or ts0 is None:
+            return None
+        T_wh0 = world_pose(self._headset_mocap, ts0)
+        T_wh1 = world_pose(self._headset_mocap, ts1)
+        omega_h0 = headset_angular_velocity(self._headset_mocap, ts0)
+        v_wh0 = headset_linear_velocity(self._headset_mocap, ts0)
+        if T_wh0 is None or T_wh1 is None or omega_h0 is None or v_wh0 is None:
+            return None
+        return T_wh0, T_wh1, omega_h0, v_wh0
+
+    # ------------------------------------------------------------------
+    # Continuous rotation gate (fusion_heuristic.rot_gate_mode: continuous) -- see rot_gate_threshold_deg
+    # ------------------------------------------------------------------
+    def rot_coast_budget_s(self, frame_ts_ns: int, legacy_budget_s: float) -> float:
+        """ROTATION-only coast/anchor budget (fusion_heuristic.coast_rot_budget_mode). legacy -> returns
+        legacy_budget_s unchanged. headset -> when the headset ego-motion correction is available for
+        [last_update_ts_ns, frame_ts_ns] returns max(legacy_budget_s, headset_rot_coast_budget_s(peak gyro)),
+        else legacy_budget_s (no headset data => the prediction ignores head rotation => keep the steep
+        legacy shrink). Position budgets never go through this."""
+        if str(self._hc_get("coast_rot_budget_mode", "legacy")).lower() != "headset":
+            return legacy_budget_s
+        ts0 = self.last_update_ts_ns
+        if ts0 is None or self._headset_inputs(ts0, frame_ts_ns) is None:
+            return legacy_budget_s
+        peak_gyro_dps, _ = self._peak_gyro_accel(frame_ts_ns)
+        return max(legacy_budget_s, headset_rot_coast_budget_s(
+            peak_gyro_dps, float(self._hc_get("coast_rot_budget_hs_full_s", 0.30)),
+            float(self._hc_get("coast_rot_budget_hs_full_until_dps", 1000.0)),
+            float(self._hc_get("coast_rot_budget_hs_floor_s", 0.035)),
+            float(self._hc_get("coast_rot_budget_hs_floor_at_dps", 1500.0))))
+
+    def _rot_quality_scale(self, quality: float) -> float:
+        """Quality-aware shrink of the warm hard gate's ROTATION ceiling (continuous mode only):
+        s + (1-s)*min(1, quality/full) with s = rot_gate_quality_min_scale (1.0 = off) and full =
+        rot_gate_quality_full_trust_at. Mirrors the quality shrink the position ceiling already has. Real case:
+        static_hard frame 2593 (left, 3 lost frames): a 5-inlier / 1.32 px candidate (quality 0.0), 143 mm / 38 deg
+        off mocap, passed a flat 40 deg ceiling with 37.9 deg innovation. Offline over all 8 recordings the correct
+        weak accepts after a short loss have <= 22.5 deg innovation while the wrong ones sit at 35-130 deg."""
+        if not self._rot_gate_continuous():
+            return 1.0
+        s_min = float(self._hc_get("rot_gate_quality_min_scale", 1.0))
+        full = float(self._hc_get("rot_gate_quality_full_trust_at", 0.7))
+        if s_min >= 1.0 or full <= 0.0:
+            return 1.0
+        return s_min + (1.0 - s_min) * float(np.clip(quality / full, 0.0, 1.0))
+
+    def _rot_gate_continuous(self) -> bool:
+        """rot_gate_mode: legacy | continuous | auto. auto = continuous whenever headset ego-motion data
+        is available to this filter (headset mocap loaded and not disabled), else legacy -- the
+        no-headset case is not validated yet (see config.yml future-work note)."""
+        mode = str(self._hc_get("rot_gate_mode", "legacy")).lower()
+        if mode == "auto":
+            return self._headset_possible()
+        return mode == "continuous"
+
+    def _rot_gate_params(self) -> dict:
+        return dict(base_deg=float(self._hc_get("rot_gate_base_deg", 40.0)),
+                    sat_allow_deg=float(self._hc_get("rot_gate_sat_allow_deg", 25.0)),
+                    nohs_allow_dps=float(self._hc_get("rot_gate_nohs_allow_dps", 500.0)),
+                    cap_hs_deg=float(self._hc_get("rot_gate_cap_hs_deg", 75.0)),
+                    cap_nohs_deg=float(self._hc_get("rot_gate_cap_nohs_deg", 150.0)),
+                    max_state_age_s=float(self._hc_get("rot_gate_max_state_age_s", 3.0)))
+
+    def _rot_gate_saturated(self, ts0, ts1):
+        """(saturated, peak_dps): gyro clip within the padded window, OR peak gyro >= rot_gate_sat_peak_dps
+        (a clipped window can read as low as ~1250 dps because of the mix, so both are used)."""
+        ceil_dps = self._hc_get("rot_gate_clip_ceiling_dps", None)
+        ceil = None if ceil_dps is None else np.radians(np.asarray(ceil_dps, dtype=float))
+        clipped, peak_dps = gyro_window_clip_flags(
+            self._gyro_data, ts0, ts1, ceil_rad_s=ceil, frac=float(self._hc_get("rot_gate_clip_frac", 0.95)),
+            pad_ns=int(float(self._hc_get("rot_gate_pad_s", 0.010)) * 1e9))
+        return (clipped or peak_dps >= float(self._hc_get("rot_gate_sat_peak_dps", 1800.0))), peak_dps
+
+    def _rot_gate_info(self, frame_ts_ns: int) -> dict:
+        """{'T', 'dt_s', 'headset', 'saturated', 'peak_dps'} for a candidate at frame_ts_ns against the
+        state last committed at last_update_ts_ns. Mode (headset vs not) is read from predict()'s own
+        stamp when it matches this window, else re-derived from the lookups; memoised per (ts0, ts1)."""
+        ts0 = self.last_update_ts_ns
+        key = (ts0, frame_ts_ns)
+        c = self._rot_gate_cache
+        if c is not None and c[0] == key:
+            return c[1]
+        dt_s = 0.0 if ts0 is None else max(0.0, (frame_ts_ns - ts0) / 1e9)
+        st = self._pred_stamp
+        if st is not None and st[0] == ts0 and st[1] == frame_ts_ns:
+            hs = st[2] is True
+        else:
+            hs = self._headset_inputs(ts0, frame_ts_ns) is not None
+        sat, peak_dps = self._rot_gate_saturated(ts0, frame_ts_ns) if ts0 is not None else (False, 0.0)
+        info = dict(T=rot_gate_threshold_deg(dt_s, hs, sat, **self._rot_gate_params()), dt_s=dt_s,
+                    headset=hs, saturated=sat, peak_dps=peak_dps)
+        self._rot_gate_cache = (key, info)
+        return info
+
+    def _note_last_known_R(self, frame_ts_ns: int, coverage_fallback: bool) -> None:
+        """Remember self.R as the bootstrap gate's reference -- only from a solid accept."""
+        if coverage_fallback or self._rotation_seed_grace_frames > 0 or self.R is None:
+            return
+        self._last_known_R, self._last_known_R_ts_ns = self.R.copy(), frame_ts_ns
+
+    def _bootstrap_rot_check(self, R_meas, frame_ts_ns: int):
+        """Bootstrap rotation gate (fusion_heuristic.bootstrap_rot_gate_mode legacy|shadow|enforce): after a
+        reset self.R is gone, so a fresh bootstrap pair had no gyro reference at all and two wrong candidates
+        that agree with each other (walk_medium 93.70 s: 135 deg, 5 inliers) were confirmed. Propagates the
+        last solid accepted rotation by the headset-corrected gyro to the candidate's time and compares.
+        Returns None when not evaluable (mode legacy, no reference, reference older than
+        bootstrap_rot_gate_max_age_s, no headset ego-motion data for the window, no gyro coverage), else
+        dict(innov, T, age_s, saturated, would_veto)."""
+        mode = str(self._hc_get("bootstrap_rot_gate_mode", "legacy")).lower()
+        if mode not in ("shadow", "enforce") or self._last_known_R is None or self._gyro_data is None:
+            return None
+        ts0 = self._last_known_R_ts_ns
+        age_s = (frame_ts_ns - ts0) / 1e9
+        if age_s <= 0.0 or age_s > float(self._hc_get("bootstrap_rot_gate_max_age_s", 1.5)):
+            return None
+        hs = self._headset_inputs(ts0, frame_ts_ns)
+        if hs is None:
+            return None
+        t_gyro, gyro_body = slice_imu_to_window(*self._gyro_data, ts0, frame_ts_ns)
+        R_rel = integrate_gyro_segment(t_gyro, gyro_body, ts0, frame_ts_ns)
+        if R_rel is None:
+            return None
+        R_pred = hs[1].R.T @ hs[0].R @ self._last_known_R @ R_rel
+        innov = float(np.degrees(np.linalg.norm(Rotation.from_matrix(R_pred.T @ R_meas).as_rotvec())))
+        sat, _ = self._rot_gate_saturated(ts0, frame_ts_ns)
+        T = rot_gate_threshold_deg(age_s, True, sat, **self._rot_gate_params())
+        return dict(innov=innov, T=T, age_s=age_s, saturated=bool(sat), would_veto=innov > T)
+
+    def _gyro_only_rot_veto(self, R_meas, frame_ts_ns: int):
+        """Continuous-gate check for the frames where predict() returned None (rig-frame g_world not
+        converged, or accel/lever missing) and try_update would otherwise FAIL OPEN and accept every
+        candidate unchecked -- a rotation gate needs only gyro. Returns (rot_innov_deg, T, info) if the
+        candidate contradicts the gyro-only (no headset correction) rotation prediction R_state @ R_gyro by
+        more than the no-headset threshold, else None (also None when the gate cannot be evaluated: no
+        gyro coverage, rotation seed untrustworthy, state too stale)."""
+        if (self._gyro_data is None or self.R is None or self.last_update_ts_ns is None
+                or self._rotation_seed_grace_frames > 0):
+            return None
+        ts0 = self.last_update_ts_ns
+        t_gyro, gyro_body = slice_imu_to_window(*self._gyro_data, ts0, frame_ts_ns)
+        R_rel = integrate_gyro_segment(t_gyro, gyro_body, ts0, frame_ts_ns)
+        if R_rel is None:
+            return None
+        R_pred = self.R @ R_rel
+        innov = float(np.degrees(np.linalg.norm(Rotation.from_matrix(R_pred.T @ R_meas).as_rotvec())))
+        dt_s = max(0.0, (frame_ts_ns - ts0) / 1e9)
+        sat, peak_dps = self._rot_gate_saturated(ts0, frame_ts_ns)
+        T = rot_gate_threshold_deg(dt_s, False, sat, **self._rot_gate_params())
+        info = dict(T=T, dt_s=dt_s, headset=False, saturated=sat, peak_dps=peak_dps)
+        return (innov, T, info) if innov > T else None
 
     def predict_dense(self, target_ts_ns: int, sample_every_n: int = 1):
         """Dense dead-reckoned trajectory from last_update_ts_ns to target_ts_ns,
@@ -1248,6 +1487,21 @@ class HeuristicPoseFusionFilter:
 
         # ── Predict; fail-open if IMU/g_world unavailable ───────────────
         predicted = self.predict(frame_ts_ns)
+        if predicted is None and self._rot_gate_continuous():
+            # predict() had no full (position+rotation) prediction, which used to mean "accept everything".
+            # Rotation only needs the gyro, so still veto a candidate that contradicts it.
+            _veto = self._gyro_only_rot_veto(R_meas, frame_ts_ns)
+            if _veto is not None:
+                _innov, _T, _info = _veto
+                self.consecutive_rejects += 1
+                self._set_last(outcome="implausible_reject", rot_innov_deg=_innov, confidence=confidence)
+                _log.info(
+                    f"[{self._ctrl_name}] IMPLAUSIBLE vs gyro-only prediction (no full IMU prediction) "
+                    f"ts={frame_ts_ns} rule=nohs_gyro_only mode=continuous rot_innov={_innov:.2f}deg "
+                    f"T={_T:.1f}deg dt={_info['dt_s']:.4f}s peak_gyro={_info['peak_dps']:.0f}dps "
+                    f"sat={_info['saturated']} rejects={self.consecutive_rejects} -- REJECTED, "
+                    f"vision candidate was {_fmt_v(p_meas)}")
+                return False
         if predicted is None:
             self.R, self.p = R_meas, p_meas
             self.v = np.zeros(3)
@@ -1323,6 +1577,15 @@ class HeuristicPoseFusionFilter:
         rot_pred_implausible = (dt_s <= _rot_pred_budget_s
                                  and self._rotation_seed_grace_frames <= 0
                                  and rot_innov_deg > _rot_veto_thresh_deg)
+        if self._rot_gate_continuous():
+            # continuous mode replaces the (dt <= budget) & (innov > 100 deg) switch wholesale
+            _gi = self._rot_gate_info(frame_ts_ns)
+            rot_pred_implausible = (self._rotation_seed_grace_frames <= 0 and rot_innov_deg > _gi["T"])
+            if rot_pred_implausible:
+                _log.info(f"[{self._ctrl_name}] rot gate VETO ts={frame_ts_ns} rule=rot_pred_implausible "
+                          f"mode=continuous headset={_gi['headset']} rot_innov={rot_innov_deg:.2f}deg "
+                          f"T={_gi['T']:.1f}deg dt={_gi['dt_s']:.4f}s peak_gyro={_gi['peak_dps']:.0f}dps "
+                          f"sat={_gi['saturated']} rejects={self.consecutive_rejects}")
 
         # IMU frame-count decay: w_imu (and, below, the hard implausibility
         # gate's trust in p_pred) fades linearly to 0 over imu_decay_frames
@@ -1493,8 +1756,9 @@ class HeuristicPoseFusionFilter:
         _pos_ceil_m_quality, _ = self._implausible_jump_thresholds(frame_ts_ns, quality=_candidate_quality)
         _pos_implausible = (imu_frame_scale > 0.0 and self.velocity_established
                              and pos_innov_m > _pos_ceil_m_quality)
+        _rot_ceil_deg_q = _rot_ceil_deg * self._rot_quality_scale(_candidate_quality)
         _rot_implausible = (imu_frame_scale > 0.0 and not _rot_seed_untrustworthy
-                             and rot_innov_deg > _rot_ceil_deg)
+                             and rot_innov_deg > _rot_ceil_deg_q)
         _implausible = _pos_implausible or _rot_implausible
         if _implausible:
             if self._check_reject_streak_override(R_meas, p_meas, frame_ts_ns, confidence, solution, n_inliers,
@@ -1507,7 +1771,8 @@ class HeuristicPoseFusionFilter:
                             confidence=confidence, pos_pred=p_pred, R_pred=R_pred)
             _log.info(
                 f"[{self._ctrl_name}] IMPLAUSIBLE vision jump ts={frame_ts_ns} — "
-                f"pos_innov={pos_innov_m * 1000:.1f}mm rot_innov={rot_innov_deg:.2f}deg -- "
+                f"pos_innov={pos_innov_m * 1000:.1f}mm rot_innov={rot_innov_deg:.2f}deg "
+                f"(rot ceiling {_rot_ceil_deg_q:.1f}deg, quality {_candidate_quality:.2f}) -- "
                 f"likely identity swap or a degenerate low-point fit; REJECTED "
                 f"(state left at IMU prediction), vision candidate was {_fmt_v(p_meas)}"
             )
@@ -1640,6 +1905,7 @@ class HeuristicPoseFusionFilter:
             # coast_trust_rot_shrink_s_per_mps2 stays unused.
             _rot_budget_s = self._effective_coast_budget_s(_degenerate_base_s, frame_ts_ns,
                                                              axis="gyro", rate_prefix="coast_trust_rot")
+            _rot_budget_s = self.rot_coast_budget_s(frame_ts_ns, _rot_budget_s)
             if dt_s > _pos_budget_s or dt_s > _rot_budget_s:
                 return self._try_cold_reacquire(
                     R_meas, p_meas, frame_ts_ns, confidence,
@@ -1836,9 +2102,21 @@ class HeuristicPoseFusionFilter:
         elif solution.get("coverage_fallback", False):
             self._seed_rotation_grace(True)
         elif self._rotation_seed_grace_frames > 0:
-            self._rotation_seed_grace_frames -= 1
+            # rotation_seed_grace_vetted_deg (default 20; <= 0 disables): this accept was exempt from the
+            # rotation gate, but if its rotation nevertheless AGREED with the gyro prediction, the reference
+            # is gyro-consistent -- the seed evidently was right -- so the exemption ends now instead of
+            # counting down. An exempt accept that disagrees with the gyro (the 2026-09-13 frame 66->67 case:
+            # a wrong reference) keeps the old countdown. Real case: static_hard frames 5868-5871 accepted
+            # with 0.5/1.8/1.0/0.4 deg gyro innovation, yet grace was still 1 at 5872, where a wrong 133 deg
+            # candidate (17 inliers, 0.06 px) slipped through.
+            _vetted_deg = float(self._hc_get("rotation_seed_grace_vetted_deg", 20.0))
+            if _vetted_deg > 0.0 and rot_innov_deg <= _vetted_deg:
+                self._rotation_seed_grace_frames = 0
+            else:
+                self._rotation_seed_grace_frames -= 1
         self.last_update_ts_ns = frame_ts_ns
         self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
+        self._note_last_known_R(frame_ts_ns, bool(solution.get("coverage_fallback", False)))
         self._report(frame_ts_ns, self.R, self.p)
         self.frames_since_update = 0
 
@@ -2280,6 +2558,16 @@ class HeuristicPoseFusionFilter:
         # through this candidate's R should point along world -y (down) -- see
         # the veto below for the real cases and numbers. None when there is no
         # accel sample to check against (veto then simply doesn't apply).
+        if log_prefix == "BOOTSTRAP":
+            _bg = self._bootstrap_rot_check(R_meas, frame_ts_ns)
+            if _bg is not None:
+                _bg_mode = str(self._hc_get("bootstrap_rot_gate_mode", "legacy")).lower()
+                _log.info(f"[{self._ctrl_name}] BOOTSTRAP-GATE {_bg_mode.upper()} ts={frame_ts_ns} "
+                          f"innov={_bg['innov']:.2f}deg T={_bg['T']:.1f}deg age={_bg['age_s']:.3f}s "
+                          f"sat={_bg['saturated']} n_inliers={n_inliers} would_veto={_bg['would_veto']}")
+                if _bg_mode == "enforce" and _bg["would_veto"]:
+                    rot_pred_implausible = True
+                    weak = True   # `weak` was already computed above from the original rot_pred_implausible
         _bootstrap_gravity_angle_deg = None
         if log_prefix == "BOOTSTRAP" and accel_now is not None:
             _a = np.asarray(accel_now, dtype=float)
@@ -2570,6 +2858,8 @@ class HeuristicPoseFusionFilter:
         self._seed_rotation_grace(coverage_fallback, high_risk=high_risk)
         self.last_update_ts_ns = frame_ts_ns
         self._last_known_p, self._last_known_p_ts_ns = self.p.copy(), frame_ts_ns
+        if log_prefix != "BOOTSTRAP":
+            self._note_last_known_R(frame_ts_ns, coverage_fallback)
         self.frames_since_update = 0
         self.consecutive_rejects = 0
         self._report(frame_ts_ns, self.R, self.p)
@@ -2621,6 +2911,8 @@ class HeuristicPoseFusionFilter:
         self.consecutive_rejects = 0
         self.frames_since_update = 0
         self._last_predict_seen_ts_ns = None
+        self._pred_stamp = None
+        self._rot_gate_cache = None
         self._cold_pending = None
         self.reported_R = self.reported_p = None
         # Otherwise the next _report() call after re-bootstrapping would compute

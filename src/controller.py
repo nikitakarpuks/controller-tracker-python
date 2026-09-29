@@ -2427,6 +2427,11 @@ class ControllerTracker:
                                                        _anchor_per_gyro_rot, _anchor_rot_min_budget_s,
                                                        _anchor_rot_calm_extend_ceiling_s,
                                                        _anchor_rot_calm_extend_max_dps)
+            # headset-ego-motion-active rotation budget (fusion_heuristic.coast_rot_budget_mode; the
+            # getattr guard covers the Kalman filter, which has no such method) -- rotation only
+            _rot_budget_fn = getattr(self._fusion_filter, "rot_coast_budget_s", None)
+            if _rot_budget_fn is not None:
+                _rot_budget_s = _rot_budget_fn(frame_ts_ns, _rot_budget_s)
             _imu_only_max_s = min(_pos_budget_s, _rot_budget_s)
 
         _imu_pose = None
@@ -2900,7 +2905,7 @@ class ControllerTracker:
         resolve cross-controller conflicts before committing any one of them
         via _commit_fused_solution. cam_solutions must be non-empty.
         """
-        from src.pose_search import fuse_camera_poses
+        from src.pose_search import fuse_camera_poses, fused_pose_consistent_cameras
 
         # ── Fuse every camera's independent solution into one pose ─────────────
         _fuse_in = [
@@ -2921,14 +2926,36 @@ class ControllerTracker:
         )
         _t_fuse = time.perf_counter() - _t_fuse_start
 
+        # ── Which cameras' pairs does the returned pose actually explain? ──────────
+        # fuse_camera_poses may return a single camera's own solve (its fallback when the per-camera solves
+        # disagree); cameras whose pairs contradict the returned pose are dropped from this candidate's
+        # inliers / aux evidence / claimed blobs / per-camera priors (see fused_pose_consistent_cameras).
+        # Identical to the old behaviour when every camera is consistent (the normal joint-fit case).
+        _consistent, _cons_rms = fused_pose_consistent_cameras(
+            _fuse_in, T_world_ctrl, model_positions,
+            max_reproj_px=float(self._matching_cfg.get("fused_aux_max_reproj_px", 8.0)))
+        _kept_cams = [cs for cs in cam_solutions if self.cameras[cs["cam_id"]].camera_idx in _consistent]
+        if not _kept_cams:            # numerically degenerate -- keep the old all-cameras behaviour
+            _kept_cams = list(cam_solutions)
+        _kept_ids = {cs["cam_id"] for cs in _kept_cams}
+        _dropped = {cs["cam_id"]: _cons_rms.get(self.cameras[cs["cam_id"]].camera_idx)
+                    for cs in cam_solutions if cs["cam_id"] not in _kept_ids}
+        if _dropped:
+            logger.bind(cat="pose_fusion").debug(
+                f"[{self.ctrl_name}] fusion: dropped camera(s) inconsistent with the returned pose "
+                f"(RMS px of their own pairs under it): "
+                + ", ".join(f"cam{cid}={r:.0f}px" for cid, r in _dropped.items())
+                + f" -- kept {sorted(_kept_ids)}")
+
         # ── Anchor camera for reporting/self-cal: fixed_primary_cam if it solved
-        # this frame, else whichever camera had the most inlier pairs ──────────
-        _solved_ids = {cs["cam_id"] for cs in cam_solutions}
+        # (and is consistent with the returned pose), else whichever consistent camera had the most inlier
+        # pairs ──────────
+        _solved_ids = _kept_ids
         if fixed_primary_cam is not None and fixed_primary_cam in _solved_ids:
             primary_cam_id = fixed_primary_cam
         else:
             primary_cam_id = max(
-                cam_solutions, key=lambda cs: len(cs["solution"]["assignment"])
+                _kept_cams, key=lambda cs: len(cs["solution"]["assignment"])
             )["cam_id"]
         anchor_solution = next(
             cs["solution"] for cs in cam_solutions if cs["cam_id"] == primary_cam_id
@@ -2976,16 +3003,19 @@ class ControllerTracker:
         # camera) — the same values behind the "importance=[...]" debug line
         # above, exposed here for consumers (e.g. visualization) that want to
         # reflect actual per-camera contribution rather than a primary/aux label.
-        solution["camera_importance"] = {cid: w / _w_total for cid, w in _raw_w.items()}
+        solution["camera_importance"] = {cid: w / _w_total for cid, w in _raw_w.items() if cid in _kept_ids}
+        # cameras whose own pairs the returned pose explains (claim registration / priors read this)
+        solution["fused_cam_ids"] = sorted(_kept_ids)
+        solution["dropped_cam_rms_px"] = _dropped
         # Per-camera search method this frame -- "proximity", "p3p_systematic"
         # (brute), or "prior_constrained_P2P"/"prior_constrained_P1P" (low-blob-
         # count fallback, see run_cheap_search's own comment) -- exposed for
         # visualization (2026-09-16: replaced the old importance-gradient ray
         # coloring with discrete per-method colors, see _method_color).
-        solution["camera_method"] = {cs["cam_id"]: cs["solution"].get("method") for cs in cam_solutions}
+        solution["camera_method"] = {cs["cam_id"]: cs["solution"].get("method") for cs in _kept_cams}
         _other_assignments = {
             cs["cam_id"]: cs["solution"]["assignment"]
-            for cs in cam_solutions if cs["cam_id"] != primary_cam_id
+            for cs in _kept_cams if cs["cam_id"] != primary_cam_id
         }
         if _other_assignments:
             # Multiple cameras independently solved and were fused here -- each
@@ -3253,6 +3283,20 @@ class ControllerTracker:
         # prediction (found in review -- pairing a rejected pose with the discarded
         # candidate's error/assignment silently corrupts calibration-threshold data).
         solution["fusion_accepted"] = accepted
+        # Read-only exports for offline analysis (detectability/one-euro tables), no behavior depends on
+        # these. fusion_outcome: the filter's own outcome label for this frame (fused/bootstrap/fail_open/
+        # implausible_reject/... -- see HeuristicPoseFusionFilter._set_last), already computed on every
+        # try_update() call at no extra cost (unlike debug_snapshot(), which needs pose_fusion_debug.enabled).
+        # raw_R/raw_p: the pre-One-Euro tracking state (see last_raw_R/_p's own comment) -- when there is no
+        # fusion filter at all (fusion.enabled: false), there is no smoothing to strip, so raw == reported.
+        if self._fusion_filter is not None:
+            solution["fusion_outcome"] = self._fusion_filter._last.get("outcome")
+            solution["raw_R"] = self._fusion_filter.last_raw_R
+            solution["raw_p"] = self._fusion_filter.last_raw_p
+        else:
+            solution["fusion_outcome"] = "no_filter"
+            solution["raw_R"] = T_world_ctrl.R if T_world_ctrl is not None else None
+            solution["raw_p"] = T_world_ctrl.t if T_world_ctrl is not None else None
 
         # Reporting/self-cal anchor tracking (per-camera importance above is now the
         # reported signal; kept only for get_designated_primary_cameras()).
@@ -3260,7 +3304,10 @@ class ControllerTracker:
 
         # ── Register claimed blobs (every camera that actually solved) ──────────
         if claimed_blobs is not None and accepted:
+            _fused_ids = solution.get("fused_cam_ids")   # only cameras whose pairs the fused pose explains
             for cs in cam_solutions:
+                if _fused_ids is not None and cs["cam_id"] not in _fused_ids:
+                    continue
                 for b, _ in cs["solution"]["assignment"]:
                     claimed_blobs.setdefault(cs["cam_id"], set()).add(b)
 

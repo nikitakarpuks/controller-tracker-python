@@ -1,0 +1,17 @@
+variants with the SMALLEST gain/misalignment residual |K_X|_F (left/right)  [no-correction reference 0.0105/0.0116]
+  e1 P=DRt1 A=Minv b=+b bia                    |K|F 0.0071/0.0137  |b| 0.0155/0.0183
+  e1 P=DRt1 A=Minv b=+b mix                    |K|F 0.0071/0.0137  |b| 0.0155/0.0183
+  e1 P=DRt1 A=Minv b=-b bia                    |K|F 0.0071/0.0137  |b| 0.0125/0.0065
+  e1 P=DRt1 A=Minv b=-b mix                    |K|F 0.0071/0.0137  |b| 0.0125/0.0064
+  e1 P=DRt1 A=Minv b=0 mix                     |K|F 0.0071/0.0137  |b| 0.0087/0.0115
+  e1 P=Rt1 A=Minv b=+b bia                     |K|F 0.0083/0.0137  |b| 0.0117/0.0067
+
+rotation-invariant comparison: eigenvalues of the symmetric part of the pooled CSV-stream K0 vs of +/-(M-I) (factory mixing deviation)
+left_controller: eig(sym K0) = [-0.0049  0.0038  0.0071]   trace +0.0060  antisym-rotation vector (deg) = [ 0.186 -0.016  0.026]
+      entry 0: eig(M-I) = [-0.0032  0.0001  0.0049]  trace(M-I) +0.0019
+      entry 1: eig(M-I) = [-0.001   0.005   0.0086]  trace(M-I) +0.0127
+right_controller: eig(sym K0) = [-0.0035  0.002   0.0059]   trace +0.0044  antisym-rotation vector (deg) = [ 0.357  0.082 -0.049]
+      entry 0: eig(M-I) = [0.0005 0.0077 0.014 ]  trace(M-I) +0.0222
+      entry 1: eig(M-I) = [-0.0026  0.0094  0.0127]  trace(M-I) +0.0195
+
+If the CSV lacked the mixing correction its K0 would be ~ -(M-I) (all eigenvalues NEGATIVE, trace -0.008..-0.019); if it had the inverse applied, ~ +(M-I)^2 (tiny). Observed trace is small/mixed-sign.

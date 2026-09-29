@@ -1,0 +1,42 @@
+
+== A. gyro bias from vision orientation (sigma_phi=0.3 deg = 5.24e-03 rad, 7201 frames over 120s, mean dt 16.7 ms)
+  A1 iid: std(b_hat - b) after W seconds (KF, q=1e-7):
+     W=   1s  MC 2.12e-03 rad/s   closed-form iid LS-slope 2.34e-03
+     W=   3s  MC 5.12e-04 rad/s   closed-form iid LS-slope 4.51e-04
+     W=  10s  MC 8.71e-05 rad/s   closed-form iid LS-slope 7.40e-05
+     W=  30s  MC 1.59e-05 rad/s   closed-form iid LS-slope 1.43e-05
+     W= 100s  MC 4.08e-06 rad/s   closed-form iid LS-slope 2.34e-06
+  A2 corr tau_c=1s: std(b_hat - b) after W seconds (KF, q=1e-7):
+     W=   1s  MC 6.38e-03 rad/s   closed-form iid LS-slope 2.34e-03
+     W=   3s  MC 2.51e-03 rad/s   closed-form iid LS-slope 4.51e-04
+     W=  10s  MC 8.51e-04 rad/s   closed-form iid LS-slope 7.40e-05
+     W=  30s  MC 1.82e-04 rad/s   closed-form iid LS-slope 1.43e-05
+     W= 100s  MC 3.06e-05 rad/s   closed-form iid LS-slope 2.34e-06
+  A3 drifting bias q=1e-05 rad/s/sqrt(s): MC steady-state std 3.56e-05 rad/s | Kalman-Bucy closed form 3.41e-05 | natural time-const 1/wn = 8.2 s
+  A3 drifting bias q=1e-04 rad/s/sqrt(s): MC steady-state std 1.85e-04 rad/s | Kalman-Bucy closed form 1.92e-04 | natural time-const 1/wn = 2.6 s
+  A3 drifting bias q=1e-03 rad/s/sqrt(s): MC steady-state std 1.04e-03 rad/s | Kalman-Bucy closed form 1.08e-03 | natural time-const 1/wn = 0.8 s
+  A4 30s window, alternating dt: std of naive mean(e_k/dt_k) = 5.60e-03 rad/s vs time-weighted sum(e)/sum(dt) = 2.31e-04 rad/s  (ratio 24x)
+  A5 5deg outlier every 2 s: KF no gate std 2.98e-05 rad/s | with |v|<4sigma gate 1.72e-05 rad/s
+
+== B. accel bias from vision position (sigma_p=4 mm, PERFECT orientation, true b_a=0.1 m/s^2)
+  -- factory-derived velocity walk 5.4e-4
+     data span T=  3s: MC std(b_a_hat - b_a) 8.42e-04 m/s^2 | closed form (iid position, no velocity noise) 8.88e-04
+     data span T=  6s: MC std(b_a_hat - b_a) 1.71e-04 m/s^2 | closed form (iid position, no velocity noise) 1.57e-04
+     data span T= 10s: MC std(b_a_hat - b_a) 5.53e-05 m/s^2 | closed form (iid position, no velocity noise) 4.38e-05
+     data span T= 15s: MC std(b_a_hat - b_a) 4.11e-05 m/s^2 | closed form (iid position, no velocity noise) 1.59e-05
+     data span T= 35s: MC std(b_a_hat - b_a) 9.93e-06 m/s^2 | closed form (iid position, no velocity noise) 1.91e-06
+  -- Basalt default velocity walk 1.6e-2
+     data span T=  3s: MC std(b_a_hat - b_a) 1.74e-03 m/s^2 | closed form (iid position, no velocity noise) 8.88e-04
+     data span T=  6s: MC std(b_a_hat - b_a) 7.96e-04 m/s^2 | closed form (iid position, no velocity noise) 1.57e-04
+     data span T= 10s: MC std(b_a_hat - b_a) 6.18e-04 m/s^2 | closed form (iid position, no velocity noise) 4.38e-05
+     data span T= 15s: MC std(b_a_hat - b_a) 4.00e-04 m/s^2 | closed form (iid position, no velocity noise) 1.59e-05
+     data span T= 35s: MC std(b_a_hat - b_a) 1.66e-04 m/s^2 | closed form (iid position, no velocity noise) 1.91e-06
+
+== C. gravity leakage: apparent accel bias = g*sin(orientation error)
+  orientation error  0.1 deg -> 0.017 m/s^2
+  orientation error  0.3 deg -> 0.051 m/s^2
+  orientation error  0.5 deg -> 0.086 m/s^2
+  orientation error  1.0 deg -> 0.171 m/s^2
+  orientation error  2.0 deg -> 0.342 m/s^2
+  orientation error  5.0 deg -> 0.855 m/s^2
+  factory-uncertainty for reference: accel 0.01 m/s^2 (=0.06 deg of tilt), gyro 1e-4 rad/s

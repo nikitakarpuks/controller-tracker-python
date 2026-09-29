@@ -1,0 +1,37 @@
+static_dark   left_controller  steps  4891  angle(Q, D) =  1.21 deg   angle(Q, I) =  178.9 deg   low-omega samples  1341
+static_dark   right_controller steps  3905  angle(Q, D) =  1.47 deg   angle(Q, I) =  178.8 deg   low-omega samples  1277
+walk_dark     left_controller  steps  3550  angle(Q, D) =  1.22 deg   angle(Q, I) =  178.8 deg   low-omega samples  2369
+walk_dark     right_controller steps  3588  angle(Q, D) =  1.23 deg   angle(Q, I) =  179.0 deg   low-omega samples  2185
+static_easy   left_controller  steps  3912  angle(Q, D) =  1.09 deg   angle(Q, I) =  179.0 deg   low-omega samples  1587
+static_easy   right_controller steps  3553  angle(Q, D) =  1.50 deg   angle(Q, I) =  178.7 deg   low-omega samples  1387
+static_medium left_controller  steps  3360  angle(Q, D) =  0.97 deg   angle(Q, I) =  179.1 deg   low-omega samples   827
+static_medium right_controller steps  3277  angle(Q, D) =  1.14 deg   angle(Q, I) =  179.3 deg   low-omega samples   805
+static_hard   left_controller  steps   277  angle(Q, D) =  1.58 deg   angle(Q, I) =  178.5 deg   low-omega samples   124
+static_hard   right_controller steps   257  angle(Q, D) =  0.83 deg   angle(Q, I) =  179.7 deg   low-omega samples   157
+walk_easy     left_controller  steps  3552  angle(Q, D) =  1.24 deg   angle(Q, I) =  178.8 deg   low-omega samples   875
+walk_easy     right_controller steps  3435  angle(Q, D) =  1.37 deg   angle(Q, I) =  178.9 deg   low-omega samples   909
+walk_medium   left_controller  steps  2627  angle(Q, D) =  1.07 deg   angle(Q, I) =  179.0 deg   low-omega samples   459
+walk_medium   right_controller steps  2258  angle(Q, D) =  1.24 deg   angle(Q, I) =  179.2 deg   low-omega samples   427
+walk_hard     left_controller  steps   267  angle(Q, D) =  1.28 deg   angle(Q, I) =  179.0 deg   low-omega samples   533
+walk_hard     right_controller steps   175  angle(Q, D) =  0.41 deg   angle(Q, I) =  180.0 deg   low-omega samples   481
+
+Statistic B: median |accel| over samples with |gyro|<0.5 rad/s, by loader variant (raw CSV = as recorded):
+          rec             ctrl  n_low_omega  med_absa_lowomega_csv_raw  med_absa_lowomega_L0_OLD  med_absa_lowomega_L1_drop2nd  med_absa_lowomega_L2_scale_only  med_absa_lowomega_L3_NEW
+  static_dark  left_controller         1341                     10.122                    10.272                        10.122                           10.074                     9.926
+  static_dark right_controller         1277                      9.998                    10.249                         9.998                           10.051                     9.805
+    walk_dark  left_controller         2369                     10.087                    10.236                        10.087                           10.038                     9.892
+    walk_dark right_controller         2185                     10.013                    10.288                        10.013                           10.089                     9.820
+  static_easy  left_controller         1587                     10.088                    10.230                        10.088                           10.033                     9.893
+  static_easy right_controller         1387                      9.975                    10.226                         9.975                           10.028                     9.782
+static_medium  left_controller          827                     10.159                    10.294                        10.159                           10.095                     9.963
+static_medium right_controller          805                      9.978                    10.203                         9.978                           10.006                     9.786
+  static_hard  left_controller          124                     10.123                    10.254                        10.123                           10.056                     9.927
+  static_hard right_controller          157                      9.960                    10.205                         9.960                           10.007                     9.768
+    walk_easy  left_controller          875                     10.110                    10.255                        10.110                           10.057                     9.914
+    walk_easy right_controller          909                      9.960                    10.223                         9.960                           10.025                     9.768
+  walk_medium  left_controller          459                     10.116                    10.257                        10.116                           10.058                     9.920
+  walk_medium right_controller          427                      9.944                    10.207                         9.944                           10.009                     9.752
+    walk_hard  left_controller          533                     10.020                    10.128                        10.020                            9.932                     9.826
+    walk_hard right_controller          481                     10.047                    10.276                        10.047                           10.077                     9.853
+left_controller: factory accel Rt rotation angle 105.2 deg ; angle(D^T Rt) 138.5 deg ; angle(D^T Rt^T) 138.5 deg
+right_controller: factory accel Rt rotation angle 105.7 deg ; angle(D^T Rt) 136.6 deg ; angle(D^T Rt^T) 136.6 deg

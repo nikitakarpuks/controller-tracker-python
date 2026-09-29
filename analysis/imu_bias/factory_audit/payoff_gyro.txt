@@ -1,0 +1,9 @@
+gyro left_controller done
+gyro right_controller done
+
+variant                                 T=0.044     T=0.1       T=0.3       T=1.0          (median deg; mean in brackets)
+G0_loader(e1 mix+bias)                   0.592 [ 0.797]  0.794 [ 1.009]  1.141 [ 1.398]  1.700 [ 1.868] 
+G1_csv_as_is                             0.580 [ 0.790]  0.761 [ 0.978]  1.010 [ 1.283]  1.345 [ 1.519] 
+G2_csv - const bias(per-rec oracle)      0.577 [ 0.789]  0.764 [ 0.976]  0.999 [ 1.268]  1.260 [ 1.426] 
+G3_csv - ONE bias(all recs)              0.578 [ 0.789]  0.764 [ 0.977]  1.002 [ 1.269]  1.257 [ 1.422] 
+G4_csv - bias - K (per-rec oracle)       0.578 [ 0.786]  0.749 [ 0.957]  0.953 [ 1.221]  1.067 [ 1.248] 

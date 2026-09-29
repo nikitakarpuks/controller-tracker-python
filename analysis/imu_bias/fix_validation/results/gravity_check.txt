@@ -1,0 +1,14 @@
+static_dark   left_controller  windows   4 (  1.0 s)  |f| csv 10.100  L3 9.905  k_iso +7.11%  per-axis k [ 27.57 -53.57  -8.47]  b [ 0.19   5.377 -0.215]
+walk_dark     left_controller  windows   3 (  0.8 s)  |f| csv 10.125  L3 9.929  k_iso -1.85%  per-axis k [ 3.62  6.49 -5.88]  b [ 0.064 -0.27  -0.233]
+walk_easy     left_controller  windows   7 (  1.8 s)  |f| csv 10.115  L3 9.920  k_iso -4.76%  per-axis k [-11.67 -18.19   4.38]  b [0.128 2.078 0.089]
+walk_dark     right_controller windows   3 (  0.8 s)  |f| csv 10.004  L3 9.811  k_iso -55.69%  per-axis k [ 46.57  51.71 -69.26]  b [-0.05  -4.68  -2.261]
+static_medium right_controller windows   5 (  1.2 s)  |f| csv 10.004  L3 9.810  k_iso -0.65%  per-axis k [ 1.07 -5.77 -1.21]  b [-0.055  0.746 -0.055]
+
+recordings x controllers with quiet windows: 5 of 12
+  mean |f| quiet  absf_L0_old           min 10.237  max 10.284  median 10.262   (g0 = 9.80665)
+  mean |f| quiet  absf_L1_drop2nd       min 10.004  max 10.125  median 10.100   (g0 = 9.80665)
+  mean |f| quiet  absf_L2_scale_only    min 10.040  max 10.085  median 10.064   (g0 = 9.80665)
+  mean |f| quiet  absf_L3_new           min 9.810  max 9.929  median 9.905   (g0 = 9.80665)
+  isotropic gain k_iso on the CSV: min -0.5569 max 0.0711 median -0.0185  (driver constant predicts +0.0197)
+  per-axis k (CSV axes) median: x 0.0362 y -0.0577 z -0.0588
+  bias along gravity (m/s^2) median 0.725, range [-3.765, 5.243]

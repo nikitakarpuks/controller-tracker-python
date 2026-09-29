@@ -1,0 +1,10 @@
+accel left_controller done
+accel right_controller done
+
+variant                                 T=0.1       T=0.3       T=1.0          (median mm; mean in brackets)
+A0_loader(e1 mix+bias)                   3.503 [ 4.645] 21.238 [22.794] 196.359 [199.136] 
+A1_csv_as_is                             3.030 [ 4.284] 15.106 [17.876] 135.517 [145.923] 
+A2_csv * 9.80665/10                      2.584 [ 3.629] 10.269 [12.615] 75.139 [88.007] 
+A3_csv*scale - bias(per-rec oracle)      2.577 [ 3.623]  8.875 [11.521] 55.188 [70.565] 
+A4_loader * 9.80665/10                   2.951 [ 3.922] 15.388 [17.139] 128.110 [135.174] 
+A5_csv oracle bias+S+dg (ceiling)        2.523 [ 3.560]  8.110 [10.890] 44.649 [61.451] 
