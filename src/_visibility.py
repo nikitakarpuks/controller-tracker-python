@@ -389,7 +389,8 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                   facing_threshold_deg: float = 86.0,
                   occlusion_margin_m: float = 0.0,
                   debug: bool = False,
-                  stage_counter: Optional[Dict[str, int]] = None) -> np.ndarray:
+                  stage_counter: Optional[Dict[str, int]] = None,
+                  image_margin_px: float = 0.0) -> np.ndarray:
     """
     Visibility score (float32, N,) for each LED. 1.0 = cleanly visible; 0.0 = not visible.
     Values in (0, 1) indicate borderline visibility near a geometric threshold.
@@ -423,6 +424,13 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
     cam_rpmax         : max valid normalised radius; 0 disables the check.
     occlusion_margin_m: penetration depth (metres) that maps to score 0 in checks 3 & 4.
                         0 = hard binary (original behaviour).
+    image_margin_px   : tolerance (pixels) added on every side of the image rectangle in check 2b.
+                        0 (default) = exact border (old behaviour). Callers evaluating a PREDICTED
+                        pose (proximity search) pass a small margin so an LED whose predicted
+                        projection lands a pixel or two outside the border -- while its real blob is
+                        still inside the image -- is not hard-zeroed and dropped from the candidates
+                        (walk_easy right, cam1, frame 734: LED 15 at y=480.36 of 480). The test stays
+                        binary; the facing/occlusion scores are unaffected.
     stage_counter     : optional dict, mutated in place with call-funnel counts (keys:
                         'total', 'exit_facing', 'exit_infame', 'reached_frustum',
                         'exit_frustum', 'reached_handle') — diagnostic only, never
@@ -481,8 +489,9 @@ def _visible_mask(R: np.ndarray, tvec: np.ndarray,
                 rv, tv, cam_K, dc,
             )
         pts      = pts.reshape(-1, 2)
-        in_frame = (pts[:, 0] >= 0) & (pts[:, 0] < cam_w) & \
-                   (pts[:, 1] >= 0) & (pts[:, 1] < cam_h)
+        _m = float(image_margin_px)
+        in_frame = (pts[:, 0] >= -_m) & (pts[:, 0] < cam_w + _m) & \
+                   (pts[:, 1] >= -_m) & (pts[:, 1] < cam_h + _m)
         if cam_rpmax > 0.0:
             z_a      = led_cam[active, 2]
             rp       = np.hypot(led_cam[active, 0] / z_a, led_cam[active, 1] / z_a)

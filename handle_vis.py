@@ -43,8 +43,8 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.load_config import load_yaml_config, load_json_config
-from src.controller import create_leds_from_config, _compute_geometry, mirror_primitives
-from src.geometry import tangent_frame, Box3D, Cylinder3D
+from src.controller import create_leds_from_config, mirror_primitives
+from src.geometry import _compute_geometry, tangent_frame, Box3D, Cylinder3D
 from src.visualization import build_alignment_transform, load_trimesh, make_disk_mesh
 from src._visibility import _visible_mask
 
@@ -283,7 +283,7 @@ def main():
     mesh_path  = config["visualization"].get("3d_model_path")
     if mesh_path:
         try:
-            raw_mesh     = load_trimesh(mesh_path)
+            raw_mesh     = load_trimesh(mesh_path, config["visualization"].get("3d_model_node"))
             T_model_ctrl = build_alignment_transform(
                 config["controllers"]["right_controller"]["mesh_alignment"]
             )

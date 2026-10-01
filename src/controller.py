@@ -5151,13 +5151,20 @@ class TrackingSystem:
             for b in names[i + 1:]:
                 sol_b = candidates[b]
                 conflict = False
+                # A committed (already-decided) solution can legitimately carry
+                # T_world_ctrl=None ("nothing to report this frame", e.g. a
+                # rejected first bootstrap candidate). Pose-based checks below
+                # have nothing to compare against then; the pose-independent
+                # shared-blob check still applies.
+                _both_posed = (sol_a.get('T_world_ctrl') is not None
+                               and sol_b.get('T_world_ctrl') is not None)
 
                 # Two rigid controllers cannot occupy overlapping 3D space --
                 # camera-agnostic, so it catches a bad candidate even when it
                 # shares no registered camera with the other (e.g. two cold
                 # cameras solved for two different controllers but both
                 # actually recovered the same physical controller's pose).
-                if _min_center_dist > 0.0:
+                if _both_posed and _min_center_dist > 0.0:
                     center_dist = float(np.linalg.norm(
                         sol_a['T_world_ctrl'].t - sol_b['T_world_ctrl'].t))
                     if center_dist < _min_center_dist:
@@ -5199,7 +5206,7 @@ class TrackingSystem:
                         )
                         break
 
-                if not conflict and _occlusion_on:
+                if not conflict and _occlusion_on and _both_posed:
                     for occluder, victim, sol_occ, sol_vic in ((a, b, sol_a, sol_b), (b, a, sol_b, sol_a)):
                         tracker_vic = next(iter(self.ctrl_trackers[victim].trackers.values()))
                         geom_occ    = next(iter(self.ctrl_trackers[occluder].trackers.values()))._geometry
@@ -5243,7 +5250,7 @@ class TrackingSystem:
                 # inlier-discounted `_score` below, so whichever candidate
                 # has more total corroborated inliers (primary + aux) and
                 # lower combined error naturally wins.
-                if not conflict and _occlusion_on:
+                if not conflict and _occlusion_on and _both_posed:
                     for proj_name, proj_sol, main_name, main_sol in (
                         (a, sol_a, b, sol_b), (b, sol_b, a, sol_a),
                     ):

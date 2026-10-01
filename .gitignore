@@ -1,5 +1,30 @@
 #/data/
 .venv
-# *.stp
+
+# HP's official Reverb G2 controller CAD model (licensed asset -- must never be committed).
+# Keep it locally only; converted/cached derivatives are ignored too.
+*.stp
+*.step
+*.stp.cache*
+# Mentor's Reverb G2 scene (controllers + headset): may be shown in screenshots/renders, but
+# must NOT be published -- keep local only.
+data/controllers/reverbg2.glb
+# Rerun recordings (large, regenerable)
+*.rrd
 #/guidance/
 /TUM-THESIS/
+
+# Python / tooling caches (always regenerable)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+
+# Stray LaTeX build output that has ended up at the repo root before (the real thesis build
+# lives entirely under TUM-THESIS/, which is already excluded above).
+/out/
+
+# Per-tool local settings accidentally created outside the repo's own .claude/
+visualization/.claude/

@@ -337,17 +337,14 @@ def make_contour_mesh_3d(contours_px: list, cam, frustum_z: float,
 def show_initial_alignment(model_positions: np.ndarray,
                            model_normals: np.ndarray,
                            mesh_path: str,
-                           vis_cfg: dict = None):
+                           vis_cfg: dict = None,
+                           mesh_node: str = None):
     if vis_cfg is None:
         vis_cfg = VIS_CONFIG
 
     rr.init("controller_initial_alignment", spawn=True)
 
-    scene = trimesh.load(mesh_path, force='scene')
-    mesh = scene.geometry.get(
-        "REVERB_G2_CONTROLLER_RIGHT_HAND",
-        list(scene.geometry.values())[0]
-    )
+    mesh = load_trimesh(mesh_path, mesh_node)
 
     if vis_cfg.get("show_mesh", True):
         rr.log(
@@ -397,7 +394,86 @@ def show_initial_alignment(model_positions: np.ndarray,
 # Mesh loader
 # =========================================================
 
-def load_trimesh(path: str):
+def _mesh_from_glb_scene(scene, node_name=None):
+    """Pick one controller mesh out of a glTF/GLB *scene* and return it in world units.
+
+    Unlike the STEP path, a GLB's meshes live in local coordinates under a node hierarchy
+    (a Blender export typically carries a unit scale and rotation on the parents), so the
+    node's world transform MUST be applied or the mesh comes out in the wrong units and
+    orientation. node_name selects the scene-graph node (e.g. "Controller_2"); if None, the
+    first node named like a right-hand controller is used, else the first geometry node.
+    """
+    nodes = list(scene.graph.nodes_geometry)
+    if not nodes:
+        raise ValueError("GLB scene contains no geometry")
+    chosen = None
+    if node_name is not None:
+        chosen = next((n for n in nodes if n == node_name), None)
+        if chosen is None:
+            raise ValueError(f"3d_model_node {node_name!r} not found; available: {nodes}")
+    else:
+        chosen = next((n for n in nodes if "right" in n.lower()), nodes[0])
+    T, geom_name = scene.graph[chosen]
+    mesh = scene.geometry[geom_name].copy()
+    mesh.apply_transform(T)
+    return mesh
+
+
+def _led_surface_gaps(mesh, points: np.ndarray, normals: np.ndarray, max_dist: float) -> np.ndarray:
+    """Signed gap between each LED and the mesh surface along the LED's own normal:
+    + = the LED floats outside the surface, - = it is buried, nan = no crossing within max_dist."""
+    n = len(points)
+    origins = np.concatenate([points, points])
+    dirs = np.concatenate([-normals, normals])                 # first n rays look inward, last n outward
+    locs, ray_idx, _ = mesh.ray.intersects_location(origins, dirs, multiple_hits=False)
+    dist = np.full(2 * n, np.inf)
+    for loc, r in zip(locs, ray_idx):
+        dist[r] = np.linalg.norm(loc - origins[r])
+    d_in, d_out = dist[:n], dist[n:]
+    gap = np.where(d_in <= d_out, d_in, -d_out)
+    gap[np.minimum(d_in, d_out) > max_dist] = np.nan
+    return gap
+
+
+def conform_mesh_to_leds(mesh, points: np.ndarray, normals: np.ndarray,
+                         sigma: float = 0.007, subdivisions: int = 2,
+                         iterations: int = 4, max_dist: float = 0.006):
+    """DISPLAY-ONLY: return a copy of `mesh` whose surface is nudged, along the LED normals,
+    until every calibrated LED lies on it. The LEDs themselves are not moved.
+
+    Simplified or re-meshed controller models have flat facets where the real body bulges, so
+    LEDs (which are calibrated, not fitted to the drawn model) hover above the surface and a
+    rigid alignment cannot close that gap. The mesh is subdivided first so the wall can actually
+    curve, then vertices are displaced by a Gaussian-weighted blend of the neighbouring LEDs'
+    gaps, refined for a few iterations. Vertices far from every LED are left untouched.
+    """
+    m = mesh.copy()
+    for _ in range(int(subdivisions)):
+        m = m.subdivide()
+    pts = np.asarray(points, dtype=np.float64)
+    nrm = np.asarray(normals, dtype=np.float64)
+    nrm = nrm / (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-12)
+    for _ in range(int(iterations)):
+        gap = _led_surface_gaps(m, pts, nrm, max_dist)
+        ok = ~np.isnan(gap)
+        if not ok.any() or np.nanmax(np.abs(gap)) < 5e-5:
+            break
+        V = np.asarray(m.vertices, dtype=np.float64)
+        d2 = ((V[:, None, :] - pts[None, ok, :]) ** 2).sum(-1)                      # (verts, leds)
+        facing = np.clip(np.asarray(m.vertex_normals) @ nrm[ok].T, 0.0, 1.0) ** 2   # ignore the far side of thin walls
+        w = np.exp(-d2 / (2.0 * sigma ** 2)) * facing
+        disp = np.einsum("vl,l,lk->vk", w, gap[ok], nrm[ok]) / (w.sum(1, keepdims=True) + 0.02)
+        m.vertices = V + disp
+    return m
+
+
+conform_mesh_to_leds_fn = conform_mesh_to_leds   # the animator's bool parameter shadows the name
+
+
+def load_trimesh(path: str, node_name=None):
+    if Path(path).suffix.lower() in (".glb", ".gltf"):
+        return _mesh_from_glb_scene(trimesh.load(str(path), force='scene'), node_name)
+
     # STEP has no native fast parser — trimesh's STEP loader round-trips
     # through cascadio (a packaged OpenCASCADE) to tessellate the full CAD
     # B-rep/NURBS geometry into a mesh, which costs ~5.3s on this file
@@ -445,7 +521,9 @@ class ControllerAnimatorRerun:
                  vis_cfg: dict = None,
                  matching_cfg: dict = None,
                  pose_fusion_debug_enabled: bool = False,
-                 pose_fusion_debug_show_tabs: bool = True):
+                 pose_fusion_debug_show_tabs: bool = True,
+                 mesh_node: str = None,
+                 conform_mesh_to_leds: bool = False):
         """
         controllers_vis: {ctrl_name: {"positions": np.ndarray,   # model-frame LED positions
                                       "normals":   np.ndarray,   # model-frame LED normals
@@ -477,8 +555,18 @@ class ControllerAnimatorRerun:
         self.visual_offset   = np.array([0.0, 0.0, 0.0])
 
         self._mesh_path_for_occ = mesh_path
+        self._mesh_node = mesh_node   # GLB scene node to use (None for STEP / auto)
         self._occ_mesh = None
-        raw_mesh = load_trimesh(mesh_path)
+        raw_mesh = load_trimesh(mesh_path, mesh_node)
+        if conform_mesh_to_leds and controllers_vis:
+            # One mesh is shared by all controllers (the left one is the mirrored right one), so
+            # conform it to every controller's model-frame LEDs at once.
+            all_pos = np.concatenate([np.asarray(cv["positions"], dtype=np.float64) for cv in controllers_vis.values()])
+            all_nrm = np.concatenate([np.asarray(cv["normals"], dtype=np.float64) for cv in controllers_vis.values()])
+            n_before = len(raw_mesh.faces)
+            raw_mesh = conform_mesh_to_leds_fn(raw_mesh, all_pos, all_nrm)
+            logger.info(f"[visualization] mesh conformed to the LED cloud (display only): "
+                        f"{n_before} -> {len(raw_mesh.faces)} faces")
         self._mesh_faces = raw_mesh.faces
         self._mesh_vertex_normals = (raw_mesh.vertex_normals
                                      if hasattr(raw_mesh, "vertex_normals") else None)
@@ -496,7 +584,7 @@ class ControllerAnimatorRerun:
         try:
             if getattr(self, "_occ_mesh", None) is None:
                 # Full mesh: quadric decimation opened holes (rays leaked through).
-                self._occ_mesh = load_trimesh(self._mesh_path_for_occ)
+                self._occ_mesh = load_trimesh(self._mesh_path_for_occ, self._mesh_node)
             m = self._occ_mesh
             Rm, tm = T_world_model_occ.R, T_world_model_occ.t
             o = Rm.T @ (np.asarray(cam_origin_world, dtype=np.float64) - tm)

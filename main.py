@@ -21,7 +21,7 @@ from src.imu_data import load_and_calibrate_controller_imu, create_imu_calib_fro
     ACCEL_QUIET_MAGNITUDE_BAND
 from src.mocap_data import DeviceMocap, load_mocap_csv, load_mocap_fine_offset_ns, load_T_imu_marker, \
                             load_vision_offset_ns, load_vision_drift_params, controller_imu_files, \
-                            relative_pose, DRIFT_CHECK_VARIANT
+                            relative_pose, DRIFT_CHECK_VARIANT, load_device_mocap_from_config
 from src.headset_pose_source import MocapHeadsetPoseSource
 from src.load_config import load_yaml_config, load_json_config
 from src.preprocess_data import get_data, count_images
@@ -241,45 +241,20 @@ def main():
     device_mocap: dict = {}   # {"headset": DeviceMocap, ctrl_key: DeviceMocap, ...}
     if mocap_cfg.get("enabled", False):
         _recording_root    = Path(config["data"]["root"]).parent
-        _MOCAP_DISK_NAMES  = {"headset": "headset", "left_controller": "ctrlleft", "right_controller": "ctrlright"}
-        _mocap_device_cfg  = {"headset": config["cameras"],
-                               "left_controller":  config["controllers"]["left_controller"],
-                               "right_controller": config["controllers"]["right_controller"]}
         for device_key in ["headset", *enabled_ctrls]:
-            _dev_cfg    = _mocap_device_cfg[device_key]
-            calib_path  = _dev_cfg.get("mocap_calib_path")
-            offset_override_ns = _dev_cfg.get("mocap_fine_offset_override_ns")
-            device_dir  = _recording_root / "mocap_filtered" / _MOCAP_DISK_NAMES[device_key]
-            data_path   = device_dir / "data.csv"
-            drift_path  = device_dir / "drift_check" / DRIFT_CHECK_VARIANT / "drift_check.json"
-            # drift_path is only required when no manual override is configured --
-            # an override lets a device be used before its drift_check has even
-            # been run (see config.yml's mocap_fine_offset_override_ns comment).
-            if not calib_path or not data_path.exists() or (offset_override_ns is None and not drift_path.exists()):
+            # Built by the SHARED loader (src/mocap_data.py) -- also what xrtslam-metrics' target
+            # generation uses, so ground truth and live lookup can't disagree.
+            _dm, _why = load_device_mocap_from_config(_recording_root, device_key, config)
+            if _dm is None:
                 logger.bind(cat="startup").warning(
-                    f"[{device_key}] mocap data/calibration incomplete ({device_dir}) — "
-                    f"mocap ground truth disabled for this device")
+                    f"[{device_key}] {_why} — mocap ground truth disabled for this device")
                 continue
-            t_mocap, position, quat_xyzw = load_mocap_csv(data_path)
-            if offset_override_ns is not None:
-                fine_offset_ns = float(offset_override_ns)
-                _offset_source = "config override"
-            else:
-                fine_offset_ns = load_mocap_fine_offset_ns(drift_path)
-                _offset_source = f"{DRIFT_CHECK_VARIANT}/drift_check.json"
-            T_imu_marker = load_T_imu_marker(calib_path)
-            _max_gap_ns  = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
-            vision_offset_ns = load_vision_offset_ns(_dev_cfg)
-            drift_offset_ns, drift_rate_ns_per_ns = load_vision_drift_params(_dev_cfg)
-            device_mocap[device_key] = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
-                                                    max_interp_gap_ns=_max_gap_ns, vision_offset_ns=vision_offset_ns,
-                                                    drift_offset_ns=drift_offset_ns,
-                                                    drift_rate_ns_per_ns=drift_rate_ns_per_ns)
+            device_mocap[device_key] = _dm
             logger.bind(cat="startup").info(
-                f"[{device_key}] mocap loaded: {len(t_mocap)} samples from {data_path} "
-                f"(fine offset {fine_offset_ns / 1e6:.1f} ms, from {_offset_source}; "
-                f"vision offset {vision_offset_ns / 1e6:.2f} ms; "
-                f"drift {drift_offset_ns / 1e6:+.2f} ms + {drift_rate_ns_per_ns * 60e9 / 1e6:+.2f} ms/min)")
+                f"[{device_key}] mocap loaded: {len(_dm.t_ns)} samples from {_dm.data_path} "
+                f"(fine offset {_dm.fine_offset_ns / 1e6:.1f} ms, from {_dm.fine_offset_source}; "
+                f"vision offset {_dm.vision_offset_ns / 1e6:.2f} ms; "
+                f"drift {_dm.drift_offset_ns / 1e6:+.2f} ms + {_dm.drift_rate_ns_per_ns * 60e9 / 1e6:+.2f} ms/min)")
 
     # For src/lamp_region_memory.py (blob_detection.lamp_blob_filter.static_lamp_mask)
     # -- None (complete no-op there) whenever headset mocap isn't loaded.
@@ -324,7 +299,8 @@ def main():
     blob_parallel = tracking_system.blob_parallel_enabled
 
     if config["visualization"].get("fine_tune_alignment") and "right_controller" in enabled_ctrls:
-        mesh = load_trimesh(config["visualization"]["3d_model_path"])
+        mesh = load_trimesh(config["visualization"]["3d_model_path"],
+                            config["visualization"].get("3d_model_node"))
         fine_tune_alignment(ctrl_leds["right_controller"], mesh, right_ctrl_cfg)
 
     # ── Visualiser setup (streamed, one log_frame() call per tracked frame —
@@ -351,6 +327,8 @@ def main():
                 config["visualization"].get("pose_fusion_debug", {}).get("enabled", False)),
             pose_fusion_debug_show_tabs=bool(
                 config["visualization"].get("pose_fusion_debug", {}).get("show_tabs", True)),
+            mesh_node=config["visualization"].get("3d_model_node"),
+            conform_mesh_to_leds=bool(config["visualization"].get("conform_mesh_to_leds", False)),
         )
         animator.begin(cameras, save_path=config["visualization"].get("save_recording"))
 
@@ -631,6 +609,17 @@ def main():
             Returns ({ctrl_name: {cam_idx: (BlobResult, canvases)}},
             {ctrl_name: {cam_idx: elapsed_ms}}).
             """
+            # TEMPORARY (thesis figure -- revert by removing this block or setting
+            # blob_detection.debug_force_cold_detection: false in config.yml): forces
+            # every detect() call this frame onto the cold, no-prior two-pass path, so
+            # the pass-1/pass-2 debug canvases are populated on EVERY frame instead of
+            # only on a real cold start or the mid-Phase-2 redetect fallback below.
+            # Leaves has_recent_memory/lamp_protect_rects untouched, so lamp filtering
+            # still behaves as it would on a genuine cold frame.
+            if _blob_cfg.get("debug_force_cold_detection", False):
+                for _kw_per_cam in cam_kwargs_per_ctrl.values():
+                    for _kw in _kw_per_cam.values():
+                        _kw["predicted_leds"] = None
             img_path_arg = img_path if _visualize_save else None
             results_by_ctrl: dict = {c: {} for c in cam_kwargs_per_ctrl}
             ms_by_ctrl: dict = {c: {} for c in cam_kwargs_per_ctrl}
