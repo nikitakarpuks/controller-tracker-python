@@ -26,6 +26,8 @@ Uses stdlib unittest (pytest is not a declared dependency of this project).
 Run with:  python3 -m unittest tests.test_controller_imu_only_propagation
 """
 import unittest
+from collections import deque
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -173,6 +175,96 @@ class TimeBasedBudgetTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 0)
         self.assertIsNone(tracker._last_imu_only_pose)
+
+
+class MarkAllLostIdempotencyTests(unittest.TestCase):
+    """Regression for a real, live-confirmed bug (found investigating an
+    uncaught 178.8mm/86.34deg jump -- walk_dark recording, right_controller,
+    data.frame_range {lower: 300, upper: 370}, local frame 64): main.py's
+    per-controller loop can call ControllerTracker.update() -- and therefore
+    _mark_all_lost -- up to TWICE for the exact same frame_ts_ns: once with
+    allow_brute=False (cheap-only), and again with force_brute=True after a
+    cold blob re-detect, when both fail (see main.py's _update_ctrl call
+    sites, and ControllerTracker.update()'s own two _mark_all_lost call
+    sites). _mark_all_lost already had a same-frame dedup guard for
+    predict() itself (_last_imu_propagate_ts_ns), but nothing downstream of
+    it was gated on it: a second same-timestamp call still re-ran the
+    consecutive_failures increment and the grace-exhausted clear_prior()
+    check, using a spurious "no IMU pose available" (the guard skipped
+    RECOMPUTING _imu_pose but the local variable was left at its initial
+    None instead of reusing the real one the first call had just computed
+    and cached in self._last_imu_only_pose) -- silently wiping out a
+    pose_history the first call had just legitimately IMU-propagated. This
+    is what starved the very next frame's jump candidate of a real
+    predicted_pose, letting it sail through the much looser fusion-level
+    implausibility gate uncaught."""
+
+    def _make_tracker_with_camera(self):
+        camera = Mock()
+        camera.T_world_cam = Transform(np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32))
+        cam_tracker = SimpleNamespace(
+            prev_pose=None, prev_prev_pose=None,
+            pose_history=deque(maxlen=5), vel_ema=None,
+            tracking_lost_last_frame=False, consecutive_failures=0,
+        )
+
+        def _clear_prior():
+            cam_tracker.prev_pose = None
+            cam_tracker.prev_prev_pose = None
+            cam_tracker.vel_ema = None
+            cam_tracker.pose_history.clear()
+        cam_tracker.clear_prior = _clear_prior
+
+        matching_cfg = {"imu_only_propagation_max_s": 0.066, "tracking_lost_grace_frames": 1}
+        tracker = ControllerTracker(
+            "test", {0: camera}, {0: cam_tracker}, matching_cfg=matching_cfg,
+            fusion_cfg={"enabled": True, "filter_type": "heuristic"},
+        )
+        tracker._fusion_filter.velocity_established = True
+        return tracker, cam_tracker
+
+    def test_second_call_same_ts_does_not_double_count_or_clear_prior(self):
+        tracker, cam_tracker = self._make_tracker_with_camera()
+        calls = []
+        tracker._fusion_filter.last_update_ts_ns = 0
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        ts = int(0.03 * _NS)  # well within the 66ms budget
+        tracker._mark_all_lost(frame_ts_ns=ts)
+        self.assertEqual(cam_tracker.consecutive_failures, 1)
+        self.assertEqual(len(cam_tracker.pose_history), 1)
+        self.assertIsNotNone(cam_tracker.prev_pose)
+
+        # SAME frame_ts_ns again -- simulates main.py's force_brute retry
+        # after a cold re-detect, when the retry ALSO fails.
+        tracker._mark_all_lost(frame_ts_ns=ts)
+
+        self.assertEqual(len(calls), 1, "predict() must not be called twice for the same frame_ts_ns")
+        self.assertEqual(cam_tracker.consecutive_failures, 1,
+                          "one real lost frame must not be double-counted just because "
+                          "_mark_all_lost was called twice for it")
+        self.assertEqual(len(cam_tracker.pose_history), 1,
+                          "the second call must not clear_prior() on a pose_history the "
+                          "first call had just legitimately IMU-propagated")
+        self.assertIsNotNone(cam_tracker.prev_pose)
+
+    def test_distinct_frame_ts_each_still_counts_and_clears_after_grace(self):
+        """Regression pin: the dedup guard must only suppress a genuine
+        SAME-timestamp re-entry, not real distinct lost frames -- grace
+        (default 1) must still exhaust and clear_prior() across two truly
+        separate lost frames with no IMU coverage available at all."""
+        tracker, cam_tracker = self._make_tracker_with_camera()
+        tracker._fusion_filter.velocity_established = False  # no IMU pose available
+        cam_tracker.prev_pose = (np.zeros((3, 1), np.float32), np.zeros(3, np.float32))
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.01 * _NS))
+        self.assertEqual(cam_tracker.consecutive_failures, 1)
+        self.assertIsNotNone(cam_tracker.prev_pose, "grace=1 not yet exceeded after 1 failure")
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.02 * _NS))
+        self.assertEqual(cam_tracker.consecutive_failures, 2)
+        self.assertIsNone(cam_tracker.prev_pose,
+                           "2nd DISTINCT failed frame exceeds grace=1 -- clear_prior must still fire")
 
 
 class FramesSinceUpdateDoesNotFreezeTests(unittest.TestCase):
@@ -473,6 +565,145 @@ class RotationAxisOwnBudgetTests(unittest.TestCase):
         # 3ms elapsed -- inside the accel axis's own 3ms floor.
         tracker._mark_all_lost(frame_ts_ns=int(0.003 * _NS))
         self.assertEqual(len(calls), 1, "accel axis must still floor at its own coast_trust_min_budget_s")
+
+
+class AnchorRotBudgetDecouplingTests(unittest.TestCase):
+    """Regression for the coast_trust_anchor_rot_* refit (2026-09-17, walk_dark
+    frame-64 jump investigation): ControllerTracker._mark_all_lost's own
+    rot_budget_s used to read the SAME coast_trust_rot_* keys as
+    HeuristicPoseFusionFilter's precision-sensitive rot consumers (the
+    degenerate w_sum<=0 fallback / rot_pred_implausible gate widening) --
+    a real, only-moderately-fast loss (peak gyro ~211deg/s, accel calm)
+    shrank this search-anchor budget to 28ms, just under a real 33ms
+    two-real-frame gap, so IMU-only propagation declined, pose_history got
+    legitimately cleared (2 consecutive real losses exceeded
+    tracking_lost_grace_frames), and the eventual reacquisition candidate
+    reached finalize_search with no predicted_pose at all -- letting a
+    178.8mm/86.34deg jump through the much looser fusion-level gate
+    uncaught. coast_trust_anchor_rot_* decouples this consumer's own,
+    fitted-for-this-coarser-use numbers, falling back to coast_trust_rot_*
+    when unset."""
+
+    def _make_tracker_with_imu(self, gyro_samples, accel_samples, **cfg_overrides):
+        matching_cfg = {
+            "imu_only_propagation_max_s": 0.066,
+            "tracking_lost_grace_frames": 1,
+            "coast_trust_accel_calm_floor_mps2": 0.0,
+            "coast_trust_gyro_calm_floor_dps": 0.0,
+            "coast_trust_shrink_s_per_mps2": 0.0,
+            "coast_trust_shrink_s_per_dps": 0.0,
+            "coast_trust_min_budget_s": 0.035,
+            **cfg_overrides,
+        }
+        tracker = ControllerTracker(
+            "test", {}, {}, matching_cfg=matching_cfg,
+            fusion_cfg={"enabled": True, "filter_type": "heuristic"},
+        )
+        tracker._fusion_filter.velocity_established = True
+        tracker._fusion_filter.last_update_ts_ns = 0
+        t_g = np.array([t for t, _ in gyro_samples], dtype=np.int64)
+        g = np.array([v for _, v in gyro_samples], dtype=np.float64)
+        t_a = np.array([t for t, _ in accel_samples], dtype=np.int64)
+        a = np.array([v for _, v in accel_samples], dtype=np.float64)
+        tracker._gyro_data = (t_g, g)
+        tracker._accel_data = (t_a, a)
+        tracker._g_world_estimator = Mock(g_world=np.array([0.0, 0.0, 9.81]))
+        return tracker
+
+    def test_anchor_rot_keys_override_the_shared_coast_trust_rot_keys(self):
+        """coast_trust_anchor_rot_* must be consulted INSTEAD OF
+        coast_trust_rot_* when both are set -- the whole point of decoupling
+        this consumer from HeuristicPoseFusionFilter's own rot consumers."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.02 * _NS), [0.0, 0.0, np.radians(300.0)])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.02 * _NS), [0.0, 0.0, 9.81])],
+            coast_trust_rot_shrink_s_per_dps=1.0,         # absurdly punishing -- would wipe the budget
+            coast_trust_rot_min_budget_s=0.0,
+            coast_trust_anchor_rot_shrink_s_per_dps=0.0,  # anchor-specific: no shrink at all
+            coast_trust_anchor_rot_min_budget_s=0.003,
+            coast_trust_anchor_rot_calm_extend_ceiling_s=0.0,
+            coast_trust_anchor_rot_calm_extend_max_dps=0.0,
+        )
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.02 * _NS))  # 20ms elapsed, well under the 66ms flat base
+
+        self.assertEqual(len(calls), 1,
+                          "the anchor-specific (zero-shrink) numbers must win over the punishing "
+                          "shared coast_trust_rot_* numbers")
+
+    def test_anchor_rot_falls_back_to_coast_trust_rot_when_unset(self):
+        """Regression pin: with no coast_trust_anchor_rot_* keys configured
+        (any deployment/test config that hasn't picked up this refit yet),
+        behavior is byte-identical to the pre-refit coast_trust_rot_*-only
+        numbers."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.02 * _NS), [0.0, 0.0, np.radians(1000.0)])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.02 * _NS), [0.0, 0.0, 9.81])],
+            coast_trust_rot_shrink_s_per_dps=0.00018,  # shipped coast_trust_rot_* rate
+            coast_trust_rot_min_budget_s=0.003,
+        )  # no coast_trust_anchor_rot_* override at all
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.02 * _NS))  # 20ms elapsed
+
+        self.assertEqual(len(calls), 0,
+                          "with no anchor-specific override, must fall back to the shared "
+                          "coast_trust_rot_* numbers exactly as before this refit")
+
+    def test_moderate_gyro_no_longer_over_shrinks_the_anchor_budget(self):
+        """Direct regression for the real walk_dark frame-64 jump case: peak
+        gyro ~211deg/s, elapsed ~33ms (two real frames at this recording's
+        11/22ms oscillating cadence). With the OLD shared coast_trust_rot_*
+        numbers this budget shrank to 28ms (< the real gap, propagation
+        declined). With the shipped coast_trust_anchor_rot_* numbers, the
+        budget must comfortably exceed the real gap."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.0333 * _NS), [0.0, 0.0, np.radians(210.8)])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.0333 * _NS), [0.0, 0.0, 9.81])],
+            coast_trust_rot_shrink_s_per_dps=0.00018,
+            coast_trust_rot_min_budget_s=0.003,
+            coast_trust_rot_calm_extend_ceiling_s=0.15,
+            coast_trust_rot_calm_extend_max_dps=100.0,
+            coast_trust_anchor_rot_shrink_s_per_dps=0.00009,
+            coast_trust_anchor_rot_min_budget_s=0.003,
+            coast_trust_anchor_rot_calm_extend_ceiling_s=0.15,
+            coast_trust_anchor_rot_calm_extend_max_dps=200.0,
+        )
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.0333 * _NS))
+
+        self.assertEqual(len(calls), 1,
+                          "the anchor-specific numbers must let IMU-only propagation succeed at this "
+                          "real, moderate gyro rate over a real two-frame gap")
+
+    def test_anchor_rot_still_shrinks_hard_for_violent_rotation(self):
+        """Regression pin: the more lenient anchor numbers must still
+        collapse to the floor for genuinely violent rotation (well above
+        the ~500-700deg/s reliability ceiling), same as the shared
+        coast_trust_rot_* curve does -- this refit only widens the moderate
+        ~100-600deg/s band, it must not flatten out fast-motion behavior."""
+        tracker = self._make_tracker_with_imu(
+            [(0, [0.0, 0.0, 0.0]), (int(0.02 * _NS), [0.0, 0.0, np.radians(1200.0)])],
+            [(0, [0.0, 0.0, 9.81]), (int(0.02 * _NS), [0.0, 0.0, 9.81])],
+            coast_trust_anchor_rot_shrink_s_per_dps=0.00009,
+            coast_trust_anchor_rot_min_budget_s=0.003,
+            coast_trust_anchor_rot_calm_extend_ceiling_s=0.15,
+            coast_trust_anchor_rot_calm_extend_max_dps=200.0,
+        )
+        calls = []
+        tracker._fusion_filter.predict = _stub_predict(calls)
+
+        tracker._mark_all_lost(frame_ts_ns=int(0.02 * _NS))  # 20ms elapsed
+
+        self.assertEqual(len(calls), 0,
+                          "even the more lenient anchor numbers must collapse to the floor for "
+                          "violent rotation, well below a 20ms elapsed gap")
+        self.assertIsNone(tracker._last_imu_only_pose)
 
 
 class CalmMotionExtendTests(unittest.TestCase):

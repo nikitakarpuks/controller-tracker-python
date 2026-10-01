@@ -1,5 +1,11 @@
 # Algorithm Overview
 
+> Written before the IMU/pose-fusion filter, the lamp-blob filter, and cold-reacquire
+> safeguards were added (see the thesis chapters on IMU support and constellation tracking).
+> It still accurately describes the core blob-detection and correspondence-search pipeline
+> below — brute-force, proximity and prior-constrained matching — which has not changed
+> structurally since.
+
 ```mermaid
 flowchart TD
     A["<font color='#e07a00'>Load config</font><br/>YAML + camera intrinsics + controller JSON"] --> B["<font color='#e07a00'>Setup</font><br/>Camera · ControllerModel · TrackingSystem"]

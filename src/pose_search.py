@@ -599,6 +599,57 @@ class BruteSearchState:
     tier_lq_total:  List[int] = field(default_factory=list)
 
 
+def _proximity_confidence(n_final_pairs: int, n_pairs: int, error: float, li_f: np.ndarray,
+                           cx: float, cy: float, rpmax_px: float,
+                           strong_match_px: float, redundancy_ref: float,
+                           edge_inner_fraction: float, edge_conf_floor: float) -> float:
+    """proximity_search's own confidence formula, factored out (2026-09-17) so
+    it's directly unit-testable without a full PoseSearcher/Camera/blob-
+    detection harness -- same reasoning as pose_fusion_heuristic.py's
+    _vision_quality. Four independent multiplicative factors:
+
+      ransac_inlier_ratio: how much of the attempted match actually held up
+        under the final RANSAC consistency check.
+      err_factor: how close the mean reprojection error is to a confidently-
+        good fit (strong_match_px).
+      redundancy_factor: a near-minimal (3-point) fit has zero spare degrees
+        of freedom and can look deceptively good regardless of whether the
+        correspondence is correct; this discounts fits with little
+        redundancy beyond the minimal case.
+      radial_factor (2026-09-17): a KB4 calibration's own accuracy degrades
+        approaching rpmax_px -- a camera whose matched blobs sit near that
+        boundary can still post a tiny reprojection error (near-edge points
+        are easy to fit with low pixel error even when poorly constrained),
+        maxing out err_factor even though its read is geometrically less
+        reliable than a camera matched near its own optical center. Found
+        via a real case (walk_dark frames 1150-1250, right_controller):
+        cam0's matched LEDs sat at the fisheye edge with err~0.1px while
+        cam1's sat near center with err~0.5-0.7px, and joint fusion
+        (_compute_fused_solution/src/controller.py, _joint_refine_pose --
+        both consume this confidence as their only per-camera weighting
+        input) pulled the blended pose toward cam0's edge-degraded read,
+        leaving cam1's own well-fit LED 31 off by 3.3-4.4px against the
+        final pose. Reuses camera.radial_taper_weight and the same
+        edge_confidence_inner_fraction/_floor config already used by
+        brute_search_tier's own radial discount (~line 2616-2630 below) --
+        not a second, driftable copy. Mean (not min) across final_pairs'
+        matched points -- matches this formula's other three factors' own
+        simple-scalar style, not brute_search_tier's weighted-coverage
+        style; li_f empty (shouldn't happen -- final_pairs is always
+        non-empty by the time this is called) falls back to full trust
+        rather than a degenerate mean-of-nothing.
+    """
+    ransac_inlier_ratio = n_final_pairs / max(n_pairs, 1)
+    err_factor           = min(1.0, strong_match_px / max(error, 1e-6))
+    redundancy_factor    = min(1.0, max(0.0, n_final_pairs - 3) / max(redundancy_ref, 1e-6))
+    if len(li_f) == 0:
+        radial_factor = 1.0
+    else:
+        r_px = np.hypot(li_f[:, 0] - cx, li_f[:, 1] - cy)
+        radial_factor = float(np.mean(radial_taper_weight(r_px, rpmax_px, edge_inner_fraction, edge_conf_floor)))
+    return ransac_inlier_ratio * err_factor * redundancy_factor * radial_factor
+
+
 class PoseSearcher:
     """
     Stateless (read-only after __init__) pose estimator for one (camera, model) pair.
@@ -665,6 +716,9 @@ class PoseSearcher:
         self._c_prox_stage2_max_err_factor = float(_cfg.get('proximity_stage2_max_err_factor', 4.0))
         self._c_vis_occlusion_margin_m   = float(_cfg.get('visibility_occlusion_margin_m',  0.0))
         self._c_prox_vis_score_threshold = float(_cfg.get('proximity_vis_score_threshold',  0.95))
+        # Image-border tolerance (px) for the PREDICTED-pose visibility pass in proximity_search (see
+        # _visible_mask's image_margin_px); 0 = exact border.
+        self._c_prox_image_margin_px = float(_cfg.get('proximity_image_margin_px', 0.0))
         # constrained
         self._c_cs_reproj_px        = float(_cfg.get('reprojection_threshold',            2.0))
         # brute-force
@@ -938,6 +992,7 @@ class PoseSearcher:
             cam_rpmax=self.camera.rpmax, cam_is_fisheye=self.camera.is_fisheye,
             facing_threshold_deg=self._c_facing_deg,
             occlusion_margin_m=self._c_vis_occlusion_margin_m,
+            image_margin_px=self._c_prox_image_margin_px,
         )
         if occluders_per_cam:
             _occ = occluders_per_cam.get(self.camera.camera_idx)
@@ -1765,12 +1820,22 @@ class PoseSearcher:
         # barely-constrained fit compared to a well-redundant 12-point one. Without this
         # term a lucky/degenerate near-minimal camera can end up as confident as a
         # genuinely well-matched, highly redundant one.
-        _n_locked            = len(truly_locked_k)
-        _n_hyp               = len(hyp_k)
-        _ransac_inlier_ratio = len(final_pairs) / max(len(pairs), 1)
-        _err_factor          = min(1.0, self._c_prox_strong_match_px / max(error, 1e-6))
-        _redundancy_factor   = min(1.0, max(0.0, len(final_pairs) - 3) / max(self._c_prox_redundancy_ref, 1e-6))
-        _confidence          = _ransac_inlier_ratio * _err_factor * _redundancy_factor
+        #
+        # radial_factor (2026-09-17): a KB4 calibration's own accuracy degrades
+        # approaching rpmax_px -- see _proximity_confidence's own docstring
+        # (module-level, above this class) for the full "why" and the real
+        # case (walk_dark frames 1150-1250, right_controller) this was found
+        # from. Same edge_confidence_inner_fraction/_floor config already
+        # used by brute_search_tier's own radial discount (~line 2616-2630
+        # below) -- reused, not duplicated.
+        _n_locked = len(truly_locked_k)
+        _n_hyp    = len(hyp_k)
+        _confidence = _proximity_confidence(
+            len(final_pairs), len(pairs), error, li_f,
+            self.camera.cx, self.camera.cy, self.camera.rpmax_px,
+            self._c_prox_strong_match_px, self._c_prox_redundancy_ref,
+            self._c_edge_inner_fraction, self._c_edge_conf_floor,
+        )
 
         return {
             "rvec":       rvec,

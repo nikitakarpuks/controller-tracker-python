@@ -726,5 +726,137 @@ class ScalarNotPerAxisPositionJumpGateTests(unittest.TestCase):
         self.assertIsNotNone(diagonal, "the same small magnitude, spread across axes, must also be accepted")
 
 
+class ReacquireRotationWideningGyroInformedTests(unittest.TestCase):
+    """Regression for the 2026-09-17 fix (walk_dark frame-64 jump
+    investigation): the re-acquisition rotation widening -- both here
+    (vs-last_good_pose, the "cold-start / re-acquisition plausibility
+    check") and in the SEPARATE vs-predicted_pose widening block that feeds
+    _jump_vs_pred -- used to widen by a flat max_plausible_hand_ang_speed_
+    deg_s*stale_s rate regardless of how calm real measured gyro actually
+    was over the coast window. Found letting a real 86.34deg candidate
+    through BOTH checks with real peak gyro only ~211deg/s (real p95
+    rotation error at these exact conditions, per a 217k-sample re-run of
+    this session's own IMU-trust sweep: ~15.8deg). Both blocks now share
+    _gyro_informed_rot_widen_deg, capped by peak_gyro_accel_over_window's
+    real measured peak gyro (src/imu_data.py) via
+    pose_jump_pred_reacquire_widen_k_deg_per_dps_s -- min()'d against the
+    original flat rate, so it can only tighten, never widen further.
+
+    Exercises the vs-last_good_pose block specifically (last_good_pose set,
+    matching the real case, which also has a real controller history) --
+    that block runs FIRST and is authoritative whenever last_good_pose is
+    available (see LastGoodPoseRescueDuringReacquisitionTests above: the
+    SEPARATE vs-predicted_pose block explicitly defers to it, never
+    independently overriding an accept)."""
+
+    @staticmethod
+    def _gyro_accel(peak_gyro_dps, t1_ns):
+        gyro = (np.array([0, t1_ns], dtype=np.int64),
+                np.array([[0.0, 0.0, 0.0], [0.0, 0.0, np.radians(peak_gyro_dps)]]))
+        accel = (np.array([0, t1_ns], dtype=np.int64),
+                 np.array([[0.0, 0.0, 9.81], [0.0, 0.0, 9.81]]))
+        return gyro, accel
+
+    def _make_reacquiring_tracker(self):
+        return _make_tracker(
+            prev_pose=None,
+            tracking_lost_last_frame=True,
+            last_good_pose=(_ZERO_RVEC, _ZERO_TVEC),
+            last_good_pose_ts_ns=0,
+            # max_plausible_hand_ang_speed_deg_s explicitly set to the real
+            # shipped config.yml value (2200.0) -- finalize_search's own
+            # fallback default (2000.0) differs from it, and this test class's
+            # own math throughout assumes the real 2200.0 flat rate.
+            matching_cfg={"pose_jump_pred_reacquire_widen_k_deg_per_dps_s": 3.0,
+                           "max_plausible_hand_ang_speed_deg_s": 2200.0},
+        )
+
+    def test_real_case_rejected_with_gyro_informed_widening(self):
+        """Direct regression for the real case: peak gyro ~211deg/s,
+        stale_s~33ms. Flat widening would have allowed this (base 27deg +
+        2200*0.0333=73.3deg = 100.3deg > 86deg, accepted); the gyro-informed
+        cap (base 27deg + 3.0*210.8*0.0333=21.1deg = 48.1deg < 86deg) must
+        now reject it."""
+        t1_ns = int(0.0333 * 1e9)
+        gyro, accel = self._gyro_accel(210.8, t1_ns)
+        tracker = self._make_reacquiring_tracker()
+        predicted_pose = (_ZERO_RVEC, _ZERO_TVEC)
+        candidate = _solution(_rvec_deg([0, 0, 1], 86.0), _ZERO_TVEC)
+
+        result = tracker.finalize_search(
+            candidate, predicted_pose, blobs=np.zeros((0, 2), dtype=np.float32),
+            allow_expensive_fallback=False, frame_ts_ns=t1_ns,
+            jump_stats_gyro_data=gyro, jump_stats_accel_data=accel,
+        )
+
+        self.assertIsNone(result, "an 86deg candidate with real peak gyro only ~211deg/s must now "
+                                   "be rejected, not swallowed by flat worst-case widening")
+
+    def test_falls_back_to_flat_widening_when_no_imu_data(self):
+        """Regression pin for the fallback bug caught writing this test:
+        without gyro/accel data, peak_gyro_accel_over_window's own (0.0,
+        0.0) fail-open contract must NOT make the gyro-informed term 0.0
+        and collapse the widening via min(flat, 0.0)=0.0 -- it must fall
+        back to the flat rate outright, reproducing the exact pre-fix
+        accept for this same 86deg candidate (base 27deg + flat
+        73.3deg = 100.3deg > 86deg)."""
+        t1_ns = int(0.0333 * 1e9)
+        tracker = self._make_reacquiring_tracker()
+        predicted_pose = (_ZERO_RVEC, _ZERO_TVEC)
+        candidate = _solution(_rvec_deg([0, 0, 1], 86.0), _ZERO_TVEC)
+
+        result = tracker.finalize_search(
+            candidate, predicted_pose, blobs=np.zeros((0, 2), dtype=np.float32),
+            allow_expensive_fallback=False, frame_ts_ns=t1_ns,
+            # no jump_stats_gyro_data/accel_data -- IMU disabled
+        )
+
+        self.assertIsNotNone(result, "with no IMU data, widening must fall back to the flat "
+                                      "worst-case rate exactly as before this fix")
+
+    def test_never_widens_past_the_flat_ceiling(self):
+        """An extreme/out-of-sample gyro reading must still be capped by
+        the flat worst-case rate via min(), never produce a LARGER widening
+        than today's ceiling."""
+        t1_ns = int(0.0333 * 1e9)
+        gyro, accel = self._gyro_accel(5000.0, t1_ns)  # extreme, out-of-sample
+        tracker = self._make_reacquiring_tracker()
+        predicted_pose = (_ZERO_RVEC, _ZERO_TVEC)
+        # Would be rejected if the gyro-informed term were used uncapped
+        # (3.0*5000*0.0333=500deg), but the flat ceiling (27+73.3=100.3deg)
+        # still accepts it.
+        candidate = _solution(_rvec_deg([0, 0, 1], 95.0), _ZERO_TVEC)
+
+        result = tracker.finalize_search(
+            candidate, predicted_pose, blobs=np.zeros((0, 2), dtype=np.float32),
+            allow_expensive_fallback=False, frame_ts_ns=t1_ns,
+            jump_stats_gyro_data=gyro, jump_stats_accel_data=accel,
+        )
+
+        self.assertIsNotNone(result, "an extreme gyro reading must not widen the threshold "
+                                      "PAST the flat worst-case ceiling")
+
+    def test_still_accepts_genuine_calm_reacquisition(self):
+        """Regression pin: ordinary, small candidate deltas at the same
+        real-but-moderate gyro are still accepted -- this tightening must
+        not introduce new false rejects for genuine reacquisitions."""
+        t1_ns = int(0.0333 * 1e9)
+        gyro, accel = self._gyro_accel(210.8, t1_ns)
+        tracker = self._make_reacquiring_tracker()
+        predicted_pose = (_ZERO_RVEC, _ZERO_TVEC)
+        # 15deg -- comfortably within the gyro-informed widened threshold
+        # (base 27deg + ~21.1deg gyro-informed = ~48.1deg).
+        candidate = _solution(_rvec_deg([0, 0, 1], 15.0), _ZERO_TVEC)
+
+        result = tracker.finalize_search(
+            candidate, predicted_pose, blobs=np.zeros((0, 2), dtype=np.float32),
+            allow_expensive_fallback=False, frame_ts_ns=t1_ns,
+            jump_stats_gyro_data=gyro, jump_stats_accel_data=accel,
+        )
+
+        self.assertIsNotNone(result, "a genuine, moderate reacquisition delta must still be "
+                                      "accepted with the gyro-informed widening")
+
+
 if __name__ == "__main__":
     unittest.main()

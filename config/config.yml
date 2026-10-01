@@ -1,6 +1,5 @@
 data:
-  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826173350_walk_dark/mav0"
-#  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826180039_walk_hard/mav0"
+  root: "/home/nikitakarpuks/Downloads/recordings-aug26/euroc_recording_20260826175510_walk_medium/mav0"
   layout: "per_camera_folders"  # "concatenated" = one folder, every camera's view packed
                            # side-by-side into a single wide image per frame (uses
                            # img_width/total_cameras_number below to slice per camera).
@@ -29,10 +28,10 @@ data:
   total_cameras_number: 4
   selected_cameras: [0, 1, 2, 3] # choose any sequential cameras, max list is [0, 1, 2, 3]
   frame_range:
-    lower: 0  # inclusive, 0-based index into the alphabetically-sorted image list
+    lower: 1500  # inclusive, 0-based index into the alphabetically-sorted image list
                  # (each camera folder in "per_camera_folders" layout); null = start
                  # from the first image
-    upper: null  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
+    upper: 1800  # exclusive index; null = no upper limit. E.g. lower: 100, upper: 200
                  # processes images at sorted positions 100..199 only.
 
 fusion_heuristic:
@@ -820,6 +819,7 @@ imu:
                   # diagnostic (log-only). Requires
                   # <data.root>/imu1/data.csv (left) and imu2/data.csv (right) in
                   # EuRoC format; falls back to pure vision-history prediction
+                  # (with a startup warning) if a file is missing.
   recorded_stream_factory_corrected: true  # the recorded imu1/imu2 CSVs were written by Monado AFTER its own
                   # mix + bias + axis-rotation step (wmr_controller_hp.c:258-276), so the loader must NOT
                   # apply the factory mix+bias again (it used to: doubled the bias, re-applied the mixing
@@ -829,7 +829,6 @@ imu:
   accel_driver_scale: 0.980665  # multiplies the accelerometer: Monado reports counts/(98000/2) = 10.000 for one g
                   # ("1g ~ 490,000 counts" is the driver author's own unconfirmed observation), so true m/s^2 =
                   # reported * 9.80665/10. Removes a measured ~1.9-2.5 % accel gain error. 1.0 = no scaling.
-                  # (with a startup warning) if a file is missing.
 
 fusion:
   enabled: true  # master switch; false = today's behavior exactly -- raw vision solve
@@ -1005,6 +1004,7 @@ controllers:
     enabled: true
     config_path: "./data/controllers/right_controller_A85K6081930636R.json"
     mocap_calib_path: "/home/nikitakarpuks/Downloads/recordings-aug26/mocap_calibrations_for_each_device/controller_right_calib.json" # see cameras.mocap_calib_path above
+    mocap_fine_offset_override_ns: null # see cameras.mocap_fine_offset_override_ns above
     mocap_vision_offset_ns: 7600000 # vision frame stamp -> this controller's IMU clock (see src/mocap_data.py's
                           # "Vision-clock offset" docstring): mocap is looked up at
                           # frame_ts + this + fine_offset. Measured ~+7.6ms for both controllers (vision-vs-
@@ -1033,15 +1033,30 @@ controllers:
                           # this file exists it's loaded and used directly (no fitting); if the path is set
                           # but the file is missing, the next compare_vision_mocap.py run fits it fresh and
                           # writes it here; null = always fit fresh, never cached.
-    mesh_alignment:
+    mesh_alignment:   # for reverbg2.glb / Controller_1 (see visualization.3d_model_path)
+      # 2026-09-27: switched from node Controller_2 to Controller_1 (Controller_2 is the LEFT-hand mirror image).
+      # Then a ring-coplanarity fit (2026-09-27): the ring's actual top rim (radial band at the LED radius, top 12%
+      # by height within it -- a wide/ambiguous band was tried first and rejected, see below) was rotated onto the
+      # LED-derived frustum's fixed top plane by the MINIMAL rotation (axis necessarily perpendicular to the ring
+      # axis, so it adds ~0.05deg of roll -- essentially none) and shifted along the ring axis to close the offset.
+      # Render-checked before applying (ring stays round, frustum ellipse now sits on the rim instead of floating
+      # above it): ring tilt 2.13 -> 0.07 deg, ring/frustum z-offset 0.8 -> 0.03 mm, LED->surface mean 1.55 -> 1.95 mm.
+      # handle_primitives (occlusion proxy, used by tracking) were NOT touched. Display only.
+      # REJECTED ATTEMPT (same day, not this fit): an earlier coplanarity fit used a wide/ambiguous ring-band window
+      # that actually captured wall points; forcing it flat tripled the LED gap (1.7->3.9mm) and, once
+      # conform_mesh_to_leds pulled the surface onto the now much-further LEDs, visibly deformed the drawn mesh.
+      # That one was applied without rendering it first and had to be reverted -- always render before applying here.
       translation: # in meters
-        x: 0.19610239
-        y: 0.01522315
-        z: -0.09380996
+        x: -0.26698393
+        y: 0.20203745
+        z: -0.08105860
       rotation: # in radians
-        rx: -0.00523160
-        ry: 0.22553752
-        rz: 3.15
+        rx: 2.98830638
+        ry: 0.00483836
+        rz: 0.09446360
+    # mesh_alignment for the HP STP (previous):
+    #   translation: {x: 0.19610239, y: 0.01522315, z: -0.09380996}
+    #   rotation:    {rx: -0.00523160, ry: 0.22553752, rz: 3.15}
     handle_primitives:
       boxes:
         - name: box_vertical
@@ -1088,6 +1103,14 @@ geometry:
 
 
 blob_detection:
+
+  debug_force_cold_detection: true  # TEMPORARY, for browsing the two-pass rescue example
+                                     # in rerun (thesis figure) -- forces every frame's
+                                     # detect() call onto the cold, no-prior two-pass path
+                                     # (main.py's _run_blob_detect_batch_multi). Set back to
+                                     # false (or delete this line) once done; normal live
+                                     # tracking should not run with this on, since it disables
+                                     # all warm/predicted-pose-guided detection.
 
   # ── Common (both warm and cold paths) ────────────────────────────────────
   # visualize_save / visualize_rerun live under visualization: below, next to
@@ -1935,6 +1958,10 @@ matching:
     - [2, 3]
     - [2, 3, "edge"]
     - [3, 3, "edge"]
+#    - [4, 2]
+#    - [2, 4]
+#    - [3, 3]
+
 
   p4_threshold_px: 2.5
   hungarian_threshold_px: 5.0    # loose pre-filter on raw P3P pose; RANSAC does the real filtering
@@ -2155,7 +2182,11 @@ matching:
   proximity_top_k_ransac: 3
   proximity_stage2_max_err_factor: 4.0  # skip stage-2 RANSAC rescoring when best ITERATIVE err > this × accept_error_px (too few points for RANSAC to rescue a fit that far off)
   visibility_occlusion_margin_m: 0.02   # penetration depth (m) at which body/frustum occlusion score reaches 0; 0 = hard binary
-  proximity_vis_score_threshold: 0.95   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
+  proximity_vis_score_threshold: 0.9   # include LEDs with vis score >= this in proximity search (catches borderline edge cases)
+  proximity_image_margin_px: 4.0        # image-border tolerance (px) for proximity's PREDICTED-pose visibility: an LED whose predicted
+                                        # projection lands within this many px OUTSIDE the image is still a candidate (its real blob may be
+                                        # inside; prediction is ~2-3 px off). 0 = exact border (old). walk_easy right cam1 frame 734: LED 15
+                                        # predicted at y=480.36 of 480 -> was dropped -> 3 < 4 pairs -> None -> thin 3-match P2P.
 
   proximity_expansion_velocity_k: 0.1   # extra px per px/(reference frame) of estimated velocity
   # Fixed period used to convert vel_ema (a genuine m/s rate) into the
@@ -2718,9 +2749,23 @@ visualization:
   # contour, legend strip, warm-mode tile grid) has a real per-frame CPU cost,
   # so it's only computed when one of these two sinks actually wants it:
   visualize_save:  false   # write canvases to ./visualization/blobs/*.png
-  visualize_rerun: false   # log canvases into the Rerun stream/.rrd recording —
+  visualize_rerun: true   # log canvases into the Rerun stream/.rrd recording —
                            # this is what balloons recording file size
-  3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
+  # Mentor-provided Reverb G2 scene (GLB). Screenshots/renders of it are fine for the thesis, but the file
+  # itself must NOT be published (git-ignored). 3d_model_node picks the right-hand controller node; the
+  # left controller reuses the right mesh mirrored (see prepare_model_geometry). mesh_alignment below is
+  # specific to this file (ICP to the HP STP through the old alignment, then LED-refined with
+  # fine_tune_alignment: all 32 LEDs outside the surface, 1.1 mm mean / 1.8 mm max).
+  3d_model_path: "./data/controllers/reverbg2.glb"
+  3d_model_node: "Controller_1"   # right-hand mesh (Controller_2 is the left-hand mirror image)
+  # Display only: locally nudge the drawn mesh (<= ~2.5 mm, after subdividing it) so the calibrated
+  # LEDs sit ON its surface instead of hovering. The LEDs themselves are never moved. The mentor's
+  # GLB has flat facets where the real ring wall bulges, which no rigid alignment can fix. Set to
+  # false to draw the model exactly as provided.
+  conform_mesh_to_leds: true
+  # Previous (HP STP, LEDs 0.19 mm mean from surface) -- to roll back, restore this path, drop
+  # 3d_model_node, and restore the commented mesh_alignment under right_controller:
+  # 3d_model_path: "./data/controllers/reverb_g2_controller_3d_model.stp"
   save_recording: "./visualization/recording.rrd"  # set to null to disable saving
   fine_tune_alignment: false  # set to true to run alignment optimiser and print refined params
 

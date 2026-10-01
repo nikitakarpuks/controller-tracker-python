@@ -84,6 +84,8 @@ Vision-clock DRIFT (DeviceMocap.drift_offset_ns / drift_rate_ns_per_ns) -- a THI
     track), and no comparably-validated headset-side drift fit exists.
 """
 import json
+from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -374,3 +376,56 @@ def relative_pose(headset: DeviceMocap, device: DeviceMocap, query_ts_ns: int):
     T_world_deviceMarker  = Transform(*d)
     T_headsetMarker_deviceMarker = T_world_headsetMarker.inverse().compose(T_world_deviceMarker)
     return headset.T_imu_marker.compose(T_headsetMarker_deviceMarker).compose(device.T_imu_marker.inverse())
+
+
+MOCAP_DISK_NAMES = {"headset": "headset", "left_controller": "ctrlleft", "right_controller": "ctrlright"}
+
+
+def load_device_mocap_from_config(recording_root, device_key: str, config: dict) -> Tuple[Optional[DeviceMocap], Optional[str]]:
+    """THE one place a recording's per-device DeviceMocap is built from config.yml -- shared by
+    main.py (live pipeline) and xrtslam-metrics' make_xrtslam_targets.py, so the ground truth the
+    metrics are computed against can never again disagree with the mocap lookup the pipeline
+    uses (the targets script used to build DeviceMocap with only the fine offset, silently missing
+    mocap_vision_offset_ns and the vision<->mocap drift -- ~2-9 ms of time error growing over a
+    recording, i.e. 10-25 mm of apparent error at 2-3 m/s).
+
+    recording_root: the recording directory that CONTAINS mav0/ and mocap_filtered/.
+    device_key: "headset" | "left_controller" | "right_controller".
+    Returns (DeviceMocap, None), or (None, reason) when the device's mocap data/calibration is
+    incomplete (caller decides whether to warn or fail). The returned object also carries
+    `.fine_offset_source` (str, for logging only).
+
+    Per-device settings come from config["cameras"] (headset) or config["controllers"][key]:
+    mocap_calib_path, mocap_fine_offset_override_ns, mocap_vision_offset_ns and
+    mocap_vision_drift_offset_ns / mocap_vision_drift_rate_ms_per_min (headset has none -> (0, 0)
+    drift, deliberately, see module docstring). max_interp_gap_ms comes from config["mocap"]."""
+    recording_root = Path(recording_root)
+    mocap_cfg = config.get("mocap", {})
+    dev_cfg = config["cameras"] if device_key == "headset" else config["controllers"][device_key]
+    calib_path = dev_cfg.get("mocap_calib_path")
+    offset_override_ns = dev_cfg.get("mocap_fine_offset_override_ns")
+    device_dir = recording_root / "mocap_filtered" / MOCAP_DISK_NAMES[device_key]
+    data_path = device_dir / "data.csv"
+    drift_path = device_dir / "drift_check" / DRIFT_CHECK_VARIANT / "drift_check.json"
+    # drift_path is only required when no manual override is configured -- an override lets a
+    # device be used before its drift_check has even been run (see config.yml's
+    # mocap_fine_offset_override_ns comment).
+    if not calib_path or not data_path.exists() or (offset_override_ns is None and not drift_path.exists()):
+        return None, f"mocap data/calibration incomplete ({device_dir})"
+    t_mocap, position, quat_xyzw = load_mocap_csv(data_path)
+    if offset_override_ns is not None:
+        fine_offset_ns = float(offset_override_ns)
+        source = "config override"
+    else:
+        fine_offset_ns = load_mocap_fine_offset_ns(drift_path)
+        source = f"{DRIFT_CHECK_VARIANT}/drift_check.json"
+    T_imu_marker = load_T_imu_marker(calib_path)
+    max_gap_ns = float(mocap_cfg.get("max_interp_gap_ms", 30.0)) * 1e6
+    vision_offset_ns = load_vision_offset_ns(dev_cfg)
+    drift_offset_ns, drift_rate_ns_per_ns = load_vision_drift_params(dev_cfg)
+    dm = DeviceMocap(t_mocap, position, quat_xyzw, fine_offset_ns, T_imu_marker,
+                     max_interp_gap_ns=max_gap_ns, vision_offset_ns=vision_offset_ns,
+                     drift_offset_ns=drift_offset_ns, drift_rate_ns_per_ns=drift_rate_ns_per_ns)
+    dm.fine_offset_source = source
+    dm.data_path = data_path
+    return dm, None

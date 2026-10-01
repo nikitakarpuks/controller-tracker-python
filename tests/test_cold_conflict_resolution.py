@@ -108,6 +108,60 @@ class ResolveColdConflictsTests(unittest.TestCase):
         losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
         self.assertEqual(losers, set())
 
+    def test_tied_discounted_score_breaks_tie_on_raw_error(self):
+        # Real case: walk_dark frame ~2011 identity swap. Both candidates'
+        # raw errors (0.15px, 0.05px -- a real 3x difference) land under
+        # the default score_error_floor_px (0.5, via strong_match_error_px's
+        # own default), and total_pairs is identical (2 each) -- the floor-
+        # clamped discounted score ties exactly (both become
+        # max(error, 0.5) * (min_inliers/total_pairs) = 0.5 * 4/2 = 2.0).
+        # Without a tie-break on raw error, min()'s arbitrary set()
+        # iteration order decides -- the objectively better fit (ctrl_b,
+        # 0.05px) must win instead of whichever happens to iterate first.
+        candidates = {
+            "ctrl_a": {
+                "primary_cam": 0, "error": 0.15, "T_world_ctrl": _T(10.0),
+                "assignment": [(5, 0), (6, 1)], "aux_assignments": {},
+            },
+            "ctrl_b": {
+                "primary_cam": 0, "error": 0.05, "T_world_ctrl": _T(20.0),
+                "assignment": [(5, 0), (7, 1)], "aux_assignments": {},
+            },
+        }
+        blob_geometry = {
+            "ctrl_a": {0: _geo({5: (500, 0), 6: (600, 0)})},
+            "ctrl_b": {0: _geo({5: (500, 0), 7: (700, 0)})},
+        }
+        ts = _make_tracking_system()
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        self.assertEqual(losers, {"ctrl_a"},
+                          "the objectively better fit (lower raw error) must win an exact "
+                          "floor-clamped-score tie, not an arbitrary iteration order")
+
+    def test_larger_total_pairs_still_wins_despite_higher_raw_error(self):
+        # Regression pin: the raw-error tie-break must never override a
+        # genuine total_pairs difference -- more corroborating evidence
+        # still wins even against a lower raw error, since the discounted
+        # score already discriminates before the tie-break is ever reached.
+        candidates = {
+            "ctrl_a": {  # fewer pairs, lower raw error
+                "primary_cam": 0, "error": 0.05, "T_world_ctrl": _T(10.0),
+                "assignment": [(5, 0)], "aux_assignments": {},
+            },
+            "ctrl_b": {  # more pairs, higher (but still sub-floor) raw error
+                "primary_cam": 0, "error": 0.15, "T_world_ctrl": _T(20.0),
+                "assignment": [(5, 0), (6, 1), (8, 2)], "aux_assignments": {},
+            },
+        }
+        blob_geometry = {
+            "ctrl_a": {0: _geo({5: (500, 0)})},
+            "ctrl_b": {0: _geo({5: (500, 0), 6: (600, 0), 8: (800, 0)})},
+        }
+        ts = _make_tracking_system()
+        losers, _reasons, _contested = ts._resolve_cold_conflicts(candidates, blob_geometry=blob_geometry)
+        self.assertEqual(losers, {"ctrl_a"},
+                          "more corroborating total_pairs must still decide over the raw-error tiebreak")
+
     def test_missing_blob_geometry_skips_shared_blob_check(self):
         # No blob_geometry supplied at all -- shared-blob comparison must be
         # skipped entirely (never flagged) rather than falling back to raw
@@ -616,6 +670,60 @@ class DetectColdIdentitySwapTests(unittest.TestCase):
         }, matching_cfg={"cold_swap_margin": 0.85})
         suspected = ts._detect_cold_identity_swap(candidates)
         self.assertEqual(suspected, {"ctrl_a", "ctrl_b"})
+
+    def test_fresh_bootstrap_near_other_controllers_last_position_flagged(self):
+        # One-sided case (2026-09-17): ctrl_b is a genuine first-ever
+        # bootstrap (no fusion filter at all -- p AND _last_known_p both
+        # None, unlike a reset-with-stale-reference case), so the symmetric
+        # "both sides have a reference" check above can't run. Real case
+        # (walk_dark frame ~2011): left_controller's very first bootstrap
+        # landed 4.8cm from right_controller's own real position captured
+        # 78ms earlier -- reproduced here with the same real numbers.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.132, 0.550, 0.240)},  # ctrl_a's own new candidate (unused by the one-sided path)
+            "ctrl_b": {"T_world_ctrl": _T3(0.102, 0.513, 0.238)},  # fresh bootstrap, ~4.8cm from ctrl_a's own reference
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": np.array([0.132, 0.550, 0.240]),
+            "ctrl_b": None,
+        }, matching_cfg={"cold_swap_bootstrap_max_dist_m": 0.12})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, {"ctrl_b"},
+                          "only the bootstrapping side's identity is in question here -- "
+                          "ctrl_a's own established tracking must not be flagged")
+
+    def test_fresh_bootstrap_far_from_other_controller_not_flagged(self):
+        # Same one-sided shape, but the bootstrap lands nowhere near the
+        # other controller's own reference -- an ordinary, unrelated
+        # first-ever sighting, must not be flagged.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.132, 0.550, 0.240)},
+            "ctrl_b": {"T_world_ctrl": _T3(2.0, 2.0, 2.0)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": np.array([0.132, 0.550, 0.240]),
+            "ctrl_b": None,
+        }, matching_cfg={"cold_swap_bootstrap_max_dist_m": 0.12})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, set())
+
+    def test_both_sides_fresh_bootstrap_still_skipped(self):
+        # Regression pin for the function's own remaining documented
+        # out-of-scope case: BOTH sides are genuine first-ever bootstraps
+        # (no fusion filter, no reference on either side) -- even if their
+        # new candidates happen to land close together, there is nothing to
+        # compare against on either side, so this must still be skipped
+        # exactly as before this fix.
+        candidates = {
+            "ctrl_a": {"T_world_ctrl": _T3(0.10, 0.50, 0.24)},
+            "ctrl_b": {"T_world_ctrl": _T3(0.11, 0.51, 0.24)},
+        }
+        ts = _make_tracking_system_with_trackers({
+            "ctrl_a": None,
+            "ctrl_b": None,
+        }, matching_cfg={"cold_swap_bootstrap_max_dist_m": 0.12})
+        suspected = ts._detect_cold_identity_swap(candidates)
+        self.assertEqual(suspected, set())
 
 
 if __name__ == "__main__":
